@@ -86,6 +86,7 @@ export interface Translations {
       analytics: string;
       chat: string;
       config: string;
+      controlCenter: string;
       cron: string;
       documentation: string;
       keys: string;

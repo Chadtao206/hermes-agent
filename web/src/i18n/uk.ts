@@ -70,6 +70,7 @@ export const uk: Translations = {
       analytics: "Аналітика",
       chat: "Чат",
       config: "Конфігурація",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "Документація",
       keys: "Ключі",

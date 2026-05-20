@@ -4,7 +4,7 @@ from argparse import Namespace
 
 import pytest
 
-from cron.jobs import create_job, get_job, list_jobs
+from cron.jobs import create_job, get_job, list_jobs, mark_job_run, save_job_output
 from hermes_cli.cron import cron_command
 
 
@@ -111,3 +111,42 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["profile"] == "default"
+
+    def test_health_shows_manual_only_and_scheduler_proof(self, tmp_cron_dir, capsys):
+        manual_only = create_job(prompt="Weekly audit", schedule="every 1h", name="Manual Only")
+        save_job_output(
+            manual_only["id"],
+            f"""# Manual equivalent: weekly audit\n\nJob ID: {manual_only['id']}\nRun Time: 2026-05-19 08:50:16 PDT\nTrigger: ops kanban task t_example\n\nResponse\n\nvalidated\n""",
+        )
+
+        scheduler_job = create_job(prompt="Daily audit", schedule="every 1h", name="Scheduler Proof")
+        mark_job_run(scheduler_job["id"], success=True)
+        save_job_output(
+            scheduler_job["id"],
+            f"""# Cron Job: scheduler proof\n\n**Job ID:** {scheduler_job['id']}\n**Receipt:** scheduler-executed\n**Run Time:** 2026-05-19 08:45:00\n**Schedule:** every 60m\n\n## Response\n\nok\n""",
+        )
+
+        cron_command(Namespace(cron_command="health", all=False))
+        out = capsys.readouterr().out
+
+        assert "Cron Health" in out
+        assert "Manual validation is useful evidence" in out
+        assert manual_only["id"] in out
+        assert scheduler_job["id"] in out
+        assert "manual-only" in out
+        assert "scheduler" in out
+
+    def test_list_surfaces_manual_receipt_context(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [12345])
+        job = create_job(prompt="Weekly audit", schedule="every 1h")
+        save_job_output(
+            job["id"],
+            f"""# Manual equivalent: weekly audit\n\nJob ID: {job['id']}\nRun Time: 2026-05-19 08:50:16 PDT\nTrigger: ops kanban task t_example\n\nResponse\n\nvalidated\n""",
+        )
+
+        cron_command(Namespace(cron_command="list", all=False))
+        out = capsys.readouterr().out
+
+        assert "Proof:" in out
+        assert "manual-only" in out
+        assert "Manual:" in out

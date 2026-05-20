@@ -70,6 +70,7 @@ export const hu: Translations = {
       analytics: "Analitika",
       chat: "Csevegés",
       config: "Beállítások",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "Dokumentáció",
       keys: "Kulcsok",

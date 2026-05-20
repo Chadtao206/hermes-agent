@@ -70,6 +70,7 @@ export const tr: Translations = {
       analytics: "Analiz",
       chat: "Sohbet",
       config: "Yapılandırma",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "Dokümantasyon",
       keys: "Anahtarlar",

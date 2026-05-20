@@ -1208,6 +1208,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                "**Receipt:** scheduler-executed\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** script failed\n\n"
@@ -1224,6 +1225,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                "**Receipt:** scheduler-executed\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (wakeAgent=false)\n"
@@ -1235,6 +1237,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                "**Receipt:** scheduler-executed\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (empty output)\n"
@@ -1244,6 +1247,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
+            "**Receipt:** scheduler-executed\n"
             f"**Run Time:** {now_iso}\n"
             f"**Mode:** no_agent (script)\n\n"
             f"---\n\n"
@@ -1285,6 +1289,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                "**Receipt:** scheduler-executed\n"
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
@@ -1304,6 +1309,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         blocked_doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
+            "**Receipt:** scheduler-executed\n"
             f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Status:** BLOCKED\n\n"
             "The assembled prompt (user prompt + loaded skill content) tripped "
@@ -1705,6 +1711,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
+**Receipt:** scheduler-executed
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
@@ -1727,6 +1734,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
+**Receipt:** scheduler-executed
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 

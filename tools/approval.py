@@ -502,16 +502,38 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    __slots__ = ("event", "data", "result", "request_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        self.request_id: str = os.urandom(8).hex()
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+
+
+def cc_create_pending_request(request_id: str, session_id: str, kind: str, **kwargs) -> None:
+    try:
+        from control_center_store import cc_create_pending_request as _cc
+        _cc(request_id, session_id, kind, **kwargs)
+    except Exception:
+        pass
+
+
+def cc_resolve_pending_request(request_id: str) -> None:
+    try:
+        from control_center_store import cc_resolve_pending_request as _cc
+        _cc(request_id)
+    except Exception:
+        pass
+
+
+def _publish_approval_pending(entry: "_ApprovalEntry", session_key: str) -> None:
+    command = (entry.data.get("command") or "")[:200]
+    cc_create_pending_request(entry.request_id, session_key, "approval", prompt_preview=command)
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -536,6 +558,7 @@ def unregister_gateway_notify(session_key: str) -> None:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
+        cc_resolve_pending_request(entry.request_id)
         entry.event.set()
 
 
@@ -563,9 +586,32 @@ def resolve_gateway_approval(session_key: str, choice: str,
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
+        cc_resolve_pending_request(entry.request_id)
         entry.result = choice
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_request(session_key: str, request_id: str, choice: str) -> int:
+    """Resolve exactly one queued gateway approval by request id."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return 0
+        target = None
+        for idx, entry in enumerate(queue):
+            if entry.request_id == request_id:
+                target = queue.pop(idx)
+                break
+        if target is None:
+            return 0
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+    cc_resolve_pending_request(target.request_id)
+    target.result = choice
+    target.event.set()
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -614,6 +660,7 @@ def clear_session(session_key: str) -> None:
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
+        cc_resolve_pending_request(entry.request_id)
         entry.result = "deny"
         entry.event.set()
 
@@ -1201,6 +1248,7 @@ def check_all_command_guards(command: str, env_type: str,
             entry = _ApprovalEntry(approval_data)
             with _lock:
                 _gateway_queues.setdefault(session_key, []).append(entry)
+            _publish_approval_pending(entry, session_key)
 
             # Notify plugins that an approval is being requested. Fires before
             # the gateway notify callback so observers (e.g. macOS notifier
@@ -1226,6 +1274,11 @@ def check_all_command_guards(command: str, env_type: str,
                         queue.remove(entry)
                     if not queue:
                         _gateway_queues.pop(session_key, None)
+                # Delivery failure is a terminal interruption for this approval
+                # request. Clear the control-center pending row immediately so
+                # the dashboard does not show a stale approval that was never
+                # successfully presented to the user.
+                cc_resolve_pending_request(entry.request_id)
                 return {
                     "approved": False,
                     "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
@@ -1278,6 +1331,12 @@ def check_all_command_guards(command: str, env_type: str,
                     queue.remove(entry)
                 if not queue:
                     _gateway_queues.pop(session_key, None)
+
+            # If the wait timed out (resolve_gateway_approval was never called),
+            # the pending-request row is still marked 'pending'. Resolve it now
+            # so the control-center doesn't show a stale approval row.
+            if not resolved:
+                cc_resolve_pending_request(entry.request_id)
 
             choice = entry.result
             # Normalize outcome for the post hook. Unresolved (timeout) and

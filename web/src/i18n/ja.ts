@@ -70,6 +70,7 @@ export const ja: Translations = {
       analytics: "分析",
       chat: "チャット",
       config: "設定",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "ドキュメント",
       keys: "キー",

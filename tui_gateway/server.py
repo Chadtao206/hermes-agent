@@ -282,6 +282,63 @@ def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
         pass
 
 
+def _cc_publish_session(session_key: str, **kwargs) -> None:
+    """Best-effort publish TUI session state to the control-center store."""
+    if not session_key:
+        return
+    try:
+        from control_center_store import cc_upsert_live_session
+        cc_upsert_live_session(session_key, **kwargs)
+    except Exception:
+        pass
+
+
+def _cc_clear_session(session_key: str) -> None:
+    """Best-effort clear TUI session row from the control-center store."""
+    if not session_key:
+        return
+    try:
+        from control_center_store import cc_clear_live_session
+        cc_clear_live_session(session_key)
+    except Exception:
+        pass
+
+
+def _cc_create_pending_request(request_id: str, session_key: str, kind: str, **kwargs) -> None:
+    """Best-effort create a pending_request row in the control-center store."""
+    if not session_key:
+        return
+    try:
+        from control_center_store import cc_create_pending_request
+        cc_create_pending_request(request_id, session_key, kind, **kwargs)
+    except Exception:
+        pass
+
+
+def _cc_resolve_pending_request(request_id: str) -> None:
+    """Best-effort resolve a pending_request row in the control-center store."""
+    if not request_id:
+        return
+    try:
+        from control_center_store import cc_resolve_pending_request
+        cc_resolve_pending_request(request_id)
+    except Exception:
+        pass
+
+
+def _emit_approval_request(session_key: str, sid: str, data: dict) -> None:
+    """Publish TUI approval pending-input state and emit the approval event."""
+    if session_key:
+        _cc_publish_session(
+            session_key,
+            owner_kind="tui",
+            owner_id=str(os.getpid()),
+            running=True,
+            awaiting_input=True,
+        )
+    _emit("approval.request", sid, data)
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session."""
     if not session or session.get("_finalized"):
@@ -307,6 +364,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
     _notify_session_boundary("on_session_finalize", session_id)
+
+    _cc_clear_session(session_key or "")
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -574,7 +633,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 )
 
                 register_gateway_notify(
-                    key, lambda data: _emit("approval.request", sid, data)
+                    key, lambda data: _emit_approval_request(key, sid, data)
                 )
                 notify_registered = True
                 load_permanent_allowlist()
@@ -724,14 +783,39 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+_BLOCK_EVENT_KINDS = {
+    "clarify.request": "clarify",
+    "sudo.request": "sudo",
+    "secret.request": "secret",
+}
+
+
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     _pending[rid] = (sid, ev)
     payload["request_id"] = rid
+
+    kind = _BLOCK_EVENT_KINDS.get(event)
+    session_key = (_sessions.get(sid) or {}).get("session_key", "")
+    if kind and session_key:
+        prompt_preview = (payload.get("question") or payload.get("prompt") or "")[:200] or None
+        _cc_create_pending_request(rid, session_key, kind, prompt_preview=prompt_preview)
+        _cc_publish_session(session_key, owner_kind="tui", owner_id=str(os.getpid()), running=True, awaiting_input=True)
+
     _emit(event, sid, payload)
     ev.wait(timeout=timeout)
     _pending.pop(rid, None)
+
+    if kind and session_key:
+        _cc_resolve_pending_request(rid)
+        # Only re-publish as running if the session is still open; session.close
+        # pops _sessions[sid] before calling _finalize_session, so a missing or
+        # finalized entry means we must not resurrect the row as running=True.
+        session_obj = _sessions.get(sid)
+        if session_obj is not None and not session_obj.get("_finalized"):
+            _cc_publish_session(session_key, owner_kind="tui", owner_id=str(os.getpid()), running=True, awaiting_input=False)
+
     return _answers.pop(rid, "")
 
 
@@ -750,7 +834,156 @@ def _clear_pending(sid: str | None = None) -> None:
             ev.set()
 
 
-# ── Agent factory ────────────────────────────────────────────────────
+_CC_COMMAND_POLL_INTERVAL = 0.5
+_cc_command_watcher_started = False
+_cc_command_watcher_lock = threading.Lock()
+
+
+def _sid_for_session_key(session_key: str) -> str | None:
+    for sid, session in _sessions.items():
+        if session.get("session_key") == session_key and not session.get("_finalized"):
+            return sid
+    return None
+
+
+def _cc_handle_command(command: dict) -> dict:
+    command_id = int(command.get("id") or 0)
+    action = str(command.get("action") or "")
+    session_key = str(command.get("target_session_id") or "")
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    sid = _sid_for_session_key(session_key)
+    if not sid:
+        raise RuntimeError("target session is not attached to this TUI process")
+
+    if action == "interrupt":
+        resp = handle_request(
+            {
+                "id": f"__cc_interrupt__{command_id}",
+                "method": "session.interrupt",
+                "params": {"session_id": sid},
+            }
+        )
+    elif action == "steer":
+        resp = handle_request(
+            {
+                "id": f"__cc_steer__{command_id}",
+                "method": "session.steer",
+                "params": {"session_id": sid, "text": payload.get("text", "")},
+            }
+        )
+    elif action == "submit":
+        resp = handle_request(
+            {
+                "id": f"__cc_submit__{command_id}",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": payload.get("text", "")},
+            }
+        )
+    elif action == "respond_pending":
+        kind = str(payload.get("kind") or "")
+        request_id = str(payload.get("request_id") or "")
+        if kind == "approval":
+            resp = handle_request(
+                {
+                    "id": f"__cc_approval__{command_id}",
+                    "method": "approval.respond",
+                    "params": {
+                        "session_id": sid,
+                        "request_id": request_id,
+                        "choice": payload.get("choice", "deny"),
+                    },
+                }
+            )
+        elif kind == "clarify":
+            resp = handle_request(
+                {
+                    "id": f"__cc_clarify__{command_id}",
+                    "method": "clarify.respond",
+                    "params": {
+                        "session_id": sid,
+                        "request_id": request_id,
+                        "answer": payload.get("text", ""),
+                    },
+                }
+            )
+        elif kind == "sudo":
+            resp = handle_request(
+                {
+                    "id": f"__cc_sudo__{command_id}",
+                    "method": "sudo.respond",
+                    "params": {
+                        "session_id": sid,
+                        "request_id": request_id,
+                        "password": payload.get("text", ""),
+                    },
+                }
+            )
+        elif kind == "secret":
+            resp = handle_request(
+                {
+                    "id": f"__cc_secret__{command_id}",
+                    "method": "secret.respond",
+                    "params": {
+                        "session_id": sid,
+                        "request_id": request_id,
+                        "value": payload.get("text", ""),
+                    },
+                }
+            )
+        else:
+            raise RuntimeError(f"unsupported pending request kind: {kind}")
+    else:
+        raise RuntimeError(f"unsupported control-center command: {action}")
+
+    if isinstance(resp, dict) and resp.get("error"):
+        raise RuntimeError(resp["error"].get("message") or f"{action} failed")
+    return (resp or {}).get("result") or {"status": "ok"}
+
+
+def _cc_consume_one_command() -> bool:
+    try:
+        from control_center_store import cc_claim_next_command, cc_complete_command
+    except Exception:
+        return False
+
+    command = cc_claim_next_command(owner_kind="tui", owner_id=str(os.getpid()))
+    if not command:
+        return False
+
+    try:
+        result = _cc_handle_command(command)
+        cc_complete_command(int(command.get("id") or 0), status="completed", result=result)
+    except Exception as exc:
+        cc_complete_command(
+            int(command.get("id") or 0),
+            status="failed",
+            result={"error": str(exc)},
+        )
+    return True
+
+
+def _cc_command_watcher_loop() -> None:
+    while True:
+        handled = False
+        try:
+            while _cc_consume_one_command():
+                handled = True
+        except Exception:
+            pass
+        if not handled:
+            time.sleep(_CC_COMMAND_POLL_INTERVAL)
+
+
+def _ensure_cc_command_watcher() -> None:
+    global _cc_command_watcher_started
+    with _cc_command_watcher_lock:
+        if _cc_command_watcher_started:
+            return
+        threading.Thread(target=_cc_command_watcher_loop, daemon=True).start()
+        _cc_command_watcher_started = True
+
+
+# ── Agent factory ───────────────────────────────────────────────────
 
 
 def resolve_skin() -> dict:
@@ -1301,7 +1534,7 @@ def _sync_session_key_after_compress(
         try:
             register_gateway_notify(
                 new_session_id,
-                lambda data: _emit("approval.request", sid, data),
+                lambda data: _emit_approval_request(new_session_id, sid, data),
             )
         except Exception:
             pass
@@ -2079,10 +2312,11 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit("approval.request", sid, data))
+        register_gateway_notify(key, lambda data: _emit_approval_request(key, sid, data))
         load_permanent_allowlist()
     except Exception:
         pass
+    _ensure_cc_command_watcher()
     # Surface the self-improvement background review's "💾 …" summary as a
     # review.summary event so Ink can render it as a persistent system line
     # in the transcript. In the CLI path this message is printed via
@@ -2260,6 +2494,8 @@ def _(rid, params: dict) -> dict:
         "transport": current_transport() or _stdio_transport,
     }
 
+    _cc_publish_session(key, owner_kind="tui", owner_id=str(os.getpid()), running=False)
+
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
     # flushed.  This keeps startup responsive while still hydrating tools/skills
@@ -2411,6 +2647,7 @@ def _(rid, params: dict) -> dict:
         _init_session(sid, target, agent, history, cols=int(params.get("cols", 80)))
     except Exception as e:
         return _err(rid, 5000, f"resume failed: {e}")
+    _cc_publish_session(target, owner_kind="tui", owner_id=str(os.getpid()), running=False)
     return _ok(
         rid,
         {
@@ -2780,6 +3017,9 @@ def _(rid, params: dict) -> dict:
     if not session:
         return _ok(rid, {"closed": False})
     _finalize_session(session)
+    # Release any _block() waits for this session so they don't idle until
+    # their individual timeouts (up to 300 s) before unwinding.
+    _clear_pending(sid)
     try:
         from tools.approval import unregister_gateway_notify
 
@@ -2871,6 +3111,19 @@ def _(rid, params: dict) -> dict:
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
+    try:
+        from tools.clarify_gateway import clear_session as clear_clarify_session
+
+        clear_clarify_session(session["session_key"])
+    except Exception:
+        pass
+    _cc_publish_session(
+        session["session_key"],
+        owner_kind="tui",
+        owner_id=str(os.getpid()),
+        running=bool(session.get("running", False)),
+        awaiting_input=False,
+    )
     return _ok(rid, {"status": "interrupted"})
 
 
@@ -3283,6 +3536,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         approval_token = None
         session_tokens = []
         goal_followup = None  # set by the post-turn goal hook below
+        _cc_publish_session(session.get("session_key", ""), running=True)
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -3602,6 +3856,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
+            _cc_publish_session(session.get("session_key", ""), running=False)
 
         # Chain a goal-continuation turn if the judge said so. We do
         # this AFTER the finally releases session["running"], so the
@@ -3872,18 +4127,29 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from tools.approval import resolve_gateway_approval
+        from tools.approval import resolve_gateway_approval, resolve_gateway_approval_request
 
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+        request_id = str(params.get("request_id", "") or "")
+        if request_id:
+            resolved = resolve_gateway_approval_request(
+                session["session_key"],
+                request_id,
+                params.get("choice", "deny"),
+            )
+        else:
+            resolved = resolve_gateway_approval(
+                session["session_key"],
+                params.get("choice", "deny"),
+                resolve_all=params.get("all", False),
+            )
+        _cc_publish_session(
+            session["session_key"],
+            owner_kind="tui",
+            owner_id=str(os.getpid()),
+            running=bool(session.get("running", False)),
+            awaiting_input=False,
         )
+        return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))
 

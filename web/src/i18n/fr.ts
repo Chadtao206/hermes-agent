@@ -70,6 +70,7 @@ export const fr: Translations = {
       analytics: "Analyses",
       chat: "Chat",
       config: "Configuration",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "Documentation",
       keys: "Clés",

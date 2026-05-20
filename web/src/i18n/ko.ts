@@ -70,6 +70,7 @@ export const ko: Translations = {
       analytics: "분석",
       chat: "채팅",
       config: "설정",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "문서",
       keys: "키",

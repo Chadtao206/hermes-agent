@@ -70,6 +70,7 @@ export const af: Translations = {
       analytics: "Analise",
       chat: "Klets",
       config: "Konfigurasie",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "Dokumentasie",
       keys: "Sleutels",

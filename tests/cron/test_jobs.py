@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cron.jobs import (
+    build_job_health,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -15,6 +16,7 @@ from cron.jobs import (
     load_jobs,
     save_jobs,
     get_job,
+    list_job_output_receipts,
     list_jobs,
     update_job,
     pause_job,
@@ -558,6 +560,87 @@ class TestMarkJobRun:
         assert updated["next_run_at"] is None
         assert updated["enabled"] is False
         assert updated["state"] == "completed"
+
+
+class TestCronHealth:
+    def test_manual_receipt_surfaces_manual_only_proof(self, tmp_cron_dir):
+        job = create_job(prompt="Weekly report", schedule="every 1h")
+
+        manual_doc = """# Manual equivalent: weekly report
+
+Job ID: {job_id}
+Run Time: 2026-05-19 08:50:16 PDT
+Trigger: ops kanban task t_example
+
+Response
+
+All good.
+""".format(job_id=job["id"])
+        save_job_output(job["id"], manual_doc)
+
+        saved_job = get_job(job["id"])
+        assert saved_job is not None
+        health = build_job_health(saved_job)
+
+        assert health["proof"] == "manual-only"
+        assert health["last_scheduler_success_at"] is None
+        assert health["last_manual_validation_at"] is not None
+        assert "manual-only-proof" in health["flags"]
+        assert health["receipts"]["manual"] == 1
+
+    def test_scheduler_and_manual_receipts_are_counted_separately(self, tmp_cron_dir):
+        job = create_job(prompt="Daily report", schedule="every 1h")
+        mark_job_run(job["id"], success=True)
+
+        scheduler_doc = """# Cron Job: daily report
+
+**Job ID:** {job_id}
+**Receipt:** scheduler-executed
+**Run Time:** 2026-05-19 08:45:00
+**Schedule:** every 60m
+
+## Response
+
+ok
+""".format(job_id=job["id"])
+        manual_doc = """# Manual equivalent: daily report
+
+Job ID: {job_id}
+Run Time: 2026-05-19 08:50:16 PDT
+Trigger: ops kanban task t_example
+
+Response
+
+validated
+""".format(job_id=job["id"])
+        receipt_dir = tmp_cron_dir / "cron" / "output" / job["id"]
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        (receipt_dir / "scheduler.md").write_text(scheduler_doc, encoding="utf-8")
+        (receipt_dir / "manual.md").write_text(manual_doc, encoding="utf-8")
+
+        receipts = list_job_output_receipts(job["id"])
+        saved_job = get_job(job["id"])
+        assert saved_job is not None
+        health = build_job_health(saved_job)
+
+        assert len(receipts) == 2
+        assert health["proof"] == "scheduler"
+        assert health["last_scheduler_success_at"] is not None
+        assert health["last_manual_validation_at"] is not None
+        assert health["receipts"]["scheduler"] == 1
+        assert health["receipts"]["manual"] == 1
+
+    def test_missing_latest_scheduler_receipt_is_flagged(self, tmp_cron_dir):
+        job = create_job(prompt="Daily report", schedule="every 1h")
+        mark_job_run(job["id"], success=True)
+
+        saved_job = get_job(job["id"])
+        assert saved_job is not None
+        health = build_job_health(saved_job)
+
+        assert health["proof"] == "scheduler"
+        assert health["latest_scheduler_receipt_missing"] is True
+        assert "missing-latest-scheduler-receipt" in health["flags"]
 
 
 class TestAdvanceNextRun:

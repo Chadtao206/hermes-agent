@@ -4906,3 +4906,185 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+# ── Control-center state publication ────────────────────────────────────────
+
+
+def test_session_create_publishes_live_session(monkeypatch):
+    published = []
+    monkeypatch.setattr(server, "_cc_publish_session", lambda key, **kw: published.append((key, kw)))
+
+    resp = server.dispatch({"id": "cc1", "method": "session.create", "params": {"cols": 80}})
+
+    assert "result" in resp
+    assert len(published) == 1
+    session_key, kw = published[0]
+    assert session_key, "session_key must be non-empty"
+    assert kw.get("owner_kind") == "tui"
+    assert kw.get("running") is False
+
+
+def test_session_close_clears_live_session(monkeypatch):
+    cleared = []
+    monkeypatch.setattr(server, "_cc_clear_session", lambda key: cleared.append(key))
+    monkeypatch.setattr(server, "_cc_publish_session", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    resp_create = server.dispatch({"id": "cc2a", "method": "session.create", "params": {}})
+    sid = resp_create["result"]["session_id"]
+    server.dispatch({"id": "cc2b", "method": "session.close", "params": {"session_id": sid}})
+
+    assert len(cleared) == 1
+
+
+def test_session_close_unknown_sid_does_not_call_clear(monkeypatch):
+    cleared = []
+    monkeypatch.setattr(server, "_cc_clear_session", lambda key: cleared.append(key))
+
+    server.dispatch({"id": "cc3", "method": "session.close", "params": {"session_id": "nonexistent"}})
+
+    assert cleared == []
+
+
+# ── Gap 1+2: TUI _block() publishes awaiting_input + pending_requests ─────────
+
+
+def test_block_creates_pending_request_and_sets_awaiting_input():
+    """_block() creates a pending_request row and publishes awaiting_input=True."""
+    import uuid
+    import threading
+    from unittest.mock import patch, call
+
+    published_sessions = []
+    created_requests = []
+
+    # Inject a fake session so _block can look up session_key
+    sid = "blk-sid-001"
+    session_key = "blk-sk-001"
+    server._sessions[sid] = {"session_key": session_key, "running": True}
+
+    try:
+        with patch.object(server, "_cc_publish_session", side_effect=lambda sk, **kw: published_sessions.append((sk, kw))):
+            with patch.object(server, "_cc_create_pending_request", side_effect=lambda rid, sk, kind, **kw: created_requests.append({"rid": rid, "sk": sk, "kind": kind, **kw})):
+                with patch.object(server, "_cc_resolve_pending_request", side_effect=lambda rid: None):
+                    # Resolve the block after a short delay
+                    def _resolve_later():
+                        import time; time.sleep(0.02)
+                        # Find the pending rid and answer it
+                        for rid, (owner, ev) in list(server._pending.items()):
+                            if owner == sid:
+                                server._answers[rid] = "yes"
+                                ev.set()
+
+                    t = threading.Thread(target=_resolve_later, daemon=True)
+                    t.start()
+
+                    with patch.object(server, "_emit", side_effect=lambda *a, **kw: None):
+                        result = server._block("clarify.request", sid, {"question": "Color?"}, timeout=2.0)
+                    t.join(timeout=1.0)
+    finally:
+        server._sessions.pop(sid, None)
+
+    # A pending request row should have been created
+    assert len(created_requests) == 1
+    req = created_requests[0]
+    assert req["sk"] == session_key
+    assert req["kind"] == "clarify"
+
+    # awaiting_input=True should have been published before the block
+    awaiting_true = [kw for _, kw in published_sessions if kw.get("awaiting_input") is True]
+    assert awaiting_true, "expected at least one publish with awaiting_input=True"
+
+
+def test_block_resolves_pending_request_and_clears_awaiting_input():
+    """_block() resolves the pending_request row and publishes awaiting_input=False on return."""
+    import threading
+    from unittest.mock import patch
+
+    resolved_rids = []
+    published_sessions = []
+
+    sid = "blk-sid-002"
+    session_key = "blk-sk-002"
+    server._sessions[sid] = {"session_key": session_key, "running": True}
+
+    try:
+        with patch.object(server, "_cc_publish_session", side_effect=lambda sk, **kw: published_sessions.append((sk, kw))):
+            with patch.object(server, "_cc_create_pending_request", side_effect=lambda *a, **kw: None):
+                with patch.object(server, "_cc_resolve_pending_request", side_effect=lambda rid: resolved_rids.append(rid)):
+                    def _resolve_later():
+                        import time; time.sleep(0.02)
+                        for rid, (owner, ev) in list(server._pending.items()):
+                            if owner == sid:
+                                server._answers[rid] = "done"
+                                ev.set()
+
+                    t = threading.Thread(target=_resolve_later, daemon=True)
+                    t.start()
+
+                    with patch.object(server, "_emit", side_effect=lambda *a, **kw: None):
+                        server._block("sudo.request", sid, {}, timeout=2.0)
+                    t.join(timeout=1.0)
+    finally:
+        server._sessions.pop(sid, None)
+
+    # The pending request should be resolved
+    assert len(resolved_rids) == 1
+
+    # awaiting_input=False should have been published after the block returned
+    awaiting_false = [kw for _, kw in published_sessions if kw.get("awaiting_input") is False]
+    assert awaiting_false, "expected at least one publish with awaiting_input=False after return"
+
+
+# ── Gap 1 ext: close/finalize while _block() is pending ────────────────────
+
+
+def test_block_close_while_pending_resolves_and_does_not_republish():
+    """When session.close fires while _block() is waiting, the pending request
+    must be resolved and the session must NOT be re-published as running=True."""
+    import threading
+    from unittest.mock import patch
+
+    resolved_rids = []
+    published_running_true_after_close = []
+
+    sid = "blk-sid-close-001"
+    session_key = "blk-sk-close-001"
+    server._sessions[sid] = {"session_key": session_key, "running": True}
+
+    closed_event = threading.Event()
+
+    def _close_session_after_delay():
+        time.sleep(0.03)
+        # Simulate session.close: pop from _sessions, mark finalized, clear pending
+        session = server._sessions.pop(sid, None)
+        if session:
+            session["_finalized"] = True
+        server._clear_pending(sid)
+        closed_event.set()
+
+    def _capture_publish(sk, **kw):
+        # Only flag if published as running=True *after* session was closed
+        if closed_event.is_set() and kw.get("running") is True:
+            published_running_true_after_close.append(kw)
+
+    t = threading.Thread(target=_close_session_after_delay, daemon=True)
+    t.start()
+
+    try:
+        with patch.object(server, "_cc_publish_session", side_effect=_capture_publish):
+            with patch.object(server, "_cc_create_pending_request", side_effect=lambda *a, **kw: None):
+                with patch.object(server, "_cc_resolve_pending_request", side_effect=lambda rid: resolved_rids.append(rid)):
+                    with patch.object(server, "_emit", side_effect=lambda *a, **kw: None):
+                        server._block("clarify.request", sid, {"question": "Q?"}, timeout=2.0)
+        t.join(timeout=1.0)
+    finally:
+        server._sessions.pop(sid, None)
+
+    # Pending request must be resolved even when session closes mid-wait
+    assert len(resolved_rids) == 1, "pending request should be resolved on close"
+    # Session must NOT be re-published as running=True after it was closed
+    assert not published_running_true_after_close, (
+        "session must not be re-published as running=True after close"
+    )

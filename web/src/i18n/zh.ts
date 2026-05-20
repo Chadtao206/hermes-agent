@@ -69,6 +69,7 @@ export const zh: Translations = {
       analytics: "分析",
       chat: "对话",
       config: "配置",
+      controlCenter: "Control Center",
       cron: "定时任务",
       documentation: "文档",
       keys: "密钥",

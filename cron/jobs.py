@@ -726,6 +726,215 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+# =============================================================================
+# Health / receipt inspection
+# =============================================================================
+
+_RECEIPT_SCHEDULER = "scheduler"
+_RECEIPT_MANUAL = "manual"
+_RECEIPT_UNKNOWN = "unknown"
+_RECEIPT_MATCH_WINDOW_SECONDS = 10 * 60
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-ish datetime string into an aware datetime when possible."""
+    if not value:
+        return None
+    try:
+        return _ensure_aware(datetime.fromisoformat(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_receipt(lines: List[str]) -> tuple[str, bool]:
+    """Classify a saved cron output receipt and whether it represents success."""
+    header = next((line.strip() for line in lines if line.strip()), "")
+    if header.startswith("# Manual equivalent:"):
+        return _RECEIPT_MANUAL, True
+
+    if header.startswith("# Cron Job:"):
+        failed = "(FAILED)" in header
+        if not failed:
+            normalized_lines = [line.strip().lower() for line in lines[:40]]
+            failed = any(
+                marker in line
+                for line in normalized_lines
+                for marker in (
+                    "**status:** script failed",
+                    "**status:** blocked",
+                    "## error",
+                )
+            )
+        return _RECEIPT_SCHEDULER, not failed
+
+    return _RECEIPT_UNKNOWN, True
+
+
+def _read_job_output_receipt(path: Path) -> Optional[Dict[str, Any]]:
+    """Read a saved cron output file and return lightweight receipt metadata."""
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+        stat = path.stat()
+    except OSError:
+        return None
+
+    lines = raw_text.splitlines()
+    receipt_type, success = _classify_receipt(lines)
+
+    run_time_text = None
+    trigger = None
+    for line in lines[:20]:
+        text = line.strip()
+        lower = text.lower()
+        if lower.startswith("**run time:**"):
+            run_time_text = text.split(":", 1)[1].strip()
+        elif lower.startswith("run time:"):
+            run_time_text = text.split(":", 1)[1].strip()
+        elif lower.startswith("trigger:"):
+            trigger = text.split(":", 1)[1].strip()
+
+    recorded_at_dt = datetime.fromtimestamp(stat.st_mtime).astimezone()
+    return {
+        "path": str(path),
+        "filename": path.name,
+        "receipt_type": receipt_type,
+        "success": success,
+        "recorded_at": recorded_at_dt.isoformat(),
+        "recorded_at_dt": recorded_at_dt,
+        "run_time_text": run_time_text,
+        "trigger": trigger,
+    }
+
+
+def list_job_output_receipts(job_id: str) -> List[Dict[str, Any]]:
+    """List saved output receipts for a cron job, newest first."""
+    ensure_dirs()
+    job_output_dir = OUTPUT_DIR / job_id
+    if not job_output_dir.exists() or not job_output_dir.is_dir():
+        return []
+
+    receipts: List[Dict[str, Any]] = []
+    for path in sorted(job_output_dir.glob("*.md")):
+        receipt = _read_job_output_receipt(path)
+        if receipt:
+            receipts.append(receipt)
+
+    receipts.sort(key=lambda item: item["recorded_at_dt"], reverse=True)
+    return receipts
+
+
+def _first_matching_receipt(receipts: List[Dict[str, Any]], *, receipt_type: str,
+                            success: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+    for receipt in receipts:
+        if receipt.get("receipt_type") != receipt_type:
+            continue
+        if success is not None and receipt.get("success") is not success:
+            continue
+        return receipt
+    return None
+
+
+def build_job_health(job: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Return operator-facing cron health facts for a single job."""
+    normalized = _normalize_job_record(job)
+    receipts = list_job_output_receipts(normalized["id"])
+    scheduler_receipt = _first_matching_receipt(receipts, receipt_type=_RECEIPT_SCHEDULER)
+    scheduler_success_receipt = _first_matching_receipt(
+        receipts, receipt_type=_RECEIPT_SCHEDULER, success=True)
+    manual_receipt = _first_matching_receipt(receipts, receipt_type=_RECEIPT_MANUAL)
+    now_dt = now or _hermes_now()
+
+    last_attempt_at = _parse_iso_datetime(normalized.get("last_run_at"))
+    next_run_at = _parse_iso_datetime(normalized.get("next_run_at"))
+
+    scheduler_success_at: Optional[datetime] = None
+    if normalized.get("last_status") == "ok" and last_attempt_at is not None:
+        scheduler_success_at = last_attempt_at
+    elif scheduler_success_receipt is not None:
+        scheduler_success_at = scheduler_success_receipt.get("recorded_at_dt")
+
+    last_manual_at = manual_receipt.get("recorded_at_dt") if manual_receipt else None
+
+    flags: List[str] = []
+    if normalized.get("enabled", True) and normalized.get("state") not in {"paused", "completed"}:
+        if next_run_at is None:
+            flags.append("missing-next-run")
+        elif next_run_at <= now_dt:
+            flags.append("stale")
+
+    if normalized.get("last_status") == "error":
+        flags.append("scheduler-error")
+
+    if normalized.get("last_delivery_error"):
+        flags.append("delivery-error")
+
+    if not receipts:
+        flags.append("no-output-receipts")
+
+    latest_scheduler_receipt_missing = False
+    if last_attempt_at is not None:
+        if scheduler_receipt is None:
+            latest_scheduler_receipt_missing = True
+        else:
+            delta_seconds = (last_attempt_at - scheduler_receipt["recorded_at_dt"]).total_seconds()
+            if delta_seconds > _RECEIPT_MATCH_WINDOW_SECONDS:
+                latest_scheduler_receipt_missing = True
+    if latest_scheduler_receipt_missing:
+        flags.append("missing-latest-scheduler-receipt")
+
+    if scheduler_success_at is not None:
+        proof = "scheduler"
+    elif last_manual_at is not None:
+        proof = "manual-only"
+    else:
+        proof = "missing"
+
+    if proof == "manual-only":
+        flags.append("manual-only-proof")
+    elif proof == "missing":
+        flags.append("no-proof")
+
+    if "stale" in flags or "scheduler-error" in flags or "no-proof" in flags:
+        severity = "critical"
+    elif "manual-only-proof" in flags or "missing-latest-scheduler-receipt" in flags or "delivery-error" in flags:
+        severity = "warning"
+    else:
+        severity = "healthy"
+
+    return {
+        "id": normalized["id"],
+        "name": normalized["name"],
+        "schedule_display": normalized.get("schedule_display"),
+        "state": normalized.get("state"),
+        "enabled": normalized.get("enabled", True),
+        "mode": "no-agent" if normalized.get("no_agent") else "agent",
+        "proof": proof,
+        "severity": severity,
+        "last_scheduler_success_at": scheduler_success_at.isoformat() if scheduler_success_at else None,
+        "last_manual_validation_at": last_manual_at.isoformat() if last_manual_at else None,
+        "last_run_at": last_attempt_at.isoformat() if last_attempt_at else None,
+        "last_status": normalized.get("last_status"),
+        "last_error": normalized.get("last_error"),
+        "last_delivery_error": normalized.get("last_delivery_error"),
+        "next_run_at": next_run_at.isoformat() if next_run_at else normalized.get("next_run_at"),
+        "latest_scheduler_receipt_missing": latest_scheduler_receipt_missing,
+        "receipts": {
+            "total": len(receipts),
+            "scheduler": sum(1 for receipt in receipts if receipt.get("receipt_type") == _RECEIPT_SCHEDULER),
+            "manual": sum(1 for receipt in receipts if receipt.get("receipt_type") == _RECEIPT_MANUAL),
+            "unknown": sum(1 for receipt in receipts if receipt.get("receipt_type") == _RECEIPT_UNKNOWN),
+            "latest_scheduler_receipt": scheduler_receipt,
+            "latest_manual_receipt": manual_receipt,
+        },
+        "flags": flags,
+    }
+
+
+def get_jobs_health(include_disabled: bool = False) -> List[Dict[str, Any]]:
+    """Return operator-facing health facts for all cron jobs."""
+    return [build_job_health(job) for job in list_jobs(include_disabled=include_disabled)]
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     jobs = load_jobs()

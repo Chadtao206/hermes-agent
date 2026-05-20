@@ -11789,6 +11789,13 @@ def main():
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
+    # cron health
+    cron_health = cron_subparsers.add_parser(
+        "health",
+        help="Show scheduler proof vs manual validation health for cron jobs",
+    )
+    cron_health.add_argument("--all", action="store_true", help="Include disabled jobs")
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     _add_accept_hooks_flag(cron_tick)

@@ -843,6 +843,56 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+def cc_upsert_live_session(session_key: str, **kwargs) -> None:
+    """Best-effort forward to control_center_store.cc_upsert_live_session."""
+    try:
+        from control_center_store import cc_upsert_live_session as _cc
+        _cc(session_key, **kwargs)
+    except Exception:
+        pass
+
+
+def _cc_publish_gateway_session(
+    session_key: str,
+    *,
+    running: bool = True,
+    source=None,
+    **kwargs,
+) -> None:
+    """Best-effort publish gateway session state to the control-center store."""
+    if not session_key:
+        return
+    extra: dict = {}
+    payload: dict = {}
+    if source is not None:
+        try:
+            platform_val = getattr(source, "platform", None)
+            platform_str = str(getattr(platform_val, "value", platform_val) or "")
+            if platform_str:
+                extra["source"] = platform_str
+                payload["platform"] = platform_str
+        except Exception:
+            pass
+    if "profile" not in kwargs:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            _profile = get_active_profile_name()
+            if _profile:
+                extra["profile"] = _profile
+        except Exception:
+            pass
+    if payload:
+        extra["payload"] = payload
+    cc_upsert_live_session(
+        session_key,
+        owner_kind="gateway",
+        owner_id=str(os.getpid()),
+        running=running,
+        **extra,
+        **kwargs,
+    )
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2838,6 +2888,109 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    async def _cc_handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        session_key = str(command.get("target_session_id") or "")
+        action = str(command.get("action") or "")
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        source = self._get_cached_session_source(session_key)
+
+        if action == "interrupt":
+            if source is None:
+                raise RuntimeError("session source is unavailable")
+            await self._interrupt_and_clear_session(
+                session_key,
+                source,
+                interrupt_reason="control_center_interrupt",
+                invalidation_reason="control_center_interrupt",
+            )
+            return {"status": "interrupted"}
+
+        if action == "steer":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                raise RuntimeError("text is required")
+            agent = self._running_agents.get(session_key)
+            if agent is None or agent is _AGENT_PENDING_SENTINEL or not hasattr(agent, "steer"):
+                raise RuntimeError("session is not steerable right now")
+            accepted = bool(agent.steer(text))
+            if not accepted:
+                raise RuntimeError("steer was rejected")
+            return {"status": "queued", "text": text}
+
+        if action == "submit":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                raise RuntimeError("text is required")
+            if source is None:
+                raise RuntimeError("session source is unavailable")
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+            )
+            await self._handle_message(event)
+            return {"status": "submitted", "text": text}
+
+        if action == "respond_pending":
+            request_id = str(payload.get("request_id") or "")
+            kind = str(payload.get("kind") or "")
+            if not request_id:
+                raise RuntimeError("request_id is required")
+            if kind == "approval":
+                from tools.approval import resolve_gateway_approval_request
+
+                resolved = resolve_gateway_approval_request(
+                    session_key,
+                    request_id,
+                    str(payload.get("choice") or "deny"),
+                )
+                if resolved <= 0:
+                    raise RuntimeError("approval request was not pending")
+                _cc_publish_gateway_session(session_key, running=bool(self._running_agents.get(session_key)), source=source, awaiting_input=False)
+                return {"resolved": resolved}
+            if kind == "clarify":
+                from tools.clarify_gateway import resolve_gateway_clarify
+
+                if not resolve_gateway_clarify(request_id, str(payload.get("text") or "")):
+                    raise RuntimeError("clarify request was not pending")
+                _cc_publish_gateway_session(session_key, running=bool(self._running_agents.get(session_key)), source=source, awaiting_input=False)
+                return {"resolved": 1}
+            raise RuntimeError(f"unsupported pending request kind: {kind}")
+
+        raise RuntimeError(f"unsupported control-center command: {action}")
+
+    async def _cc_process_one_command(self) -> bool:
+        try:
+            from control_center_store import cc_claim_next_command, cc_complete_command
+        except Exception:
+            return False
+
+        command = cc_claim_next_command(owner_kind="gateway", owner_id=str(os.getpid()))
+        if not command:
+            return False
+
+        command_id = int(command.get("id") or 0)
+        try:
+            result = await self._cc_handle_command(command)
+            cc_complete_command(command_id, status="completed", result=result)
+        except Exception as exc:
+            cc_complete_command(command_id, status="failed", result={"error": str(exc)})
+        return True
+
+    async def _control_center_command_watcher(self) -> None:
+        while True:
+            handled = False
+            try:
+                while await self._cc_process_one_command():
+                    handled = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("control-center command watcher iteration failed", exc_info=True)
+            if not handled:
+                await asyncio.sleep(0.5)
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -4074,7 +4227,13 @@ class GatewayRunner:
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher to finalize expired sessions
-        asyncio.create_task(self._session_expiry_watcher())
+        task = asyncio.create_task(self._session_expiry_watcher())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        task = asyncio.create_task(self._control_center_command_watcher())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
@@ -7493,6 +7652,7 @@ class GatewayRunner:
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
+        _cc_publish_gateway_session(_quick_key, running=True, source=source)
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         _run_generation = self._begin_session_run_generation(_quick_key)
@@ -14788,6 +14948,11 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        try:
+            source = self._get_cached_session_source(session_key)
+        except Exception:
+            source = None
+        _cc_publish_gateway_session(session_key, running=False, source=source)
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
@@ -14912,6 +15077,18 @@ class GatewayRunner:
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolve_gateway_approval(session_key, "deny", resolve_all=True)
+        except Exception:
+            pass
+        try:
+            from tools.clarify_gateway import clear_session as clear_clarify_session
+
+            clear_clarify_session(session_key)
+        except Exception:
+            pass
         if release_running_state:
             self._release_running_agent_state(session_key)
 
@@ -17551,9 +17728,15 @@ class GatewayRunner:
                 # were unwinding has already installed its own state; this
                 # guard prevents an old run from clobbering it on the way
                 # out.
-                self._release_running_agent_state(
+                cleared = self._release_running_agent_state(
                     session_key, run_generation=run_generation
                 )
+                if not cleared:
+                    logger.debug(
+                        "skip running=False control-center publish for stale generation %s (%s)",
+                        run_generation,
+                        session_key,
+                    )
             if self._draining:
                 self._update_runtime_status("draining")
             

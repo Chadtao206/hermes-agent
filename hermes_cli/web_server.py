@@ -4422,6 +4422,258 @@ async def post_plugin_visibility(request: Request, name: str, body: _PluginVisib
     return {"ok": True, "name": name, "hidden": body.hidden}
 
 
+# ---------------------------------------------------------------------------
+# Control Center endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/control-center/overview")
+async def get_control_center_overview():
+    try:
+        import control_center_store as _cc
+        return _cc.read_overview()
+    except Exception:
+        return {
+            "gateway": {"running": False, "state": None},
+            "counts": {
+                "active_sessions": 0,
+                "pending_requests": 0,
+                "running_processes": 0,
+                "profiles_online": 0,
+            },
+            "alerts": [],
+        }
+
+
+@app.get("/api/control-center/sessions")
+async def get_control_center_sessions():
+    try:
+        import control_center_store as _cc
+        return {"sessions": _cc.read_sessions(limit=50, running_only=True)}
+    except Exception:
+        return {"sessions": []}
+
+
+@app.get("/api/control-center/pending")
+async def get_control_center_pending():
+    try:
+        import control_center_store as _cc
+        return {"requests": _cc.read_pending_requests()}
+    except Exception:
+        return {"requests": []}
+
+
+@app.get("/api/control-center/commands")
+async def get_control_center_commands(limit: int = 50):
+    try:
+        import control_center_store as _cc
+        return {"commands": _cc.read_commands(limit=max(1, min(limit, 200)))}
+    except Exception:
+        return {"commands": []}
+
+
+async def _control_center_json(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return payload
+
+
+def _require_live_control_center_session(session_id: str) -> dict:
+    import control_center_store as _cc
+
+    for session in _cc.read_sessions(limit=500, running_only=True):
+        if session.get("session_id") == session_id:
+            return session
+    raise HTTPException(status_code=404, detail="live session not found")
+
+
+@app.post("/api/control-center/sessions/{session_id}/interrupt")
+async def post_control_center_interrupt(session_id: str):
+    import control_center_store as _cc
+
+    _require_live_control_center_session(session_id)
+    command_id = _cc.cc_enqueue_command("interrupt", target_session_id=session_id)
+    commands = _cc.read_commands(limit=20)
+    command = next((item for item in commands if item.get("id") == command_id), None)
+    return {"ok": True, "command": command or {"id": command_id, "status": "pending"}}
+
+
+@app.post("/api/control-center/sessions/{session_id}/steer")
+async def post_control_center_steer(session_id: str, request: Request):
+    import control_center_store as _cc
+
+    _require_live_control_center_session(session_id)
+    payload = await _control_center_json(request)
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    command_id = _cc.cc_enqueue_command("steer", target_session_id=session_id, payload={"text": text})
+    commands = _cc.read_commands(limit=20)
+    command = next((item for item in commands if item.get("id") == command_id), None)
+    return {"ok": True, "command": command or {"id": command_id, "status": "pending"}}
+
+
+@app.post("/api/control-center/sessions/{session_id}/submit")
+async def post_control_center_submit(session_id: str, request: Request):
+    import control_center_store as _cc
+
+    _require_live_control_center_session(session_id)
+    payload = await _control_center_json(request)
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    command_id = _cc.cc_enqueue_command("submit", target_session_id=session_id, payload={"text": text})
+    commands = _cc.read_commands(limit=20)
+    command = next((item for item in commands if item.get("id") == command_id), None)
+    return {"ok": True, "command": command or {"id": command_id, "status": "pending"}}
+
+
+@app.post("/api/control-center/pending/{request_id}/respond")
+async def post_control_center_pending_respond(request_id: str, request: Request):
+    import control_center_store as _cc
+
+    pending = _cc.cc_get_pending_request(request_id)
+    if pending is None or pending.get("status") != "pending":
+        raise HTTPException(status_code=404, detail="pending request not found")
+    payload = await _control_center_json(request)
+    response_payload = {
+        "request_id": request_id,
+        "kind": pending.get("kind"),
+    }
+    if "choice" in payload:
+        response_payload["choice"] = payload.get("choice")
+    if "text" in payload:
+        response_payload["text"] = payload.get("text")
+    if "approve" in payload:
+        response_payload["approve"] = bool(payload.get("approve"))
+    command_id = _cc.cc_enqueue_command(
+        "respond_pending",
+        target_session_id=pending.get("session_id"),
+        payload=response_payload,
+    )
+    commands = _cc.read_commands(limit=20)
+    command = next((item for item in commands if item.get("id") == command_id), None)
+    return {"ok": True, "command": command or {"id": command_id, "status": "pending"}}
+
+
+@app.get("/api/control-center/processes")
+async def get_control_center_processes():
+    try:
+        import control_center_store as _cc
+        return {"processes": _cc.read_processes()}
+    except Exception:
+        return {"processes": []}
+
+
+def _control_center_process_result(result: dict) -> dict:
+    status = result.get("status")
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail=result.get("error") or "process not found")
+    if status == "error":
+        raise HTTPException(status_code=400, detail=result.get("error") or "process action failed")
+    return {"ok": True, "result": result}
+
+
+@app.post("/api/control-center/processes/{session_id}/kill")
+async def post_control_center_process_kill(session_id: str):
+    try:
+        from tools.process_registry import process_registry
+
+        result = process_registry.kill_process(session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _control_center_process_result(result)
+
+
+@app.get("/api/control-center/processes/{session_id}/poll")
+async def get_control_center_process_poll(session_id: str):
+    try:
+        from tools.process_registry import process_registry
+
+        result = process_registry.poll(session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _control_center_process_result(result)
+
+
+@app.get("/api/control-center/processes/{session_id}/log")
+async def get_control_center_process_log(session_id: str, offset: int = 0, limit: int = 200):
+    try:
+        from tools.process_registry import process_registry
+
+        safe_offset = max(0, offset)
+        safe_limit = max(1, min(limit, 1000))
+        result = process_registry.read_log(session_id, offset=safe_offset, limit=safe_limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _control_center_process_result(result)
+
+
+@app.post("/api/control-center/processes/{session_id}/wait")
+async def post_control_center_process_wait(session_id: str, timeout: int = 3):
+    try:
+        from tools.process_registry import process_registry
+
+        safe_timeout = max(1, min(timeout, 10))
+        result = process_registry.wait(session_id, timeout=safe_timeout)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _control_center_process_result(result)
+
+
+@app.get("/api/control-center/system-processes")
+async def get_control_center_system_processes(limit: int = 100):
+    try:
+        import control_center_store as _cc
+        return {"processes": _cc.read_system_processes(limit=max(1, min(limit, 200)))}
+    except Exception:
+        return {"processes": []}
+
+
+@app.get("/api/control-center/runtimes")
+async def get_control_center_runtimes():
+    try:
+        import control_center_store as _cc
+        return _cc.read_runtime_health()
+    except Exception:
+        return {"last_checked": None, "runtimes": [], "alerts": []}
+
+
+@app.post("/api/control-center/runtimes/{runtime_id}/actions/{action}")
+async def post_control_center_runtime_action(runtime_id: str, action: str):
+    try:
+        import control_center_store as _cc
+        result = _cc.execute_runtime_action(runtime_id, action)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=result.get("error") or "runtime not found")
+    if result.get("status") in {"error", "failed"}:
+        raise HTTPException(status_code=400, detail=result.get("error") or result.get("output") or "runtime action failed")
+    return {"ok": result.get("status") != "unavailable", "result": result}
+
+
+@app.get("/api/control-center/delegation")
+async def get_control_center_delegation():
+    try:
+        import control_center_store as _cc
+        return {"subagents": _cc.read_delegation_subagents(limit=20)}
+    except Exception:
+        return {"subagents": []}
+
+
+@app.get("/api/control-center/profiles")
+async def get_control_center_profiles():
+    try:
+        import control_center_store as _cc
+        return {"profiles": _cc.read_profiles()}
+    except Exception:
+        return {"profiles": []}
+
+
 @app.get("/dashboard-plugins/{plugin_name}/{file_path:path}")
 async def serve_plugin_asset(plugin_name: str, file_path: str):
     """Serve static assets from a dashboard plugin directory.

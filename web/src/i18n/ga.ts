@@ -70,6 +70,7 @@ export const ga: Translations = {
       analytics: "Anailís",
       chat: "Comhrá",
       config: "Cumraíocht",
+      controlCenter: "Control Center",
       cron: "Cron",
       documentation: "Doiciméadú",
       keys: "Eochracha",

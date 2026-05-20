@@ -41,6 +41,26 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================================
+# Control-center store helpers (best-effort, never raises)
+# =========================================================================
+
+def cc_create_pending_request(request_id: str, session_id: str, kind: str, **kwargs) -> None:
+    try:
+        from control_center_store import cc_create_pending_request as _cc
+        _cc(request_id, session_id, kind, **kwargs)
+    except Exception:
+        pass
+
+
+def cc_resolve_pending_request(request_id: str) -> None:
+    try:
+        from control_center_store import cc_resolve_pending_request as _cc
+        _cc(request_id)
+    except Exception:
+        pass
+
+
+# =========================================================================
 # Module-level state
 # =========================================================================
 
@@ -97,6 +117,7 @@ def register(
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
+    cc_create_pending_request(clarify_id, session_key, "clarify", prompt_preview=(question[:200] if question else None))
     return entry
 
 
@@ -130,6 +151,8 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             break
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
+
+    cc_resolve_pending_request(clarify_id)
 
     with _lock:
         # Remove from indices regardless of resolution outcome.
@@ -220,6 +243,7 @@ def clear_session(session_key: str) -> int:
         # falsy result as "user did not respond".
         entry.response = ""
         entry.event.set()
+        cc_resolve_pending_request(entry.clarify_id)
         cancelled += 1
     return cancelled
 

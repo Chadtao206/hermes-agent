@@ -70,6 +70,7 @@ export const zhHant: Translations = {
       analytics: "分析",
       chat: "對話",
       config: "設定",
+      controlCenter: "Control Center",
       cron: "排程任務",
       documentation: "文件",
       keys: "金鑰",

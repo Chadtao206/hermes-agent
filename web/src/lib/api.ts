@@ -341,6 +341,84 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     }),
+
+  // Control Center
+  getControlCenterOverview: () =>
+    fetchJSON<ControlCenterOverviewResponse>("/api/control-center/overview"),
+  getControlCenterSessions: () =>
+    fetchJSON<{ sessions: ControlCenterLiveSession[] }>("/api/control-center/sessions"),
+  getControlCenterPending: () =>
+    fetchJSON<{ requests: ControlCenterPendingRequest[] }>("/api/control-center/pending"),
+  getControlCenterCommands: () =>
+    fetchJSON<{ commands: ControlCenterCommand[] }>("/api/control-center/commands"),
+  interruptControlCenterSession: (sessionId: string) =>
+    fetchJSON<{ ok: boolean; command: ControlCenterCommand }>(
+      `/api/control-center/sessions/${encodeURIComponent(sessionId)}/interrupt`,
+      { method: "POST" },
+    ),
+  steerControlCenterSession: (sessionId: string, text: string) =>
+    fetchJSON<{ ok: boolean; command: ControlCenterCommand }>(
+      `/api/control-center/sessions/${encodeURIComponent(sessionId)}/steer`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      },
+    ),
+  submitControlCenterSession: (sessionId: string, text: string) =>
+    fetchJSON<{ ok: boolean; command: ControlCenterCommand }>(
+      `/api/control-center/sessions/${encodeURIComponent(sessionId)}/submit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      },
+    ),
+  respondToControlCenterPending: (
+    requestId: string,
+    payload: { choice?: string; text?: string; approve?: boolean },
+  ) =>
+    fetchJSON<{ ok: boolean; command: ControlCenterCommand }>(
+      `/api/control-center/pending/${encodeURIComponent(requestId)}/respond`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    ),
+  getControlCenterProcesses: () =>
+    fetchJSON<{ processes: ControlCenterProcess[] }>("/api/control-center/processes"),
+  killControlCenterProcess: (sessionId: string) =>
+    fetchJSON<ControlCenterProcessActionResponse>(
+      `/api/control-center/processes/${encodeURIComponent(sessionId)}/kill`,
+      { method: "POST" },
+    ),
+  pollControlCenterProcess: (sessionId: string) =>
+    fetchJSON<ControlCenterProcessActionResponse>(
+      `/api/control-center/processes/${encodeURIComponent(sessionId)}/poll`,
+    ),
+  getControlCenterProcessLog: (sessionId: string, limit = 200, offset = 0) =>
+    fetchJSON<ControlCenterProcessActionResponse>(
+      `/api/control-center/processes/${encodeURIComponent(sessionId)}/log?limit=${limit}&offset=${offset}`,
+    ),
+  waitControlCenterProcess: (sessionId: string, timeout = 3) =>
+    fetchJSON<ControlCenterProcessActionResponse>(
+      `/api/control-center/processes/${encodeURIComponent(sessionId)}/wait?timeout=${timeout}`,
+      { method: "POST" },
+    ),
+  getControlCenterSystemProcesses: () =>
+    fetchJSON<{ processes: ControlCenterSystemProcess[] }>("/api/control-center/system-processes"),
+  getControlCenterRuntimes: () =>
+    fetchJSON<ControlCenterRuntimeHealthResponse>("/api/control-center/runtimes"),
+  runControlCenterRuntimeAction: (runtimeId: string, action: string) =>
+    fetchJSON<ControlCenterRuntimeActionResponse>(
+      `/api/control-center/runtimes/${encodeURIComponent(runtimeId)}/actions/${encodeURIComponent(action)}`,
+      { method: "POST" },
+    ),
+  getControlCenterDelegation: () =>
+    fetchJSON<{ subagents: ControlCenterDelegationSummary[] }>("/api/control-center/delegation"),
+  getControlCenterProfiles: () =>
+    fetchJSON<{ profiles: ControlCenterProfileStatus[] }>("/api/control-center/profiles"),
 };
 
 export interface ActionResponse {
@@ -817,4 +895,165 @@ export interface AgentPluginUpdateResponse {
 export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
+}
+
+// ── Control Center types ───────────────────────────────────────────────
+
+export interface ControlCenterOverviewResponse {
+  gateway: {
+    running: boolean;
+    state: string | null;
+  };
+  counts: {
+    active_sessions: number;
+    pending_requests: number;
+    running_processes: number;
+    profiles_online: number;
+  };
+  alerts: Array<{ level: string; message: string }>;
+}
+
+export interface ControlCenterLiveSession {
+  session_id: string;
+  title: string;
+  source: string | null;
+  model: string | null;
+  profile: string | null;
+  owner_kind: "gateway" | "tui" | "cli" | "dashboard" | "unknown";
+  running: boolean;
+  awaiting_input: boolean;
+  pending_request_kinds: string[];
+  started_at: number;
+  last_seen_at: number;
+  last_preview?: string | null;
+}
+
+export interface ControlCenterPendingRequest {
+  request_id: string;
+  session_id: string;
+  kind: "approval" | "clarify" | "sudo" | "secret";
+  prompt_preview: string;
+  created_at: number;
+  session_title?: string;
+  choices?: string[];
+}
+
+export interface ControlCenterCommand {
+  id: number;
+  target_session_id: string | null;
+  action: string;
+  status: "pending" | "claimed" | "completed" | "failed" | "expired" | string;
+  created_at: number;
+  claimed_at?: number | null;
+  completed_at?: number | null;
+  payload?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+}
+
+export interface ControlCenterProcess {
+  session_id: string;
+  pid: number | null;
+  command: string;
+  cwd?: string | null;
+  started_at: number;
+  uptime_seconds?: number | null;
+  status?: string | null;
+  exited: boolean;
+  exit_code: number | null;
+  notify_on_complete: boolean;
+  session_key?: string | null;
+  detached?: boolean;
+  output_preview?: string | null;
+  controllable?: boolean;
+}
+
+export interface ControlCenterSystemProcess {
+  pid: number;
+  ppid: number;
+  elapsed: string;
+  kind: string;
+  command: string;
+  command_preview: string;
+  managed: boolean;
+}
+
+export interface ControlCenterProcessActionResponse {
+  ok: boolean;
+  result: {
+    session_id?: string;
+    command?: string;
+    status?: string;
+    pid?: number | null;
+    uptime_seconds?: number;
+    output_preview?: string;
+    output?: string;
+    total_lines?: number;
+    showing?: string;
+    exit_code?: number | null;
+    timeout_note?: string;
+    note?: string;
+    error?: string;
+    [key: string]: unknown;
+  };
+}
+
+
+export interface ControlCenterRuntimeAction {
+  id: string;
+  label: string;
+  available: boolean;
+  reason?: string | null;
+  destructive?: boolean;
+}
+
+export interface ControlCenterRuntimeCard {
+  id: string;
+  name: string;
+  status: string;
+  running: boolean;
+  state?: string | null;
+  primary_pid?: number | null;
+  pids: number[];
+  source: string;
+  details: Record<string, unknown>;
+  warnings: string[];
+  actions: ControlCenterRuntimeAction[];
+}
+
+export interface ControlCenterRuntimeHealthResponse {
+  last_checked: number | null;
+  runtimes: ControlCenterRuntimeCard[];
+  alerts: Array<{ level: string; runtime?: string; message: string }>;
+}
+
+export interface ControlCenterRuntimeActionResponse {
+  ok: boolean;
+  result: {
+    status: string;
+    runtime_id?: string;
+    action?: string;
+    exit_code?: number;
+    output?: string;
+    error?: string;
+    runtime?: ControlCenterRuntimeCard | null;
+    [key: string]: unknown;
+  };
+}
+
+export interface ControlCenterDelegationSummary {
+  session_id: string;
+  subagent_id: string;
+  status: string;
+  profile?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  parent_subagent_id?: string | null;
+}
+
+export interface ControlCenterProfileStatus {
+  name: string;
+  is_online: boolean;
+  last_seen: number | null;
+  active_sessions: number;
+  model: string | null;
 }
