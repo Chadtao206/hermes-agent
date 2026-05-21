@@ -3158,6 +3158,7 @@ class HermesCLI:
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
+        self._last_control_center_publish = 0.0
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -7595,6 +7596,158 @@ class HermesCLI:
         """Print through the active command-safe console."""
         self._output_console().print(*args, **kwargs)
 
+    def _control_center_payload(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Build a compact best-effort Control Center payload for CLI sessions."""
+        base: Dict[str, Any] = {
+            "pid": os.getpid(),
+            "cwd": os.getcwd(),
+            "argv": list(sys.argv),
+            "agent_running": bool(getattr(self, "_agent_running", False)),
+            "pending_request_kinds": [],
+        }
+        if payload:
+            base.update(payload)
+        return base
+
+    def _publish_control_center_session(
+        self,
+        *,
+        running: bool = True,
+        awaiting_input: bool = False,
+        payload: Optional[Dict[str, Any]] = None,
+        force: bool = False,
+    ) -> None:
+        """Publish this plain CLI session to the shared Control Center store.
+
+        Gateway and TUI sessions already publish live-state rows.  A normal
+        terminal CLI session has its own lifecycle and otherwise stays invisible
+        in Control Center, so this is deliberately best-effort and silent on
+        failure.  ``running`` here means the CLI process/session is live; the
+        separate ``awaiting_input`` flag distinguishes idle prompt time from an
+        active agent turn.
+        """
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            return
+        now = time.time()
+        if not force and now - getattr(self, "_last_control_center_publish", 0.0) < 5.0:
+            return
+        self._last_control_center_publish = now
+        try:
+            from control_center_store import cc_upsert_live_session
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile = get_active_profile_name()
+            except Exception:
+                profile = "default"
+            title = None
+            if getattr(self, "_session_db", None):
+                try:
+                    title = self._session_db.get_session_title(session_id)
+                except Exception:
+                    title = None
+            model = getattr(getattr(self, "agent", None), "model", None) or getattr(self, "model", None)
+            started_at = None
+            try:
+                started_at = self.session_start.timestamp()
+            except Exception:
+                pass
+            cc_upsert_live_session(
+                session_id,
+                owner_kind="cli",
+                owner_id=str(os.getpid()),
+                profile=profile,
+                source="cli",
+                title=title,
+                model=model,
+                running=bool(running),
+                awaiting_input=bool(awaiting_input),
+                started_at=started_at,
+                payload=self._control_center_payload(payload),
+            )
+        except Exception as exc:
+            logger.debug("Control Center CLI session publish failed: %s", exc)
+
+    def _mark_control_center_session_closed(self, session_id: Optional[str] = None) -> None:
+        """Mark a CLI session as no longer running in Control Center."""
+        session_id = session_id or getattr(self, "session_id", None)
+        if not session_id:
+            return
+        try:
+            from control_center_store import cc_upsert_live_session
+            cc_upsert_live_session(
+                session_id,
+                owner_kind="cli",
+                owner_id=str(os.getpid()),
+                profile=None,
+                source="cli",
+                running=False,
+                awaiting_input=False,
+                started_at=None,
+                payload=self._control_center_payload({"closed": True}),
+            )
+        except Exception as exc:
+            logger.debug("Control Center CLI session close publish failed: %s", exc)
+
+    def _control_center_command_text(self, payload: Optional[Dict[str, Any]]) -> str:
+        payload = payload or {}
+        return str(payload.get("text") or payload.get("message") or payload.get("prompt") or "").strip()
+
+    def _process_control_center_command(self) -> bool:
+        """Claim and execute one queued Control Center command for this CLI owner."""
+        try:
+            from control_center_store import cc_claim_next_command, cc_complete_command
+        except Exception:
+            return False
+        try:
+            command = cc_claim_next_command(owner_kind="cli", owner_id=str(os.getpid()))
+        except Exception as exc:
+            logger.debug("Control Center CLI command claim failed: %s", exc)
+            return False
+        if not command:
+            return False
+
+        command_id = int(command.get("id") or 0)
+        action = str(command.get("action") or "")
+        payload = command.get("payload") or {}
+        status = "completed"
+        result: Dict[str, Any]
+        try:
+            if action == "interrupt":
+                if getattr(self, "_agent_running", False) and getattr(self, "agent", None):
+                    self.agent.interrupt("control_center_interrupt")
+                    result = {"status": "interrupted"}
+                else:
+                    result = {"status": "idle", "message": "No active CLI agent turn to interrupt."}
+            elif action == "steer":
+                text = self._control_center_command_text(payload)
+                if not text:
+                    raise ValueError("text is required")
+                if getattr(self, "_agent_running", False) and getattr(self, "agent", None) and hasattr(self.agent, "steer"):
+                    accepted = bool(self.agent.steer(text))
+                    result = {"status": "steer_queued", "accepted": accepted}
+                else:
+                    self._pending_input.put(text)
+                    result = {"status": "queued_as_next_turn"}
+            elif action == "submit":
+                text = self._control_center_command_text(payload)
+                if not text:
+                    raise ValueError("text is required")
+                self._pending_input.put(text)
+                result = {"status": "queued"}
+            else:
+                status = "failed"
+                result = {"error": f"unsupported CLI Control Center command: {action}"}
+        except Exception as exc:
+            status = "failed"
+            result = {"error": str(exc)}
+
+        try:
+            cc_complete_command(command_id, status=status, result=result)
+        except Exception as exc:
+            logger.debug("Control Center CLI command completion failed: %s", exc)
+        return True
+
     @staticmethod
     def _resolve_personality_prompt(value) -> str:
         """Accept string or dict personality value; return system prompt string."""
@@ -11268,6 +11421,11 @@ class HermesCLI:
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+        self._publish_control_center_session(
+            running=True,
+            awaiting_input=False,
+            force=True,
+        )
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -11627,8 +11785,15 @@ class HermesCLI:
                 and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id
             ):
+                old_session_id = self.session_id
                 self.session_id = self.agent.session_id
                 self._pending_title = None
+                self._mark_control_center_session_closed(old_session_id)
+                self._publish_control_center_session(
+                    running=True,
+                    awaiting_input=bool(not getattr(self, "_agent_running", False)),
+                    force=True,
+                )
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
@@ -12209,6 +12374,7 @@ class HermesCLI:
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
+        self._last_control_center_publish = 0.0
         self._should_exit = False
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
 
@@ -12272,6 +12438,7 @@ class HermesCLI:
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
+        self._publish_control_center_session(running=True, awaiting_input=True, force=True)
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._ensure_tirith_security()
@@ -14016,6 +14183,11 @@ class HermesCLI:
                                     self._pending_input.put(_synth)
                             except Exception:
                                 pass
+                            self._publish_control_center_session(running=True, awaiting_input=True)
+                            try:
+                                self._process_control_center_command()
+                            except Exception as _cc_exc:
+                                logging.debug("Control Center CLI idle command processing failed: %s", _cc_exc)
                         continue
                     
                     if not user_input:
@@ -14077,12 +14249,14 @@ class HermesCLI:
 
                     # Regular chat - run agent
                     self._agent_running = True
+                    self._publish_control_center_session(running=True, awaiting_input=False, force=True)
                     app.invalidate()  # Refresh status line
 
                     try:
                         self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
+                        self._publish_control_center_session(running=True, awaiting_input=True, force=True)
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
                         self._pending_tool_info.clear()
@@ -14368,6 +14542,7 @@ class HermesCLI:
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
+            self._mark_control_center_session_closed()
             # Close session in SQLite
             if hasattr(self, '_session_db') and self._session_db and self.agent:
                 try:
@@ -14714,10 +14889,14 @@ def main(
                     # status lines).  The response is printed once below.
                     cli.agent.stream_delta_callback = None
                     cli.agent.tool_gen_callback = None
-                    result = cli.agent.run_conversation(
-                        user_message=effective_query,
-                        conversation_history=cli.conversation_history,
-                    )
+                    cli._publish_control_center_session(running=True, awaiting_input=False, force=True)
+                    try:
+                        result = cli.agent.run_conversation(
+                            user_message=effective_query,
+                            conversation_history=cli.conversation_history,
+                        )
+                    finally:
+                        cli._publish_control_center_session(running=False, awaiting_input=False, force=True)
                     # Sync session_id if mid-run compression created a
                     # continuation session. The exit line below reports
                     # session_id to stderr for automation wrappers; without
@@ -14726,7 +14905,10 @@ def main(
                         getattr(cli.agent, "session_id", None)
                         and cli.agent.session_id != cli.session_id
                     ):
+                        old_session_id = cli.session_id
                         cli.session_id = cli.agent.session_id
+                        cli._mark_control_center_session_closed(old_session_id)
+                    cli._mark_control_center_session_closed()
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                     # Surface backend errors that produced no visible output
                     # (e.g. invalid model slug → provider 4xx). Mirrors the
@@ -14770,6 +14952,7 @@ def main(
             # banner, doesn't depend on the welcome banner being shown.
             cli._show_security_advisories()
             cli.chat(query, images=single_query_images or None)
+            cli._mark_control_center_session_closed()
             cli._print_exit_summary()
         return
     
