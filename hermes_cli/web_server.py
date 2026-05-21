@@ -4443,15 +4443,7 @@ async def get_control_center_overview():
             "kanban": {"status": "unavailable", "available": False},
             "memory": {"status": "unavailable", "available": False},
             "repos": {"status": "unavailable"},
-            "control_center": {
-                "actions_enabled": _control_center_actions_enabled(),
-                "mode": "operator_actions_enabled" if _control_center_actions_enabled() else "read_only",
-                "label": "Operator actions enabled" if _control_center_actions_enabled() else "Read-only mode",
-                "reason": None if _control_center_actions_enabled() else "Set HERMES_CONTROL_CENTER_ACTIONS=1 to enable safe operator controls.",
-                "safe_session_actions": ["steer", "submit"],
-                "safe_process_actions": ["poll", "log", "wait"],
-                "destructive_controls_enabled": False,
-            },
+            "control_center": _control_center_fallback_capabilities(),
             "alerts": [],
         }
 
@@ -4489,9 +4481,45 @@ def _control_center_actions_enabled() -> bool:
     return os.environ.get("HERMES_CONTROL_CENTER_ACTIONS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _control_center_destructive_actions_enabled() -> bool:
+    return _control_center_actions_enabled() and os.environ.get(
+        "HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _control_center_fallback_capabilities() -> dict:
+    enabled = _control_center_actions_enabled()
+    destructive_enabled = _control_center_destructive_actions_enabled()
+    safe_session_actions = ["steer", "submit"]
+    safe_process_actions = ["poll", "log", "wait"]
+    pending_request_actions = ["respond_pending"]
+    return {
+        "actions_enabled": enabled,
+        "mode": "operator_actions_enabled" if enabled else "read_only",
+        "label": "Operator actions enabled" if enabled else "Read-only mode",
+        "reason": None if enabled else "Set HERMES_CONTROL_CENTER_ACTIONS=1 to enable safe operator controls.",
+        "env_var": "HERMES_CONTROL_CENTER_ACTIONS",
+        "safe_session_actions": safe_session_actions,
+        "safe_process_actions": safe_process_actions,
+        "pending_request_actions": pending_request_actions,
+        "safe_actions": safe_session_actions + safe_process_actions + pending_request_actions,
+        "destructive_actions": ["interrupt", "kill", "runtime_start", "runtime_stop", "runtime_restart"],
+        "destructive_controls_enabled": destructive_enabled,
+        "destructive_controls_env_var": "HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS",
+        "destructive_controls_reason": None if destructive_enabled else "Set HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS=1 in addition to HERMES_CONTROL_CENTER_ACTIONS=1 to enable interrupt, kill, and runtime lifecycle controls.",
+    }
+
+
 def _require_control_center_actions_enabled() -> None:
     if not _control_center_actions_enabled():
-        raise HTTPException(status_code=404, detail="Control Center actions are disabled in read-only Phase 1")
+        raise HTTPException(status_code=404, detail="Control Center actions are disabled in read-only mode")
+
+
+def _require_control_center_destructive_actions_enabled() -> None:
+    if not _control_center_actions_enabled():
+        raise HTTPException(status_code=404, detail="Control Center actions are disabled in read-only mode")
+    if not _control_center_destructive_actions_enabled():
+        raise HTTPException(status_code=404, detail="Control Center destructive controls are disabled")
 
 async def _control_center_json(request: Request) -> dict:
     try:
@@ -4514,7 +4542,7 @@ def _require_live_control_center_session(session_id: str) -> dict:
 
 @app.post("/api/control-center/sessions/{session_id}/interrupt")
 async def post_control_center_interrupt(session_id: str):
-    _require_control_center_actions_enabled()
+    _require_control_center_destructive_actions_enabled()
     import control_center_store as _cc
 
     _require_live_control_center_session(session_id)
@@ -4605,7 +4633,7 @@ def _control_center_process_result(result: dict) -> dict:
 
 @app.post("/api/control-center/processes/{session_id}/kill")
 async def post_control_center_process_kill(session_id: str):
-    _require_control_center_actions_enabled()
+    _require_control_center_destructive_actions_enabled()
     try:
         from tools.process_registry import process_registry
 
@@ -4672,7 +4700,7 @@ async def get_control_center_runtimes():
 
 @app.post("/api/control-center/runtimes/{runtime_id}/actions/{action}")
 async def post_control_center_runtime_action(runtime_id: str, action: str):
-    _require_control_center_actions_enabled()
+    _require_control_center_destructive_actions_enabled()
     try:
         import control_center_store as _cc
         result = _cc.execute_runtime_action(runtime_id, action)

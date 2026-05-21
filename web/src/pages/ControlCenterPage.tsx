@@ -12,6 +12,8 @@ import type {
   ControlCenterCommand,
   ControlCenterProcessActionResponse,
   ControlCenterRuntimeHealthResponse,
+  ControlCenterRuntimeCard,
+  ControlCenterRuntimeAction,
 } from "@/lib/api";
 import { OverviewCards } from "@/components/control-center/OverviewCards";
 import { LiveSessionsPane } from "@/components/control-center/LiveSessionsPane";
@@ -38,6 +40,7 @@ export default function ControlCenterPage() {
   const [selectedProcessId, setSelectedProcessId] = useState<string | null>(null);
   const [processDetail, setProcessDetail] = useState<ControlCenterProcessActionResponse["result"] | null>(null);
   const [processDetailLoading, setProcessDetailLoading] = useState(false);
+  const [runtimeActionResult, setRuntimeActionResult] = useState<string | null>(null);
 
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -167,6 +170,7 @@ export default function ControlCenterPage() {
 
   const controlCenterMode = overview?.control_center;
   const controlCenterActionsEnabled = Boolean(controlCenterMode?.actions_enabled);
+  const destructiveControlsEnabled = Boolean(controlCenterMode?.destructive_controls_enabled);
 
   const reportError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -189,6 +193,41 @@ export default function ControlCenterPage() {
     if (!text || !text.trim()) return;
     try {
       await api.submitControlCenterSession(session.session_id, text.trim());
+      refreshControlState();
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const handleInterrupt = async (session: ControlCenterLiveSession) => {
+    const label = session.title || session.session_id;
+    if (!window.confirm(`Interrupt live session ${label}? This will stop the current run.`)) return;
+    try {
+      await api.interruptControlCenterSession(session.session_id);
+      refreshControlState();
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const handlePendingRespond = async (request: ControlCenterPendingRequest) => {
+    try {
+      if (request.kind === "approval") {
+        const choices = request.choices?.length ? request.choices : ["once", "deny"];
+        const answer = window.prompt(
+          `Respond to approval request. Choices: ${choices.join(", ")}`,
+          choices.includes("once") ? "once" : choices[0] || "deny",
+        );
+        if (!answer || !answer.trim()) return;
+        await api.respondToControlCenterPending(request.request_id, { choice: answer.trim() });
+      } else {
+        const answer = window.prompt(
+          `Respond to ${request.kind} request for ${request.session_title || request.session_id}`,
+          "",
+        );
+        if (answer === null) return;
+        await api.respondToControlCenterPending(request.request_id, { text: answer });
+      }
       refreshControlState();
     } catch (error) {
       reportError(error);
@@ -237,6 +276,33 @@ export default function ControlCenterPage() {
     await updateProcessDetail(proc, () => api.waitControlCenterProcess(proc.session_id, 3));
   };
 
+  const handleProcessKill = async (proc: ControlCenterProcess) => {
+    const label = proc.command || proc.session_id;
+    if (!window.confirm(`Kill background process ${label}? This cannot be undone.`)) return;
+    await updateProcessDetail(proc, () => api.killControlCenterProcess(proc.session_id));
+  };
+
+  const handleRuntimeAction = async (
+    runtime: ControlCenterRuntimeCard,
+    action: ControlCenterRuntimeAction,
+  ) => {
+    if (action.destructive) {
+      const expected = `${runtime.id} ${action.id}`;
+      const answer = window.prompt(
+        `Confirm ${action.label} for ${runtime.name}. Type: ${expected}`,
+        "",
+      );
+      if (answer !== expected) return;
+    }
+    try {
+      const response = await api.runControlCenterRuntimeAction(runtime.id, action.id);
+      setRuntimeActionResult(JSON.stringify(response.result, null, 2));
+      refreshControlState();
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-6">
       <PluginSlot name="control-center:top" />
@@ -255,8 +321,11 @@ export default function ControlCenterPage() {
         </div>
         <div className="mt-1 text-xs opacity-80">
           {controlCenterActionsEnabled
-            ? "Safe controls are available: session steer/submit and process poll/log/wait. Destructive controls remain disabled for Phase 2B."
+            ? `Safe controls are available: session steer/submit, pending-request responses, and process poll/log/wait.${destructiveControlsEnabled ? " Destructive controls are enabled with confirmations." : " Destructive controls require a second explicit opt-in."}`
             : controlCenterMode?.reason || "Operator actions are disabled; this dashboard is currently read-only."}
+          {controlCenterActionsEnabled && !destructiveControlsEnabled && controlCenterMode?.destructive_controls_reason
+            ? ` ${controlCenterMode.destructive_controls_reason}`
+            : ""}
         </div>
       </div>
 
@@ -264,18 +333,18 @@ export default function ControlCenterPage() {
         <div className="flex min-w-0 flex-1 flex-col gap-6">
           <LiveSessionsPane
             sessions={sessions}
-            onInterrupt={undefined}
+            onInterrupt={destructiveControlsEnabled ? handleInterrupt : undefined}
             onSteer={controlCenterActionsEnabled ? handleSteer : undefined}
             onSubmit={controlCenterActionsEnabled ? handleSubmit : undefined}
           />
           <PendingRequestsPane
             requests={pending}
-            onRespond={undefined}
+            onRespond={controlCenterActionsEnabled ? handlePendingRespond : undefined}
           />
           <RuntimeHealthPane
             data={runtimes}
-            actionResult={null}
-            onAction={undefined}
+            actionResult={runtimeActionResult}
+            onAction={destructiveControlsEnabled ? handleRuntimeAction : undefined}
           />
           <ProcessesPane
             processes={processes}
@@ -287,7 +356,7 @@ export default function ControlCenterPage() {
             onPoll={controlCenterActionsEnabled ? handleProcessPoll : undefined}
             onReadLog={controlCenterActionsEnabled ? handleProcessReadLog : undefined}
             onWait={controlCenterActionsEnabled ? handleProcessWait : undefined}
-            onKill={undefined}
+            onKill={destructiveControlsEnabled ? handleProcessKill : undefined}
           />
           <DelegationPane subagents={subagents} />
           <ProfileHealthPane profiles={profiles} />

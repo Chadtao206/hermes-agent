@@ -1501,16 +1501,20 @@ def read_delegation_subagents(limit: int = 20) -> List[Dict[str, Any]]:
 def read_action_capabilities() -> Dict[str, Any]:
     """Return operator-action mode and safe/destructive action groups.
 
-    Backend write endpoints remain independently gated by
-    HERMES_CONTROL_CENTER_ACTIONS.  This read model lets the dashboard explain
-    why controls are hidden and only wire low-risk affordances when enabled.
+    Phase 2C exposes pending-request responses as non-destructive operator
+    actions once the base action gate is enabled. Phase 2D keeps interrupt,
+    kill, and runtime lifecycle controls behind a second explicit opt-in so a
+    dashboard can safely render them only when both backend gates agree.
     """
     raw = os.environ.get("HERMES_CONTROL_CENTER_ACTIONS", "")
     enabled = raw.strip().lower() in {"1", "true", "yes", "on"}
+    destructive_raw = os.environ.get("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", "")
+    destructive_enabled = enabled and destructive_raw.strip().lower() in {"1", "true", "yes", "on"}
     safe_session_actions = ["steer", "submit"]
     safe_process_actions = ["poll", "log", "wait"]
+    pending_request_actions = ["respond_pending"]
     destructive_actions = ["interrupt", "kill", "runtime_start", "runtime_stop", "runtime_restart"]
-    deferred_actions = ["respond_pending"]
+    safe_actions = safe_session_actions + safe_process_actions + pending_request_actions
     return {
         "actions_enabled": enabled,
         "mode": "operator_actions_enabled" if enabled else "read_only",
@@ -1519,11 +1523,13 @@ def read_action_capabilities() -> Dict[str, Any]:
         "env_var": "HERMES_CONTROL_CENTER_ACTIONS",
         "safe_session_actions": safe_session_actions,
         "safe_process_actions": safe_process_actions,
-        "safe_actions": safe_session_actions + safe_process_actions,
+        "pending_request_actions": pending_request_actions,
+        "safe_actions": safe_actions,
         "destructive_actions": destructive_actions,
-        "deferred_actions": deferred_actions,
-        "destructive_controls_enabled": False,
-        "destructive_controls_reason": "Destructive controls remain disabled for Phase 2B until audit/confirmation coverage is complete.",
+        "deferred_actions": [],
+        "destructive_controls_enabled": destructive_enabled,
+        "destructive_controls_env_var": "HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS",
+        "destructive_controls_reason": None if destructive_enabled else "Set HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS=1 in addition to HERMES_CONTROL_CENTER_ACTIONS=1 to enable interrupt, kill, and runtime lifecycle controls.",
     }
 
 

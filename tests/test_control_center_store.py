@@ -497,6 +497,27 @@ class TestReadOverview:
         assert "running" in gw
         assert "state" in gw
 
+    def test_action_capabilities_phase2c_and_phase2d_envs(self, monkeypatch, _isolate_hermes_home):
+        import control_center_store as cc
+
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_ACTIONS", raising=False)
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", raising=False)
+        caps = cc.read_action_capabilities()
+        assert caps["actions_enabled"] is False
+        assert caps["destructive_controls_enabled"] is False
+        assert "respond_pending" in caps["pending_request_actions"]
+
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
+        caps = cc.read_action_capabilities()
+        assert caps["actions_enabled"] is True
+        assert "respond_pending" in caps["safe_actions"]
+        assert caps["destructive_controls_enabled"] is False
+
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", "1")
+        caps = cc.read_action_capabilities()
+        assert caps["destructive_controls_enabled"] is True
+        assert "kill" in caps["destructive_actions"]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for ControlCenterDB tests

@@ -948,9 +948,11 @@ export interface ControlCenterActionCapabilities {
   safe_session_actions?: string[];
   safe_process_actions?: string[];
   safe_actions?: string[];
+  pending_request_actions?: string[];
   destructive_actions?: string[];
   deferred_actions?: string[];
   destructive_controls_enabled?: boolean;
+  destructive_controls_env_var?: string;
   destructive_controls_reason?: string | null;
 }
 

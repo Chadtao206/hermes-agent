@@ -79,6 +79,21 @@ class TestControlCenterEndpoints:
         assert mode["actions_enabled"] is True
         assert mode["mode"] == "operator_actions_enabled"
 
+    def test_overview_action_mode_includes_phase2c_and_phase2d_gates(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", raising=False)
+
+        data = self.client.get("/api/control-center/overview").json()
+        mode = data["control_center"]
+        assert "respond_pending" in mode["pending_request_actions"]
+        assert "respond_pending" in mode["safe_actions"]
+        assert mode["destructive_controls_enabled"] is False
+        assert mode["destructive_controls_env_var"] == "HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS"
+
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", "1")
+        data = self.client.get("/api/control-center/overview").json()
+        assert data["control_center"]["destructive_controls_enabled"] is True
+
     def test_sessions_status_and_keys(self):
         resp = self.client.get("/api/control-center/sessions")
         assert resp.status_code == 200
@@ -124,6 +139,34 @@ class TestControlCenterEndpoints:
         """Pending endpoint returns [] but the envelope key must be 'requests'."""
         data = self.client.get("/api/control-center/pending").json()
         assert data["requests"] == []
+
+    def test_pending_respond_enqueues_phase2c_command(self, monkeypatch, _isolate_hermes_home):
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
+        import control_center_store as cc
+
+        cc.cc_upsert_live_session(
+            "pending-session-001",
+            owner_kind="gateway",
+            owner_id="pid-1",
+            running=True,
+        )
+        cc.cc_create_pending_request(
+            "pending-req-001",
+            "pending-session-001",
+            "clarify",
+            prompt_preview="Need answer?",
+        )
+
+        resp = self.client.post(
+            "/api/control-center/pending/pending-req-001/respond",
+            json={"text": "yes"},
+        )
+        assert resp.status_code == 200
+        command = resp.json()["command"]
+        assert command["action"] == "respond_pending"
+        assert command["target_session_id"] == "pending-session-001"
+        assert command["payload"]["request_id"] == "pending-req-001"
+        assert command["payload"]["text"] == "yes"
 
     def test_processes_status_and_keys(self):
         resp = self.client.get("/api/control-center/processes")
@@ -261,6 +304,26 @@ class TestControlCenterEndpoints:
 
         resp = self.client.post("/api/control-center/runtimes/nope/actions/restart")
         assert resp.status_code == 404
+
+    def test_interrupt_requires_phase2d_destructive_gate(self, monkeypatch, _isolate_hermes_home):
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", raising=False)
+        import control_center_store as cc
+
+        cc.cc_upsert_live_session(
+            "destructive-session-001",
+            owner_kind="gateway",
+            owner_id="pid-1",
+            running=True,
+        )
+        resp = self.client.post("/api/control-center/sessions/destructive-session-001/interrupt")
+        assert resp.status_code == 404
+        assert "destructive" in resp.json()["detail"]
+
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_DESTRUCTIVE_ACTIONS", "1")
+        resp = self.client.post("/api/control-center/sessions/destructive-session-001/interrupt")
+        assert resp.status_code == 200
+        assert resp.json()["command"]["action"] == "interrupt"
 
     def test_delegation_status_and_keys(self):
         resp = self.client.get("/api/control-center/delegation")
