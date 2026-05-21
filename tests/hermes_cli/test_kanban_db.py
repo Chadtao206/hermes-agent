@@ -254,6 +254,100 @@ def test_link_detects_cycle(kanban_home):
             kb.link_tasks(conn, b, a)
 
 
+
+def test_rollup_link_is_observability_only_not_dispatch_gate(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn, title="orchestration root", initial_status="scheduled"
+        )
+        child = kb.create_task(conn, title="implementation lane", assignee="engineer")
+        assert kb.get_task(conn, child).status == "ready"
+
+        kb.link_tasks(conn, root, child, relation_type=kb.LINK_RELATION_ROLLUP)
+
+        # Rollup links are visible through relation-specific graph queries.
+        assert kb.parent_ids(conn, child) == []
+        assert kb.child_ids(conn, root) == []
+        assert kb.parent_ids(conn, child, relation_type=kb.LINK_RELATION_ROLLUP) == [root]
+        assert kb.child_ids(conn, root, relation_type=kb.LINK_RELATION_ROLLUP) == [child]
+
+        # But they do not demote the child or prevent dispatch claiming.
+        assert kb.get_task(conn, child).status == "ready"
+        claimed = kb.claim_task(conn, child, claimer="test")
+        assert claimed is not None
+        assert claimed.id == child
+
+
+def test_rollup_parent_result_is_not_injected_as_dependency_context(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        kb.complete_task(conn, root, result="root rollup summary")
+        child = kb.create_task(conn, title="child", assignee="engineer")
+        kb.link_tasks(conn, root, child, relation_type=kb.LINK_RELATION_ROLLUP)
+
+        context = kb.build_worker_context(conn, child)
+
+    assert "## Parent task results" not in context
+    assert "root rollup summary" not in context
+
+
+def test_legacy_task_links_migrate_to_dependency_relation_type(tmp_path):
+    db_path = tmp_path / "legacy-links.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        );
+        CREATE TABLE task_links (
+            parent_id TEXT NOT NULL,
+            child_id TEXT NOT NULL,
+            PRIMARY KEY (parent_id, child_id)
+        );
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO tasks (id, title, status, created_at) VALUES
+            ('p', 'parent', 'done', 1),
+            ('c', 'child', 'todo', 1);
+        INSERT INTO task_links (parent_id, child_id) VALUES ('p', 'c');
+    """)
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        cols = {row["name"] for row in migrated.execute("PRAGMA table_info(task_links)")}
+        row = migrated.execute(
+            "SELECT parent_id, child_id, relation_type FROM task_links"
+        ).fetchone()
+        indexes = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+
+    assert "relation_type" in cols
+    assert dict(row) == {"parent_id": "p", "child_id": "c", "relation_type": "dependency"}
+    assert "idx_links_relation_child" in indexes
+    assert "idx_links_relation_parent" in indexes
+
 def test_recompute_ready_cascades_through_chain(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")

@@ -226,6 +226,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
+    rollup_children = kb.child_ids(conn, task.id, relation_type=kb.LINK_RELATION_ROLLUP)
     return {
         "id": task.id,
         "title": task.title,
@@ -243,8 +244,10 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "model_override": task.model_override,
         "parents": parents,
         "children": children,
+        "rollup_children": rollup_children,
         "parent_count": len(parents),
         "child_count": len(children),
+        "rollup_child_count": len(rollup_children),
     }
 
 
@@ -272,6 +275,8 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            rollup_parents = kb.parent_ids(conn, tid, relation_type=kb.LINK_RELATION_ROLLUP)
+            rollup_children = kb.child_ids(conn, tid, relation_type=kb.LINK_RELATION_ROLLUP)
 
             def _task_dict(t):
                 return {
@@ -301,6 +306,8 @@ def _handle_show(args: dict, **kw) -> str:
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
+                "rollup_parents": rollup_parents,
+                "rollup_children": rollup_children,
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
@@ -749,17 +756,23 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 
 def _handle_link(args: dict, **kw) -> str:
-    """Add a parent→child dependency edge after the fact."""
+    """Add a parent→child relation after the fact."""
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
+    relation_type = args.get("relation_type") or "dependency"
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-            return _ok(parent_id=parent_id, child_id=child_id)
+            kb.link_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+                relation_type=relation_type,
+            )
+            return _ok(parent_id=parent_id, child_id=child_id, relation_type=relation_type)
         finally:
             conn.close()
     except ValueError as e:
@@ -1195,15 +1208,22 @@ KANBAN_UNBLOCK_SCHEMA = {
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
-        "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "Add a parent→child relation after both tasks already exist. "
+        "relation_type='dependency' gates dispatch; relation_type='rollup' "
+        "is observability-only for orchestration root cards. Cycles and "
+        "self-links are rejected."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "relation_type": {
+                "type": "string",
+                "enum": ["dependency", "related", "rollup", "supersedes"],
+                "default": "dependency",
+                "description": "dependency gates dispatch; rollup is observability-only.",
+            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],

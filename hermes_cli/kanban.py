@@ -480,12 +480,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- link / unlink ---
-    p_link = sub.add_parser("link", help="Add a parent->child dependency")
+    p_link = sub.add_parser("link", help="Add a parent->child relation")
     p_link.add_argument("parent_id")
     p_link.add_argument("child_id")
-    p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
+    p_link.add_argument(
+        "--type",
+        dest="relation_type",
+        default=kb.LINK_RELATION_DEPENDENCY,
+        choices=sorted(kb.VALID_LINK_RELATION_TYPES),
+        help="Relation type. 'dependency' gates dispatch; 'rollup' is observability-only.",
+    )
+    p_unlink = sub.add_parser("unlink", help="Remove a parent->child relation")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
+    p_unlink.add_argument(
+        "--type",
+        dest="relation_type",
+        default=kb.LINK_RELATION_DEPENDENCY,
+        choices=sorted(kb.VALID_LINK_RELATION_TYPES),
+    )
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -1527,6 +1540,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
+        rollup_parents = kb.parent_ids(
+            conn, args.task_id, relation_type=kb.LINK_RELATION_ROLLUP
+        )
+        rollup_children = kb.child_ids(
+            conn, args.task_id, relation_type=kb.LINK_RELATION_ROLLUP
+        )
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
         # ``tasks.result`` is left NULL unless the caller explicitly passed
@@ -1540,6 +1559,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
+            "rollup_parents": rollup_parents,
+            "rollup_children": rollup_children,
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1637,6 +1658,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  parents:   {', '.join(parents)}")
     if children:
         print(f"  children:  {', '.join(children)}")
+    if rollup_parents:
+        print(f"  rollup-parents:  {', '.join(rollup_parents)}")
+    if rollup_children:
+        print(f"  rollup-children: {', '.join(rollup_children)}")
     if task.body:
         print()
         print("Body:")
@@ -1864,19 +1889,28 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
+    relation_type = getattr(args, "relation_type", kb.LINK_RELATION_DEPENDENCY)
     with kb.connect() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
+        kb.link_tasks(
+            conn, args.parent_id, args.child_id, relation_type=relation_type
+        )
+    print(f"Linked {args.parent_id} -> {args.child_id} ({relation_type})")
     return 0
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
+    relation_type = getattr(args, "relation_type", kb.LINK_RELATION_DEPENDENCY)
     with kb.connect() as conn:
-        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+        ok = kb.unlink_tasks(
+            conn, args.parent_id, args.child_id, relation_type=relation_type
+        )
     if not ok:
-        print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
+        print(
+            f"No such link: {args.parent_id} -> {args.child_id} ({relation_type})",
+            file=sys.stderr,
+        )
         return 1
-    print(f"Unlinked {args.parent_id} -> {args.child_id}")
+    print(f"Unlinked {args.parent_id} -> {args.child_id} ({relation_type})")
     return 0
 
 
