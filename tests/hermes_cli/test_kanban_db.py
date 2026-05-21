@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -578,6 +579,43 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             assert task.status == "ready", (
                 f"task {tid} should stay ready (isolated), got {task.status}"
             )
+
+
+def test_protocol_violation_harvests_worker_log_tail(kanban_home, monkeypatch):
+    """Clean-exit protocol violations preserve log context before auto-blocking."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs closeout", assignee="a")
+        claimed = kb.claim_task(conn, tid, claimer=f"{_kb._claimer_id().split(':', 1)[0]}:worker")
+        assert claimed is not None
+        log_path = kb.worker_log_path(tid)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("useful artifact: PR ready but closeout missing\n", encoding="utf-8")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (70001, tid))
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        run = conn.execute(
+            "SELECT summary, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run is not None
+        assert "useful artifact" in (run["summary"] or "")
+        metadata = json.loads(run["metadata"])
+        assert metadata["log_tail"].endswith("closeout missing\n")
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='protocol_violation' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert "useful artifact" in json.loads(event["payload"])["log_tail"]
 
 
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):

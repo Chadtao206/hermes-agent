@@ -4244,18 +4244,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
+                # help. Before blocking, harvest the worker log tail into
+                # the run/event so Jensen can recover artifacts without
+                # respawning or manually spelunking the log file.
                 protocol_violation = True
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
                     "kanban_complete or kanban_block — protocol violation"
                 )
+                log_tail = read_worker_log(row["id"], tail_bytes=4096) or ""
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                if log_tail:
+                    event_payload["log_tail"] = log_tail[-4096:]
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -4277,9 +4282,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"],),
             )
             if cur.rowcount == 1:
+                summary = None
+                if protocol_violation and event_payload.get("log_tail"):
+                    summary = (
+                        "Protocol violation: worker exited cleanly without terminal "
+                        "kanban closeout. Harvested worker log tail for recovery.\n\n"
+                        + str(event_payload["log_tail"])[-4096:]
+                    )
                 run_id = _end_run(
                     conn, row["id"],
                     outcome="crashed", status="crashed",
+                    summary=summary,
                     error=error_text,
                     metadata=dict(event_payload),
                 )

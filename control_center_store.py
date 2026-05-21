@@ -831,6 +831,25 @@ def read_sessions(limit: int = 20, running_only: bool = False) -> List[Dict[str,
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         pending_kinds = payload.get("pending_request_kinds") or []
         meta = session_meta.get(item.get("session_id", ""), {})
+        started_at = item.get("started_at") or meta.get("started_at") or 0
+        last_seen_at = item.get("last_seen_at") or meta.get("last_active") or 0
+        try:
+            duration_seconds = max(0.0, float(last_seen_at or 0) - float(started_at or 0))
+        except Exception:
+            duration_seconds = 0.0
+        last_preview = payload.get("last_preview") if isinstance(payload, dict) else None
+        preview_lower = str(last_preview or "").lower()
+        external_wait_hint = any(
+            token in preview_lower
+            for token in (
+                "refreshing checks status",
+                "in_progress",
+                "pending",
+                "waiting on ci",
+                "waiting for checks",
+                "deploy in progress",
+            )
+        )
         result.append(
             {
                 "session_id": item.get("session_id", ""),
@@ -842,9 +861,18 @@ def read_sessions(limit: int = 20, running_only: bool = False) -> List[Dict[str,
                 "running": bool(item.get("running", False)),
                 "awaiting_input": bool(item.get("awaiting_input", False)),
                 "pending_request_kinds": list(pending_kinds) if isinstance(pending_kinds, list) else [],
-                "started_at": item.get("started_at") or meta.get("started_at") or 0,
-                "last_seen_at": item.get("last_seen_at") or meta.get("last_active") or 0,
-                "last_preview": payload.get("last_preview") if isinstance(payload, dict) else None,
+                "started_at": started_at,
+                "last_seen_at": last_seen_at,
+                "last_preview": last_preview,
+                "activity": {
+                    "api_call_count": int(meta.get("api_call_count") or 0),
+                    "tool_call_count": int(meta.get("tool_call_count") or 0),
+                    "input_tokens": int(meta.get("input_tokens") or 0),
+                    "output_tokens": int(meta.get("output_tokens") or 0),
+                    "reasoning_tokens": int(meta.get("reasoning_tokens") or 0),
+                    "duration_seconds": duration_seconds,
+                    "external_wait_hint": external_wait_hint,
+                },
             }
         )
     return result

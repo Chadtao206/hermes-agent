@@ -1168,6 +1168,18 @@ class TestOpenAIModelExecutionGuidance:
         assert "prerequisite" in text
         assert "dependency" in text
 
+    def test_guidance_covers_bounded_fast_lane(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "bounded_execution" in text
+        assert "fast lane" in text
+        assert "kanban" in text
+
+    def test_guidance_covers_external_waits(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "external_waits" in text
+        assert "foreground polling" in text
+        assert "notify_on_complete" in text
+
     def test_guidance_covers_verification(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "verification" in text or "verify" in text

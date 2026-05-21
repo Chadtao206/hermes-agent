@@ -157,9 +157,15 @@ class TestReadSessions:
             assert "pending_request_kinds" in s
             assert "started_at" in s
             assert "last_seen_at" in s
+            assert "activity" in s
             assert isinstance(s["running"], bool)
             assert isinstance(s["awaiting_input"], bool)
             assert isinstance(s["pending_request_kinds"], list)
+            assert isinstance(s["activity"], dict)
+            assert "api_call_count" in s["activity"]
+            assert "tool_call_count" in s["activity"]
+            assert "duration_seconds" in s["activity"]
+            assert "external_wait_hint" in s["activity"]
 
     def test_count_active_sessions_is_int(self, _isolate_hermes_home):
         import control_center_store as cc
