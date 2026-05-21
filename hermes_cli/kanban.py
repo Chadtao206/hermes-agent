@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_constants import get_default_hermes_root
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
@@ -345,8 +346,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
                           help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                               "that require immediate human ops (R3 gate), "
+                               "or 'scheduled' for non-dispatchable/root "
+                               "coordination cards.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -783,6 +785,93 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- closeout (telemetry) ---
+    p_closeout = sub.add_parser(
+        "closeout",
+        help="Emit a Hermes telemetry closeout record for a completed kanban task",
+        description=(
+            "One-pass telemetry closeout for a completed kanban task. Prefills "
+            "owner, title, summary, routing, and timing from the kanban DB; "
+            "delegates the actual write to the telemetry closeout script under "
+            "$HERMES_HOME/scripts/telemetry/. Correction / learning-artifact "
+            "state must be declared explicitly "
+            "— omitting them records 'unknown' rather than silently dropping."
+        ),
+    )
+    p_closeout.add_argument("task_id", help="Kanban task id (e.g. t_abcd1234)")
+    p_closeout.add_argument(
+        "--telemetry-root", default=None,
+        help="Telemetry root path (default: $HERMES_HOME/telemetry or ~/.hermes/telemetry)",
+    )
+    p_closeout.add_argument(
+        "--owner", default=None,
+        help="Owner profile override (default: task.assignee)",
+    )
+    p_closeout.add_argument(
+        "--title", default=None, help="Title override (default: task.title)",
+    )
+    p_closeout.add_argument(
+        "--summary", default=None,
+        help="user_goal_summary override (default: task.result or latest run summary or task.body)",
+    )
+    p_closeout.add_argument(
+        "--outcome", default="success",
+        choices=("success", "partial", "fail"),
+    )
+    p_closeout.add_argument(
+        "--status", default="completed",
+        choices=("open", "completed", "partial", "failed", "cancelled"),
+    )
+    p_closeout.add_argument(
+        "--verification-strength", default="moderate",
+        choices=("none", "weak", "moderate", "strong"),
+    )
+    p_closeout.add_argument(
+        "--initial-owner", default=None,
+        help="Routing initial_owner override (default: first run profile or task.assignee)",
+    )
+    p_closeout.add_argument(
+        "--current-owner", default=None,
+        help="Routing current_owner override (default: task.assignee)",
+    )
+    p_closeout.add_argument(
+        "--correct-owner", default=None,
+        choices=("true", "false"),
+        help="Mark whether the initial owner was the correct routing destination",
+    )
+    p_closeout.add_argument(
+        "--user-corrected", default=None,
+        choices=("true", "false"),
+        help="Mark whether the user had to correct the assistant during the task",
+    )
+    p_closeout.add_argument(
+        "--correction-state", default=None,
+        choices=("present", "none", "unknown"),
+        help="Explicit correction state. Omit to auto-prefill from kanban routing.",
+    )
+    p_closeout.add_argument(
+        "--no-correction", action="store_true",
+        help="Shortcut for --correction-state none",
+    )
+    p_closeout.add_argument(
+        "--learning-artifact-state", default=None,
+        choices=("present", "none", "unknown"),
+        help="Explicit learning-artifact state. Omit to auto-prefill (defaults to 'unknown').",
+    )
+    p_closeout.add_argument(
+        "--no-learning-artifact", action="store_true",
+        help="Shortcut for --learning-artifact-state none",
+    )
+    p_closeout.add_argument(
+        "--notes-json", default=None,
+        help="Extra notes JSON object merged into prefilled notes",
+    )
+    p_closeout.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the JSON payload that would be sent and exit 0 without writing",
+    )
+    p_closeout.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -915,6 +1004,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
+        "closeout": _cmd_closeout,
         "gc":       _cmd_gc,
     }
     handler = handlers.get(action)
@@ -2531,6 +2621,165 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+_LOG_TASK_CLOSEOUT_SCRIPT = (
+    Path(get_default_hermes_root()) / "scripts" / "telemetry" / "log_task_closeout.py"
+)
+
+
+def _epoch_to_iso(value: Optional[int]) -> Optional[str]:
+    if not value:
+        return None
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat()
+
+
+def _cmd_closeout(args: argparse.Namespace) -> int:
+    """Emit a Hermes telemetry closeout for a completed kanban task.
+
+    The kanban DB already knows the title, owner, timing, and the latest
+    run summary — manually retyping that into a JSON blob to feed
+    ``log_task_closeout.py`` is the footgun this command removes.
+    """
+    import subprocess
+
+    if not _LOG_TASK_CLOSEOUT_SCRIPT.exists():
+        print(
+            f"kanban closeout: telemetry script not found at {_LOG_TASK_CLOSEOUT_SCRIPT}",
+            file=sys.stderr,
+        )
+        return 1
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if not task:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        if task.status != "done":
+            print(
+                f"kanban closeout: task {args.task_id} is not done "
+                f"(status={task.status}). Closeout is only for completed tasks.",
+                file=sys.stderr,
+            )
+            return 1
+        runs = kb.list_runs(conn, args.task_id)
+        latest_summary = kb.latest_summary(conn, args.task_id)
+
+    owner = args.owner or task.assignee or "unassigned"
+    title = args.title or task.title
+    summary = (
+        args.summary
+        or task.result
+        or latest_summary
+        or (task.body.splitlines()[0] if task.body else None)
+        or title
+    )
+
+    # Routing: pick first run profile as initial owner (that's the
+    # profile that actually picked the work up first); fall back to the
+    # current assignee so we always record *some* routing context.
+    first_run_profile = next((r.profile for r in runs if r.profile), None)
+    initial_owner = args.initial_owner or first_run_profile or owner
+    current_owner = args.current_owner or owner
+
+    # Default correction state: if routing diverged (initial != current)
+    # the initial owner was wrong, so a correction occurred. Otherwise
+    # default to "unknown" so the operator must declare absence
+    # explicitly rather than silently asserting "none".
+    if args.no_correction:
+        correction_state = "none"
+    elif args.correction_state:
+        correction_state = args.correction_state
+    elif initial_owner != current_owner:
+        correction_state = "present"
+    else:
+        correction_state = "unknown"
+
+    if args.no_learning_artifact:
+        learning_artifact_state = "none"
+    elif args.learning_artifact_state:
+        learning_artifact_state = args.learning_artifact_state
+    else:
+        learning_artifact_state = "unknown"
+
+    # correct_owner / user_corrected: take explicit overrides, else
+    # derive from routing divergence so closeouts encode "the routing
+    # ended up somewhere different" as "initial owner not correct".
+    if args.correct_owner is not None:
+        correct_owner = args.correct_owner == "true"
+    elif initial_owner != current_owner:
+        correct_owner = False
+    else:
+        correct_owner = None
+
+    if args.user_corrected is not None:
+        user_corrected = args.user_corrected == "true"
+    else:
+        user_corrected = None
+
+    notes: dict[str, Any] = {
+        "initial_owner": initial_owner,
+        "current_owner": current_owner,
+        "kanban_status": task.status,
+        "kanban_run_count": len(runs),
+    }
+    if task.tenant:
+        notes["tenant"] = task.tenant
+    if task.skills:
+        notes["kanban_skills"] = list(task.skills)
+    if args.notes_json:
+        try:
+            extra = json.loads(args.notes_json)
+            if not isinstance(extra, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban closeout: --notes-json: {exc}", file=sys.stderr)
+            return 2
+        notes.update(extra)
+
+    telemetry_task_id = f"kanban:{task.id}"
+    payload = {
+        "task_id": telemetry_task_id,
+        "title": title,
+        "user_goal_summary": summary,
+        "owner_profile": owner,
+        "surface": "kanban",
+        "status": args.status,
+        "outcome": args.outcome,
+        "verification_strength": args.verification_strength,
+        "opened_at": _epoch_to_iso(task.created_at),
+        "closed_at": _epoch_to_iso(task.completed_at),
+        "session_id": task.session_id,
+        "kanban_task_id": task.id,
+        "task_type": "kanban",
+        "workdir": task.workspace_path,
+        "assisting_profiles": [
+            r.profile for r in runs
+            if r.profile and r.profile not in {owner, initial_owner}
+        ],
+        "notes": notes,
+        "correct_owner": correct_owner,
+        "user_corrected": user_corrected,
+        "correction_state": correction_state,
+        "learning_artifact_state": learning_artifact_state,
+    }
+
+    if args.dry_run or getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+        if args.dry_run:
+            return 0
+
+    cmd = ["python3", str(_LOG_TASK_CLOSEOUT_SCRIPT)]
+    if args.telemetry_root:
+        cmd += ["--telemetry-root", args.telemetry_root]
+    cmd += ["--json", json.dumps(payload, ensure_ascii=False)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
@@ -2586,6 +2835,7 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
+  `closeout <id>`       Emit telemetry closeout for a completed task (prefilled)
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

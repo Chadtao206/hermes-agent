@@ -910,7 +910,45 @@ export interface ControlCenterOverviewResponse {
     running_processes: number;
     profiles_online: number;
   };
+  kanban?: {
+    status: string;
+    available: boolean;
+    total_tasks?: number;
+    open_tasks?: number;
+    blocked_tasks?: number;
+    running_tasks?: number;
+    by_status?: Record<string, number>;
+    by_assignee?: Record<string, number>;
+    error?: string | null;
+  };
+  memory?: {
+    status: string;
+    available: boolean;
+    provider?: string | null;
+    facts?: number | null;
+    entities?: number | null;
+    banks?: number | null;
+    error?: string | null;
+  };
+  repos?: {
+    status: string;
+    hermes_source?: ControlCenterRepoStatus;
+    control_plane?: ControlCenterRepoStatus;
+  };
   alerts: Array<{ level: string; message: string }>;
+}
+
+export interface ControlCenterRepoStatus {
+  path: string;
+  status: string;
+  is_repo: boolean;
+  branch?: string | null;
+  dirty?: boolean;
+  ahead?: number | null;
+  behind?: number | null;
+  changed_files?: number;
+  last_commit?: string | null;
+  error?: string | null;
 }
 
 export interface ControlCenterLiveSession {

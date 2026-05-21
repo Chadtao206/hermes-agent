@@ -72,7 +72,7 @@ export function RuntimeHealthPane({ data, actionResult = null, onAction }: Runti
                     ))}
                   </div>
                 ) : null}
-                {runtime.actions?.length ? (
+                {onAction && runtime.actions?.length ? (
                   <div className="mt-3 flex flex-wrap gap-2">
                     {runtime.actions.map((action) => (
                       <button

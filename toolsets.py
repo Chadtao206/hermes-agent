@@ -144,6 +144,18 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "file_readonly": {
+        "description": "Read-only file inspection tools: read_file and search_files",
+        "tools": ["read_file", "search_files"],
+        "includes": []
+    },
+
+    "file_edit": {
+        "description": "File mutation tools: write_file and patch",
+        "tools": ["write_file", "patch"],
+        "includes": []
+    },
     
     "moa": {
         "description": "Advanced reasoning and problem-solving tools",
@@ -154,6 +166,18 @@ TOOLSETS = {
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
         "tools": ["skills_list", "skill_view", "skill_manage"],
+        "includes": []
+    },
+
+    "skills_readonly": {
+        "description": "Read-only skill browsing: list and view skills without edit capabilities",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
+
+    "skills_manage": {
+        "description": "Create, patch, edit, and delete skills",
+        "tools": ["skill_manage"],
         "includes": []
     },
     
@@ -186,6 +210,27 @@ TOOLSETS = {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
+    },
+
+    "orchestrator_core": {
+        "description": "Lean orchestration toolkit: inspect, delegate, search history, and load skills without default write/admin surfaces",
+        "tools": [],
+        "includes": [
+            "terminal",
+            "file_readonly",
+            "skills_readonly",
+            "todo",
+            "memory",
+            "session_search",
+            "clarify",
+            "delegation",
+        ],
+    },
+
+    "orchestrator_admin": {
+        "description": "Optional admin add-ons for orchestrators: file mutation, skill management, cron, and cross-platform messaging",
+        "tools": [],
+        "includes": ["file_edit", "skills_manage", "cronjob", "messaging"],
     },
     
     "tts": {
@@ -302,6 +347,18 @@ TOOLSETS = {
         "tools": [
             "spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",
             "spotify_playlists", "spotify_albums", "spotify_library",
+        ],
+        "includes": []
+    },
+
+    "ylopo_kg": {
+        "description": "Ylopo local repository knowledge graph tools (stats, dependencies, repo drilldown, search, ingest)",
+        "tools": [
+            "ylopo_kg_stats",
+            "ylopo_kg_deps",
+            "ylopo_kg_repo",
+            "ylopo_kg_search",
+            "ylopo_kg_ingest",
         ],
         "includes": []
     },

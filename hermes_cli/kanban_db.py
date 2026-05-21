@@ -95,7 +95,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -1532,10 +1532,10 @@ def create_task(
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
-                    task_status = "blocked"
+                # parks it directly in blocked/scheduled for human-ops review
+                # or in triage for a specifier.
+                if initial_status in {"blocked", "scheduled"}:
+                    task_status = initial_status
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
@@ -2099,29 +2099,18 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* when the most recent block event was a
-    worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).  Without that guard, a
-    ``review-required`` handoff would auto-respawn, the fresh worker
-    would find nothing to do, exit cleanly, get recorded as a protocol
-    violation, and the cycle would repeat indefinitely.
+    ``blocked`` and ``scheduled`` are explicit operator/worker states and are
+    never auto-promoted here. They require ``unblock_task`` (or equivalent
+    operator action) so real blockers do not churn through the dispatcher just
+    because their dependency graph is otherwise satisfied.
     """
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id, status FROM tasks WHERE status = 'todo'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -2129,25 +2118,13 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                # Blocked tasks also get their failure counters reset —
-                # this is effectively an auto-unblock (circuit-breaker
-                # recovery; worker-initiated blocks are skipped above).
-                if cur_status == "blocked":
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
-                        "consecutive_failures = 0, last_failure_error = NULL "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
-
 
 # ---------------------------------------------------------------------------
 # Claim / complete / block
@@ -4608,7 +4585,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT assignee, last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -4631,13 +4608,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    # Reviewer/final-acceptance cards often need to spawn *after* the engineer
+    # comments PR URLs. The active-PR guard prevents duplicate PR creation for
+    # implementer cards; it must not suppress reviewer lanes.
+    if (row["assignee"] or "").casefold() != "reviewer":
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 
@@ -4864,15 +4845,54 @@ def dispatch_once(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
-            # Emit an event so operators can see why the task was
-            # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
+            # Emit an event so operators can see why the task was skipped when
+            # reading `hermes kanban tail`. For deterministic blockers, also
+            # move the task out of ``ready`` so it does not sit in a
+            # ready-but-unspawnable limbo across dispatcher ticks.
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                    if guard_reason == "blocker_auth":
+                        reason = (
+                            "respawn guard: auth/quota blocker detected; "
+                            "operator action is required before retry"
+                        )
+                        conn.execute(
+                            "UPDATE tasks SET status = 'blocked', "
+                            "claim_lock = NULL, claim_expires = NULL, "
+                            "worker_pid = NULL WHERE id = ? AND status = 'ready'",
+                            (row["id"],),
+                        )
+                        run_id = _synthesize_ended_run(
+                            conn, row["id"], outcome="blocked", summary=reason,
+                            metadata={"respawn_guard": guard_reason},
+                        )
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {"reason": reason}, run_id=run_id,
+                        )
+                    elif guard_reason == "active_pr":
+                        reason = (
+                            "respawn guard: recent PR URL detected; task parked "
+                            "to prevent duplicate PR creation"
+                        )
+                        conn.execute(
+                            "UPDATE tasks SET status = 'scheduled', "
+                            "claim_lock = NULL, claim_expires = NULL, "
+                            "worker_pid = NULL WHERE id = ? AND status = 'ready'",
+                            (row["id"],),
+                        )
+                        run_id = _synthesize_ended_run(
+                            conn, row["id"], outcome="scheduled", summary=reason,
+                            metadata={"respawn_guard": guard_reason},
+                        )
+                        _append_event(
+                            conn, row["id"], "scheduled",
+                            {"reason": reason}, run_id=run_id,
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))

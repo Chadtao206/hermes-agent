@@ -52,17 +52,25 @@ export function LiveSessionsPane({ sessions, onInterrupt, onSteer, onSubmit }: L
                     {ago(s.last_seen_at)}
                   </span>
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onInterrupt?.(s)}>
-                    Interrupt
-                  </button>
-                  <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onSteer?.(s)}>
-                    Steer…
-                  </button>
-                  <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onSubmit?.(s)}>
-                    Submit…
-                  </button>
-                </div>
+                {onInterrupt || onSteer || onSubmit ? (
+                  <div className="flex flex-wrap gap-2">
+                    {onInterrupt ? (
+                      <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onInterrupt(s)}>
+                        Interrupt
+                      </button>
+                    ) : null}
+                    {onSteer ? (
+                      <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onSteer(s)}>
+                        Steer…
+                      </button>
+                    ) : null}
+                    {onSubmit ? (
+                      <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onSubmit(s)}>
+                        Submit…
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
               </li>
             ))}
           </ul>

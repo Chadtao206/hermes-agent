@@ -18,6 +18,10 @@ const ALERT_CLASSES: Record<string, string> = {
   info: "border-blue-500 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-200",
 };
 
+function statusLabel(status?: string | null): string {
+  return status ? status.replace(/_/g, " ") : "unknown";
+}
+
 export function OverviewCards({ data }: OverviewCardsProps) {
   const gateway = data?.gateway;
   const alerts = data?.alerts ?? [];
@@ -69,6 +73,42 @@ export function OverviewCards({ data }: OverviewCardsProps) {
             </CardContent>
           </Card>
         ))}
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <Card>
+          <CardHeader className="pb-1 pt-3 px-4">
+            <CardTitle className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Kanban</CardTitle>
+          </CardHeader>
+          <CardContent className="px-4 pb-3 text-sm">
+            <div className="font-medium text-foreground">{statusLabel(data?.kanban?.status)}</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              open {data?.kanban?.open_tasks ?? "—"} • blocked {data?.kanban?.blocked_tasks ?? "—"}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-1 pt-3 px-4">
+            <CardTitle className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Memory</CardTitle>
+          </CardHeader>
+          <CardContent className="px-4 pb-3 text-sm">
+            <div className="font-medium text-foreground">{data?.memory?.provider || statusLabel(data?.memory?.status)}</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              facts {data?.memory?.facts ?? "—"} • entities {data?.memory?.entities ?? "—"}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-1 pt-3 px-4">
+            <CardTitle className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Repos</CardTitle>
+          </CardHeader>
+          <CardContent className="px-4 pb-3 text-sm">
+            <div className="font-medium text-foreground">{statusLabel(data?.repos?.status)}</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              Hermes {data?.repos?.hermes_source?.dirty ? `${data.repos.hermes_source.changed_files ?? 0} changed` : "clean"} • Control plane {data?.repos?.control_plane?.dirty ? `${data.repos.control_plane.changed_files ?? 0} changed` : "clean"}
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

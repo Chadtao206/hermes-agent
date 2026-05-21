@@ -39,14 +39,14 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 class TestGuidanceConstants:
     def test_memory_guidance_discourages_task_logs(self):
-        assert "durable facts" in MEMORY_GUIDANCE
-        assert "Do NOT save task progress" in MEMORY_GUIDANCE
+        assert "still matter later" in MEMORY_GUIDANCE
+        assert "Do not save temporary task state" in MEMORY_GUIDANCE
         assert "session_search" in MEMORY_GUIDANCE
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
-        assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
+        assert "relevant prior conversation context" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
 
@@ -263,7 +263,7 @@ class TestBuildSkillsSystemPrompt:
         )
         result = build_skills_system_prompt()
         assert "python-debug" in result
-        assert "Debug Python scripts" in result
+        assert "Debug Python scripts" not in result
         assert "available_skills" in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
@@ -323,7 +323,7 @@ class TestBuildSkillsSystemPrompt:
             result = build_skills_system_prompt()
 
         assert "imessage" in result
-        assert "Send iMessages" in result
+        assert "Send iMessages" not in result
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""

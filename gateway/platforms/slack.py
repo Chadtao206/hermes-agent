@@ -881,10 +881,14 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
+            # chat.update edits a single message body, so when content exceeds
+            # Slack's hard limit we keep the first deterministic truncated chunk.
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            text = chunks[0] if chunks else formatted
             await self._get_client(chat_id).chat_update(
                 channel=chat_id,
                 ts=message_id,
-                text=formatted,
+                text=text,
             )
             if finalize:
                 await self.stop_typing(chat_id)

@@ -26,6 +26,7 @@ import { RuntimeHealthPane } from "@/components/control-center/RuntimeHealthPane
 
 const OVERVIEW_MS = 5_000;
 const DETAIL_MS = 4_000;
+const CONTROL_CENTER_ACTIONS_ENABLED = false;
 
 export default function ControlCenterPage() {
   const [overview, setOverview] = useState<ControlCenterOverviewResponse | null>(null);
@@ -307,12 +308,19 @@ ${output}` : ""}`);
         <div className="flex min-w-0 flex-1 flex-col gap-6">
           <LiveSessionsPane
             sessions={sessions}
-            onInterrupt={handleInterrupt}
-            onSteer={handleSteer}
-            onSubmit={handleSubmit}
+            onInterrupt={CONTROL_CENTER_ACTIONS_ENABLED ? handleInterrupt : undefined}
+            onSteer={CONTROL_CENTER_ACTIONS_ENABLED ? handleSteer : undefined}
+            onSubmit={CONTROL_CENTER_ACTIONS_ENABLED ? handleSubmit : undefined}
           />
-          <PendingRequestsPane requests={pending} onRespond={handlePendingRespond} />
-          <RuntimeHealthPane data={runtimes} actionResult={runtimeActionResult} onAction={handleRuntimeAction} />
+          <PendingRequestsPane
+            requests={pending}
+            onRespond={CONTROL_CENTER_ACTIONS_ENABLED ? handlePendingRespond : undefined}
+          />
+          <RuntimeHealthPane
+            data={runtimes}
+            actionResult={CONTROL_CENTER_ACTIONS_ENABLED ? runtimeActionResult : null}
+            onAction={CONTROL_CENTER_ACTIONS_ENABLED ? handleRuntimeAction : undefined}
+          />
           <ProcessesPane
             processes={processes}
             systemProcesses={systemProcesses}
@@ -320,10 +328,10 @@ ${output}` : ""}`);
             processDetail={processDetail}
             processDetailLoading={processDetailLoading}
             onSelect={handleProcessSelect}
-            onPoll={handleProcessPoll}
-            onReadLog={handleProcessReadLog}
-            onWait={handleProcessWait}
-            onKill={handleProcessKill}
+            onPoll={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessPoll : undefined}
+            onReadLog={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessReadLog : undefined}
+            onWait={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessWait : undefined}
+            onKill={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessKill : undefined}
           />
           <DelegationPane subagents={subagents} />
           <ProfileHealthPane profiles={profiles} />

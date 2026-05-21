@@ -1455,56 +1455,226 @@ def read_delegation_subagents(limit: int = 20) -> List[Dict[str, Any]]:
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# Phase 1 read-only status domains
+# ---------------------------------------------------------------------------
+
+def read_kanban_status() -> Dict[str, Any]:
+    """Return a best-effort summary of the local kanban board."""
+    db_path = _hermes_home() / "kanban.db"
+    status: Dict[str, Any] = {
+        "status": "missing",
+        "available": False,
+        "db_path": str(db_path),
+        "total_tasks": 0,
+        "by_status": {},
+        "by_assignee": {},
+        "open_tasks": 0,
+        "blocked_tasks": 0,
+        "running_tasks": 0,
+        "updated_at": None,
+        "error": None,
+    }
+    if not db_path.exists():
+        return status
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT status, assignee, COUNT(*) AS count FROM tasks GROUP BY status, assignee").fetchall()
+        by_status: Dict[str, int] = {}
+        by_assignee: Dict[str, int] = {}
+        total = 0
+        for row in rows:
+            count = int(row["count"] or 0)
+            task_status = str(row["status"] or "unknown")
+            assignee = str(row["assignee"] or "unassigned")
+            by_status[task_status] = by_status.get(task_status, 0) + count
+            by_assignee[assignee] = by_assignee.get(assignee, 0) + count
+            total += count
+        open_count = sum(count for name, count in by_status.items() if name not in {"done", "completed", "cancelled", "archived"})
+        status.update({
+            "status": "ok",
+            "available": True,
+            "total_tasks": total,
+            "by_status": by_status,
+            "by_assignee": by_assignee,
+            "open_tasks": open_count,
+            "blocked_tasks": by_status.get("blocked", 0),
+            "running_tasks": by_status.get("in_progress", 0) + by_status.get("running", 0),
+            "updated_at": db_path.stat().st_mtime,
+        })
+    except Exception as exc:
+        status.update({"status": "unavailable", "error": str(exc)})
+    return status
+
+
+def _count_table(conn: sqlite3.Connection, table: str) -> Optional[int]:
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    except Exception:
+        return None
+
+
+def read_memory_status() -> Dict[str, Any]:
+    """Return best-effort local Holographic memory status for the active profile."""
+    db_path = _hermes_home() / "memory_store.db"
+    status: Dict[str, Any] = {
+        "status": "missing",
+        "available": False,
+        "provider": None,
+        "db_path": str(db_path),
+        "facts": None,
+        "entities": None,
+        "banks": None,
+        "updated_at": None,
+        "error": None,
+    }
+    try:
+        from hermes_cli.config import cfg_get
+        status["provider"] = cfg_get("memory.provider", None)
+    except Exception:
+        status["provider"] = None
+    if not db_path.exists():
+        return status
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            facts = _count_table(conn, "facts")
+            entities = _count_table(conn, "entities")
+            banks = _count_table(conn, "memory_banks")
+        status.update({
+            "status": "ok",
+            "available": True,
+            "facts": facts,
+            "entities": entities,
+            "banks": banks,
+            "updated_at": db_path.stat().st_mtime,
+        })
+    except Exception as exc:
+        status.update({"status": "unavailable", "error": str(exc)})
+    return status
+
+
+def _git_status_summary(repo_path: Path) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "path": str(repo_path),
+        "status": "missing",
+        "is_repo": False,
+        "branch": None,
+        "dirty": False,
+        "ahead": None,
+        "behind": None,
+        "changed_files": 0,
+        "last_commit": None,
+        "error": None,
+    }
+    if not repo_path.exists():
+        return summary
+    if not (repo_path / ".git").exists():
+        summary["status"] = "not_repo"
+        return summary
+    try:
+        branch = subprocess.run(["git", "-C", str(repo_path), "branch", "--show-current"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        status = subprocess.run(["git", "-C", str(repo_path), "status", "--porcelain=v1", "--branch"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        commit = subprocess.run(["git", "-C", str(repo_path), "log", "--oneline", "-1"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        lines = [line for line in (status.stdout or "").splitlines() if line]
+        branch_line = lines[0] if lines and lines[0].startswith("##") else ""
+        changed = [line for line in lines if not line.startswith("##")]
+        ahead = behind = None
+        if "ahead " in branch_line:
+            try:
+                ahead = int(branch_line.split("ahead ", 1)[1].split(",", 1)[0].split("]", 1)[0])
+            except Exception:
+                ahead = None
+        if "behind " in branch_line:
+            try:
+                behind = int(branch_line.split("behind ", 1)[1].split(",", 1)[0].split("]", 1)[0])
+            except Exception:
+                behind = None
+        summary.update({
+            "status": "ok",
+            "is_repo": True,
+            "branch": (branch.stdout or "").strip() or None,
+            "dirty": bool(changed),
+            "ahead": ahead,
+            "behind": behind,
+            "changed_files": len(changed),
+            "last_commit": (commit.stdout or "").strip() or None,
+        })
+    except Exception as exc:
+        summary.update({"status": "unavailable", "is_repo": True, "error": str(exc)})
+    return summary
+
+
+def read_repo_status() -> Dict[str, Any]:
+    """Return best-effort git summaries for Hermes source and control-plane repo."""
+    hermes_source = Path(__file__).resolve().parent
+    control_plane = Path.home() / "code" / "hermes-control-plane"
+    return {
+        "status": "ok",
+        "hermes_source": _git_status_summary(hermes_source),
+        "control_plane": _git_status_summary(control_plane),
+    }
+
 # ---------------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------------
 
 def read_profiles() -> List[Dict[str, Any]]:
-    """Return a lightweight profile list derived from active gateway agents."""
+    """Return a lightweight profile list from gateway agents and live sessions.
+
+    Gateway runtime status is optional: TUI/CLI/dashboard sessions can still be
+    visible in the shared control-center store when the gateway is down.
+    """
+    active_agents = None
     try:
         from gateway.status import get_running_pid, read_runtime_status
-        pid = get_running_pid(cleanup_stale=False)
-        if pid is None:
-            return []
-        runtime = read_runtime_status() or {}
-        active_agents = runtime.get("active_agents")
+        if get_running_pid(cleanup_stale=False) is not None:
+            runtime = read_runtime_status() or {}
+            active_agents = runtime.get("active_agents")
     except Exception:
-        return []
+        active_agents = None
 
-    # If runtime provides a populated dict, use it directly.
-    if isinstance(active_agents, dict) and active_agents:
-        result = []
-        for name, info in active_agents.items():
-            result.append(
-                {
-                    "name": str(name),
-                    "is_online": True,
-                    "last_seen": None,
-                    "active_sessions": 1,
-                    "model": (info.get("model") if isinstance(info, dict) else None),
-                }
-            )
-        return result
-
-    # active_agents is a count (int) or empty dict — derive profiles from live sessions.
+    sessions: List[Dict[str, Any]] = []
     try:
         sessions = read_sessions(limit=200, running_only=True)
-        by_profile: Dict[str, List[Dict[str, Any]]] = {}
-        for s in sessions:
-            name = s.get("profile") or "default"
-            by_profile.setdefault(name, []).append(s)
-        return [
-            {
-                "name": name,
-                "is_online": True,
-                "last_seen": max((s["last_seen_at"] for s in sess_list), default=None),
-                "active_sessions": len(sess_list),
-                "model": sess_list[0].get("model") if sess_list else None,
-            }
-            for name, sess_list in by_profile.items()
-        ]
     except Exception:
-        return []
+        sessions = []
+
+    by_profile: Dict[str, List[Dict[str, Any]]] = {}
+    for session in sessions:
+        name = str(session.get("profile") or "default")
+        by_profile.setdefault(name, []).append(session)
+
+    result_by_name: Dict[str, Dict[str, Any]] = {}
+    if isinstance(active_agents, dict):
+        for name, info in active_agents.items():
+            profile_name = str(name)
+            session_rows = by_profile.get(profile_name, [])
+            result_by_name[profile_name] = {
+                "name": profile_name,
+                "is_online": True,
+                "last_seen": max((s.get("last_seen_at") for s in session_rows), default=None),
+                "active_sessions": max(1, len(session_rows)),
+                "model": (info.get("model") if isinstance(info, dict) else None) or (session_rows[0].get("model") if session_rows else None),
+            }
+
+    for name, session_rows in by_profile.items():
+        if name in result_by_name:
+            result_by_name[name]["active_sessions"] = len(session_rows)
+            result_by_name[name]["last_seen"] = max((s.get("last_seen_at") for s in session_rows), default=None)
+            if not result_by_name[name].get("model") and session_rows:
+                result_by_name[name]["model"] = session_rows[0].get("model")
+            continue
+        result_by_name[name] = {
+            "name": name,
+            "is_online": True,
+            "last_seen": max((s.get("last_seen_at") for s in session_rows), default=None),
+            "active_sessions": len(session_rows),
+            "model": session_rows[0].get("model") if session_rows else None,
+        }
+
+    return sorted(result_by_name.values(), key=lambda row: str(row.get("name") or ""))
 
 
 def count_profiles_online() -> int:
@@ -1572,6 +1742,10 @@ def read_overview() -> Dict[str, Any]:
     except Exception:
         pass
 
+    kanban = read_kanban_status()
+    memory = read_memory_status()
+    repos = read_repo_status()
+
     return {
         "gateway": gateway,
         "counts": {
@@ -1580,5 +1754,8 @@ def read_overview() -> Dict[str, Any]:
             "running_processes": running_processes,
             "profiles_online": profiles_online,
         },
+        "kanban": kanban,
+        "memory": memory,
+        "repos": repos,
         "alerts": alerts,
     }

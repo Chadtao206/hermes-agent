@@ -4440,6 +4440,9 @@ async def get_control_center_overview():
                 "running_processes": 0,
                 "profiles_online": 0,
             },
+            "kanban": {"status": "unavailable", "available": False},
+            "memory": {"status": "unavailable", "available": False},
+            "repos": {"status": "unavailable"},
             "alerts": [],
         }
 
@@ -4471,6 +4474,16 @@ async def get_control_center_commands(limit: int = 50):
         return {"commands": []}
 
 
+
+
+def _control_center_actions_enabled() -> bool:
+    return os.environ.get("HERMES_CONTROL_CENTER_ACTIONS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_control_center_actions_enabled() -> None:
+    if not _control_center_actions_enabled():
+        raise HTTPException(status_code=404, detail="Control Center actions are disabled in read-only Phase 1")
+
 async def _control_center_json(request: Request) -> dict:
     try:
         payload = await request.json()
@@ -4492,6 +4505,7 @@ def _require_live_control_center_session(session_id: str) -> dict:
 
 @app.post("/api/control-center/sessions/{session_id}/interrupt")
 async def post_control_center_interrupt(session_id: str):
+    _require_control_center_actions_enabled()
     import control_center_store as _cc
 
     _require_live_control_center_session(session_id)
@@ -4503,6 +4517,7 @@ async def post_control_center_interrupt(session_id: str):
 
 @app.post("/api/control-center/sessions/{session_id}/steer")
 async def post_control_center_steer(session_id: str, request: Request):
+    _require_control_center_actions_enabled()
     import control_center_store as _cc
 
     _require_live_control_center_session(session_id)
@@ -4518,6 +4533,7 @@ async def post_control_center_steer(session_id: str, request: Request):
 
 @app.post("/api/control-center/sessions/{session_id}/submit")
 async def post_control_center_submit(session_id: str, request: Request):
+    _require_control_center_actions_enabled()
     import control_center_store as _cc
 
     _require_live_control_center_session(session_id)
@@ -4533,6 +4549,7 @@ async def post_control_center_submit(session_id: str, request: Request):
 
 @app.post("/api/control-center/pending/{request_id}/respond")
 async def post_control_center_pending_respond(request_id: str, request: Request):
+    _require_control_center_actions_enabled()
     import control_center_store as _cc
 
     pending = _cc.cc_get_pending_request(request_id)
@@ -4579,6 +4596,7 @@ def _control_center_process_result(result: dict) -> dict:
 
 @app.post("/api/control-center/processes/{session_id}/kill")
 async def post_control_center_process_kill(session_id: str):
+    _require_control_center_actions_enabled()
     try:
         from tools.process_registry import process_registry
 
@@ -4644,6 +4662,7 @@ async def get_control_center_runtimes():
 
 @app.post("/api/control-center/runtimes/{runtime_id}/actions/{action}")
 async def post_control_center_runtime_action(runtime_id: str, action: str):
+    _require_control_center_actions_enabled()
     try:
         import control_center_store as _cc
         result = _cc.execute_runtime_action(runtime_id, action)

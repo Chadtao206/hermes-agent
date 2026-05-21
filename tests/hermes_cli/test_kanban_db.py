@@ -266,8 +266,8 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
-def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
-    """blocked tasks with all parents done should be promoted to ready."""
+def test_recompute_ready_does_not_auto_promote_blocked_with_done_parents(kanban_home):
+    """blocked tasks require explicit unblock even when parents are done."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
@@ -285,13 +285,14 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         )
         conn.commit()
         assert kb.get_task(conn, child).status == "blocked"
-        # recompute_ready should promote blocked → ready and reset failures
+        # recompute_ready must not undo a real blocked state.
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, child)
-        assert task.status == "ready"
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "persistent error"
 
 
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
@@ -343,11 +344,26 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
         assert kb.schedule_task(conn, t, reason="run next week") is True
         task = kb.get_task(conn, t)
+        assert task is not None
         assert task.status == "scheduled"
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+
+
+def test_create_task_can_start_scheduled_for_root_orchestration_cards(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="orchestration root",
+            assignee="default",
+            initial_status="scheduled",
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "scheduled"
+        assert kb.claim_task(conn, t) is None
 
 
 def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
@@ -1278,19 +1294,26 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
-def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
+def test_respawn_guard_allows_reviewer_after_pr_comment(kanban_home):
+    """Reviewer cards must still spawn after engineer comments PR URLs."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="final review", assignee="reviewer")
+        kb.add_comment(
+            conn, t, "engineer",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_dispatch_respawn_guard_blocks_auth_error_without_ready_limbo(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once defers (does NOT auto-block) a ready task whose last
-    error is a blocker_auth.
+    """dispatch_once moves deterministic auth/quota blockers out of ready.
 
-    The old behaviour auto-blocked on first occurrence, which was too
-    aggressive: a transient 429 rate-limit (which typically clears in
-    seconds to minutes) would end up requiring manual unblock. The new
-    behaviour defers the spawn this tick; the task stays in ``ready``
-    and gets another chance next tick. If the auth error genuinely
-    persists, the existing ``consecutive_failures`` circuit breaker
-    will auto-block via the normal failure-limit path.
+    Retrying profile-auth or quota failures every gateway tick creates noisy
+    churn and hides the real operator action. The guard still records the
+    reason, but the task is parked in blocked until explicitly unblocked.
     """
     spawned_ids = []
 
@@ -1305,22 +1328,15 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
-    # Critical: task is NOT auto-blocked on first occurrence.
-    assert t not in res.auto_blocked, (
-        f"blocker_auth should defer, not auto-block on first occurrence; "
-        f"got auto_blocked={res.auto_blocked!r}"
-    )
-    # It IS recorded as respawn_guarded with the reason.
     assert (t, "blocker_auth") in res.respawn_guarded, (
         f"expected (task_id, 'blocker_auth') in respawn_guarded; "
         f"got {res.respawn_guarded!r}"
     )
-    # And it's NOT spawned this tick.
     assert t not in spawned_ids
-    # Status stays ``ready`` so a future tick (or operator action) can
-    # retry without manual unblock.
     with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "blocked"
 
 
 def test_dispatch_respawn_guard_skips_recent_success(
@@ -1349,10 +1365,10 @@ def test_dispatch_respawn_guard_skips_recent_success(
         assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
 
 
-def test_dispatch_respawn_guard_skips_active_pr(
+def test_dispatch_respawn_guard_parks_active_pr(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """dispatch_once schedules implementer tasks with active PR comments."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -1370,13 +1386,15 @@ def test_dispatch_respawn_guard_skips_active_pr(
     assert t not in spawned_ids
     assert t not in res.auto_blocked
     with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "ready"
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "scheduled"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):
-    """In dry_run mode, blocker_auth tasks are recorded in respawn_guarded (not auto-blocked)."""
+    """In dry_run mode, blocker_auth tasks are recorded in respawn_guarded (not blocked)."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="dry-quota", assignee="alice")
         conn.execute(

@@ -1667,6 +1667,20 @@ class TestEditMessage:
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert kwargs["text"] == "AT&amp;T &lt; 5 &gt; 3"
 
+    @pytest.mark.asyncio
+    async def test_edit_message_truncates_oversized_payload(self, adapter):
+        """Oversized edits are truncated before chat.update to avoid msg_too_long."""
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        oversized = "x" * (adapter.MAX_MESSAGE_LENGTH + 2500)
+
+        result = await adapter.edit_message("C123", "1234.5678", oversized)
+
+        assert result.success is True
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        expected = adapter.truncate_message(oversized, adapter.MAX_MESSAGE_LENGTH)[0]
+        assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert kwargs["text"] == expected
+
 
 # ---------------------------------------------------------------------------
 # TestEditMessageStreamingPipeline
@@ -1745,6 +1759,21 @@ class TestEditMessageStreamingPipeline:
             assert kwargs["text"] == expected, f"Failed for input: {raw!r}"
 
         # Total edit count should match number of updates
+        assert adapter._app.client.chat_update.call_count == len(updates)
+
+    @pytest.mark.asyncio
+    async def test_edit_message_progressive_growth_stays_under_limit(self, adapter):
+        """Growing streaming edits should always stay within Slack max length."""
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        large_step = "x" * (adapter.MAX_MESSAGE_LENGTH // 2)
+        updates = [large_step, large_step * 2, large_step * 3]
+
+        for update in updates:
+            result = await adapter.edit_message("C123", "ts1", update)
+            assert result.success is True
+            kwargs = adapter._app.client.chat_update.call_args.kwargs
+            assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+
         assert adapter._app.client.chat_update.call_count == len(updates)
 
     @pytest.mark.asyncio

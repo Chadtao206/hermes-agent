@@ -100,18 +100,18 @@ export function ProcessesPane({
                         <span className="rounded border px-2 py-0.5">exit {p.exit_code}</span>
                       ) : null}
                       {!controllable ? <span className="rounded border px-2 py-0.5">metadata only</span> : null}
-                      {controllable ? (
-                        <button className="rounded border px-2 py-1 hover:bg-accent" onClick={() => onPoll?.(p)}>
+                      {controllable && onPoll ? (
+                        <button className="rounded border px-2 py-1 hover:bg-accent" onClick={() => onPoll(p)}>
                           Poll
                         </button>
                       ) : null}
-                      {controllable ? (
-                        <button className="rounded border px-2 py-1 hover:bg-accent" onClick={() => onReadLog?.(p)}>
+                      {controllable && onReadLog ? (
+                        <button className="rounded border px-2 py-1 hover:bg-accent" onClick={() => onReadLog(p)}>
                           Log
                         </button>
                       ) : null}
-                      {!p.exited && controllable ? (
-                        <button className="rounded border px-2 py-1 hover:bg-accent" onClick={() => onWait?.(p)}>
+                      {!p.exited && controllable && onWait ? (
+                        <button className="rounded border px-2 py-1 hover:bg-accent" onClick={() => onWait(p)}>
                           Wait 3s
                         </button>
                       ) : null}

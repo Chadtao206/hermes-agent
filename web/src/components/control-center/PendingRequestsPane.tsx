@@ -37,9 +37,11 @@ export function PendingRequestsPane({ requests, onRespond }: PendingRequestsPane
                     {r.session_title || r.session_id} • {r.kind}
                   </div>
                 </div>
-                <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onRespond?.(r)}>
-                  Respond…
-                </button>
+                {onRespond ? (
+                  <button className="rounded border px-2 py-1 text-xs hover:bg-accent" onClick={() => onRespond(r)}>
+                    Respond…
+                  </button>
+                ) : null}
               </li>
             ))}
           </ul>

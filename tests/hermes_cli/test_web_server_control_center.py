@@ -51,6 +51,16 @@ class TestControlCenterEndpoints:
         data = self.client.get("/api/control-center/overview").json()
         assert isinstance(data["alerts"], list)
 
+    def test_overview_includes_phase1_status_domains(self):
+        data = self.client.get("/api/control-center/overview").json()
+        for key in ("kanban", "memory", "repos"):
+            assert key in data, f"overview missing {key} status domain"
+            assert "status" in data[key]
+        assert "available" in data["kanban"]
+        assert "available" in data["memory"]
+        assert "hermes_source" in data["repos"]
+        assert "control_plane" in data["repos"]
+
     def test_sessions_status_and_keys(self):
         resp = self.client.get("/api/control-center/sessions")
         assert resp.status_code == 200
@@ -205,21 +215,12 @@ class TestControlCenterEndpoints:
         assert "last_checked" in data
         assert data["runtimes"][0]["id"] == "dashboard"
 
-    def test_runtime_action_unavailable_response(self, monkeypatch):
-        import control_center_store as cc
-
-        monkeypatch.setattr(cc, "execute_runtime_action", lambda runtime_id, action: {
-            "status": "unavailable",
-            "runtime_id": runtime_id,
-            "action": action,
-            "error": "blocked",
-        })
+    def test_runtime_actions_disabled_by_default_for_phase1(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_ACTIONS", raising=False)
 
         resp = self.client.post("/api/control-center/runtimes/dashboard/actions/stop")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is False
-        assert data["result"]["status"] == "unavailable"
+        assert resp.status_code == 404
+        assert "disabled" in resp.json()["detail"]
 
     def test_runtime_action_not_found_returns_404(self, monkeypatch):
         import control_center_store as cc
@@ -271,6 +272,27 @@ class TestControlCenterEndpoints:
         data = resp.json()
         assert "profiles" in data
         assert isinstance(data["profiles"], list)
+
+    def test_profiles_fallback_to_live_sessions_when_gateway_down(self, _isolate_hermes_home, monkeypatch):
+        import control_center_store as cc
+
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda cleanup_stale=False: None)
+        cc.cc_upsert_live_session(
+            "phase1-profile-fallback",
+            owner_kind="tui",
+            owner_id="pid-1",
+            profile="reviewer",
+            title="Fallback Session",
+            model="claude-test",
+            running=True,
+        )
+
+        data = self.client.get("/api/control-center/profiles").json()
+        profiles = data["profiles"]
+        reviewer = next((p for p in profiles if p["name"] == "reviewer"), None)
+        assert reviewer is not None
+        assert reviewer["active_sessions"] == 1
+        assert reviewer["model"] == "claude-test"
 
     def test_sessions_endpoint_excludes_inactive_sessions(self, _isolate_hermes_home):
         """Sessions endpoint must not list sessions whose last activity is >5 min old."""
