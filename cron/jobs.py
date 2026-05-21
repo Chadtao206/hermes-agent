@@ -882,15 +882,29 @@ def build_job_health(job: Dict[str, Any], now: Optional[datetime] = None) -> Dic
     if latest_scheduler_receipt_missing:
         flags.append("missing-latest-scheduler-receipt")
 
+    pending_first_run = (
+        normalized.get("enabled", True)
+        and normalized.get("state") not in {"paused", "completed"}
+        and last_attempt_at is None
+        and scheduler_success_at is None
+        and last_manual_at is None
+        and next_run_at is not None
+        and next_run_at > now_dt
+    )
+
     if scheduler_success_at is not None:
         proof = "scheduler"
     elif last_manual_at is not None:
         proof = "manual-only"
+    elif pending_first_run:
+        proof = "pending_first_run"
     else:
         proof = "missing"
 
     if proof == "manual-only":
         flags.append("manual-only-proof")
+    elif proof == "pending_first_run":
+        flags.append("pending-first-run")
     elif proof == "missing":
         flags.append("no-proof")
 

@@ -4,7 +4,7 @@ from argparse import Namespace
 
 import pytest
 
-from cron.jobs import create_job, get_job, list_jobs, mark_job_run, save_job_output
+from cron.jobs import build_job_health, create_job, get_job, list_jobs, mark_job_run, save_job_output
 from hermes_cli.cron import cron_command
 
 
@@ -135,6 +135,17 @@ class TestCronCommandLifecycle:
         assert scheduler_job["id"] in out
         assert "manual-only" in out
         assert "scheduler" in out
+
+
+    def test_health_classifies_future_first_run_as_pending_not_critical(self, tmp_cron_dir):
+        job = create_job(prompt="Future weekly review", schedule="7d", name="Future First Run")
+
+        health = build_job_health(job)
+
+        assert health["proof"] == "pending_first_run"
+        assert health["severity"] == "healthy"
+        assert "pending-first-run" in health["flags"]
+        assert "no-proof" not in health["flags"]
 
     def test_list_surfaces_manual_receipt_context(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [12345])

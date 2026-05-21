@@ -55,6 +55,8 @@ def _proof_label(health: dict) -> str:
         return color("scheduler", Colors.GREEN)
     if proof == "manual-only":
         return color("manual-only", Colors.YELLOW)
+    if proof == "pending_first_run":
+        return color("pending-first-run", Colors.BLUE)
     return color("missing", Colors.RED)
 
 
@@ -83,6 +85,7 @@ def cron_health(show_all: bool = False):
     scheduler_count = sum(1 for row in health_rows if row.get("proof") == "scheduler")
     manual_only_count = sum(1 for row in health_rows if row.get("proof") == "manual-only")
     missing_count = sum(1 for row in health_rows if row.get("proof") == "missing")
+    pending_first_run_count = sum(1 for row in health_rows if row.get("proof") == "pending_first_run")
     stale_count = sum(1 for row in health_rows if "stale" in row.get("flags", []))
     receipt_gap_count = sum(1 for row in health_rows if row.get("latest_scheduler_receipt_missing"))
 
@@ -96,6 +99,7 @@ def cron_health(show_all: bool = False):
         f"scheduler={scheduler_count}  "
         f"manual-only={manual_only_count}  "
         f"missing={missing_count}  "
+        f"pending-first-run={pending_first_run_count}  "
         f"stale={stale_count}  "
         f"missing-latest-receipt={receipt_gap_count}"
     )
