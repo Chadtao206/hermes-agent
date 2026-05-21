@@ -268,32 +268,34 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
 
 
 def test_recompute_ready_does_not_auto_promote_blocked_with_done_parents(kanban_home):
-    """blocked tasks require explicit unblock even when parents are done."""
+    """Explicit worker/operator blocks require unblock even when parents are done."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
             conn, title="child", assignee="a", parents=[parent],
         )
-        # Complete the parent
+        # Complete the parent, which promotes the child to ready.
         kb.claim_task(conn, parent)
         kb.complete_task(conn, parent, result="ok")
-        # Manually block the child (simulates a worker that failed
-        # after the parent finished)
-        conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=5, "
-            "last_failure_error='persistent error' WHERE id=?",
-            (child,),
+        assert kb.get_task(conn, child).status == "ready"
+
+        # Block through the real worker/operator path so a sticky ``blocked``
+        # event exists. Direct status flips without a blocked event model
+        # circuit-breaker/triage recovery and are covered by
+        # test_kanban_blocked_sticky.py.
+        kb.claim_task(conn, child)
+        kb.block_task(
+            conn, child,
+            reason="review-required: persistent error",
+            expected_run_id=kb.get_task(conn, child).current_run_id,
         )
-        conn.commit()
         assert kb.get_task(conn, child).status == "blocked"
-        # recompute_ready must not undo a real blocked state.
+
         promoted = kb.recompute_ready(conn)
         assert promoted == 0
         task = kb.get_task(conn, child)
         assert task is not None
         assert task.status == "blocked"
-        assert task.consecutive_failures == 5
-        assert task.last_failure_error == "persistent error"
 
 
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
@@ -616,6 +618,133 @@ def test_protocol_violation_harvests_worker_log_tail(kanban_home, monkeypatch):
         ).fetchone()
         assert event is not None
         assert "useful artifact" in json.loads(event["payload"])["log_tail"]
+
+
+def test_protocol_violation_event_carries_structured_failure_class(
+    kanban_home, monkeypatch,
+):
+    """Clean-exit violation stamps a stable enum + guidance on the event,
+    run metadata, and the auto-block ``gave_up`` payload.
+
+    Telemetry filters and Control Center recovery loops need a queryable
+    classification rather than regexing the free-text ``error`` field.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs closeout", assignee="a")
+        kb.claim_task(
+            conn, tid,
+            claimer=f"{_kb._claimer_id().split(':', 1)[0]}:worker",
+        )
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (70002, tid))
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [tid]
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        violation_payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='protocol_violation' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["payload"])
+        assert violation_payload["failure_class"] == (
+            _kb.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
+        )
+        assert "kanban_complete" in violation_payload["guidance"]
+        assert "kanban_block" in violation_payload["guidance"]
+
+        run_meta = json.loads(conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["metadata"])
+        assert run_meta["failure_class"] == (
+            _kb.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
+        )
+
+        gave_up_payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["payload"])
+        assert gave_up_payload["failure_class"] == (
+            _kb.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
+        )
+        assert "kanban_complete" in gave_up_payload["guidance"]
+
+
+def test_nonprotocol_crash_does_not_set_protocol_violation_failure_class(
+    kanban_home, monkeypatch,
+):
+    """A nonzero-exit crash must NOT carry the protocol-violation class.
+
+    Guards against ``failure_class`` leaking onto every gave_up event
+    after the breaker trips for ordinary crashes (which would defeat
+    the point of a queryable classification).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 137),
+    )
+
+    with kb.connect() as conn:
+        tids = []
+        for i in range(4):  # 4 same-fingerprint failures → systemic auto-block
+            tid = kb.create_task(conn, title=f"oom-{i}", assignee="a")
+            host = _kb._claimer_id().split(":", 1)[0]
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=? WHERE id=?",
+                (60000 + i, f"{host}:w{i}", tid),
+            )
+            tids.append(tid)
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+        for tid in tids:
+            assert kb.get_task(conn, tid).status == "blocked"
+            violation = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? "
+                "AND kind='protocol_violation'",
+                (tid,),
+            ).fetchone()
+            assert violation is None, (
+                "ordinary crash must not emit a protocol_violation event"
+            )
+            gave_up_payload = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()["payload"])
+            assert "failure_class" not in gave_up_payload
+
+
+def test_worker_context_advertises_closeout_requirement(kanban_home):
+    """``build_worker_context`` must surface the terminal closeout contract.
+
+    Reduces the protocol-violation recurrence rate by repeating the
+    contract in the very text the worker re-reads on orient — the
+    system-prompt KANBAN_GUIDANCE is not always preserved across
+    compaction or restarts.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs closeout", assignee="a")
+        ctx = kb.build_worker_context(conn, tid)
+
+    assert "Closeout requirement" in ctx
+    assert "kanban_complete" in ctx
+    assert "kanban_block" in ctx
+    # The structured failure-class enum should appear so a worker that
+    # later sees the same string in a prior-attempt summary can
+    # cross-reference what tripped it.
+    assert "protocol_violation_clean_exit" in ctx
 
 
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
@@ -1937,6 +2066,55 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+
+    def test_dispatcher_spawn_prompt_includes_closeout_contract(
+        self, tmp_path, monkeypatch,
+    ):
+        # The opening user-message prompt the dispatcher hands the worker
+        # must spell out the kanban_complete / kanban_block terminal
+        # contract. This is the most visible layer (shows up in ``ps``
+        # and the worker log header) and the one a triaging human reads
+        # first when chasing protocol_violation_clean_exit auto-blocks.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                self.pid = 4243
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_closeout_prompt",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_closeout_prompt",
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        cmd = captured["cmd"]
+        # The prompt is the argument after ``-q`` in the argv list.
+        prompt = cmd[cmd.index("-q") + 1]
+        assert "t_closeout_prompt" in prompt
+        assert "kanban_complete" in prompt
+        assert "kanban_block" in prompt
+        assert "protocol violation" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------

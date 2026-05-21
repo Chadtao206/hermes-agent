@@ -863,6 +863,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Shortcut for --learning-artifact-state none",
     )
     p_closeout.add_argument(
+        "--provenance", default=None,
+        choices=("real", "synthetic", "unknown"),
+        help=(
+            "Provenance of this kanban task for workflow-metrics eligibility. "
+            "Defaults to 'real' for completed kanban closeouts — only override "
+            "for synthetic/seed/demo runs that should be excluded from KPIs."
+        ),
+    )
+    p_closeout.add_argument(
+        "--substantiality", default=None,
+        choices=("substantial", "trivial", "unknown"),
+        help=(
+            "Substantiality of this kanban task for workflow-metrics eligibility. "
+            "Defaults to 'substantial' for completed kanban closeouts — override "
+            "for trivial/scratch work that should be excluded from KPIs."
+        ),
+    )
+    p_closeout.add_argument(
         "--notes-json", default=None,
         help="Extra notes JSON object merged into prefilled notes",
     )
@@ -2701,6 +2719,14 @@ def _cmd_closeout(args: argparse.Namespace) -> int:
     else:
         learning_artifact_state = "unknown"
 
+    # Provenance / substantiality default to real/substantial for kanban
+    # closeout so completed kanban work counts in workflow-metrics
+    # eligibility (which filters on lower(provenance)='real' and
+    # lower(substantiality)='substantial'). Operators override to mark
+    # synthetic/seed/trivial runs that should stay excluded from KPIs.
+    provenance = args.provenance or "real"
+    substantiality = args.substantiality or "substantial"
+
     # correct_owner / user_corrected: take explicit overrides, else
     # derive from routing divergence so closeouts encode "the routing
     # ended up somewhere different" as "initial owner not correct".
@@ -2761,6 +2787,8 @@ def _cmd_closeout(args: argparse.Namespace) -> int:
         "user_corrected": user_corrected,
         "correction_state": correction_state,
         "learning_artifact_state": learning_artifact_state,
+        "provenance": provenance,
+        "substantiality": substantiality,
     }
 
     if args.dry_run or getattr(args, "json", False):

@@ -144,6 +144,24 @@ _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
 
+# Structured failure-class taxonomy stamped into task_events / run metadata /
+# gave_up payloads so downstream tooling (Control Center, telemetry audits,
+# Jensen recovery loops) can filter on a stable enum instead of grepping the
+# free-text ``error`` field. Add new entries here as new deterministic
+# failure modes are recognised by the dispatcher.
+FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT = "protocol_violation_clean_exit"
+
+# Operator/worker-facing guidance attached alongside the failure class.
+# Stays short — meant for a one-line nudge in dashboards and for the
+# next worker reading the prior-attempt history, not a tutorial.
+_PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE = (
+    "Worker exited cleanly without calling kanban_complete or kanban_block. "
+    "Before exit, the worker MUST call kanban_complete(summary=..., metadata=...) "
+    "on success or kanban_block(reason=...) when it cannot continue. "
+    "Inspect log_tail for partial progress before unblocking."
+)
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -1610,6 +1628,17 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
+                if task_status == "blocked":
+                    # ``initial_status='blocked'`` is an explicit operator gate
+                    # (for example immediate R3 review). Emit a matching blocked
+                    # event so recompute_ready treats it as sticky until an
+                    # explicit unblock clears it.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "initial_status=blocked"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -1962,7 +1991,7 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -1987,6 +2016,19 @@ def _end_run(
             run_id,
         ),
     )
+    if cur.rowcount == 0:
+        # Defensive telemetry: caller attempted to close a run that had
+        # already been ended (typically two independent failure/reclaim
+        # paths racing). Keep behavior backward-compatible by still
+        # clearing ``tasks.current_run_id`` below and returning the run_id.
+        _append_event(
+            conn, task_id, "double_close_attempt",
+            {
+                "run_id": run_id,
+                "caller_outcome": outcome,
+            },
+            run_id=run_id,
+        )
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
@@ -2081,8 +2123,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    DB manipulation). Tasks created with ``initial_status='blocked'`` do
+    append a ``blocked`` event, so they are treated as sticky until an
+    explicit unblock.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -2094,23 +2137,26 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote dispatchable tasks to ``ready`` once parents are done.
 
-    Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
-
-    ``blocked`` and ``scheduled`` are explicit operator/worker states and are
-    never auto-promoted here. They require ``unblock_task`` (or equivalent
-    operator action) so real blockers do not churn through the dispatcher just
-    because their dependency graph is otherwise satisfied.
+    ``todo`` tasks become ready when every parent is ``done`` or
+    ``archived``.  ``blocked`` tasks are more nuanced: explicit
+    worker/operator blocks (including ``initial_status='blocked'`` gates)
+    are sticky and require ``unblock_task``, while circuit-breaker /
+    direct-triage blocks (no latest ``blocked`` event) are allowed to
+    auto-recover.  ``scheduled`` remains an explicit parking state and is
+    never auto-promoted here.
     """
     promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status FROM tasks WHERE status = 'todo'"
+        candidate_rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
-        for row in todo_rows:
+        for row in candidate_rows:
             task_id = row["id"]
+            status = row["status"]
+            if status == "blocked" and _has_sticky_block(conn, task_id):
+                continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -2119,7 +2165,13 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    """
+                    UPDATE tasks
+                       SET status = 'ready',
+                           consecutive_failures = 0,
+                           last_failure_error = NULL
+                     WHERE id = ? AND status IN ('todo', 'blocked')
+                    """,
                     (task_id,),
                 )
                 _append_event(conn, task_id, "promoted", None)
@@ -4254,10 +4306,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 )
                 log_tail = read_worker_log(row["id"], tail_bytes=4096) or ""
                 event_kind = "protocol_violation"
+                # ``failure_class`` / ``guidance`` give downstream tooling a
+                # stable enum + one-line nudge to filter on rather than
+                # regexing the free-text error. Same fields flow into the
+                # subsequent ``gave_up`` event via ``event_payload_extra``
+                # below so dashboards see the classification on the
+                # auto-block too, not only on the underlying violation.
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    "failure_class": FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+                    "guidance": _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
                 }
                 if log_tail:
                     event_payload["log_tail"] = log_tail[-4096:]
@@ -4329,6 +4389,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 not protocol_violation
                 and _fp_counts.get(fp, 0) >= 3
             )
+            # When the trigger was a clean-exit protocol violation, stamp
+            # the structured classification onto the ``gave_up`` event too
+            # so downstream filters see the same enum on the auto-block as
+            # on the underlying ``protocol_violation`` event.
+            extra: dict = {"pid": pid, "claimer": claimer}
+            if protocol_violation:
+                extra["failure_class"] = (
+                    FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
+                )
+                extra["guidance"] = _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -4336,7 +4406,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 failure_limit=1 if (protocol_violation or is_systemic) else None,
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
+                event_payload_extra=extra,
             )
             if tripped:
                 auto_blocked.append(tid)
@@ -5323,7 +5393,19 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    # The worker sees this as its opening user message. The closeout
+    # clause is the third layer (after the system-prompt KANBAN_GUIDANCE
+    # and the ``## Closeout requirement`` block in build_worker_context)
+    # nudging the worker to end with kanban_complete / kanban_block — and
+    # it has the side benefit of being visible in ``ps`` and the worker
+    # log header so a human triaging a dead worker can read the contract
+    # the dispatcher held it to without opening the DB.
+    prompt = (
+        f"work kanban task {task.id}. "
+        f"End with kanban_complete (success) or kanban_block (cannot "
+        f"continue) before exit — clean exit without one is a protocol "
+        f"violation and auto-blocks the task."
+    )
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -5582,6 +5664,27 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    lines.append("")
+
+    # Terminal closeout contract — repeated here even though
+    # ``KANBAN_GUIDANCE`` in the system prompt also covers it. Workers that
+    # restart, recompact, or summarise their history can drop the system
+    # prompt context; the worker_context returned by ``kanban_show`` is
+    # what they re-read. Without an explicit closeout line here, a worker
+    # that finishes its tool calls and then "wraps up" conversationally
+    # exits cleanly without a terminal transition — the exact protocol
+    # violation that the dispatcher flags as ``failure_class=
+    # protocol_violation_clean_exit``. Keep this short; it's a reminder,
+    # not a tutorial.
+    lines.append("## Closeout requirement (do not skip)")
+    lines.append(
+        "Before you exit, you MUST call exactly one terminal kanban tool: "
+        "`kanban_complete(summary=..., metadata=...)` on success, or "
+        "`kanban_block(reason=...)` if you cannot continue. Exiting "
+        "cleanly without one of these is a protocol violation "
+        "(`failure_class=protocol_violation_clean_exit`) and will auto-"
+        "block this task on the first occurrence."
+    )
     lines.append("")
 
     if task.body and task.body.strip():

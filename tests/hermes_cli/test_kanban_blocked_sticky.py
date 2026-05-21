@@ -99,6 +99,78 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         assert kb.get_task(conn, child).status == "blocked"
 
 
+def test_initial_status_blocked_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
+    """Tasks created with ``initial_status='blocked'`` are explicit
+    operator gates and must stay blocked until unblocked."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ops gate", initial_status="blocked")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "blocked"
+
+
+def test_initial_status_blocked_with_done_parent_is_still_sticky(kanban_home: Path) -> None:
+    """Even when parent gates are already open, an initial blocked gate
+    remains sticky until explicit unblock."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        kb.complete_task(conn, parent, result="ok")
+
+        child = kb.create_task(
+            conn,
+            title="ops-gated child",
+            parents=[parent],
+            initial_status="blocked",
+        )
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+
+
+def test_initial_status_blocked_emits_blocked_event(kanban_home: Path) -> None:
+    """Create-time blocked tasks should emit a blocked event so the
+    sticky-block guard has durable provenance."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gate", initial_status="blocked")
+        events = kb.list_events(conn, tid)
+
+    blocked_events = [e for e in events if e.kind == "blocked"]
+    assert blocked_events
+    assert blocked_events[-1].payload == {"reason": "initial_status=blocked"}
+
+
+def test_unblock_clears_initial_status_blocked_gate(kanban_home: Path) -> None:
+    """An explicit unblock should clear create-time gates so later
+    non-sticky blocked states can auto-recover."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gate", initial_status="blocked")
+        assert kb.unblock_task(conn, tid) is True
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 1
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
