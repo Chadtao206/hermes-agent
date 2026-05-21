@@ -4443,6 +4443,15 @@ async def get_control_center_overview():
             "kanban": {"status": "unavailable", "available": False},
             "memory": {"status": "unavailable", "available": False},
             "repos": {"status": "unavailable"},
+            "control_center": {
+                "actions_enabled": _control_center_actions_enabled(),
+                "mode": "operator_actions_enabled" if _control_center_actions_enabled() else "read_only",
+                "label": "Operator actions enabled" if _control_center_actions_enabled() else "Read-only mode",
+                "reason": None if _control_center_actions_enabled() else "Set HERMES_CONTROL_CENTER_ACTIONS=1 to enable safe operator controls.",
+                "safe_session_actions": ["steer", "submit"],
+                "safe_process_actions": ["poll", "log", "wait"],
+                "destructive_controls_enabled": False,
+            },
             "alerts": [],
         }
 
@@ -4632,6 +4641,7 @@ async def get_control_center_process_log(session_id: str, offset: int = 0, limit
 
 @app.post("/api/control-center/processes/{session_id}/wait")
 async def post_control_center_process_wait(session_id: str, timeout: int = 3):
+    _require_control_center_actions_enabled()
     try:
         from tools.process_registry import process_registry
 

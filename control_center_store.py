@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import sqlite3
 import subprocess
@@ -582,6 +583,34 @@ class ControlCenterDB:
         self._execute_write(_fn)
         return expired
 
+    def expire_stale_commands(self, *, command_ttl: float = 900.0) -> int:
+        """Mark old pending/claimed commands expired so the queue cannot silently stall."""
+        now = time.time()
+        cutoff = now - command_ttl
+        expired = 0
+        result_json = json.dumps({
+            "error": "command expired before a runtime completed it",
+            "expired_after_seconds": command_ttl,
+        })
+
+        def _fn(conn: sqlite3.Connection) -> None:
+            nonlocal expired
+            cur = conn.execute(
+                """
+                UPDATE commands
+                   SET status = 'expired',
+                       completed_at = ?,
+                       result_json = ?
+                 WHERE (status = 'pending' AND created_at < ?)
+                    OR (status = 'claimed' AND COALESCE(claimed_at, created_at) < ?)
+                """,
+                (now, result_json, cutoff, cutoff),
+            )
+            expired = cur.rowcount
+
+        self._execute_write(_fn)
+        return expired
+
     # ── Pruning ──
 
     def prune_stale_rows(
@@ -602,7 +631,7 @@ class ControlCenterDB:
             )
             deleted["live_sessions"] = cur.rowcount
             cur = conn.execute(
-                "DELETE FROM commands WHERE status IN ('completed', 'failed') AND completed_at < ?",
+                "DELETE FROM commands WHERE status IN ('completed', 'failed', 'expired') AND completed_at < ?",
                 (now - command_ttl,),
             )
             deleted["commands"] = cur.rowcount
@@ -691,6 +720,14 @@ def cc_expire_unreachable_commands(**kwargs: Any) -> int:
     db = _open_cc_db()
     try:
         return db.expire_unreachable_commands(**kwargs)
+    finally:
+        db.close()
+
+
+def cc_expire_stale_commands(**kwargs: Any) -> int:
+    db = _open_cc_db()
+    try:
+        return db.expire_stale_commands(**kwargs)
     finally:
         db.close()
 
@@ -839,6 +876,7 @@ def read_pending_requests() -> List[Dict[str, Any]]:
 
 def read_commands(limit: int = 50) -> List[Dict[str, Any]]:
     cc_expire_unreachable_commands()
+    cc_expire_stale_commands()
     commands = cc_list_commands(limit=limit)
     result = []
     for item in commands:
@@ -1457,6 +1495,39 @@ def read_delegation_subagents(limit: int = 20) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Control Center operator capabilities
+# ---------------------------------------------------------------------------
+
+def read_action_capabilities() -> Dict[str, Any]:
+    """Return operator-action mode and safe/destructive action groups.
+
+    Backend write endpoints remain independently gated by
+    HERMES_CONTROL_CENTER_ACTIONS.  This read model lets the dashboard explain
+    why controls are hidden and only wire low-risk affordances when enabled.
+    """
+    raw = os.environ.get("HERMES_CONTROL_CENTER_ACTIONS", "")
+    enabled = raw.strip().lower() in {"1", "true", "yes", "on"}
+    safe_session_actions = ["steer", "submit"]
+    safe_process_actions = ["poll", "log", "wait"]
+    destructive_actions = ["interrupt", "kill", "runtime_start", "runtime_stop", "runtime_restart"]
+    deferred_actions = ["respond_pending"]
+    return {
+        "actions_enabled": enabled,
+        "mode": "operator_actions_enabled" if enabled else "read_only",
+        "label": "Operator actions enabled" if enabled else "Read-only mode",
+        "reason": None if enabled else "Set HERMES_CONTROL_CENTER_ACTIONS=1 to enable safe operator controls.",
+        "env_var": "HERMES_CONTROL_CENTER_ACTIONS",
+        "safe_session_actions": safe_session_actions,
+        "safe_process_actions": safe_process_actions,
+        "safe_actions": safe_session_actions + safe_process_actions,
+        "destructive_actions": destructive_actions,
+        "deferred_actions": deferred_actions,
+        "destructive_controls_enabled": False,
+        "destructive_controls_reason": "Destructive controls remain disabled for Phase 2B until audit/confirmation coverage is complete.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase 1 read-only status domains
 # ---------------------------------------------------------------------------
 
@@ -1757,5 +1828,6 @@ def read_overview() -> Dict[str, Any]:
         "kanban": kanban,
         "memory": memory,
         "repos": repos,
+        "control_center": read_action_capabilities(),
         "alerts": alerts,
     }

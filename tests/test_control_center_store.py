@@ -692,6 +692,52 @@ class TestControlCenterDBCommands:
         assert cmd is not None
         assert cmd["action"] == "restart"
 
+
+    def test_expire_stale_commands_marks_pending_and_claimed_expired(self, ccdb):
+        pending_id = ccdb.enqueue_command("old_pending", target_session_id="s1")
+        claimed_id = ccdb.enqueue_command("old_claimed", target_session_id="s1")
+        fresh_id = ccdb.enqueue_command("fresh", target_session_id="s1")
+        old = time.time() - 1200
+        ccdb._conn.execute(
+            "UPDATE commands SET created_at=? WHERE id=?",
+            (old, pending_id),
+        )
+        ccdb._conn.execute(
+            "UPDATE commands SET status='claimed', created_at=?, claimed_at=? WHERE id=?",
+            (old, old, claimed_id),
+        )
+
+        expired = ccdb.expire_stale_commands(command_ttl=900.0)
+
+        commands = {row["id"]: row for row in ccdb.list_commands(limit=10)}
+        assert expired == 2
+        assert commands[pending_id]["status"] == "expired"
+        assert commands[claimed_id]["status"] == "expired"
+        assert commands[fresh_id]["status"] == "pending"
+        assert commands[pending_id]["result"]["error"]
+
+
+    def test_freshly_reclaimed_old_command_does_not_expire_by_created_at(self, ccdb):
+        cmd_id = ccdb.enqueue_command("old_but_active", target_session_id="s1")
+        old = time.time() - 1200
+        ccdb._conn.execute("UPDATE commands SET created_at=? WHERE id=?", (old, cmd_id))
+
+        claimed = ccdb.claim_next_command(target_session_id="s1")
+        assert claimed is not None
+        assert claimed["claimed_at"] > old
+
+        assert ccdb.expire_stale_commands(command_ttl=900.0) == 0
+        assert ccdb.complete_command(cmd_id, result={"done": True}) is True
+        row = next(row for row in ccdb.list_commands(limit=10) if row["id"] == cmd_id)
+        assert row["status"] == "completed"
+
+    def test_expired_command_cannot_be_claimed(self, ccdb):
+        cmd_id = ccdb.enqueue_command("old", target_session_id="s1")
+        old = time.time() - 1200
+        ccdb._conn.execute("UPDATE commands SET created_at=? WHERE id=?", (old, cmd_id))
+        ccdb.expire_stale_commands(command_ttl=900.0)
+        assert ccdb.claim_next_command(target_session_id="s1") is None
+
     def test_prune_removes_completed_commands(self, ccdb):
         cmd_id = ccdb.enqueue_command("act")
         ccdb.claim_next_command()
@@ -731,6 +777,19 @@ class TestModuleLevelWrappers:
         cc.cc_create_pending_request("wr-1", "ws1", "info")
         assert cc.cc_resolve_pending_request("wr-1") is True
         assert cc.cc_resolve_pending_request("wr-1") is False
+
+
+    def test_cc_expire_stale_commands_wrapper(self, _isolate_hermes_home):
+        import control_center_store as cc
+        cmd_id = cc.cc_enqueue_command("old", target_session_id="ws1")
+        db = cc.ControlCenterDB()
+        try:
+            db._conn.execute("UPDATE commands SET created_at=? WHERE id=?", (time.time() - 1200, cmd_id))
+        finally:
+            db.close()
+        assert cc.cc_expire_stale_commands(command_ttl=900.0) == 1
+        rows = cc.cc_list_commands(limit=10)
+        assert rows[0]["status"] == "expired"
 
     def test_cc_prune_stale_rows(self, _isolate_hermes_home):
         import control_center_store as cc

@@ -935,7 +935,23 @@ export interface ControlCenterOverviewResponse {
     hermes_source?: ControlCenterRepoStatus;
     control_plane?: ControlCenterRepoStatus;
   };
+  control_center?: ControlCenterActionCapabilities;
   alerts: Array<{ level: string; message: string }>;
+}
+
+export interface ControlCenterActionCapabilities {
+  actions_enabled: boolean;
+  mode: string;
+  label: string;
+  reason?: string | null;
+  env_var?: string;
+  safe_session_actions?: string[];
+  safe_process_actions?: string[];
+  safe_actions?: string[];
+  destructive_actions?: string[];
+  deferred_actions?: string[];
+  destructive_controls_enabled?: boolean;
+  destructive_controls_reason?: string | null;
 }
 
 export interface ControlCenterRepoStatus {

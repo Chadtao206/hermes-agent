@@ -61,6 +61,24 @@ class TestControlCenterEndpoints:
         assert "hermes_source" in data["repos"]
         assert "control_plane" in data["repos"]
 
+
+    def test_overview_includes_control_center_action_mode(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_ACTIONS", raising=False)
+        data = self.client.get("/api/control-center/overview").json()
+        mode = data["control_center"]
+        assert mode["actions_enabled"] is False
+        assert mode["mode"] == "read_only"
+        assert "safe_session_actions" in mode
+        assert "safe_process_actions" in mode
+        assert mode["destructive_controls_enabled"] is False
+
+    def test_overview_action_mode_reflects_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
+        data = self.client.get("/api/control-center/overview").json()
+        mode = data["control_center"]
+        assert mode["actions_enabled"] is True
+        assert mode["mode"] == "operator_actions_enabled"
+
     def test_sessions_status_and_keys(self):
         resp = self.client.get("/api/control-center/sessions")
         assert resp.status_code == 200
@@ -214,6 +232,15 @@ class TestControlCenterEndpoints:
         data = resp.json()
         assert "last_checked" in data
         assert data["runtimes"][0]["id"] == "dashboard"
+
+
+    def test_process_wait_disabled_by_default_for_read_only_mode(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CONTROL_CENTER_ACTIONS", raising=False)
+
+        resp = self.client.post("/api/control-center/processes/proc-test/wait")
+
+        assert resp.status_code == 404
+        assert "disabled" in resp.json()["detail"]
 
     def test_runtime_actions_disabled_by_default_for_phase1(self, monkeypatch):
         monkeypatch.delenv("HERMES_CONTROL_CENTER_ACTIONS", raising=False)

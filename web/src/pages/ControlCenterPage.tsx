@@ -11,8 +11,6 @@ import type {
   ControlCenterProfileStatus,
   ControlCenterCommand,
   ControlCenterProcessActionResponse,
-  ControlCenterRuntimeAction,
-  ControlCenterRuntimeCard,
   ControlCenterRuntimeHealthResponse,
 } from "@/lib/api";
 import { OverviewCards } from "@/components/control-center/OverviewCards";
@@ -26,7 +24,6 @@ import { RuntimeHealthPane } from "@/components/control-center/RuntimeHealthPane
 
 const OVERVIEW_MS = 5_000;
 const DETAIL_MS = 4_000;
-const CONTROL_CENTER_ACTIONS_ENABLED = false;
 
 export default function ControlCenterPage() {
   const [overview, setOverview] = useState<ControlCenterOverviewResponse | null>(null);
@@ -38,7 +35,6 @@ export default function ControlCenterPage() {
   const [subagents, setSubagents] = useState<ControlCenterDelegationSummary[] | null>(null);
   const [profiles, setProfiles] = useState<ControlCenterProfileStatus[] | null>(null);
   const [runtimes, setRuntimes] = useState<ControlCenterRuntimeHealthResponse | null>(null);
-  const [runtimeActionResult, setRuntimeActionResult] = useState<string | null>(null);
   const [selectedProcessId, setSelectedProcessId] = useState<string | null>(null);
   const [processDetail, setProcessDetail] = useState<ControlCenterProcessActionResponse["result"] | null>(null);
   const [processDetailLoading, setProcessDetailLoading] = useState(false);
@@ -169,18 +165,12 @@ export default function ControlCenterPage() {
     return () => clearInterval(id);
   }, []);
 
+  const controlCenterMode = overview?.control_center;
+  const controlCenterActionsEnabled = Boolean(controlCenterMode?.actions_enabled);
+
   const reportError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     window.alert(message);
-  };
-
-  const handleInterrupt = async (session: ControlCenterLiveSession) => {
-    try {
-      await api.interruptControlCenterSession(session.session_id);
-      refreshControlState();
-    } catch (error) {
-      reportError(error);
-    }
   };
 
   const handleSteer = async (session: ControlCenterLiveSession) => {
@@ -247,79 +237,45 @@ export default function ControlCenterPage() {
     await updateProcessDetail(proc, () => api.waitControlCenterProcess(proc.session_id, 3));
   };
 
-  const handleProcessKill = async (proc: ControlCenterProcess) => {
-    const label = proc.command || proc.session_id;
-    if (!window.confirm(`Kill managed process ${label}?`)) return;
-    try {
-      const response = await api.killControlCenterProcess(proc.session_id);
-      setSelectedProcessId(proc.session_id);
-      setProcessDetail(response.result);
-      refreshControlState();
-    } catch (error) {
-      reportError(error);
-    }
-  };
-
-  const handleRuntimeAction = async (runtime: ControlCenterRuntimeCard, action: ControlCenterRuntimeAction) => {
-    if (!action.available) return;
-    if (action.destructive && !window.confirm(`${action.label} ${runtime.name}?`)) return;
-    try {
-      const response = await api.runControlCenterRuntimeAction(runtime.id, action.id);
-      const result = response.result;
-      const output = typeof result.output === "string" ? result.output : "";
-      setRuntimeActionResult(`${runtime.name} / ${action.label}: ${result.status}${output ? `
-${output}` : ""}`);
-      refreshControlState();
-    } catch (error) {
-      reportError(error);
-    }
-  };
-
-  const handlePendingRespond = async (request: ControlCenterPendingRequest) => {
-    try {
-      if (request.kind === "approval") {
-        const approve = window.confirm(request.prompt_preview || "Approve this request?");
-        await api.respondToControlCenterPending(request.request_id, { choice: approve ? "once" : "deny" });
-      } else if (request.choices && request.choices.length > 0) {
-        const text = window.prompt(
-          `${request.prompt_preview}\nChoices: ${request.choices.join(", ")}`,
-          request.choices[0] || "",
-        );
-        if (!text || !text.trim()) return;
-        await api.respondToControlCenterPending(request.request_id, { text: text.trim() });
-      } else {
-        const text = window.prompt(request.prompt_preview || `Respond to ${request.kind}`, "");
-        if (!text || !text.trim()) return;
-        await api.respondToControlCenterPending(request.request_id, { text: text.trim() });
-      }
-      refreshControlState();
-    } catch (error) {
-      reportError(error);
-    }
-  };
-
   return (
     <div className="flex flex-col gap-6">
       <PluginSlot name="control-center:top" />
 
       <OverviewCards data={overview} />
 
+      <div
+        className={`rounded-lg border px-4 py-3 text-sm ${
+          controlCenterActionsEnabled
+            ? "border-green-300 bg-green-50 text-green-900 dark:border-green-900 dark:bg-green-950/30 dark:text-green-200"
+            : "border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+        }`}
+      >
+        <div className="font-medium">
+          {controlCenterMode?.label || (controlCenterActionsEnabled ? "Operator actions enabled" : "Read-only mode")}
+        </div>
+        <div className="mt-1 text-xs opacity-80">
+          {controlCenterActionsEnabled
+            ? "Safe controls are available: session steer/submit and process poll/log/wait. Destructive controls remain disabled for Phase 2B."
+            : controlCenterMode?.reason || "Operator actions are disabled; this dashboard is currently read-only."}
+        </div>
+      </div>
+
       <div className="flex min-w-0 gap-6">
         <div className="flex min-w-0 flex-1 flex-col gap-6">
           <LiveSessionsPane
             sessions={sessions}
-            onInterrupt={CONTROL_CENTER_ACTIONS_ENABLED ? handleInterrupt : undefined}
-            onSteer={CONTROL_CENTER_ACTIONS_ENABLED ? handleSteer : undefined}
-            onSubmit={CONTROL_CENTER_ACTIONS_ENABLED ? handleSubmit : undefined}
+            onInterrupt={undefined}
+            onSteer={controlCenterActionsEnabled ? handleSteer : undefined}
+            onSubmit={controlCenterActionsEnabled ? handleSubmit : undefined}
           />
           <PendingRequestsPane
             requests={pending}
-            onRespond={CONTROL_CENTER_ACTIONS_ENABLED ? handlePendingRespond : undefined}
+            onRespond={undefined}
           />
           <RuntimeHealthPane
             data={runtimes}
-            actionResult={CONTROL_CENTER_ACTIONS_ENABLED ? runtimeActionResult : null}
-            onAction={CONTROL_CENTER_ACTIONS_ENABLED ? handleRuntimeAction : undefined}
+            actionResult={null}
+            onAction={undefined}
           />
           <ProcessesPane
             processes={processes}
@@ -328,10 +284,10 @@ ${output}` : ""}`);
             processDetail={processDetail}
             processDetailLoading={processDetailLoading}
             onSelect={handleProcessSelect}
-            onPoll={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessPoll : undefined}
-            onReadLog={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessReadLog : undefined}
-            onWait={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessWait : undefined}
-            onKill={CONTROL_CENTER_ACTIONS_ENABLED ? handleProcessKill : undefined}
+            onPoll={controlCenterActionsEnabled ? handleProcessPoll : undefined}
+            onReadLog={controlCenterActionsEnabled ? handleProcessReadLog : undefined}
+            onWait={controlCenterActionsEnabled ? handleProcessWait : undefined}
+            onKill={undefined}
           />
           <DelegationPane subagents={subagents} />
           <ProfileHealthPane profiles={profiles} />
