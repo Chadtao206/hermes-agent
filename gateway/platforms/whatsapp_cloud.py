@@ -14,10 +14,12 @@ Both share gating / mention / formatting behavior via ``WhatsAppBehaviorMixin``.
 
 Phase scope (this file evolves across phases):
 - Phase 2 — outbound text via Graph API + webhook server with verify-token
-            handshake. POST endpoint accepts payloads but does NOT yet
-            verify signatures (insecure; Phase 3 fixes this).
-- Phase 3 — X-Hub-Signature-256 HMAC verification + replay protection.
-- Phase 4 — media upload + send (image/video/audio/document).
+            handshake.
+- Phase 3 — X-Hub-Signature-256 HMAC verification (raw body, constant-time)
+            + wamid replay protection + dispatch via handle_message. Phase 3
+            adapter is end-to-end usable for text DMs.
+- Phase 4 — media upload + send (image/video/audio/document) and inbound
+            media download via the Graph media endpoint.
 - Phase 5 — 24-hour conversation window + template fallback.
 
 Required env vars to enable the adapter:
@@ -37,7 +39,10 @@ Optional / Phase-3+:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 try:
@@ -59,6 +64,8 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
     SendResult,
 )
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
@@ -71,6 +78,11 @@ DEFAULT_WEBHOOK_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8090
 DEFAULT_WEBHOOK_PATH = "/whatsapp/webhook"
 GRAPH_API_BASE = "https://graph.facebook.com"
+# Meta retries failed webhooks for up to 7 days. We don't need to remember
+# every wamid for the full retry window — the practical risk is duplicate
+# delivery within minutes, not days. 5000 entries with FIFO eviction is
+# plenty for normal traffic and bounds memory.
+WAMID_DEDUP_CACHE_SIZE = 5000
 
 
 def check_whatsapp_cloud_requirements() -> bool:
@@ -141,6 +153,14 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
         self._mention_patterns = self._compile_mention_patterns()
+
+        # Webhook dedup state — wamid → True. OrderedDict gives O(1) FIFO
+        # eviction. In-memory only; Phase 5 may promote to SessionDB if we
+        # decide we need replay protection across gateway restarts.
+        self._seen_wamids: "OrderedDict[str, bool]" = OrderedDict()
+        self._duplicate_count: int = 0
+        self._accepted_count: int = 0
+        self._rejected_signature_count: int = 0
 
         # Runtime
         self._runner = None
@@ -223,9 +243,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not self._app_secret:
             logger.warning(
                 "[whatsapp_cloud] WHATSAPP_CLOUD_APP_SECRET is not set — "
-                "incoming webhooks are NOT signature-verified. Do not "
-                "expose this endpoint to the public internet until "
-                "Phase 3 lands."
+                "incoming webhook POSTs will be refused with 503. Set "
+                "the app secret to enable inbound message delivery."
             )
         return True
 
@@ -342,6 +361,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "webhook_path": self._webhook_path,
                 "verify_token_configured": bool(self._verify_token),
                 "app_secret_configured": bool(self._app_secret),
+                "accepted": self._accepted_count,
+                "duplicates": self._duplicate_count,
+                "rejected_signature": self._rejected_signature_count,
             }
         )
 
@@ -376,32 +398,276 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return web.Response(text=challenge, content_type="text/plain")
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
-        """Inbound webhook POST stub.
+        """Inbound webhook POST handler.
 
-        Phase 2 only ACKs Meta with 200 so retries don't pile up. Phase 3
-        wires in:
-          - X-Hub-Signature-256 verification BEFORE JSON parse
-          - replay protection via wamid dedup
-          - dispatch through ``_should_process_message`` →
-            ``handle_message``
-
-        Until Phase 3 lands, do NOT expose this endpoint to the public
-        internet — anyone who can reach it can inject fake payloads.
+        Lifecycle:
+          1. Read raw bytes (signature is over the raw body — JSON parsing
+             must NOT happen first, or the bytes change).
+          2. Verify ``X-Hub-Signature-256`` HMAC against ``app_secret``.
+          3. Parse JSON.
+          4. Walk ``entry[].changes[].value.{messages, statuses, contacts}``.
+          5. Per-message: dedup by wamid, build MessageEvent, dispatch via
+             ``handle_message`` (which runs the mixin's gating).
+          6. Always respond 200 once we've ack'd a valid request — Meta
+             retries on non-200 for up to 7 days, and we don't want to
+             multiply downstream agent work because of a transient bug
+             during dispatch.
         """
-        # Read raw bytes here (not request.json()) so Phase 3's signature
-        # verification doesn't have to redo the read. aiohttp will only
-        # let us read the body once.
         try:
             raw = await request.read()
         except Exception:
             return web.Response(status=400)
-        # Light-touch sanity check — full parsing happens in Phase 3.
+
+        # Meta's documented max payload is 3MB. Reject earlier than aiohttp
+        # would so we don't even compute HMAC over giant junk.
         if len(raw) > 3 * 1024 * 1024:
-            # Meta's documented max payload is 3MB.
             return web.Response(status=413)
-        logger.debug(
-            "[whatsapp_cloud] webhook received %d bytes (signature unverified — "
-            "Phase 3 will lock this down)",
-            len(raw),
-        )
+
+        # Refuse to accept anything if app_secret isn't configured. Without
+        # it we can't authenticate the sender, and the handler would be a
+        # data-injection point. Same defensive posture as the GET verify
+        # handshake refusing when verify_token is empty.
+        if not self._app_secret:
+            logger.error(
+                "[whatsapp_cloud] webhook POST refused: app_secret unset. "
+                "Set WHATSAPP_CLOUD_APP_SECRET to enable inbound delivery."
+            )
+            return web.Response(status=503, text="app_secret not configured")
+
+        signature_header = request.headers.get("X-Hub-Signature-256", "")
+        if not self._verify_signature(raw, signature_header):
+            self._rejected_signature_count += 1
+            logger.warning(
+                "[whatsapp_cloud] rejected webhook: invalid X-Hub-Signature-256 "
+                "(header=%r, body_len=%d)",
+                signature_header,
+                len(raw),
+            )
+            return web.Response(status=401)
+
+        # Parse only AFTER signature passes — bad JSON from an attacker is
+        # already filtered out, this just guards against Meta sending
+        # something malformed.
+        import json as _json
+
+        try:
+            payload = _json.loads(raw)
+        except Exception:
+            logger.warning("[whatsapp_cloud] webhook body is not valid JSON")
+            return web.Response(status=400)
+
+        if not isinstance(payload, dict):
+            return web.Response(status=400)
+
+        await self._dispatch_payload(payload)
         return web.Response(status=200)
+
+    # ------------------------------------------------------------------ signature
+    def _verify_signature(self, raw_body: bytes, header: str) -> bool:
+        """Verify the X-Hub-Signature-256 HMAC.
+
+        Meta sends ``sha256=<hex>``; we compute the same HMAC with
+        ``app_secret`` as the key and ``raw_body`` (UTF-8 bytes, not
+        re-serialized JSON) as the message. Constant-time compare.
+        """
+        if not self._app_secret or not header:
+            return False
+        if not header.startswith("sha256="):
+            return False
+        expected_hex = header[len("sha256="):].strip()
+        if not expected_hex:
+            return False
+        computed = hmac.new(
+            self._app_secret.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(computed.lower(), expected_hex.lower())
+
+    # ------------------------------------------------------------------ dispatch
+    def _dedup_wamid(self, wamid: str) -> bool:
+        """Return True if this wamid is being seen for the first time.
+
+        Returns False (and increments duplicate counter) if the wamid is
+        already in the in-memory cache. Cache is FIFO-evicted at
+        ``WAMID_DEDUP_CACHE_SIZE``.
+        """
+        if not wamid:
+            # No wamid means we can't dedup — let it through. Meta should
+            # always populate ``id``, but be defensive.
+            return True
+        if wamid in self._seen_wamids:
+            self._duplicate_count += 1
+            return False
+        self._seen_wamids[wamid] = True
+        # Trim oldest entries to stay under the cap.
+        while len(self._seen_wamids) > WAMID_DEDUP_CACHE_SIZE:
+            self._seen_wamids.popitem(last=False)
+        return True
+
+    async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
+        """Walk a verified Meta webhook payload and dispatch each message.
+
+        Payload shape (truncated):
+          {object, entry: [{id, changes: [{value: {messages, contacts,
+          statuses, metadata}, field: "messages"}]}]}
+
+        We surface ``messages`` events as MessageEvents; ``statuses``
+        events (sent/delivered/read/failed) are logged but not dispatched
+        — the agent doesn't currently consume delivery receipts and
+        forwarding them would create noisy synthetic events.
+        """
+        if payload.get("object") != "whatsapp_business_account":
+            logger.debug(
+                "[whatsapp_cloud] ignoring non-WABA payload (object=%r)",
+                payload.get("object"),
+            )
+            return
+        for entry in payload.get("entry") or []:
+            if not isinstance(entry, dict):
+                continue
+            for change in entry.get("changes") or []:
+                if not isinstance(change, dict):
+                    continue
+                if change.get("field") != "messages":
+                    # Other fields (account_alerts, template_status_update,
+                    # etc.) are subscription-dependent and not message
+                    # ingress. Silent skip.
+                    continue
+                value = change.get("value") or {}
+                contacts = value.get("contacts") or []
+                metadata = value.get("metadata") or {}
+                # Build a wa_id → profile-name index for the messages we're
+                # about to surface.
+                contacts_by_waid: Dict[str, str] = {}
+                for contact in contacts:
+                    if not isinstance(contact, dict):
+                        continue
+                    wa_id = str(contact.get("wa_id") or "").strip()
+                    profile = contact.get("profile") or {}
+                    name = str(profile.get("name") or "").strip()
+                    if wa_id:
+                        contacts_by_waid[wa_id] = name
+
+                for raw_message in value.get("messages") or []:
+                    if not isinstance(raw_message, dict):
+                        continue
+                    wamid = str(raw_message.get("id") or "").strip()
+                    if not self._dedup_wamid(wamid):
+                        logger.debug(
+                            "[whatsapp_cloud] duplicate wamid %s, skipping",
+                            wamid,
+                        )
+                        continue
+                    event = self._build_message_event_from_cloud(
+                        raw_message, contacts_by_waid, metadata
+                    )
+                    if event is None:
+                        continue
+                    self._accepted_count += 1
+                    try:
+                        await self.handle_message(event)
+                    except Exception:
+                        # Dispatch errors must not bubble out — Meta would
+                        # retry the whole batch, multiplying the bug.
+                        logger.exception(
+                            "[whatsapp_cloud] handle_message raised for wamid %s",
+                            wamid,
+                        )
+
+                # Log status updates at debug level — useful for diagnosing
+                # "did Meta accept my outbound" without flooding INFO logs.
+                for status in value.get("statuses") or []:
+                    if isinstance(status, dict):
+                        logger.debug(
+                            "[whatsapp_cloud] status %s for %s",
+                            status.get("status"),
+                            status.get("id"),
+                        )
+
+    def _build_message_event_from_cloud(
+        self,
+        raw_message: Dict[str, Any],
+        contacts_by_waid: Dict[str, str],
+        metadata: Dict[str, Any],
+    ) -> Optional[MessageEvent]:
+        """Convert a Cloud-API message object into a Hermes MessageEvent.
+
+        Phase 3 only handles ``type: "text"`` end-to-end. Non-text types
+        produce a MessageEvent with the appropriate ``MessageType`` and
+        empty media list — Phase 4 will populate media URLs by issuing
+        ``GET /{media_id}`` against the Graph API to download the binary.
+
+        Returns None if the message is filtered out by the mixin's gating
+        (broadcast filter, allow-list, mention requirements).
+        """
+        msg_type_str = str(raw_message.get("type") or "text").lower()
+        body = ""
+        if msg_type_str == "text":
+            text = raw_message.get("text") or {}
+            body = str(text.get("body") or "")
+        elif msg_type_str in {"button", "interactive"}:
+            # Quick-reply buttons. Treat the button payload as text so the
+            # agent can reason about the user's choice.
+            if msg_type_str == "button":
+                body = str((raw_message.get("button") or {}).get("text") or "")
+            else:
+                inter = raw_message.get("interactive") or {}
+                # button_reply / list_reply both expose ``title``
+                inner = inter.get("button_reply") or inter.get("list_reply") or {}
+                body = str(inner.get("title") or "")
+
+        message_type = {
+            "text": MessageType.TEXT,
+            "image": MessageType.PHOTO,
+            "video": MessageType.VIDEO,
+            "audio": MessageType.VOICE,
+            "voice": MessageType.VOICE,
+            "document": MessageType.DOCUMENT,
+            "sticker": MessageType.PHOTO,
+            "button": MessageType.TEXT,
+            "interactive": MessageType.TEXT,
+            "location": MessageType.TEXT,
+            "contacts": MessageType.TEXT,
+        }.get(msg_type_str, MessageType.TEXT)
+
+        sender_id = str(raw_message.get("from") or "").strip()
+        sender_name = contacts_by_waid.get(sender_id, "")
+
+        # Cloud API doesn't have a separate "chat" entity for DMs — chat_id
+        # equals the sender's wa_id. Group support is deferred to v2.
+        chat_id = sender_id
+
+        # Build the data dict the mixin's _should_process_message expects.
+        # Cloud API uses different field names from Baileys, so we adapt.
+        gating_data = {
+            "chatId": chat_id,
+            "senderId": sender_id,
+            "isGroup": False,  # Phase 3 = DM only
+            "body": body,
+        }
+        if not self._should_process_message(gating_data):
+            return None
+
+        # context.id is set when the user replied to one of our messages.
+        context = raw_message.get("context") or {}
+        reply_to_id = str(context.get("id") or "").strip() or None
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=sender_name or chat_id,
+            chat_type="dm",
+            user_id=sender_id,
+            user_name=sender_name or None,
+        )
+
+        # Cloud API timestamps are unix seconds (string). MessageEvent
+        # doesn't enforce a type but downstream code formats with it.
+        return MessageEvent(
+            text=body,
+            message_type=message_type,
+            source=source,
+            raw_message=raw_message,
+            message_id=str(raw_message.get("id") or "") or None,
+            reply_to_message_id=reply_to_id,
+        )

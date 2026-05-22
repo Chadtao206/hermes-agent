@@ -59,6 +59,13 @@ def _make_adapter(**overrides):
     adapter._group_allow_from = set()
     adapter._mention_patterns = []
 
+    # Webhook dispatch state (Phase 3)
+    from collections import OrderedDict
+    adapter._seen_wamids = OrderedDict()
+    adapter._duplicate_count = 0
+    adapter._accepted_count = 0
+    adapter._rejected_signature_count = 0
+
     # BasePlatformAdapter contract — minimum to keep send/lifecycle happy
     adapter._running = True
     adapter._message_handler = None
@@ -358,42 +365,407 @@ class TestWebhookVerify:
 
 
 # ---------------------------------------------------------------------------
-# Inbound webhook POST stub (Phase 2 — Phase 3 will add real verification)
+# Inbound webhook POST — signature verification + dispatch (Phase 3)
 # ---------------------------------------------------------------------------
 
-class TestWebhookPostStub:
-    """The POST stub should accept payloads but not crash. Phase 3 wires
-    in signature verification + dispatch."""
+import hashlib
+import hmac as _hmac_lib
+
+
+def _sign(secret: str, body: bytes) -> str:
+    """Compute the X-Hub-Signature-256 header value Meta would send."""
+    digest = _hmac_lib.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    return f"sha256={digest}"
+
+
+def _post_request(body: bytes, headers: dict | None = None):
+    """Build a minimal aiohttp.web.Request stub for POST tests."""
+    request = MagicMock()
+    request.read = AsyncMock(return_value=body)
+    request.headers = headers or {}
+    return request
+
+
+# A realistic Meta inbound text-message payload, modelled on the
+# get-started docs sample.
+_SAMPLE_INBOUND_TEXT_PAYLOAD = {
+    "object": "whatsapp_business_account",
+    "entry": [
+        {
+            "id": "215589313241560883",
+            "changes": [
+                {
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "15551797781",
+                            "phone_number_id": "7794189252778687",
+                        },
+                        "contacts": [
+                            {
+                                "profile": {"name": "Jessica Laverdetman"},
+                                "wa_id": "13557825698",
+                            }
+                        ],
+                        "messages": [
+                            {
+                                "from": "13557825698",
+                                "id": "wamid.HBgLMTM1NTc4MjU2OTgVAGHAYWYET688aASGNTI1QzZFQjhEMDk2QQA=",
+                                "timestamp": "1758254144",
+                                "text": {"body": "Hi!"},
+                                "type": "text",
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ],
+}
+
+
+class TestWebhookSignature:
+    """X-Hub-Signature-256 HMAC verification."""
 
     @pytest.mark.asyncio
-    async def test_post_accepts_small_body(self):
-        adapter = _make_adapter()
-        request = MagicMock()
-        request.read = AsyncMock(return_value=b'{"object":"whatsapp_business_account"}')
+    async def test_valid_signature_accepted(self):
+        adapter = _make_adapter(app_secret="signing-key-123")
+        # Patch the dispatcher to a no-op so we don't depend on
+        # MessageEvent construction here (covered separately).
+        adapter._dispatch_payload = AsyncMock()
+        body = b'{"object":"whatsapp_business_account","entry":[]}'
+        request = _post_request(body, {"X-Hub-Signature-256": _sign("signing-key-123", body)})
 
         response = await adapter._handle_webhook(request)
 
         assert response.status == 200
+        adapter._dispatch_payload.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_post_rejects_oversize_body(self):
-        adapter = _make_adapter()
-        request = MagicMock()
-        # 4MB > 3MB limit per Meta docs.
-        request.read = AsyncMock(return_value=b"x" * (4 * 1024 * 1024))
+    async def test_tampered_body_rejected(self):
+        adapter = _make_adapter(app_secret="signing-key-123")
+        adapter._dispatch_payload = AsyncMock()
+        original = b'{"object":"whatsapp_business_account"}'
+        tampered = b'{"object":"evil_payload"}'
+        sig_for_original = _sign("signing-key-123", original)
+        request = _post_request(tampered, {"X-Hub-Signature-256": sig_for_original})
 
         response = await adapter._handle_webhook(request)
 
-        assert response.status == 413
+        assert response.status == 401
+        adapter._dispatch_payload.assert_not_called()
+        assert adapter._rejected_signature_count == 1
 
     @pytest.mark.asyncio
-    async def test_post_handles_unreadable_body(self):
-        adapter = _make_adapter()
+    async def test_missing_signature_header_rejected(self):
+        adapter = _make_adapter(app_secret="signing-key-123")
+        adapter._dispatch_payload = AsyncMock()
+        body = b'{"object":"whatsapp_business_account"}'
+        request = _post_request(body, {})
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 401
+        adapter._dispatch_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_wrong_signature_format_rejected(self):
+        adapter = _make_adapter(app_secret="signing-key-123")
+        adapter._dispatch_payload = AsyncMock()
+        body = b"{}"
+        # Missing the required ``sha256=`` prefix
+        request = _post_request(body, {"X-Hub-Signature-256": "deadbeef"})
+
+        response = await adapter._handle_webhook(request)
+        assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_app_secret_refuses_503(self):
+        """Don't quietly accept webhooks when we can't authenticate them."""
+        adapter = _make_adapter(app_secret="")
+        adapter._dispatch_payload = AsyncMock()
+        body = b'{"object":"whatsapp_business_account"}'
+        request = _post_request(body, {"X-Hub-Signature-256": "sha256=deadbeef"})
+
+        response = await adapter._handle_webhook(request)
+
+        assert response.status == 503
+        adapter._dispatch_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_signature_uses_constant_time_compare(self):
+        """Smoke-test: equivalent signatures with case differences both pass."""
+        adapter = _make_adapter(app_secret="key")
+        adapter._dispatch_payload = AsyncMock()
+        body = b'{"object":"whatsapp_business_account","entry":[]}'
+        proper = _sign("key", body)
+        # Capitalize hex — hmac.compare_digest is case-sensitive but our
+        # implementation lowercases both sides so case differences in the
+        # incoming header don't accidentally fail valid signatures.
+        upper = proper.upper().replace("SHA256=", "sha256=")
+        request = _post_request(body, {"X-Hub-Signature-256": upper})
+
+        response = await adapter._handle_webhook(request)
+        assert response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_oversize_body_rejected_before_signature(self):
+        """3MB cap per Meta — refuse without computing HMAC over giant junk."""
+        adapter = _make_adapter(app_secret="key")
+        adapter._dispatch_payload = AsyncMock()
+        body = b"x" * (4 * 1024 * 1024)
+        request = _post_request(body, {"X-Hub-Signature-256": "sha256=ignored"})
+
+        response = await adapter._handle_webhook(request)
+        assert response.status == 413
+        adapter._dispatch_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_body_rejected(self):
+        adapter = _make_adapter(app_secret="key")
         request = MagicMock()
         request.read = AsyncMock(side_effect=RuntimeError("read failed"))
+        request.headers = {}
+
+        response = await adapter._handle_webhook(request)
+        assert response.status == 400
+
+
+class TestWebhookReplay:
+    """wamid dedup — Meta retries failed deliveries up to 7 days."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_wamid_not_redispatched(self):
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock()
+        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        # First delivery
+        await adapter._handle_webhook(_post_request(body, {"X-Hub-Signature-256": sig}))
+        # Second delivery (same payload, valid signature, same wamid)
+        await adapter._handle_webhook(_post_request(body, {"X-Hub-Signature-256": sig}))
+
+        # handle_message fires once, even though the webhook fired twice
+        assert adapter.handle_message.call_count == 1
+        assert adapter._duplicate_count == 1
+        assert adapter._accepted_count == 1
+
+    def test_dedup_cache_evicts_oldest(self):
+        from gateway.platforms.whatsapp_cloud import WAMID_DEDUP_CACHE_SIZE
+        adapter = _make_adapter()
+        # Fill the cache plus 5 extra
+        for i in range(WAMID_DEDUP_CACHE_SIZE + 5):
+            assert adapter._dedup_wamid(f"wamid_{i}") is True
+        assert len(adapter._seen_wamids) == WAMID_DEDUP_CACHE_SIZE
+        # The first 5 should have been evicted
+        assert "wamid_0" not in adapter._seen_wamids
+        assert "wamid_4" not in adapter._seen_wamids
+        assert "wamid_5" in adapter._seen_wamids
+        assert f"wamid_{WAMID_DEDUP_CACHE_SIZE + 4}" in adapter._seen_wamids
+
+    def test_dedup_no_wamid_lets_through(self):
+        """Defensive — Meta should always populate ``id``, but we don't
+        want to silently drop messages if it's missing."""
+        adapter = _make_adapter()
+        assert adapter._dedup_wamid("") is True
+        assert adapter._dedup_wamid("") is True  # both pass
+
+
+class TestWebhookDispatch:
+    """End-to-end dispatch from a verified payload to handle_message."""
+
+    @pytest.mark.asyncio
+    async def test_text_message_dispatched_with_event_shape(self):
+        adapter = _make_adapter(app_secret="key")
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+        request = _post_request(body, {"X-Hub-Signature-256": sig})
 
         response = await adapter._handle_webhook(request)
 
+        assert response.status == 200
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.text == "Hi!"
+        assert event.message_id == (
+            "wamid.HBgLMTM1NTc4MjU2OTgVAGHAYWYET688aASGNTI1QzZFQjhEMDk2QQA="
+        )
+        assert event.source.platform == Platform.WHATSAPP_CLOUD
+        assert event.source.chat_id == "13557825698"
+        assert event.source.user_name == "Jessica Laverdetman"
+        assert event.source.chat_type == "dm"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_filters_via_mixin_gating(self):
+        adapter = _make_adapter(app_secret="key")
+        adapter._dm_policy = "disabled"  # block all DMs
+        adapter.handle_message = AsyncMock()
+        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+        # Gated messages don't increment the accepted counter
+        assert adapter._accepted_count == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_handler_exception_does_not_crash(self):
+        """If the agent dispatch raises, we still return 200 to Meta so
+        retries don't multiply the bug into a 7-day storm."""
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock(side_effect=RuntimeError("boom"))
+        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_dispatch_ignores_non_message_field(self):
+        """``field: 'statuses'`` etc. should not produce MessageEvents."""
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [
+                {
+                    "id": "x",
+                    "changes": [
+                        {
+                            "field": "account_alerts",
+                            "value": {"some": "alert"},
+                        }
+                    ],
+                }
+            ],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_ignores_non_waba_object(self):
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock()
+        payload = {"object": "page", "entry": []}
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_handles_button_reply(self):
+        adapter = _make_adapter(app_secret="key")
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [
+                {
+                    "id": "x",
+                    "changes": [
+                        {
+                            "field": "messages",
+                            "value": {
+                                "messaging_product": "whatsapp",
+                                "metadata": {"phone_number_id": "1"},
+                                "contacts": [
+                                    {"profile": {"name": "U"}, "wa_id": "1555"}
+                                ],
+                                "messages": [
+                                    {
+                                        "from": "1555",
+                                        "id": "wamid.button1",
+                                        "timestamp": "0",
+                                        "type": "interactive",
+                                        "interactive": {
+                                            "type": "button_reply",
+                                            "button_reply": {
+                                                "id": "yes",
+                                                "title": "Yes please",
+                                            },
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert response.status == 200
+        assert len(captured) == 1
+        assert captured[0].text == "Yes please"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_propagates_reply_to(self):
+        """``context.id`` on inbound = user replied to one of our messages."""
+        adapter = _make_adapter(app_secret="key")
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+
+        payload_with_ctx = json.loads(
+            json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD)
+        )  # deep copy
+        msg = payload_with_ctx["entry"][0]["changes"][0]["value"]["messages"][0]
+        msg["context"] = {"id": "wamid.our_outbound", "from": "15551797781"}
+        body = json.dumps(payload_with_ctx).encode("utf-8")
+        sig = _sign("key", body)
+
+        await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert len(captured) == 1
+        assert captured[0].reply_to_message_id == "wamid.our_outbound"
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_after_signature_returns_400(self):
+        """Pathological case: signature passes but body isn't JSON."""
+        adapter = _make_adapter(app_secret="key")
+        body = b"not-json"
+        sig = _sign("key", body)
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
         assert response.status == 400
 
 
@@ -420,6 +792,9 @@ class TestHealth:
         assert body["phone_number_id"] == "555"
         assert body["verify_token_configured"] is True
         assert body["app_secret_configured"] is True
+        assert body["accepted"] == 0
+        assert body["duplicates"] == 0
+        assert body["rejected_signature"] == 0
 
     @pytest.mark.asyncio
     async def test_health_flags_missing_secrets(self):
