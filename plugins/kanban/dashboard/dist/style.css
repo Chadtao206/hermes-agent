@@ -1195,6 +1195,151 @@
   color: var(--color-foreground);
 }
 
+/* Wake-health pill button + popover (drilldown anchored in toolbar). */
+.hermes-kanban-wake-health-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.hermes-kanban-wake-health-btn {
+  cursor: pointer;
+  font-family: inherit;
+  appearance: none;
+}
+.hermes-kanban-wake-health-btn:hover {
+  filter: brightness(1.05);
+}
+.hermes-kanban-wake-health--open {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-ring, #888) 35%, transparent);
+}
+.hermes-kanban-wake-health-popover {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  z-index: 40;
+  width: min(28rem, 90vw);
+  max-height: 26rem;
+  overflow-y: auto;
+  background: var(--color-popover, var(--color-card, #1c1d23));
+  color: var(--color-popover-foreground, var(--color-foreground));
+  border: 1px solid var(--color-border, rgba(120, 120, 140, 0.4));
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.5rem 0.75rem;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.hermes-kanban-wake-health-popover-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.15rem 0.25rem 0.4rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
+}
+.hermes-kanban-wake-health-popover-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.hermes-kanban-wake-health-popover-scope {
+  flex: 1;
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground, #888);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hermes-kanban-wake-health-popover-close {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.25rem;
+  padding: 0.05rem 0.4rem;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.hermes-kanban-wake-health-popover-close:hover {
+  background: color-mix(in srgb, var(--color-border) 50%, transparent);
+}
+.hermes-kanban-wake-health-popover-empty,
+.hermes-kanban-wake-health-popover-error,
+.hermes-kanban-wake-health-popover-overflow {
+  font-size: 0.78rem;
+  padding: 0.5rem 0.4rem;
+  color: var(--color-muted-foreground, #888);
+}
+.hermes-kanban-wake-health-popover-error {
+  color: var(--color-destructive, #d14a4a);
+}
+.hermes-kanban-wake-health-section {
+  padding: 0.4rem 0 0.1rem;
+}
+.hermes-kanban-wake-health-section-head {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--color-muted-foreground, #888);
+  padding: 0.15rem 0.4rem 0.3rem;
+}
+.hermes-kanban-wake-health-row {
+  padding: 0.4rem 0.45rem;
+  border-radius: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.hermes-kanban-wake-health-row + .hermes-kanban-wake-health-row {
+  margin-top: 0.2rem;
+}
+.hermes-kanban-wake-health-row--failing {
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 10%, transparent);
+}
+.hermes-kanban-wake-health-row--stale {
+  background: color-mix(in srgb, #d4b348 10%, transparent);
+}
+.hermes-kanban-wake-health-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+.hermes-kanban-wake-health-row-title {
+  font-weight: 600;
+  font-size: 0.82rem;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hermes-kanban-wake-health-row-id {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground, #888);
+}
+.hermes-kanban-wake-health-row-meta {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground, #888);
+}
+.hermes-kanban-wake-health-row-profile {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hermes-kanban-wake-health-row-time {
+  white-space: nowrap;
+}
+.hermes-kanban-wake-health-row-msg {
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hermes-kanban-wake-health-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.15rem;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Hallucination warnings: per-card badge, events callout, attention      */
 /* strip, recovery popover. Orange/red palette but muted so the board     */

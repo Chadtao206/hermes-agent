@@ -224,6 +224,130 @@ def test_board_wake_health_rollup_and_tenant_scope(client):
     assert none_visible["wake_health"]["severity"] == "none"
 
 
+def test_wake_health_details_returns_failing_and_stale_rows(client):
+    """/wake-health/details surfaces per-row drilldown for the pill popover.
+
+    - Healthy rows are omitted.
+    - Failing rows come before stale rows.
+    - Sanitized last_wake_error appears as the row message.
+    - Scope mirrors /board (tenant filter, no rows beyond visible tasks).
+    - overflow_count counts rows beyond ``limit``.
+    """
+    t_healthy = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "healthy", "tenant": "t1"},
+    ).json()["task"]
+    t_stale = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "stale", "tenant": "t1"},
+    ).json()["task"]
+    t_failing = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "failing", "tenant": "t1"},
+    ).json()["task"]
+    t_other = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "other", "tenant": "t2"},
+    ).json()["task"]
+
+    for task in (t_healthy, t_stale, t_failing, t_other):
+        r = client.post(
+            f"/api/plugins/kanban/tasks/{task['id']}/profile-subs",
+            json={"profile": "jensen"},
+        )
+        assert r.status_code == 200, r.text
+
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        kb.record_profile_wake_success(
+            conn,
+            task_id=t_healthy["id"],
+            profile="jensen",
+            new_cursor=5,
+            last_wake_at=now,
+        )
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=t_failing["id"],
+            profile="jensen",
+            claimed_cursor=9,
+            old_cursor=0,
+            error=RuntimeError("spawn refused"),
+            at=now,
+        )
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=t_other["id"],
+            profile="jensen",
+            claimed_cursor=10,
+            old_cursor=0,
+            error=RuntimeError("other tenant"),
+            at=now - 5,
+        )
+    finally:
+        conn.close()
+
+    # No scope: both failing rows + the t1 stale row, no healthy row.
+    all_resp = client.get("/api/plugins/kanban/wake-health/details").json()
+    assert all_resp["wake_health"]["subscription_count"] == 4
+    assert all_resp["wake_health"]["failing_count"] == 2
+    assert all_resp["wake_health"]["stale_count"] == 1
+    rows = all_resp["rows"]
+    kinds = [r["kind"] for r in rows]
+    # Failing first, then stale.
+    assert kinds == ["failing", "failing", "stale"], kinds
+    failing_ids = [r["task_id"] for r in rows if r["kind"] == "failing"]
+    # Most recent failure wins ordering.
+    assert failing_ids[0] == t_failing["id"]
+    assert failing_ids[1] == t_other["id"]
+    stale_row = next(r for r in rows if r["kind"] == "stale")
+    assert stale_row["task_id"] == t_stale["id"]
+    assert stale_row["message"] == "No successful wake yet"
+    failing_row = next(r for r in rows if r["task_id"] == t_failing["id"])
+    assert "spawn refused" in failing_row["message"]
+    assert failing_row["task_title"] == "failing"
+    assert failing_row["profile"] == "jensen"
+    assert failing_row["wake_failure_count"] == 1
+    # Healthy task must not surface.
+    assert all(r["task_id"] != t_healthy["id"] for r in rows)
+    assert all_resp["overflow_count"] == 0
+    assert all_resp["as_of"] > 0
+
+    # Tenant scope: t2 task is filtered out → only t1 rows remain.
+    scoped = client.get("/api/plugins/kanban/wake-health/details?tenant=t1").json()
+    scoped_ids = {r["task_id"] for r in scoped["rows"]}
+    assert t_other["id"] not in scoped_ids
+    assert t_failing["id"] in scoped_ids
+    assert t_stale["id"] in scoped_ids
+    assert scoped["wake_health"]["subscription_count"] == 3
+
+    # Tenant with no tasks → empty.
+    empty = client.get("/api/plugins/kanban/wake-health/details?tenant=missing").json()
+    assert empty["rows"] == []
+    assert empty["overflow_count"] == 0
+    assert empty["wake_health"]["subscription_count"] == 0
+
+    # Limit / overflow.
+    capped = client.get(
+        "/api/plugins/kanban/wake-health/details?limit=1"
+    ).json()
+    assert len(capped["rows"]) == 1
+    assert capped["rows"][0]["kind"] == "failing"
+    assert capped["overflow_count"] == 2  # 2 failing + 1 stale - 1 visible
+
+
+def test_wake_health_details_pill_button_is_in_bundle():
+    """Dashboard pill must be a real button wired to the popover fetch route.
+
+    Without a render harness we still want a check that the toolbar bundle
+    stays in sync with the backend route added for Phase 5.
+    """
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+    assert "hermes-kanban-wake-health-btn" in bundle
+    assert "WakeHealthDetailsPopover" in bundle
+    assert "/wake-health/details" in bundle
+
+
 def test_board_query_param_default_overrides_current_board_pointer(client):
     """Dashboard ``?board=default`` must win even if the CLI's current-board
     pointer targets a non-default board.

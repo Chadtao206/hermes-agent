@@ -1052,11 +1052,14 @@
         }),
         h(BoardToolbar, {
           board: boardData,
+          boardSlug: board,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
+          onOpenTask: setSelectedTaskId,
+          wakeTick: Object.values(profileWakeTick).reduce(function (sum, n) { return sum + (n || 0); }, 0),
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
               .then(loadBoard)
@@ -2036,6 +2039,130 @@
   // Toolbar
   // -------------------------------------------------------------------------
 
+  // Anchored read-only popover that drills into the wake-health pill: lists
+  // failing rows first (last_wake_error sanitized), then stale rows ("no
+  // successful wake yet"). Scope params mirror the active /board fetch so
+  // the rows reflect what the user is looking at.
+  function WakeHealthDetailsPopover(props) {
+    const { t } = useI18n();
+    const [state, setState] = useState({ phase: "loading", data: null, error: null });
+    const load = useCallback(function () {
+      const qs = new URLSearchParams();
+      if (props.tenantFilter) qs.set("tenant", props.tenantFilter);
+      if (props.includeArchived) qs.set("include_archived", "true");
+      const base = `${API}/wake-health/details`;
+      const url = qs.toString() ? `${base}?${qs}` : base;
+      setState(function (prev) {
+        return prev.data
+          ? { phase: "refreshing", data: prev.data, error: null }
+          : { phase: "loading", data: null, error: null };
+      });
+      SDK.fetchJSON(withBoard(url, props.boardSlug))
+        .then(function (data) { setState({ phase: "loaded", data: data, error: null }); })
+        .catch(function (err) {
+          setState({
+            phase: "error",
+            data: null,
+            error: parseApiErrorMessage(err),
+          });
+        });
+    }, [props.tenantFilter, props.includeArchived, props.boardSlug]);
+
+    useEffect(function () { load(); }, [load, props.wakeTick]);
+
+    const rows = (state.data && state.data.rows) || [];
+    const overflow = (state.data && state.data.overflow_count) || 0;
+    const failing = rows.filter(function (r) { return r.kind === "failing"; });
+    const stale = rows.filter(function (r) { return r.kind === "stale"; });
+
+    function renderRow(row) {
+      const when = row.kind === "failing"
+        ? (row.last_wake_error_at || row.last_wake_at || 0)
+        : (row.last_wake_at || 0);
+      const rel = (when && timeAgo) ? timeAgo(when) : "";
+      const fullMessage = row.message || "";
+      return h("div", {
+        key: row.task_id + "::" + row.profile + "::" + row.name,
+        className: cn(
+          "hermes-kanban-wake-health-row",
+          "hermes-kanban-wake-health-row--" + row.kind,
+        ),
+      },
+        h("div", { className: "hermes-kanban-wake-health-row-head" },
+          h("span", { className: "hermes-kanban-wake-health-row-title" },
+            row.task_title || row.task_id),
+          h("span", { className: "hermes-kanban-wake-health-row-id" }, row.task_id),
+        ),
+        h("div", { className: "hermes-kanban-wake-health-row-meta" },
+          h("span", { className: "hermes-kanban-wake-health-row-profile" },
+            row.profile + (row.name ? " · " + row.name : "")),
+          rel ? h("span", { className: "hermes-kanban-wake-health-row-time" }, rel) : null,
+        ),
+        h("div", {
+          className: "hermes-kanban-wake-health-row-msg",
+          title: fullMessage,
+        }, fullMessage),
+        h("div", { className: "hermes-kanban-wake-health-row-actions" },
+          h(Button, {
+            size: "sm",
+            onClick: function () { props.onOpenTask(row.task_id); },
+            title: "Open this task in the drawer",
+          }, tx(t, "open", "Open")),
+        ),
+      );
+    }
+
+    return h("div", {
+      className: "hermes-kanban-wake-health-popover",
+      role: "dialog",
+      "aria-label": "Wake health detail",
+    },
+      h("div", { className: "hermes-kanban-wake-health-popover-head" },
+        h("span", { className: "hermes-kanban-wake-health-popover-title" },
+          tx(t, "wakeHealth", "Wake health")),
+        props.boardSlug
+          ? h("span", { className: "hermes-kanban-wake-health-popover-scope" },
+              tx(t, "board", "Board"), ": ", props.boardSlug,
+              props.tenantFilter
+                ? " · " + tx(t, "tenant", "Tenant") + ": " + props.tenantFilter
+                : "")
+          : (props.tenantFilter
+              ? h("span", { className: "hermes-kanban-wake-health-popover-scope" },
+                  tx(t, "tenant", "Tenant"), ": ", props.tenantFilter)
+              : null),
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-wake-health-popover-close",
+          onClick: props.onClose,
+          title: tx(t, "close", "Close"),
+          "aria-label": tx(t, "close", "Close"),
+        }, "✕"),
+      ),
+      state.phase === "loading" ? h("div", {
+        className: "hermes-kanban-wake-health-popover-empty",
+      }, tx(t, "loading", "Loading…")) : null,
+      state.phase === "error" ? h("div", {
+        className: "hermes-kanban-wake-health-popover-error",
+      }, state.error || tx(t, "loadFailed", "Failed to load")) : null,
+      (state.phase === "loaded" || state.phase === "refreshing") && rows.length === 0
+        ? h("div", { className: "hermes-kanban-wake-health-popover-empty" },
+            tx(t, "wakeHealthAllHealthy", "No failing or stale wakes."))
+        : null,
+      failing.length > 0 ? h("div", { className: "hermes-kanban-wake-health-section" },
+        h("div", { className: "hermes-kanban-wake-health-section-head" },
+          tx(t, "failing", "Failing"), " · ", failing.length),
+        failing.map(renderRow),
+      ) : null,
+      stale.length > 0 ? h("div", { className: "hermes-kanban-wake-health-section" },
+        h("div", { className: "hermes-kanban-wake-health-section-head" },
+          tx(t, "stale", "Stale"), " · ", stale.length),
+        stale.map(renderRow),
+      ) : null,
+      overflow > 0 ? h("div", { className: "hermes-kanban-wake-health-popover-overflow" },
+        tx(t, "wakeHealthOverflow", "+{n} more", { n: overflow })) : null,
+    );
+  }
+
   function BoardToolbar(props) {
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
@@ -2043,6 +2170,16 @@
     const wakeHealth = normalizeWakeHealth(props.board && props.board.wake_health);
     const wakeHealthText = wakeHealthPillText(wakeHealth);
     const wakeHealthLabel = wakeHealthTitle(wakeHealth);
+    const [wakeDetailsOpen, setWakeDetailsOpen] = useState(false);
+    const closeWakeDetails = useCallback(function () { setWakeDetailsOpen(false); }, []);
+    // Close on ESC anywhere in the document while the popover is open so
+    // the toolbar's button doesn't need to retain focus to dismiss.
+    useEffect(function () {
+      if (!wakeDetailsOpen) return undefined;
+      function onKey(e) { if (e.key === "Escape") setWakeDetailsOpen(false); }
+      document.addEventListener("keydown", onKey);
+      return function () { document.removeEventListener("keydown", onKey); };
+    }, [wakeDetailsOpen]);
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "flex flex-col gap-1",
                  title: "Fuzzy-match tasks by id, title, or description. Matches across all columns." },
@@ -2097,11 +2234,36 @@
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
       h("div", { className: "flex-1" }),
-      wakeHealth.subscription_count > 0 ? h("span", {
-        className: cn("hermes-kanban-wake-health", wakeHealthPillClass(wakeHealth)),
-        title: wakeHealthLabel,
-        "aria-label": wakeHealthLabel,
-      }, wakeHealthText) : null,
+      wakeHealth.subscription_count > 0 ? h("div", {
+        className: "hermes-kanban-wake-health-wrap",
+      },
+        h("button", {
+          type: "button",
+          className: cn(
+            "hermes-kanban-wake-health",
+            "hermes-kanban-wake-health-btn",
+            wakeHealthPillClass(wakeHealth),
+            wakeDetailsOpen ? "hermes-kanban-wake-health--open" : "",
+          ),
+          title: wakeHealthLabel,
+          "aria-label": wakeHealthLabel,
+          "aria-expanded": wakeDetailsOpen ? "true" : "false",
+          "aria-haspopup": "dialog",
+          onClick: function () { setWakeDetailsOpen(function (x) { return !x; }); },
+        }, wakeHealthText),
+        wakeDetailsOpen ? h(WakeHealthDetailsPopover, {
+          boardSlug: props.boardSlug,
+          tenantFilter: props.tenantFilter,
+          includeArchived: props.includeArchived,
+          wakeTick: props.wakeTick || 0,
+          summary: wakeHealth,
+          onClose: closeWakeDetails,
+          onOpenTask: function (taskId) {
+            if (props.onOpenTask) props.onOpenTask(taskId);
+            closeWakeDetails();
+          },
+        }) : null,
+      ) : null,
       h(Button, {
         onClick: props.onNudgeDispatch,
         size: "sm",

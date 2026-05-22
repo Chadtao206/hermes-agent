@@ -555,6 +555,152 @@ def get_board(
 
 
 # ---------------------------------------------------------------------------
+# GET /wake-health/details — drilldown for the toolbar wake-health pill
+# ---------------------------------------------------------------------------
+
+_WAKE_HEALTH_DETAILS_DEFAULT_LIMIT = 50
+_WAKE_HEALTH_DETAILS_MAX_LIMIT = 200
+
+
+def _collect_wake_health_rows(
+    conn: sqlite3.Connection,
+    *,
+    task_ids: list[str],
+    tasks_by_id: dict[str, Any],
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return ordered failing+stale rows plus an overflow count.
+
+    Only enabled rows with ``wake_agent=1`` are considered (mirrors
+    :func:`_compute_wake_health`). Rows for tasks outside ``task_ids`` are
+    skipped so the popover honours the same board/tenant scope as /board.
+    """
+    if not task_ids:
+        return [], 0
+
+    failing: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    task_id_set = set(task_ids)
+
+    for i in range(0, len(task_ids), 200):
+        batch = task_ids[i:i + 200]
+        placeholders = ",".join(["?"] * len(batch))
+        rows = conn.execute(
+            f"""
+            SELECT task_id, profile, name,
+                   last_wake_at, last_wake_error_at, last_wake_error,
+                   wake_failure_count
+            FROM kanban_profile_event_subs
+            WHERE enabled = 1
+              AND wake_agent = 1
+              AND task_id IN ({placeholders})
+            """,
+            tuple(batch),
+        ).fetchall()
+        for row in rows:
+            tid = row["task_id"]
+            if tid not in task_id_set:
+                continue
+            failure_count = int(row["wake_failure_count"] or 0)
+            error_at = row["last_wake_error_at"]
+            last_wake_at = row["last_wake_at"]
+            is_failing = error_at is not None or failure_count > 0
+            is_stale = (
+                not is_failing
+                and (last_wake_at is None or last_wake_at == 0)
+            )
+            if not is_failing and not is_stale:
+                continue
+            task = tasks_by_id.get(tid)
+            base = {
+                "task_id": tid,
+                "task_title": task.title if task else tid,
+                "task_status": task.status if task else None,
+                "profile": row["profile"],
+                "name": row["name"] or "",
+                "last_wake_at": last_wake_at,
+                "last_wake_error_at": error_at,
+                "wake_failure_count": failure_count,
+            }
+            if is_failing:
+                base["kind"] = "failing"
+                base["message"] = row["last_wake_error"] or "Last wake errored"
+                failing.append(base)
+            else:
+                base["kind"] = "stale"
+                base["message"] = "No successful wake yet"
+                stale.append(base)
+
+    # Failing first, most recent error wins; stable on task id then profile.
+    failing.sort(key=lambda r: (
+        -(r["last_wake_error_at"] or 0),
+        r["task_id"],
+        r["profile"],
+        r["name"],
+    ))
+    # Stale next; no error/wake timestamps to lean on, so id-stable.
+    stale.sort(key=lambda r: (r["task_id"], r["profile"], r["name"]))
+
+    combined = failing + stale
+    overflow = max(0, len(combined) - limit)
+    return combined[:limit], overflow
+
+
+@router.get("/wake-health/details")
+def get_wake_health_details(
+    tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+    include_archived: bool = Query(False),
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    workflow_template_id: Optional[str] = Query(
+        None, description="Restrict to tasks using this workflow template id",
+    ),
+    current_step_key: Optional[str] = Query(
+        None, description="Restrict to tasks at this workflow step key",
+    ),
+    limit: int = Query(
+        _WAKE_HEALTH_DETAILS_DEFAULT_LIMIT,
+        ge=1,
+        le=_WAKE_HEALTH_DETAILS_MAX_LIMIT,
+        description="Max rows to return (failing+stale combined).",
+    ),
+):
+    """Detail rows backing the toolbar wake-health pill popover.
+
+    Scope mirrors :func:`get_board` so the popover reflects the same tasks
+    the user is currently looking at. Healthy rows are omitted; failing
+    rows are returned before stale ones, with the most recent failure
+    first. ``overflow_count`` reports rows beyond ``limit``.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        tasks = kanban_db.list_tasks(
+            conn,
+            tenant=tenant,
+            include_archived=include_archived,
+            workflow_template_id=workflow_template_id,
+            current_step_key=current_step_key,
+        )
+        task_ids = [t.id for t in tasks]
+        tasks_by_id = {t.id: t for t in tasks}
+        wake_health = _compute_wake_health(conn, task_ids=task_ids)
+        rows, overflow = _collect_wake_health_rows(
+            conn,
+            task_ids=task_ids,
+            tasks_by_id=tasks_by_id,
+            limit=limit,
+        )
+        return {
+            "wake_health": wake_health,
+            "rows": rows,
+            "overflow_count": overflow,
+            "as_of": int(time.time()),
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # GET /tasks/:id
 # ---------------------------------------------------------------------------
 
