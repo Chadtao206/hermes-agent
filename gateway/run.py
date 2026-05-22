@@ -5163,14 +5163,16 @@ class GatewayRunner:
                     if not int(psub.get("wake_agent") or 0):
                         # Subscription recorded events but is configured not to
                         # wake an agent — just advance the cursor to ack the
-                        # range and continue.
+                        # range and continue. No wake actually happened, so we
+                        # do NOT append a wake_events row.
                         await asyncio.to_thread(
                             self._kanban_profile_advance,
                             psub, pd["cursor"], p_board, None,
                         )
                         continue
+                    wake_error: Any = None
                     try:
-                        ok = await asyncio.to_thread(
+                        result = await asyncio.to_thread(
                             self._kanban_profile_wake,
                             psub,
                             pd["events"],
@@ -5185,16 +5187,30 @@ class GatewayRunner:
                             psub.get("task_id"), psub.get("profile"),
                             p_board, exc,
                         )
-                        ok = False
+                        result = False
+                        wake_error = exc
+                    # ``_kanban_profile_wake`` returns ``bool`` (legacy) or
+                    # ``(bool, error)``; tests monkeypatch the bool form, real
+                    # code now passes the Popen error in the tuple form.
+                    if isinstance(result, tuple) and len(result) == 2:
+                        ok = bool(result[0])
+                        if not ok and wake_error is None:
+                            wake_error = result[1]
+                    else:
+                        ok = bool(result)
                     if ok:
                         await asyncio.to_thread(
-                            self._kanban_profile_advance,
+                            self._kanban_profile_record_success,
                             psub, pd["cursor"], p_board, int(time.time()),
                         )
                     else:
                         await asyncio.to_thread(
-                            self._kanban_profile_rewind,
-                            psub, pd["cursor"], pd.get("old_cursor", 0), p_board,
+                            self._kanban_profile_record_failure,
+                            psub,
+                            pd["cursor"],
+                            pd.get("old_cursor", 0),
+                            p_board,
+                            wake_error,
                         )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
@@ -5307,6 +5323,88 @@ class GatewayRunner:
         finally:
             conn.close()
 
+    def _kanban_profile_record_success(
+        self,
+        sub: dict,
+        claimed_cursor: int,
+        board: Optional[str],
+        last_wake_at: int,
+    ) -> None:
+        """Sync helper: mark a profile-wake batch as successfully spawned.
+
+        Wraps :func:`kanban_db.record_profile_wake_success` — clears error
+        state, resets the failure counter, advances the cursor, and appends
+        a ``status='success'`` wake event so the dashboard sees the wake.
+        Falls back to the legacy advance helper if the wake-events table
+        is missing (mid-upgrade gateway).
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            recorder = getattr(_kb, "record_profile_wake_success", None)
+            if recorder is None:  # pragma: no cover — defensive
+                _kb.advance_profile_event_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    profile=sub["profile"],
+                    name=sub.get("name") or "",
+                    new_cursor=claimed_cursor,
+                    last_wake_at=last_wake_at,
+                )
+                return
+            recorder(
+                conn,
+                task_id=sub["task_id"],
+                profile=sub["profile"],
+                name=sub.get("name") or "",
+                new_cursor=claimed_cursor,
+                last_wake_at=last_wake_at,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_profile_record_failure(
+        self,
+        sub: dict,
+        claimed_cursor: int,
+        old_cursor: int,
+        board: Optional[str],
+        error: Any,
+    ) -> None:
+        """Sync helper: rewind a failed claim and record the failure.
+
+        Wraps :func:`kanban_db.record_profile_wake_failure`. The CAS-guarded
+        rewind preserves the cursor-retry behavior of
+        :func:`kanban_db.rewind_profile_event_cursor`; the extra writes
+        bump ``wake_failure_count``, stamp the sanitized error onto the
+        subscription, and append a ``status='failed'`` wake event row.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            recorder = getattr(_kb, "record_profile_wake_failure", None)
+            if recorder is None:  # pragma: no cover — defensive
+                _kb.rewind_profile_event_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    profile=sub["profile"],
+                    name=sub.get("name") or "",
+                    claimed_cursor=claimed_cursor,
+                    old_cursor=old_cursor,
+                )
+                return
+            recorder(
+                conn,
+                task_id=sub["task_id"],
+                profile=sub["profile"],
+                name=sub.get("name") or "",
+                claimed_cursor=claimed_cursor,
+                old_cursor=old_cursor,
+                error=error,
+            )
+        finally:
+            conn.close()
+
     def _build_kanban_event_wake_prompt(
         self,
         sub: dict,
@@ -5410,12 +5508,14 @@ class GatewayRunner:
         task,
         event_tasks: dict,
         board: Optional[str],
-    ) -> bool:
+    ) -> tuple[bool, Optional[str]]:
         """Spawn ``hermes -p <profile> chat -q <prompt>`` for a profile sub.
 
-        Fire-and-forget: returns True on Popen success (the child detaches
-        and continues in the background), False on any spawn failure. The
-        cursor advance / rewind is the caller's responsibility.
+        Fire-and-forget: returns ``(True, None)`` on Popen success (the
+        child detaches and continues in the background), ``(False, err)``
+        on any spawn failure where ``err`` is a short reason string the
+        caller forwards into the wake-events row. The cursor advance /
+        rewind is the caller's responsibility.
 
         The spawned process gets ``HERMES_KANBAN_EVENT_WAKE=1`` so the
         woken agent (or any wrapper code it runs) can detect a wake
@@ -5435,7 +5535,7 @@ class GatewayRunner:
                 "kanban notifier: profile wake skipped — no profile on sub %r",
                 sub,
             )
-            return False
+            return False, "missing profile on subscription"
         try:
             profile = normalize_profile_name(profile_raw)
         except Exception as exc:
@@ -5443,7 +5543,7 @@ class GatewayRunner:
                 "kanban notifier: invalid profile %r on sub: %s",
                 profile_raw, exc,
             )
-            return False
+            return False, f"invalid profile {profile_raw!r}: {exc.__class__.__name__}"
 
         prompt = self._build_kanban_event_wake_prompt(
             sub, events, task, event_tasks, board,
@@ -5460,7 +5560,7 @@ class GatewayRunner:
                 "kanban notifier: profile wake skipped for missing profile %s: %s",
                 profile, exc,
             )
-            return False
+            return False, f"profile {profile!r} not found"
         env["HERMES_PROFILE"] = profile
         env["HERMES_KANBAN_EVENT_WAKE"] = "1"
         resolved_board = board or _kb.get_current_board()
@@ -5527,14 +5627,14 @@ class GatewayRunner:
                     log_f.close()
                 except Exception:
                     pass
-            return False
+            return False, f"{exc.__class__.__name__}: {exc}"
         # Intentionally leave log_f open for the child to inherit; the
         # parent reference goes out of scope after we return.
         logger.info(
             "kanban notifier: woke profile %s for %s on board %s (%d events)",
             profile, sub.get("task_id"), resolved_board, len(events),
         )
-        return True
+        return True, None
 
     async def _deliver_kanban_artifacts(
         self,

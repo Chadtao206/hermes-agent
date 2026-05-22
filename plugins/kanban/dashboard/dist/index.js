@@ -500,8 +500,10 @@
     // own task's counter so it reloads itself on live events instead of
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
+    const [profileWakeTick, setProfileWakeTick] = useState({});
 
     const cursorRef = useRef(0);
+    const wakeCursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
@@ -592,6 +594,7 @@
         const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
         const qsParams = {
           since: String(cursorRef.current || 0),
+          wake_since: String(wakeCursorRef.current || 0),
           token: token,
         };
         // Pin the WS stream to the currently-selected board so events
@@ -620,6 +623,19 @@
                 return next;
               });
               scheduleReload();
+            }
+            if (msg && Array.isArray(msg.wake_events) && msg.wake_events.length > 0) {
+              wakeCursorRef.current = msg.wake_cursor || wakeCursorRef.current;
+              // Wake events only affect profile-wake rows in an open drawer.
+              // Avoid a full board reload; TaskDrawer refreshes profile-subs
+              // from its own wakeTick signal.
+              setProfileWakeTick(function (prev) {
+                const next = Object.assign({}, prev);
+                for (const e of msg.wake_events) {
+                  if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
+                }
+                return next;
+              });
             }
           } catch (_e) { /* ignore */ }
         };
@@ -1045,6 +1061,7 @@
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
+          wakeTick: profileWakeTick[selectedTaskId] || 0,
         }) : null,
       ),
     );
@@ -2836,7 +2853,7 @@
     // show stale data if we only loaded on mount).
     useEffect(function () { load(); }, [load, props.eventTick]);
     useEffect(function () { loadHomeChannels(); }, [loadHomeChannels]);
-    useEffect(function () { loadProfileSubs(); }, [loadProfileSubs, props.eventTick]);
+    useEffect(function () { loadProfileSubs(); }, [loadProfileSubs, props.eventTick, props.wakeTick]);
     useEffect(function () {
       function onKey(e) { if (e.key === "Escape" && !editing) props.onClose(); }
       window.addEventListener("keydown", onKey);
@@ -3861,9 +3878,18 @@
   function ProfileSubRow(props) {
     const { t } = useI18n();
     const sub = props.sub;
-    const lastWake = sub.last_wake_at
-      ? `${tx(t, "lastWoke", "Last woke")} ${timeAgo ? timeAgo(sub.last_wake_at) : ""}`
-      : tx(t, "neverWoke", "Never");
+    const wakeFailed = !!sub.last_wake_error_at;
+    const wakeAge = wakeFailed
+      ? (timeAgo ? timeAgo(sub.last_wake_error_at) : "")
+      : (sub.last_wake_at ? (timeAgo ? timeAgo(sub.last_wake_at) : "") : "");
+    const lastWake = wakeFailed
+      ? `${tx(t, "wakeFailed", "Failed")} ${wakeAge}`.trim()
+      : (sub.last_wake_at
+          ? `${tx(t, "woke", "Woke")} ${wakeAge}`.trim()
+          : tx(t, "neverWoke", "Never"));
+    const wakeTitle = wakeFailed && sub.last_wake_error
+      ? `${lastWake}: ${sub.last_wake_error}`
+      : lastWake;
     return h("div", { className: "hermes-kanban-profile-sub-row" },
       h("div", { className: "hermes-kanban-profile-sub-head" },
         h("span", { className: "hermes-kanban-profile-sub-name" }, sub.profile),
@@ -3901,7 +3927,11 @@
         ),
       ),
       h("div", { className: "hermes-kanban-profile-sub-foot" },
-        h("span", { className: "hermes-kanban-profile-sub-last" }, lastWake),
+        h("span", {
+          className: "hermes-kanban-profile-sub-last" + (wakeFailed ? " hermes-kanban-profile-sub-last-failed" : ""),
+          title: wakeTitle,
+          "aria-label": wakeTitle,
+        }, lastWake),
         props.pendingRemove
           ? h("span", { className: "hermes-kanban-profile-sub-confirm" },
               h("span", null, tx(t, "removeProfileSubConfirm", "Remove this subscription?")),

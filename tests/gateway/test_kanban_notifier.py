@@ -843,6 +843,114 @@ def test_chat_subscription_unaffected_when_profile_sub_present(tmp_path, monkeyp
 
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: profile-wake health tracking + wake-event audit log
+# ---------------------------------------------------------------------------
+#
+# These tests pin the gateway → kanban_db wiring for ``record_profile_wake_*``:
+# success clears the error state and appends a ``status='success'`` wake-event
+# row, failure increments ``wake_failure_count``, stamps the sanitized error,
+# preserves the existing cursor-rewind behavior, and appends a
+# ``status='failed'`` row.
+
+
+def test_profile_wake_success_records_health_and_wake_event(tmp_path, monkeypatch):
+    db_path = tmp_path / "profile-health-success.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="health success", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+        )
+        # Seed a "previously failed" state so the success path must clear it.
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            claimed_cursor=0,
+            old_cursor=0,
+            error=RuntimeError("stale"),
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        return True, None
+
+    monkeypatch.setattr(GatewayRunner, "_kanban_profile_wake", fake_wake)
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_profile_event_subs(conn, task_id=tid)[0]
+        assert int(sub["last_event_id"]) > 0
+        assert int(sub["last_wake_at"] or 0) > 0
+        # Success path must clear error fields + reset failure counter.
+        assert sub["last_wake_error"] in (None, "")
+        assert sub["last_wake_error_at"] in (None, 0)
+        assert int(sub["wake_failure_count"] or 0) == 0
+        # One pre-seeded failed row + one success row from this tick.
+        rows = kb.list_profile_wake_events(conn, task_id=tid)
+        statuses = [r["status"] for r in rows]
+        assert "success" in statuses, f"expected a success row; got {statuses}"
+        assert "failed" in statuses, f"expected pre-seeded failed row; got {statuses}"
+    finally:
+        conn.close()
+
+
+def test_profile_wake_failure_records_health_and_preserves_rewind(tmp_path, monkeypatch):
+    db_path = tmp_path / "profile-health-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="health failure", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    def fake_wake_fail(self, sub, events, task, event_tasks, board):
+        return False, "BoomError: spawn refused"
+
+    monkeypatch.setattr(GatewayRunner, "_kanban_profile_wake", fake_wake_fail)
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        sub = kb.list_profile_event_subs(conn, task_id=tid)[0]
+        # Cursor rewound to 0 → next tick retries (preserve Phase 2 behavior).
+        assert int(sub["last_event_id"]) == 0
+        assert sub["last_wake_at"] in (None, 0)
+        assert int(sub["wake_failure_count"] or 0) == 1
+        assert sub["last_wake_error"] and "BoomError" in sub["last_wake_error"]
+        assert int(sub["last_wake_error_at"] or 0) > 0
+        rows = kb.list_profile_wake_events(conn, task_id=tid)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] and "BoomError" in rows[0]["error"]
+        assert int(rows[0]["claimed_event_cursor"]) > 0
+    finally:
+        conn.close()
+
+
 def test_profile_wake_missing_profile_returns_false_and_does_not_popen(tmp_path, monkeypatch):
     """Missing profiles must be treated as spawn failure before cursor ack."""
     db_path = tmp_path / "missing-profile-wake.db"
@@ -866,7 +974,11 @@ def test_profile_wake_missing_profile_returns_false_and_does_not_popen(tmp_path,
             popen_calls.append((args, kwargs))
             raise AssertionError("Popen should not be reached for missing profile")
         mp.setattr("subprocess.Popen", fake_popen)
-        ok = runner._kanban_profile_wake(sub, [ev], task, {}, "default")
+        result = runner._kanban_profile_wake(sub, [ev], task, {}, "default")
 
+    # Phase 3: ``_kanban_profile_wake`` returns ``(ok, error_text)`` so the
+    # caller can stamp the sanitized reason onto the wake-events row.
+    ok, err = result if isinstance(result, tuple) else (result, None)
     assert ok is False
+    assert err and "does-not-exist" in err
     assert popen_calls == []

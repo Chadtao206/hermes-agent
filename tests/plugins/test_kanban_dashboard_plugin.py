@@ -824,6 +824,59 @@ def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp
     assert other_task not in task_ids
 
 
+def test_ws_events_streams_profile_wake_events_without_task_events(tmp_path, monkeypatch):
+    """The existing /events websocket keeps its task ``events`` contract but
+    can also carry profile-wake rows for the TaskDrawer health refresh path."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wake-live")
+        kb.add_profile_event_sub(conn, task_id=tid, profile="jensen")
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            claimed_cursor=123,
+            old_cursor=0,
+            error=RuntimeError("spawn refused"),
+        )
+    finally:
+        conn.close()
+
+    import hermes_cli
+    import types
+
+    stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    c = TestClient(app)
+
+    # since=999 suppresses create_task/profile-sub task_events so this asserts
+    # wake_events can independently drive a drawer-only refresh.
+    with c.websocket_connect(
+        "/api/plugins/kanban/events?token=secret-xyz&since=999&wake_since=0"
+    ) as ws:
+        payload = ws.receive_json()
+
+    assert payload["events"] == []
+    assert payload["cursor"] == 999
+    assert payload["wake_cursor"] >= 1
+    assert len(payload["wake_events"]) == 1
+    wake = payload["wake_events"][0]
+    assert wake["task_id"] == tid
+    assert wake["profile"] == "jensen"
+    assert wake["status"] == "failed"
+    assert "RuntimeError" in wake["error"]
+
+
 def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
     """``asyncio.CancelledError`` while sleeping in the poll loop is the
     normal uvicorn-shutdown path (``BaseException``, so the bare
@@ -2242,6 +2295,9 @@ def test_profile_subs_add_creates_row_with_defaults(client):
     assert sub["event_kinds"] is None
     assert sub["event_kinds_resolved"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
     assert sub["wake_prompt"] in (None, "")
+    assert sub["last_wake_error_at"] in (None, 0)
+    assert sub["last_wake_error"] in (None, "")
+    assert sub["wake_failure_count"] == 0
 
     # Round-trip via GET.
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
@@ -2249,6 +2305,34 @@ def test_profile_subs_add_creates_row_with_defaults(client):
     rows = r.json()["profile_subs"]
     assert len(rows) == 1
     assert rows[0]["profile"] == "jensen"
+
+
+def test_profile_subs_list_includes_wake_failure_health(client):
+    """TaskDrawer GET includes durable wake-health fields written by gateway."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen"},
+    )
+    conn = kb.connect()
+    try:
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=t["id"],
+            profile="jensen",
+            claimed_cursor=12,
+            old_cursor=0,
+            error=RuntimeError("spawn refused"),
+        )
+    finally:
+        conn.close()
+
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
+    assert r.status_code == 200, r.text
+    sub = r.json()["profile_subs"][0]
+    assert sub["last_wake_error_at"] > 0
+    assert "RuntimeError" in sub["last_wake_error"]
+    assert sub["wake_failure_count"] == 1
 
 
 def test_profile_subs_add_with_custom_events_and_subtree(client):

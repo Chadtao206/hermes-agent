@@ -1664,6 +1664,9 @@ def _serialize_profile_sub(row: dict) -> dict[str, Any]:
         "enabled": int(row.get("enabled") or 0),
         "created_at": row.get("created_at"),
         "last_wake_at": row.get("last_wake_at"),
+        "last_wake_error_at": row.get("last_wake_error_at"),
+        "last_wake_error": row.get("last_wake_error"),
+        "wake_failure_count": int(row.get("wake_failure_count") or 0),
     }
 
 
@@ -2336,6 +2339,12 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             cursor = 0
 
+        wake_since_raw = ws.query_params.get("wake_since", "0")
+        try:
+            wake_cursor = int(wake_since_raw)
+        except ValueError:
+            wake_cursor = 0
+
         # Board selection — pinned at the WS handshake; re-subscribe to
         # switch boards. Changing boards mid-stream would require
         # reconciling two cursors, so the UI just opens a new WS on
@@ -2346,7 +2355,7 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             ws_board = None
 
-        def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
+        def _fetch_new(cursor_val: int, wake_cursor_val: int) -> tuple[int, list[dict], int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)
             try:
                 rows = conn.execute(
@@ -2370,14 +2379,38 @@ async def stream_events(ws: WebSocket):
                         "created_at": r["created_at"],
                     })
                     new_cursor = r["id"]
-                return new_cursor, out
+
+                wake_rows = kanban_db.list_profile_wake_events(
+                    conn, since_id=wake_cursor_val, limit=200,
+                )
+                wake_out: list[dict] = []
+                new_wake_cursor = wake_cursor_val
+                for wr in wake_rows:
+                    wake_out.append({
+                        "id": wr.get("id"),
+                        "task_id": wr.get("task_id"),
+                        "profile": wr.get("profile"),
+                        "name": wr.get("name") or "",
+                        "status": wr.get("status"),
+                        "error": wr.get("error"),
+                        "claimed_event_cursor": wr.get("claimed_event_cursor"),
+                        "created_at": wr.get("created_at"),
+                    })
+                    new_wake_cursor = int(wr.get("id") or new_wake_cursor)
+                return new_cursor, out, new_wake_cursor, wake_out
             finally:
                 conn.close()
 
         while True:
-            cursor, events = await asyncio.to_thread(_fetch_new, cursor)
-            if events:
-                await ws.send_json({"events": events, "cursor": cursor})
+            cursor, events, wake_cursor, wake_events = await asyncio.to_thread(
+                _fetch_new, cursor, wake_cursor,
+            )
+            if events or wake_events:
+                payload = {"events": events, "cursor": cursor}
+                if wake_events:
+                    payload["wake_events"] = wake_events
+                    payload["wake_cursor"] = wake_cursor
+                await ws.send_json(payload)
             await asyncio.sleep(_EVENT_POLL_SECONDS)
     except WebSocketDisconnect:
         return

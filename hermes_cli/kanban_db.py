@@ -994,8 +994,31 @@ CREATE TABLE IF NOT EXISTS kanban_profile_event_subs (
     created_at       INTEGER NOT NULL,
     last_event_id    INTEGER NOT NULL DEFAULT 0,
     last_wake_at     INTEGER,
+    -- Phase 3: durable wake-health columns. ``last_wake_error_at`` /
+    -- ``last_wake_error`` are NULL when the last attempt succeeded; the
+    -- counter resets to 0 on any success and ticks up on every failed
+    -- claim (rewound cursor). The dashboard reads these to show
+    -- Never / Woke … ago / Failed … ago without scanning event rows.
+    last_wake_error_at  INTEGER,
+    last_wake_error     TEXT,
+    wake_failure_count  INTEGER NOT NULL DEFAULT 0,
     enabled          INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (task_id, profile, name)
+);
+
+-- Append-only audit log of profile-wake attempts. One row per claimed
+-- wake batch (success or failure). The dashboard tails this table on
+-- the same /events WebSocket as task_events. ``error`` is sanitized
+-- (short class+message, no traceback) and may be NULL on success.
+CREATE TABLE IF NOT EXISTS kanban_profile_wake_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id               TEXT NOT NULL,
+    profile               TEXT NOT NULL,
+    name                  TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL,  -- 'success' | 'failed'
+    error                 TEXT,
+    claimed_event_cursor  INTEGER NOT NULL DEFAULT 0,
+    created_at            INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -1009,6 +1032,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_profile_event_subs_task ON kanban_profile_event_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_profile_event_subs_profile ON kanban_profile_event_subs(profile);
+CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task
+    ON kanban_profile_wake_events(task_id, profile, name);
 """
 
 
@@ -1397,6 +1422,48 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_profile_event_subs_profile "
         "ON kanban_profile_event_subs(profile)"
+    )
+
+    # Phase 3: durable wake-health columns + append-only wake-event log.
+    # Both pieces are additive — legacy DBs that opened against an earlier
+    # gateway pick them up here without forcing a board reset.
+    psub_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(kanban_profile_event_subs)")
+    }
+    if "last_wake_error_at" not in psub_cols:
+        _add_column_if_missing(
+            conn, "kanban_profile_event_subs",
+            "last_wake_error_at", "last_wake_error_at INTEGER",
+        )
+    if "last_wake_error" not in psub_cols:
+        _add_column_if_missing(
+            conn, "kanban_profile_event_subs",
+            "last_wake_error", "last_wake_error TEXT",
+        )
+    if "wake_failure_count" not in psub_cols:
+        _add_column_if_missing(
+            conn, "kanban_profile_event_subs",
+            "wake_failure_count",
+            "wake_failure_count INTEGER NOT NULL DEFAULT 0",
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_profile_wake_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id               TEXT NOT NULL,
+            profile               TEXT NOT NULL,
+            name                  TEXT NOT NULL DEFAULT '',
+            status                TEXT NOT NULL,
+            error                 TEXT,
+            claimed_event_cursor  INTEGER NOT NULL DEFAULT 0,
+            created_at            INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task "
+        "ON kanban_profile_wake_events(task_id, profile, name)"
     )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -6805,6 +6872,161 @@ def rewind_profile_event_cursor(
             ),
         )
     return cur.rowcount > 0
+
+
+# Cap to keep one bad traceback from blowing up dashboard payloads / DB rows.
+_WAKE_ERROR_MAX_LEN = 400
+
+
+def _sanitize_wake_error(err: Any) -> Optional[str]:
+    """Compact ``ClassName: message`` form, single line, capped length.
+
+    Accepts an exception, a string, or ``None``. Strips newlines so the
+    dashboard's ``title`` attribute renders cleanly, and truncates with
+    an ellipsis so a stack-trace string can't bloat the row.
+    """
+    if err is None:
+        return None
+    if isinstance(err, BaseException):
+        msg = str(err).strip().splitlines()[0] if str(err).strip() else ""
+        text = f"{err.__class__.__name__}: {msg}" if msg else err.__class__.__name__
+    else:
+        text = str(err)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > _WAKE_ERROR_MAX_LEN:
+        text = text[: _WAKE_ERROR_MAX_LEN - 1].rstrip() + "…"
+    return text
+
+
+def record_profile_wake_success(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+    new_cursor: int,
+    last_wake_at: int,
+) -> int:
+    """Atomically mark a profile-wake batch as successfully spawned.
+
+    Advances the cursor (MAX-merged so a concurrent claim that already
+    advanced past us is not clobbered), clears any prior error state,
+    resets the failure counter, and appends a ``status='success'`` row
+    to ``kanban_profile_wake_events``. Returns the inserted wake-event id.
+    """
+    when = int(last_wake_at)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_profile_event_subs SET "
+            "    last_event_id      = MAX(last_event_id, ?), "
+            "    last_wake_at       = ?, "
+            "    last_wake_error_at = NULL, "
+            "    last_wake_error    = NULL, "
+            "    wake_failure_count = 0 "
+            "WHERE task_id = ? AND profile = ? AND name = ?",
+            (int(new_cursor), when, task_id, profile, name or ""),
+        )
+        cur = conn.execute(
+            "INSERT INTO kanban_profile_wake_events "
+            "(task_id, profile, name, status, error, "
+            " claimed_event_cursor, created_at) "
+            "VALUES (?, ?, ?, 'success', NULL, ?, ?)",
+            (task_id, profile, name or "", int(new_cursor), when),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def record_profile_wake_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+    claimed_cursor: int,
+    old_cursor: int,
+    error: Any = None,
+    at: Optional[int] = None,
+) -> int:
+    """Atomically rewind a failed profile-wake claim and record the failure.
+
+    Cursor rewind is CAS-guarded on ``claimed_cursor`` (matches
+    :func:`rewind_profile_event_cursor`) so a racing claim that already
+    advanced further is preserved. Health columns and the wake-event row
+    are written regardless so the failure is always observable in the
+    dashboard, even when the rewind is a no-op.
+    Returns the inserted wake-event id.
+    """
+    when = int(at if at is not None else time.time())
+    sanitized = _sanitize_wake_error(error)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_profile_event_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND profile = ? AND name = ? "
+            "AND last_event_id = ?",
+            (
+                int(old_cursor), task_id, profile, name or "",
+                int(claimed_cursor),
+            ),
+        )
+        conn.execute(
+            "UPDATE kanban_profile_event_subs SET "
+            "    last_wake_error_at = ?, "
+            "    last_wake_error    = ?, "
+            "    wake_failure_count = wake_failure_count + 1 "
+            "WHERE task_id = ? AND profile = ? AND name = ?",
+            (when, sanitized, task_id, profile, name or ""),
+        )
+        cur = conn.execute(
+            "INSERT INTO kanban_profile_wake_events "
+            "(task_id, profile, name, status, error, "
+            " claimed_event_cursor, created_at) "
+            "VALUES (?, ?, ?, 'failed', ?, ?, ?)",
+            (
+                task_id, profile, name or "", sanitized,
+                int(claimed_cursor), when,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_profile_wake_events(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    profile: Optional[str] = None,
+    name: Optional[str] = None,
+    since_id: int = 0,
+    limit: int = 200,
+) -> list[dict]:
+    """Tail / list rows from ``kanban_profile_wake_events``.
+
+    ``since_id`` is an exclusive lower bound on the autoincrement id;
+    the dashboard tail loop passes the largest id it has seen so each
+    poll returns only newly-appended rows. Ordered ASC by id so the
+    caller can use the last row's id as the next ``since_id``.
+    """
+    where = ["id > ?"]
+    params: list[Any] = [int(since_id)]
+    if task_id is not None:
+        where.append("task_id = ?")
+        params.append(task_id)
+    if profile is not None:
+        where.append("profile = ?")
+        params.append(profile)
+    if name is not None:
+        where.append("name = ?")
+        params.append(name)
+    sql = (
+        "SELECT id, task_id, profile, name, status, error, "
+        "       claimed_event_cursor, created_at "
+        "FROM kanban_profile_wake_events "
+        "WHERE " + " AND ".join(where) + " "
+        "ORDER BY id ASC LIMIT ?"
+    )
+    params.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 # ---------------------------------------------------------------------------

@@ -151,6 +151,103 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_connect_migrates_legacy_profile_wake_health_schema(tmp_path):
+    """Boards with Phase-2 profile subscriptions gain wake-health storage.
+
+    Phase 2 created ``kanban_profile_event_subs`` before durable wake-health
+    columns / wake-event rows existed. Opening that board must add the new
+    columns and append-only table idempotently.
+    """
+    db_path = tmp_path / "legacy-profile-wake.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE kanban_profile_event_subs (
+            task_id TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            event_kinds TEXT,
+            include_children INTEGER NOT NULL DEFAULT 0,
+            wake_agent INTEGER NOT NULL DEFAULT 1,
+            wake_prompt TEXT,
+            created_at INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            last_wake_at INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (task_id, profile, name)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    # Run twice to pin idempotence as well as first-open migration.
+    kb.init_db(db_path=db_path)
+    kb.init_db(db_path=db_path)
+
+    with kb.connect(db_path) as migrated:
+        psub_cols = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(kanban_profile_event_subs)")
+        }
+        tables = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+
+    assert {"last_wake_error_at", "last_wake_error", "wake_failure_count"} <= psub_cols
+    assert "kanban_profile_wake_events" in tables
+    assert "idx_profile_wake_events_task" in indexes
+
+
+def test_profile_wake_error_sanitizer_is_single_line_and_capped():
+    err = RuntimeError("line1\nline2 " + ("x" * 800))
+    text = kb._sanitize_wake_error(err)
+
+    assert text is not None
+    assert text.startswith("RuntimeError: line1")
+    assert "\n" not in text
+    assert len(text) <= 400
+
+    long_text = kb._sanitize_wake_error("E " + ("x" * 800))
+    assert long_text is not None
+    assert len(long_text) == 400
+    assert long_text.endswith("…")
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
