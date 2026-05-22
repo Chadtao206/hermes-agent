@@ -233,6 +233,155 @@ def test_connect_migrates_legacy_profile_wake_health_schema(tmp_path):
     assert "idx_profile_wake_events_task" in indexes
 
 
+def test_init_creates_kanban_notifier_heartbeats_table(kanban_home):
+    """A fresh DB should expose the notifier heartbeats table + indexes."""
+    with kb.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_notifier_heartbeats)")
+        }
+
+    assert "kanban_notifier_heartbeats" in tables
+    assert "idx_notifier_heartbeats_board" in indexes
+    assert {
+        "notifier_id", "board_slug", "db_path", "notifier_profile",
+        "host", "pid", "started_at", "last_seen_at",
+    } <= cols
+
+
+def test_legacy_db_migration_adds_notifier_heartbeats_table(tmp_path):
+    """Opening a board predating the heartbeats table must add it idempotently."""
+    db_path = tmp_path / "legacy-no-heartbeats.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # Twice — must be idempotent.
+    kb.init_db(db_path=db_path)
+    kb.init_db(db_path=db_path)
+
+    with kb.connect(db_path) as migrated:
+        tables = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "kanban_notifier_heartbeats" in tables
+
+
+def test_record_and_list_notifier_heartbeats_classifies_active_and_stale(kanban_home):
+    """``record_notifier_heartbeat`` upserts per (notifier, board, db); the
+    list helper classifies rows within the active window as active and rows
+    beyond it as stale."""
+    with kb.connect() as conn:
+        now = 1_000_000
+        # Two notifier processes on the same board+db (overlap) plus a third
+        # notifier whose last heartbeat is well outside the active window.
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-a:1111:900",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="jensen",
+            host="host-a",
+            pid=1111,
+            started_at=900,
+            now=now,
+        )
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-b:2222:920",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="boris",
+            host="host-b",
+            pid=2222,
+            started_at=920,
+            now=now,
+        )
+        stale_window = kb.NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS + 30
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-c:3333:100",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="andrej",
+            host="host-c",
+            pid=3333,
+            started_at=100,
+            now=now - stale_window,
+        )
+
+        # Idempotent upsert: same triple repeats with a newer last_seen.
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-a:1111:900",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="jensen",
+            host="host-a",
+            pid=1111,
+            started_at=900,
+            now=now,
+        )
+
+        rows = kb.list_notifier_heartbeats(
+            conn,
+            board_slug="default",
+            db_path="/tmp/board.db",
+            now=now,
+        )
+
+    by_id = {row["notifier_id"]: row for row in rows}
+    assert len(by_id) == 3, rows  # upsert kept one row per notifier
+    assert by_id["host-a:1111:900"]["active"] is True
+    assert by_id["host-b:2222:920"]["active"] is True
+    assert by_id["host-c:3333:100"]["active"] is False
+
+    # Scope filters: db_path mismatch yields no rows.
+    with kb.connect() as conn:
+        other = kb.list_notifier_heartbeats(
+            conn,
+            board_slug="default",
+            db_path="/tmp/other.db",
+            now=now,
+        )
+    assert other == []
+
+
 def test_profile_wake_error_sanitizer_is_single_line_and_capped():
     err = RuntimeError("line1\nline2 " + ("x" * 800))
     text = kb._sanitize_wake_error(err)

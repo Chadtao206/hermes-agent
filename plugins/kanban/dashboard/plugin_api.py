@@ -392,6 +392,66 @@ def _compute_wake_health(
     return out
 
 
+def _resolved_board_slug_and_db_path(board: Optional[str]) -> tuple[str, str]:
+    """Return dashboard/gateway-compatible board slug and resolved DB path."""
+    slug = board or kanban_db.get_current_board()
+    try:
+        slug = kanban_db._normalize_board_slug(slug) or kanban_db.DEFAULT_BOARD
+    except Exception:
+        slug = kanban_db.DEFAULT_BOARD
+    try:
+        db_path = str(kanban_db.kanban_db_path(board).expanduser().resolve())
+    except Exception:
+        db_path = str(kanban_db.kanban_db_path(board))
+    return slug, db_path
+
+
+def _compute_notifier_health(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    wake_health: dict[str, Any],
+) -> dict[str, Any]:
+    """Return gateway-notifier presence/overlap health for this board DB."""
+    as_of = int(time.time())
+    subscription_count = int(wake_health.get("subscription_count") or 0)
+    _board_slug, db_path = _resolved_board_slug_and_db_path(board)
+    rows = kanban_db.list_notifier_heartbeats(
+        conn,
+        db_path=db_path,
+        now=as_of,
+    )
+    active_count = sum(1 for row in rows if row.get("active"))
+    stale_count = max(0, len(rows) - active_count)
+    overlap_count = max(0, active_count - 1)
+
+    if subscription_count <= 0:
+        severity = "no_subscriptions"
+        message = "No profile wake subscriptions in this board scope."
+    elif active_count <= 0:
+        severity = "no_notifier"
+        message = "No active notifier heartbeat for this board."
+    elif overlap_count > 0:
+        severity = "overlap"
+        message = (
+            f"{active_count} active notifiers for this board; "
+            "duplicate wake races possible."
+        )
+    else:
+        severity = "healthy"
+        message = "One active notifier heartbeat for this board."
+
+    return {
+        "active_count": active_count,
+        "overlap_count": overlap_count,
+        "stale_count": stale_count,
+        "severity": severity,
+        "message": message,
+        "rows": rows[:10],
+        "as_of": as_of,
+    }
+
+
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     """Return {'parents': [...], 'children': [...]} for a task."""
     parents = [
@@ -448,6 +508,9 @@ def get_board(
         )
         task_ids = [t.id for t in tasks]
         wake_health = _compute_wake_health(conn, task_ids=task_ids)
+        notifier_health = _compute_notifier_health(
+            conn, board=board, wake_health=wake_health,
+        )
 
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
@@ -547,6 +610,7 @@ def get_board(
             "tenants": tenants,
             "assignees": assignees,
             "wake_health": wake_health,
+            "notifier_health": notifier_health,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -684,6 +748,9 @@ def get_wake_health_details(
         task_ids = [t.id for t in tasks]
         tasks_by_id = {t.id: t for t in tasks}
         wake_health = _compute_wake_health(conn, task_ids=task_ids)
+        notifier_health = _compute_notifier_health(
+            conn, board=board, wake_health=wake_health,
+        )
         rows, overflow = _collect_wake_health_rows(
             conn,
             task_ids=task_ids,
@@ -692,6 +759,7 @@ def get_wake_health_details(
         )
         return {
             "wake_health": wake_health,
+            "notifier_health": notifier_health,
             "rows": rows,
             "overflow_count": overflow,
             "as_of": int(time.time()),

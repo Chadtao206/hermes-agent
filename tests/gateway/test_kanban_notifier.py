@@ -549,6 +549,76 @@ def _make_runner_no_adapters():
     return runner
 
 
+def test_notifier_heartbeat_records_on_adapterless_tick(tmp_path, monkeypatch):
+    """The gateway records presence even when only profile wakes are possible."""
+    db_path = tmp_path / "adapterless-heartbeat.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    runner = _make_runner_no_adapters()
+    runner._kanban_notifier_profile = "default"
+    runner._kanban_notifier_started_at = 1_000
+    runner._kanban_notifier_host = "test-host"
+    runner._kanban_notifier_id = "test-host:4242:1000"
+    monkeypatch.setattr("gateway.run.os.getpid", lambda: 4242)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        rows = kb.list_notifier_heartbeats(
+            conn,
+            board_slug="default",
+            db_path=str(db_path.resolve()),
+            now=int(kb.time.time()),
+        )
+    finally:
+        conn.close()
+
+    assert len(rows) == 1
+    assert rows[0]["notifier_id"] == "test-host:4242:1000"
+    assert rows[0]["notifier_profile"] == "default"
+    assert rows[0]["active"] is True
+
+
+def test_notifier_heartbeat_failure_does_not_block_profile_wake(tmp_path, monkeypatch):
+    """Heartbeat write failures are diagnostics-only; wake claims still run."""
+    db_path = tmp_path / "heartbeat-failure-still-wakes.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wake despite heartbeat fail", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    captured_events = []
+
+    def fake_heartbeat(*args, **kwargs):
+        raise RuntimeError("heartbeat table temporarily unavailable")
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        captured_events.extend(events)
+        return True, None
+
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", fake_heartbeat)
+    monkeypatch.setattr(GatewayRunner, "_kanban_profile_wake", fake_wake)
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert captured_events
+    assert any(ev.kind == "claimed" for ev in captured_events)
+
+
 def test_profile_event_wake_spawns_without_adapters(tmp_path, monkeypatch):
     """A profile event sub spawns the wake command with no chat adapter connected."""
     db_path = tmp_path / "profile-wake.db"

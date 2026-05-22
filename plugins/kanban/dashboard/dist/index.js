@@ -2072,6 +2072,10 @@
 
     const rows = (state.data && state.data.rows) || [];
     const overflow = (state.data && state.data.overflow_count) || 0;
+    const notifierHealth = (state.data && state.data.notifier_health) || {};
+    const notifierSeverity = notifierHealth.severity || "";
+    const showNotifierWarning = (state.phase === "loaded" || state.phase === "refreshing")
+      && (notifierSeverity === "no_notifier" || notifierSeverity === "overlap");
     const failing = rows.filter(function (r) { return r.kind === "failing"; });
     const stale = rows.filter(function (r) { return r.kind === "stale"; });
 
@@ -2144,6 +2148,14 @@
       state.phase === "error" ? h("div", {
         className: "hermes-kanban-wake-health-popover-error",
       }, state.error || tx(t, "loadFailed", "Failed to load")) : null,
+      showNotifierWarning ? h("div", {
+        className: "hermes-kanban-wake-health-notifier-warning",
+        title: notifierHealth.message || "",
+      }, notifierHealth.message || (
+        notifierSeverity === "no_notifier"
+          ? "No active notifier heartbeat for this board"
+          : "Active notifier overlap; duplicate wake races possible"
+      )) : null,
       (state.phase === "loaded" || state.phase === "refreshing") && rows.length === 0
         ? h("div", { className: "hermes-kanban-wake-health-popover-empty" },
             tx(t, "wakeHealthAllHealthy", "No failing or stale wakes."))

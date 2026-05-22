@@ -210,6 +210,42 @@ def test_board_wake_health_rollup_and_tenant_scope(client):
     assert all_board["wake_health"]["stale_count"] == 1
     assert all_board["wake_health"]["severity"] == "failing"
     assert all_board["wake_health"]["as_of"] > 0
+    assert all_board["notifier_health"]["severity"] == "no_notifier"
+    assert all_board["notifier_health"]["active_count"] == 0
+
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        db_path = str(kb.kanban_db_path().expanduser().resolve())
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-a:111:1",
+            board_slug="default",
+            db_path=db_path,
+            notifier_profile="default",
+            host="host-a",
+            pid=111,
+            started_at=1,
+            now=now,
+        )
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-b:222:2",
+            board_slug="default",
+            db_path=db_path,
+            notifier_profile="ops",
+            host="host-b",
+            pid=222,
+            started_at=2,
+            now=now,
+        )
+    finally:
+        conn.close()
+
+    overlap_board = client.get("/api/plugins/kanban/board").json()
+    assert overlap_board["notifier_health"]["severity"] == "overlap"
+    assert overlap_board["notifier_health"]["active_count"] == 2
+    assert overlap_board["notifier_health"]["overlap_count"] == 1
 
     scoped = client.get("/api/plugins/kanban/board?tenant=t1").json()
     assert scoped["wake_health"]["subscription_count"] == 3
@@ -222,6 +258,38 @@ def test_board_wake_health_rollup_and_tenant_scope(client):
     assert none_visible["wake_health"]["failing_count"] == 0
     assert none_visible["wake_health"]["stale_count"] == 0
     assert none_visible["wake_health"]["severity"] == "none"
+    assert none_visible["notifier_health"]["severity"] == "no_subscriptions"
+
+
+def test_notifier_health_uses_db_path_for_pinned_board_aliases(client, tmp_path, monkeypatch):
+    """Pinned HERMES_KANBAN_DB boards share one notifier heartbeat by DB path."""
+    shared_db = tmp_path / "shared-board.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db(db_path=shared_db)
+    kb.create_board("alpha", name="Alpha")
+
+    conn = kb.connect(board="alpha")
+    try:
+        task_id = kb.create_task(conn, title="alpha wake", assignee="worker")
+        kb.add_profile_event_sub(conn, task_id=task_id, profile="jensen")
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-a:111:1",
+            board_slug="default",
+            db_path=str(shared_db.resolve()),
+            notifier_profile="default",
+            host="host-a",
+            pid=111,
+            started_at=1,
+            now=int(time.time()),
+        )
+    finally:
+        conn.close()
+
+    resp = client.get("/api/plugins/kanban/board?board=alpha").json()
+    assert resp["wake_health"]["subscription_count"] == 1
+    assert resp["notifier_health"]["severity"] == "healthy"
+    assert resp["notifier_health"]["active_count"] == 1
 
 
 def test_wake_health_details_returns_failing_and_stale_rows(client):
@@ -289,6 +357,7 @@ def test_wake_health_details_returns_failing_and_stale_rows(client):
     assert all_resp["wake_health"]["subscription_count"] == 4
     assert all_resp["wake_health"]["failing_count"] == 2
     assert all_resp["wake_health"]["stale_count"] == 1
+    assert all_resp["notifier_health"]["severity"] == "no_notifier"
     rows = all_resp["rows"]
     kinds = [r["kind"] for r in rows]
     # Failing first, then stale.
@@ -346,6 +415,8 @@ def test_wake_health_details_pill_button_is_in_bundle():
     assert "hermes-kanban-wake-health-btn" in bundle
     assert "WakeHealthDetailsPopover" in bundle
     assert "/wake-health/details" in bundle
+    assert "No active notifier heartbeat for this board" in bundle
+    assert "duplicate wake races possible" in bundle
 
 
 def test_board_query_param_default_overrides_current_board_pointer(client):

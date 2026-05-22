@@ -101,6 +101,14 @@ DEFAULT_NOTIFY_TERMINAL_KINDS: tuple[str, ...] = (
     "completed", "blocked", "gave_up", "crashed", "timed_out", "archived",
 )
 
+# Window after a notifier's last heartbeat in which we still consider that
+# notifier "live" for the board DB it was scanning. The watcher ticks every
+# 5s by default, so 30s tolerates a couple of missed ticks (slow disk, GC
+# pause) without flipping a healthy notifier to "stale". Rows older than the
+# window stay in the table for forensic context — the dashboard reports them
+# as stale but does not treat that as the same problem as "no notifier".
+NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS = 30
+
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -1021,6 +1029,24 @@ CREATE TABLE IF NOT EXISTS kanban_profile_wake_events (
     created_at            INTEGER NOT NULL
 );
 
+-- Per-gateway notifier heartbeats. One row per (notifier process, board
+-- slug, resolved DB path) the watcher scans. The dashboard tells "no
+-- active notifier" apart from "overlapping notifiers racing" by counting
+-- rows whose ``last_seen_at`` falls inside the active window. Identity
+-- columns let operators distinguish hosts/PIDs when the overlap warning
+-- fires; ``notifier_profile`` ties the row back to the owning profile.
+CREATE TABLE IF NOT EXISTS kanban_notifier_heartbeats (
+    notifier_id      TEXT NOT NULL,
+    board_slug       TEXT NOT NULL,
+    db_path          TEXT NOT NULL,
+    notifier_profile TEXT,
+    host             TEXT NOT NULL,
+    pid              INTEGER NOT NULL,
+    started_at       INTEGER NOT NULL,
+    last_seen_at     INTEGER NOT NULL,
+    PRIMARY KEY (notifier_id, board_slug, db_path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1034,6 +1060,10 @@ CREATE INDEX IF NOT EXISTS idx_profile_event_subs_task ON kanban_profile_event_s
 CREATE INDEX IF NOT EXISTS idx_profile_event_subs_profile ON kanban_profile_event_subs(profile);
 CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task
     ON kanban_profile_wake_events(task_id, profile, name);
+CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_board
+    ON kanban_notifier_heartbeats(board_slug, db_path);
+CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen
+    ON kanban_notifier_heartbeats(last_seen_at);
 """
 
 
@@ -1464,6 +1494,35 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task "
         "ON kanban_profile_wake_events(task_id, profile, name)"
+    )
+
+    # Per-gateway notifier heartbeats live in their own additive table.
+    # Legacy boards opened before this slice landed never had the table at
+    # all; the dashboard's notifier health rollup degrades to "no notifier"
+    # for those boards until the gateway logs its first heartbeat against
+    # the new table.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_notifier_heartbeats (
+            notifier_id      TEXT NOT NULL,
+            board_slug       TEXT NOT NULL,
+            db_path          TEXT NOT NULL,
+            notifier_profile TEXT,
+            host             TEXT NOT NULL,
+            pid              INTEGER NOT NULL,
+            started_at       INTEGER NOT NULL,
+            last_seen_at     INTEGER NOT NULL,
+            PRIMARY KEY (notifier_id, board_slug, db_path)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_board "
+        "ON kanban_notifier_heartbeats(board_slug, db_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen "
+        "ON kanban_notifier_heartbeats(last_seen_at)"
     )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -7027,6 +7086,94 @@ def list_profile_wake_events(
     )
     params.append(int(limit))
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Kanban notifier heartbeat telemetry
+# ---------------------------------------------------------------------------
+
+def record_notifier_heartbeat(
+    conn: sqlite3.Connection,
+    *,
+    notifier_id: str,
+    board_slug: str,
+    db_path: str,
+    notifier_profile: Optional[str],
+    host: str,
+    pid: int,
+    started_at: int,
+    now: Optional[int] = None,
+) -> None:
+    """Upsert one gateway notifier heartbeat for a scanned board DB.
+
+    Identity is intentionally process-scoped: one row per
+    ``(notifier_id, board_slug, db_path)``. The dashboard can then count
+    active rows for the board DB to distinguish missing notifier coverage
+    from overlapping notifier processes that may race wake claims.
+    """
+    when = int(now if now is not None else time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_notifier_heartbeats (
+                notifier_id, board_slug, db_path, notifier_profile,
+                host, pid, started_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(notifier_id, board_slug, db_path) DO UPDATE SET
+                notifier_profile = excluded.notifier_profile,
+                host             = excluded.host,
+                pid              = excluded.pid,
+                started_at       = excluded.started_at,
+                last_seen_at     = excluded.last_seen_at
+            """,
+            (
+                str(notifier_id), str(board_slug or DEFAULT_BOARD), str(db_path),
+                notifier_profile, str(host or "unknown"), int(pid),
+                int(started_at), when,
+            ),
+        )
+
+
+def list_notifier_heartbeats(
+    conn: sqlite3.Connection,
+    *,
+    board_slug: Optional[str] = None,
+    db_path: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    now: Optional[int] = None,
+    active_window_seconds: int = NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS,
+) -> list[dict]:
+    """List notifier heartbeat rows with active/stale classification."""
+    as_of = int(now if now is not None else time.time())
+    window = max(1, int(active_window_seconds))
+    where: list[str] = []
+    params: list[Any] = []
+    if board_slug is not None:
+        where.append("board_slug = ?")
+        params.append(str(board_slug or DEFAULT_BOARD))
+    if db_path is not None:
+        where.append("db_path = ?")
+        params.append(str(db_path))
+    if notifier_profile is not None:
+        where.append("notifier_profile = ?")
+        params.append(str(notifier_profile))
+    sql = (
+        "SELECT notifier_id, board_slug, db_path, notifier_profile, "
+        "       host, pid, started_at, last_seen_at "
+        "FROM kanban_notifier_heartbeats"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY last_seen_at DESC, notifier_id ASC"
+    out: list[dict] = []
+    for row in conn.execute(sql, params).fetchall():
+        item = dict(row)
+        last_seen = int(item.get("last_seen_at") or 0)
+        age = max(0, as_of - last_seen) if last_seen else None
+        item["age_seconds"] = age
+        item["active"] = bool(last_seen and age is not None and age <= window)
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------------------

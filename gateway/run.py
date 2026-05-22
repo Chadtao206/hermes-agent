@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import signal
 import tempfile
@@ -4714,6 +4715,22 @@ class GatewayRunner:
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+        notifier_started_at = getattr(self, "_kanban_notifier_started_at", None)
+        if not notifier_started_at:
+            notifier_started_at = int(time.time())
+            self._kanban_notifier_started_at = notifier_started_at
+        notifier_host = getattr(self, "_kanban_notifier_host", None)
+        if not notifier_host:
+            try:
+                notifier_host = socket.gethostname() or "unknown"
+            except Exception:
+                notifier_host = "unknown"
+            self._kanban_notifier_host = notifier_host
+        notifier_pid = os.getpid()
+        notifier_id = getattr(self, "_kanban_notifier_id", None)
+        if not notifier_id:
+            notifier_id = f"{notifier_host}:{notifier_pid}:{notifier_started_at}"
+            self._kanban_notifier_id = notifier_id
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -4768,6 +4785,23 @@ class GatewayRunner:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
+                            try:
+                                _kb.record_notifier_heartbeat(
+                                    conn,
+                                    notifier_id=notifier_id,
+                                    board_slug=slug,
+                                    db_path=resolved_db_path,
+                                    notifier_profile=notifier_profile,
+                                    host=notifier_host,
+                                    pid=notifier_pid,
+                                    started_at=notifier_started_at,
+                                    now=int(time.time()),
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "kanban notifier: heartbeat record failed for board %s: %s",
+                                    slug, exc,
+                                )
                             # `connect()` runs the schema + idempotent migration
                             # on first open per process, so an explicit
                             # `init_db()` here would be redundant. Worse:

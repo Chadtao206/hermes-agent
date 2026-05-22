@@ -1260,12 +1260,19 @@
 }
 .hermes-kanban-wake-health-popover-empty,
 .hermes-kanban-wake-health-popover-error,
-.hermes-kanban-wake-health-popover-overflow {
+.hermes-kanban-wake-health-popover-overflow,
+.hermes-kanban-wake-health-notifier-warning {
   font-size: 0.78rem;
   padding: 0.5rem 0.4rem;
   color: var(--color-muted-foreground, #888);
 }
 .hermes-kanban-wake-health-popover-error {
+  color: var(--color-destructive, #d14a4a);
+}
+.hermes-kanban-wake-health-notifier-warning {
+  margin: 0.45rem 0.25rem 0.15rem;
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 10%, transparent);
   color: var(--color-destructive, #d14a4a);
 }
 .hermes-kanban-wake-health-section {
