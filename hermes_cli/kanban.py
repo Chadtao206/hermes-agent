@@ -912,6 +912,128 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- profile-subs (profile-level event subscriptions) ---
+    p_psubs = sub.add_parser(
+        "profile-subs",
+        help="Manage profile-level Kanban event subscriptions "
+             "(gateway wakes a profile when matching task events land)",
+        description=(
+            "Profile event subscriptions are the orchestration analogue of "
+            "notify subs: instead of pushing chat messages, the gateway wakes "
+            "`hermes -p <profile>` when matching events on a task land. The "
+            "primary key is (task_id, profile, name); the same profile can "
+            "carry multiple subscriptions on one task via distinct names."
+        ),
+    )
+    psubs_sub = p_psubs.add_subparsers(dest="profile_subs_action")
+
+    psubs_list = psubs_sub.add_parser(
+        "list",
+        help="List profile event subscriptions (defaults to enabled only)",
+    )
+    psubs_list.add_argument(
+        "--task", dest="task_id", default=None, metavar="TASK_ID",
+        help="Filter by task id",
+    )
+    psubs_list.add_argument(
+        "--profile", default=None,
+        help="Filter by profile",
+    )
+    psubs_list.add_argument(
+        "--all", action="store_true",
+        help="Include disabled subscriptions",
+    )
+    psubs_list.add_argument("--json", action="store_true")
+
+    psubs_add = psubs_sub.add_parser(
+        "add",
+        help="Add (or idempotently update) a profile event subscription. "
+             "Omitted flags preserve existing values; explicit reverse flags "
+             "(e.g. --enable, --wake, --clear-wake-prompt, --default-events) "
+             "revert previously-set fields.",
+    )
+    psubs_add.add_argument("task_id")
+    psubs_add.add_argument("profile")
+    psubs_add.add_argument(
+        "--name", default="",
+        help="Optional name to disambiguate multiple subs for the same "
+             "(task, profile) pair (default: empty)",
+    )
+    psubs_add.add_argument(
+        "--events", nargs="*", default=None, metavar="KIND",
+        help="Event kinds to watch. Comma- and/or space-separated, e.g. "
+             "'--events completed,blocked' or '--events completed blocked'. "
+             "On a new sub, omitting this flag means use the default terminal "
+             "kinds shared with notify subs.",
+    )
+    psubs_add.add_argument(
+        "--default-events", dest="default_events", action="store_true",
+        help="Reset event_kinds back to the default terminal kinds (mutually "
+             "exclusive with --events)",
+    )
+    psubs_add.add_argument(
+        "--include-children", dest="include_children",
+        action="store_const", const=True, default=None,
+        help="Also wake on events from dependency descendants of TASK_ID",
+    )
+    psubs_add.add_argument(
+        "--no-include-children", dest="include_children",
+        action="store_const", const=False,
+        help="Stop watching dependency descendants of TASK_ID",
+    )
+    psubs_add.add_argument(
+        "--wake", dest="wake_agent",
+        action="store_const", const=True, default=None,
+        help="Spawn `hermes -p <profile>` when matching events land (default "
+             "for new subs)",
+    )
+    psubs_add.add_argument(
+        "--no-wake", dest="wake_agent",
+        action="store_const", const=False,
+        help="Record events and advance the cursor without spawning the "
+             "profile (useful for a poller / dry-run)",
+    )
+    psubs_add.add_argument(
+        "--wake-prompt", dest="wake_prompt",
+        default=_PROFILE_SUB_CLI_UNSET, metavar="TEXT",
+        help="Override the body of the wake prompt the gateway sends",
+    )
+    psubs_add.add_argument(
+        "--clear-wake-prompt", dest="wake_prompt",
+        action="store_const", const=None,
+        help="Clear any custom wake prompt and fall back to the default body",
+    )
+    psubs_add.add_argument(
+        "--enable", dest="enabled",
+        action="store_const", const=True, default=None,
+        help="Mark the subscription enabled (re-enable a disabled sub)",
+    )
+    psubs_add.add_argument(
+        "--disable", dest="enabled",
+        action="store_const", const=False,
+        help="Mark the subscription disabled (no claims, no wakes)",
+    )
+    # Legacy alias for --disable; same effect, kept for backwards compat.
+    psubs_add.add_argument(
+        "--disabled", dest="enabled",
+        action="store_const", const=False,
+        help=argparse.SUPPRESS,
+    )
+    psubs_add.add_argument("--json", action="store_true")
+
+    psubs_rm = psubs_sub.add_parser(
+        "remove",
+        help="Remove a profile event subscription by sub id "
+             "(TASK_ID:PROFILE[:NAME])",
+    )
+    psubs_rm.add_argument(
+        "sub_id",
+        metavar="SUB_ID",
+        help="Subscription id formatted as 'TASK_ID:PROFILE' or "
+             "'TASK_ID:PROFILE:NAME' (see `profile-subs list`)",
+    )
+    psubs_rm.add_argument("--json", action="store_true")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1032,6 +1154,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "notify-subscribe":   _cmd_notify_subscribe,
         "notify-list":        _cmd_notify_list,
         "notify-unsubscribe": _cmd_notify_unsubscribe,
+        "profile-subs":       _dispatch_profile_subs,
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
@@ -2453,6 +2576,221 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Profile-level event subscriptions (hermes kanban profile-subs ...)
+# ---------------------------------------------------------------------------
+
+# Sentinel used by ``profile-subs add`` flags (e.g. ``--wake-prompt`` vs
+# ``--clear-wake-prompt``) to distinguish "flag omitted, preserve existing
+# value" from "flag explicitly set to None to reset to the default".
+_PROFILE_SUB_CLI_UNSET = object()
+
+
+def _parse_event_kinds_flag(values: Optional[list[str]]) -> Optional[list[str]]:
+    """Parse ``--events`` ``nargs='*'`` input.
+
+    Accepts space-separated values, comma-separated values inside a single
+    token, and any mix of the two. Returns a de-duplicated list of stripped
+    kinds, or ``None`` when nothing was supplied (which the DB helper treats
+    as "use the default terminal kinds").
+    """
+    if not values:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for piece in (raw or "").split(","):
+            kind = piece.strip()
+            if kind and kind not in seen:
+                seen.add(kind)
+                out.append(kind)
+    return out or None
+
+
+def _parse_profile_sub_id(value: str) -> tuple[str, str, str]:
+    """Parse ``TASK_ID:PROFILE[:NAME]`` into a ``(task_id, profile, name)`` tuple."""
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("sub_id is required (TASK_ID:PROFILE[:NAME])")
+    parts = raw.split(":", 2)
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"invalid sub_id {value!r}; expected TASK_ID:PROFILE[:NAME]"
+        )
+    return parts[0], parts[1], parts[2] if len(parts) > 2 else ""
+
+
+def _format_profile_sub_id(task_id: str, profile: str, name: str) -> str:
+    return f"{task_id}:{profile}:{name}" if name else f"{task_id}:{profile}"
+
+
+def _profile_sub_id_from_row(sub: dict) -> str:
+    return _format_profile_sub_id(
+        sub.get("task_id") or "",
+        sub.get("profile") or "",
+        sub.get("name") or "",
+    )
+
+
+def _format_kinds_for_display(value: Any) -> str:
+    parsed = kb._parse_event_kinds_column(value)
+    if not parsed:
+        return "default"
+    return ",".join(parsed)
+
+
+def _dispatch_profile_subs(args: argparse.Namespace) -> int:
+    sub_action = getattr(args, "profile_subs_action", None)
+    if sub_action == "list":
+        return _cmd_profile_subs_list(args)
+    if sub_action == "add":
+        return _cmd_profile_subs_add(args)
+    if sub_action == "remove":
+        return _cmd_profile_subs_remove(args)
+    print(
+        "usage: hermes kanban profile-subs <list|add|remove> [options]\n"
+        "Run 'hermes kanban profile-subs --help' for details.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _cmd_profile_subs_list(args: argparse.Namespace) -> int:
+    task_id = getattr(args, "task_id", None)
+    profile = getattr(args, "profile", None)
+    enabled_only = not getattr(args, "all", False)
+    with kb.connect() as conn:
+        subs = kb.list_profile_event_subs(
+            conn,
+            task_id=task_id,
+            profile=profile,
+            enabled_only=enabled_only,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(subs, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if not subs:
+        print("(no profile event subscriptions)")
+        return 0
+    for s in subs:
+        sub_id = _profile_sub_id_from_row(s)
+        kinds = _format_kinds_for_display(s.get("event_kinds"))
+        flags: list[str] = []
+        if int(s.get("include_children") or 0):
+            flags.append("include-children")
+        if not int(s.get("wake_agent") or 0):
+            flags.append("no-wake")
+        if not int(s.get("enabled") or 0):
+            flags.append("disabled")
+        if s.get("wake_prompt"):
+            flags.append("wake-prompt")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        last_event = int(s.get("last_event_id") or 0)
+        print(
+            f"  {sub_id:40s}  kinds={kinds}  "
+            f"(since event {last_event}){flag_str}"
+        )
+    return 0
+
+
+def _cmd_profile_subs_add(args: argparse.Namespace) -> int:
+    task_id = args.task_id
+    profile = args.profile
+    name = getattr(args, "name", "") or ""
+
+    events_raw = getattr(args, "events", None)
+    default_events = bool(getattr(args, "default_events", False))
+    if events_raw is not None and default_events:
+        print(
+            "kanban profile-subs add: --events and --default-events "
+            "are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Tri-state: None=preserve, True/False=explicit set.
+    include_children = getattr(args, "include_children", None)
+    wake_agent = getattr(args, "wake_agent", None)
+    enabled = getattr(args, "enabled", None)
+
+    # wake_prompt uses the CLI sentinel so we can distinguish "flag omitted"
+    # from "--clear-wake-prompt" (which lands as a literal None).
+    wake_prompt = getattr(args, "wake_prompt", _PROFILE_SUB_CLI_UNSET)
+
+    with kb.connect() as conn:
+        if kb.get_task(conn, task_id) is None:
+            print(f"no such task: {task_id}", file=sys.stderr)
+            return 1
+        existed = any(
+            (s.get("name") or "") == name
+            for s in kb.list_profile_event_subs(
+                conn, task_id=task_id, profile=profile, enabled_only=False,
+            )
+        )
+        add_kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "profile": profile,
+            "name": name,
+        }
+        if default_events:
+            # Explicit reset → helper writes NULL (use default terminal kinds).
+            add_kwargs["event_kinds"] = None
+        else:
+            kinds = _parse_event_kinds_flag(events_raw)
+            if kinds is not None:
+                add_kwargs["event_kinds"] = kinds
+        if include_children is not None:
+            add_kwargs["include_children"] = include_children
+        if wake_agent is not None:
+            add_kwargs["wake_agent"] = wake_agent
+        if wake_prompt is not _PROFILE_SUB_CLI_UNSET:
+            add_kwargs["wake_prompt"] = wake_prompt
+        if enabled is not None:
+            add_kwargs["enabled"] = enabled
+        kb.add_profile_event_sub(conn, **add_kwargs)
+        stored = [
+            s for s in kb.list_profile_event_subs(
+                conn, task_id=task_id, profile=profile, enabled_only=False,
+            )
+            if (s.get("name") or "") == name
+        ]
+
+    sub_id = _format_profile_sub_id(task_id, profile, name)
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "sub_id": sub_id,
+            "task_id": task_id,
+            "profile": profile,
+            "name": name,
+            "existed": existed,
+            "sub": stored[0] if stored else None,
+        }, indent=2, ensure_ascii=False, default=str))
+        return 0
+    verb = "Updated" if existed else "Added"
+    print(f"{verb} profile-sub {sub_id}")
+    return 0
+
+
+def _cmd_profile_subs_remove(args: argparse.Namespace) -> int:
+    try:
+        task_id, profile, name = _parse_profile_sub_id(args.sub_id)
+    except ValueError as exc:
+        print(f"kanban profile-subs remove: {exc}", file=sys.stderr)
+        return 2
+    with kb.connect() as conn:
+        ok = kb.remove_profile_event_sub(
+            conn, task_id=task_id, profile=profile, name=name,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({"removed": ok, "sub_id": args.sub_id}))
+        return 0 if ok else 1
+    if not ok:
+        print(f"(no such profile-sub: {args.sub_id})", file=sys.stderr)
+        return 1
+    print(f"Removed profile-sub {args.sub_id}")
+    return 0
+
+
 def _cmd_log(args: argparse.Namespace) -> int:
     content = kb.read_worker_log(args.task_id, tail_bytes=args.tail)
     if content is None:
@@ -2905,6 +3243,7 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `profile-subs <list|add|remove>`  Wake a profile on matching task events
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

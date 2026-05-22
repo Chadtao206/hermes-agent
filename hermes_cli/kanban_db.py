@@ -6519,7 +6519,7 @@ def add_profile_event_sub(
     task_id: str,
     profile: str,
     name: str = "",
-    event_kinds: Optional[Iterable[str]] = None,
+    event_kinds: Any = _PROFILE_EVENT_UNSET,
     include_children: Optional[bool] = None,
     wake_agent: Optional[bool] = None,
     wake_prompt: Any = _PROFILE_EVENT_UNSET,
@@ -6533,10 +6533,21 @@ def add_profile_event_sub(
     an optional argument explicitly updates only that field. This mirrors
     ``add_notify_sub`` and prevents accidental re-adds from disabling subtree
     fan-out or wake settings.
+
+    Passing ``event_kinds=None`` (or ``wake_prompt=None``) explicitly resets
+    that field to the default (stored as NULL); pass an iterable to set a
+    specific kind list. The default sentinel preserves the existing value.
     """
     now = int(time.time())
-    normalized_kinds = _normalize_event_kinds(event_kinds)
-    kinds_json = json.dumps(normalized_kinds) if normalized_kinds is not None else None
+    kinds_provided = event_kinds is not _PROFILE_EVENT_UNSET
+    normalized_kinds = (
+        _normalize_event_kinds(event_kinds) if kinds_provided else None
+    )
+    kinds_json = (
+        json.dumps(normalized_kinds)
+        if kinds_provided and normalized_kinds is not None
+        else None
+    )
     include_children_flag = 1 if include_children else 0
     wake_agent_flag = 0 if wake_agent is False else 1
     enabled_flag = 0 if enabled is False else 1
@@ -6560,7 +6571,7 @@ def add_profile_event_sub(
 
         sets: list[str] = []
         params: list[Any] = []
-        if event_kinds is not None:
+        if kinds_provided:
             sets.append("event_kinds = ?")
             params.append(kinds_json)
         if include_children is not None:
