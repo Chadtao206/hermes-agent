@@ -52,6 +52,22 @@ for the full pattern (Template Buttons postback at 45s, `RequestCache`
 state machine, `interrupt_session_activity` override for `/stop`
 orphans) and the developer-guide page for the prose walkthrough.
 
+**Sibling adapters that share behavior.** When a single platform has
+two transport modes the user picks between — unofficial vs official
+APIs, polling vs websocket, library A vs library B — the right
+structure is two adapters that share a behavior mixin. WhatsApp does
+this: `gateway/platforms/whatsapp.py` (Baileys bridge) and
+`gateway/platforms/whatsapp_cloud.py` (Meta Cloud API) both inherit
+from `WhatsAppBehaviorMixin` in `gateway/platforms/whatsapp_common.py`.
+The mixin owns gating, allow-lists, mention parsing, broadcast
+filters, and the WhatsApp-flavored markdown conversion — everything
+that's platform-protocol-agnostic. Each adapter owns its transport.
+Both register distinct `Platform.*` enum values so the gateway can run
+both simultaneously against different phone numbers. The mixin must
+come **first** in the bases list — `class WhatsAppAdapter(Mixin,
+BasePlatformAdapter)` — so the mixin's `format_message` overrides
+`BasePlatformAdapter`'s generic default.
+
 See `plugins/platforms/irc/`, `plugins/platforms/teams/`, and
 `plugins/platforms/google_chat/` for complete working examples, and
 `website/docs/developer-guide/adding-platform-adapters.md` for the full
