@@ -18,8 +18,10 @@ Phase scope (this file evolves across phases):
 - Phase 3 — X-Hub-Signature-256 HMAC verification (raw body, constant-time)
             + wamid replay protection + dispatch via handle_message. Phase 3
             adapter is end-to-end usable for text DMs.
-- Phase 4 — media upload + send (image/video/audio/document) and inbound
-            media download via the Graph media endpoint.
+- Phase 4 — media upload + send (image/video/audio/document), inbound
+            media download via the Graph media endpoint, voice-note opus
+            conversion via ffmpeg with graceful MP3 fallback when ffmpeg
+            isn't on PATH. Document text injection for readable types.
 - Phase 5 — 24-hour conversation window + template fallback.
 
 Required env vars to enable the adapter:
@@ -39,10 +41,15 @@ Optional / Phase-3+:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
+import mimetypes
+import os
+import shutil
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
@@ -67,8 +74,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    SUPPORTED_DOCUMENT_TYPES,
 )
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +92,72 @@ GRAPH_API_BASE = "https://graph.facebook.com"
 # delivery within minutes, not days. 5000 entries with FIFO eviction is
 # plenty for normal traffic and bounds memory.
 WAMID_DEDUP_CACHE_SIZE = 5000
+
+# Per-type size caps documented by Meta for the Cloud API /media endpoint.
+# These are the hard limits; we refuse uploads above them with a clean
+# error instead of round-tripping to Graph just to be rejected.
+# https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media
+_MEDIA_SIZE_LIMITS = {
+    "image": 5 * 1024 * 1024,        # 5 MB (JPEG, PNG)
+    "video": 16 * 1024 * 1024,       # 16 MB
+    "audio": 16 * 1024 * 1024,       # 16 MB (MP3, AAC, AMR, OGG opus)
+    "document": 100 * 1024 * 1024,   # 100 MB
+    "sticker": 100 * 1024,           # 100 KB animated, 500 KB static
+}
+
+# Default mime types when we can't guess from the path's extension.
+_DEFAULT_MIME = {
+    "image": "image/jpeg",
+    "video": "video/mp4",
+    "audio": "audio/mpeg",
+    "document": "application/octet-stream",
+    "sticker": "image/webp",
+}
+
+# ffmpeg location at import time. ``shutil.which`` honours PATHEXT on
+# Windows so a user's ``ffmpeg.exe`` is picked up. None means MP3 voice
+# falls back to "audio file attachment" rendering in WhatsApp.
+_FFMPEG_PATH = shutil.which("ffmpeg")
+
+# Python's mimetypes module returns RFC-correct but real-world-uncommon
+# extensions for some types (audio/ogg → .oga since RFC 5334; audio/mp4
+# → .mp4 instead of the de-facto .m4a for voice notes). Our downstream
+# STT pipeline whitelists the common-in-the-wild extensions, so override
+# the few Meta sends that don't match those defaults.
+_WHATSAPP_MIME_EXTENSION_OVERRIDES: Dict[str, str] = {
+    # WhatsApp voice notes — opus codec inside an Ogg container.
+    "audio/ogg": ".ogg",
+    "audio/x-opus+ogg": ".ogg",
+    "audio/opus": ".ogg",
+    # iOS voice memos — AAC inside an MP4 container; STT tools expect .m4a.
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    # Image — mimetypes occasionally returns .jpe (legacy IANA) instead
+    # of .jpg, which trips up tools that switch on extension.
+    "image/jpeg": ".jpg",
+}
+
+
+def _ext_for_mime(mime: str) -> Optional[str]:
+    """Resolve a mime type to the file extension we want on disk.
+
+    Consults the override map first so types like ``audio/ogg`` produce
+    the extension downstream tools actually accept (``.ogg``, not the
+    technically-correct-but-broken ``.oga``). Falls back to Python's
+    ``mimetypes.guess_extension`` for anything we haven't pinned.
+    """
+    if not mime:
+        return None
+    primary = mime.split(";")[0].strip().lower()
+    override = _WHATSAPP_MIME_EXTENSION_OVERRIDES.get(primary)
+    if override:
+        return override
+    return mimetypes.guess_extension(primary) or None
+
+
+# Inbound media cache lives under the user's hermes dir so it survives
+# restarts and gateway reloads — same convention the Baileys bridge uses.
+_INBOUND_MEDIA_CACHE = Path(get_hermes_dir("platforms/whatsapp_cloud/media", "whatsapp_cloud/media"))
 
 
 def check_whatsapp_cloud_requirements() -> bool:
@@ -161,6 +236,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._duplicate_count: int = 0
         self._accepted_count: int = 0
         self._rejected_signature_count: int = 0
+
+        # One-shot flags for warnings that would otherwise spam the log.
+        self._warned_no_ffmpeg: bool = False
 
         # Runtime
         self._runner = None
@@ -351,6 +429,424 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # cached on the MessageEvent, not here.
         return {"name": chat_id, "type": "dm"}
 
+    # ------------------------------------------------------------------ outbound media
+    async def _upload_media(
+        self,
+        file_path: str,
+        media_kind: str,
+        mime_type: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Upload a local file to the Graph /media endpoint.
+
+        Returns ``(media_id, None)`` on success, ``(None, error_string)``
+        on failure. Two-step send: this gets the id, then ``_send_media``
+        references it. Used when we have a local file and no public URL.
+
+        ``media_kind`` is one of "image", "video", "audio", "document",
+        "sticker" — selects size cap + default mime fallback.
+        """
+        if self._http_client is None:
+            return None, "Not connected"
+        if not os.path.exists(file_path):
+            return None, f"File not found: {file_path}"
+
+        size = os.path.getsize(file_path)
+        cap = _MEDIA_SIZE_LIMITS.get(media_kind, _MEDIA_SIZE_LIMITS["document"])
+        if size > cap:
+            return None, (
+                f"File {os.path.basename(file_path)} is {size} bytes; "
+                f"Cloud API {media_kind} cap is {cap} bytes"
+            )
+
+        if not mime_type:
+            mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = _DEFAULT_MIME.get(media_kind, "application/octet-stream")
+
+        url = self._graph_url("media")
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+        try:
+            with open(file_path, "rb") as fh:
+                files = {
+                    "file": (os.path.basename(file_path), fh, mime_type),
+                    "messaging_product": (None, "whatsapp"),
+                    "type": (None, mime_type),
+                }
+                resp = await self._http_client.post(url, headers=headers, files=files)
+        except Exception as exc:
+            logger.exception("[whatsapp_cloud] media upload failed")
+            return None, str(exc)
+
+        if resp.status_code != 200:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"raw": resp.text[:500]}
+            return None, self._format_graph_error(body, resp.status_code)
+
+        try:
+            data = resp.json()
+            media_id = data.get("id")
+        except Exception:
+            media_id = None
+        if not media_id:
+            return None, "Upload response missing 'id'"
+        return media_id, None
+
+    async def _send_media(
+        self,
+        chat_id: str,
+        media_kind: str,
+        *,
+        media_id: Optional[str] = None,
+        media_link: Optional[str] = None,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """POST a media message referencing either an uploaded media_id or
+        a public ``link``.
+
+        Exactly one of ``media_id`` or ``media_link`` must be set. Captions
+        and filenames are passed through where Meta accepts them (caption
+        on image/video/document; filename on document only).
+        """
+        if self._http_client is None:
+            return SendResult(success=False, error="Not connected")
+        if bool(media_id) == bool(media_link):
+            return SendResult(
+                success=False,
+                error="Exactly one of media_id or media_link must be set",
+            )
+
+        url = self._graph_url("messages")
+        headers = {
+            "Authorization": f"Bearer {self._access_token}",
+            "Content-Type": "application/json",
+        }
+
+        media_block: Dict[str, Any] = {}
+        if media_id:
+            media_block["id"] = media_id
+        else:
+            media_block["link"] = media_link
+        if caption and media_kind in {"image", "video", "document"}:
+            media_block["caption"] = caption
+        if filename and media_kind == "document":
+            media_block["filename"] = filename
+
+        payload: Dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": chat_id,
+            "type": media_kind,
+            media_kind: media_block,
+        }
+        if reply_to:
+            payload["context"] = {"message_id": reply_to}
+
+        try:
+            resp = await self._http_client.post(url, headers=headers, json=payload)
+        except Exception as exc:
+            logger.exception("[whatsapp_cloud] media send failed")
+            return SendResult(success=False, error=str(exc))
+
+        if resp.status_code != 200:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"raw": resp.text[:500]}
+            error_msg = self._format_graph_error(body, resp.status_code)
+            logger.warning(
+                "[whatsapp_cloud] media send rejected (status=%d, kind=%s): %s",
+                resp.status_code, media_kind, error_msg,
+            )
+            return SendResult(success=False, error=error_msg)
+
+        try:
+            data = resp.json()
+            ids = data.get("messages") or []
+            wamid = ids[0].get("id") if ids else None
+        except Exception:
+            wamid = None
+        return SendResult(success=True, message_id=wamid)
+
+    async def _send_media_from_path_or_link(
+        self,
+        chat_id: str,
+        source: str,
+        media_kind: str,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> SendResult:
+        """Smart dispatcher: HTTPS URL → ``link`` send; local path → upload + ``id`` send.
+
+        Prefers the ``link`` path when possible (one fewer Graph round
+        trip). Meta fetches from the URL themselves. Used as the common
+        backend for ``send_image`` / ``send_video`` / etc. — keeps the
+        public method bodies thin.
+        """
+        if source.startswith(("http://", "https://")):
+            return await self._send_media(
+                chat_id,
+                media_kind,
+                media_link=source,
+                caption=caption,
+                filename=filename,
+                reply_to=reply_to,
+            )
+        media_id, err = await self._upload_media(source, media_kind, mime_type)
+        if err:
+            return SendResult(success=False, error=err)
+        return await self._send_media(
+            chat_id,
+            media_kind,
+            media_id=media_id,
+            caption=caption,
+            filename=filename,
+            reply_to=reply_to,
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an image by public URL. Prefers Meta's ``link`` mode.
+
+        ``**kwargs`` absorbs platform-agnostic args the base class passes
+        (e.g. ``metadata``) that the Cloud API doesn't have a use for.
+        Mirrors send_image_file / send_video / send_voice / send_document.
+        """
+        return await self._send_media_from_path_or_link(
+            chat_id, image_url, "image", caption=caption, reply_to=reply_to
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file via two-step upload + id."""
+        return await self._send_media_from_path_or_link(
+            chat_id, image_path, "image", caption=caption, reply_to=reply_to
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video. Local path → upload; HTTPS URL → link mode."""
+        return await self._send_media_from_path_or_link(
+            chat_id, video_path, "video", caption=caption, reply_to=reply_to
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an audio file as a WhatsApp voice message.
+
+        WhatsApp renders ``audio/ogg; codecs=opus`` as the green
+        voice-note bubble; other audio types (MP3, AAC, etc.) appear as
+        a generic audio attachment. Hermes TTS produces MP3, so we try
+        ffmpeg conversion to opus first and fall back to sending the
+        MP3 as-is when ffmpeg is unavailable.
+        """
+        source = audio_path
+        mime_type: Optional[str] = None
+
+        is_local_mp3 = (
+            not audio_path.startswith(("http://", "https://"))
+            and audio_path.lower().endswith(".mp3")
+            and os.path.exists(audio_path)
+        )
+        if is_local_mp3:
+            opus_path = await self._convert_to_opus(audio_path)
+            if opus_path:
+                source = opus_path
+                mime_type = "audio/ogg; codecs=opus"
+            else:
+                # Will deliver as MP3 attachment, not voice bubble.
+                # Warn-once is logged inside _convert_to_opus.
+                mime_type = "audio/mpeg"
+
+        return await self._send_media_from_path_or_link(
+            chat_id, source, "audio",
+            caption=caption, reply_to=reply_to, mime_type=mime_type,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document attachment with optional filename + caption."""
+        return await self._send_media_from_path_or_link(
+            chat_id, file_path, "document",
+            caption=caption,
+            filename=file_name or os.path.basename(file_path),
+            reply_to=reply_to,
+        )
+
+    # ------------------------------------------------------------------ opus conversion
+    async def _convert_to_opus(self, mp3_path: str) -> Optional[str]:
+        """Convert an MP3 to ``audio/ogg; codecs=opus`` for voice bubbles.
+
+        Returns the path to the converted file, or None if ffmpeg is
+        missing / conversion fails (caller falls back to sending the
+        original MP3 as an audio file).
+
+        ``-application voip`` tunes the opus encoder for speech.
+        ``-b:a 32k -vbr on`` matches the bitrate WhatsApp produces for
+        native voice notes (small files, good intelligibility).
+        """
+        if not _FFMPEG_PATH:
+            self._warn_once_no_ffmpeg()
+            return None
+
+        out_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _FFMPEG_PATH, "-y", "-i", mp3_path,
+                "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                "-application", "voip", out_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not Path(out_path).exists():
+                logger.error(
+                    "[whatsapp_cloud] ffmpeg opus conversion failed "
+                    "(returncode=%s): %s",
+                    proc.returncode,
+                    (stderr or b"").decode("utf-8", errors="replace")[:500],
+                )
+                return None
+            return out_path
+        except Exception:
+            logger.exception("[whatsapp_cloud] ffmpeg subprocess raised")
+            return None
+
+    def _warn_once_no_ffmpeg(self) -> None:
+        if self._warned_no_ffmpeg:
+            return
+        self._warned_no_ffmpeg = True
+        logger.warning(
+            "[whatsapp_cloud] ffmpeg not found on PATH — voice messages will "
+            "be delivered as MP3 audio attachments instead of native voice "
+            "notes (green waveform bubble). Install ffmpeg to enable: "
+            "Windows `winget install Gyan.FFmpeg`, macOS `brew install ffmpeg`, "
+            "Linux package manager."
+        )
+
+    # ------------------------------------------------------------------ inbound media
+    async def _download_media_to_cache(
+        self,
+        media_id: str,
+        *,
+        ext_hint: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Two-step Graph media download: ``GET /<id>`` → temp URL → bytes.
+
+        Returns ``(local_path, mime_type)`` on success. ``mime_type``
+        falls back to what Graph reports in the metadata response.
+        Returns ``(None, None)`` on any failure (logged).
+
+        The temporary URL from step 1 is signed and expires in ~5
+        minutes; we download immediately and never persist the URL.
+        """
+        if self._http_client is None:
+            return None, None
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+
+        # Step 1 — metadata (gives us a temporary signed URL + mime)
+        try:
+            meta_resp = await self._http_client.get(
+                f"{GRAPH_API_BASE}/{self._api_version}/{media_id}",
+                headers=headers,
+            )
+        except Exception:
+            logger.exception(
+                "[whatsapp_cloud] media metadata fetch raised (id=%s)", media_id
+            )
+            return None, None
+        if meta_resp.status_code != 200:
+            logger.warning(
+                "[whatsapp_cloud] media metadata fetch failed (id=%s, status=%d)",
+                media_id, meta_resp.status_code,
+            )
+            return None, None
+
+        try:
+            meta = meta_resp.json()
+        except Exception:
+            return None, None
+        temp_url = meta.get("url")
+        mime = meta.get("mime_type") or ""
+        if not temp_url:
+            return None, None
+
+        # Step 2 — bytes (auth required even though URL is signed; Meta
+        # documents this explicitly — the URL alone is not enough).
+        try:
+            blob_resp = await self._http_client.get(temp_url, headers=headers)
+        except Exception:
+            logger.exception(
+                "[whatsapp_cloud] media bytes fetch raised (id=%s)", media_id
+            )
+            return None, None
+        if blob_resp.status_code != 200:
+            logger.warning(
+                "[whatsapp_cloud] media bytes fetch failed (id=%s, status=%d)",
+                media_id, blob_resp.status_code,
+            )
+            return None, None
+
+        # Decide the extension. Prefer the override map so audio/ogg
+        # produces .ogg (not the technically-correct-but-broken .oga
+        # mimetypes returns by default). Fall back to ext_hint then
+        # ``.bin`` for unknown types.
+        ext = ext_hint
+        if not ext and mime:
+            ext = _ext_for_mime(mime)
+        if not ext:
+            ext = ".bin"
+
+        _INBOUND_MEDIA_CACHE.mkdir(parents=True, exist_ok=True)
+        out_path = _INBOUND_MEDIA_CACHE / f"{media_id}{ext}"
+        try:
+            out_path.write_bytes(blob_resp.content)
+        except OSError:
+            logger.exception(
+                "[whatsapp_cloud] failed to write cached media (id=%s)", media_id
+            )
+            return None, None
+
+        return str(out_path), mime or None
+
+
     # ------------------------------------------------------------------ inbound
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response(
@@ -361,6 +857,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "webhook_path": self._webhook_path,
                 "verify_token_configured": bool(self._verify_token),
                 "app_secret_configured": bool(self._app_secret),
+                "ffmpeg_present": _FFMPEG_PATH is not None,
                 "accepted": self._accepted_count,
                 "duplicates": self._duplicate_count,
                 "rejected_signature": self._rejected_signature_count,
@@ -559,7 +1056,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             wamid,
                         )
                         continue
-                    event = self._build_message_event_from_cloud(
+                    event = await self._build_message_event_from_cloud(
                         raw_message, contacts_by_waid, metadata
                     )
                     if event is None:
@@ -585,7 +1082,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             status.get("id"),
                         )
 
-    def _build_message_event_from_cloud(
+    async def _build_message_event_from_cloud(
         self,
         raw_message: Dict[str, Any],
         contacts_by_waid: Dict[str, str],
@@ -593,13 +1090,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     ) -> Optional[MessageEvent]:
         """Convert a Cloud-API message object into a Hermes MessageEvent.
 
-        Phase 3 only handles ``type: "text"`` end-to-end. Non-text types
-        produce a MessageEvent with the appropriate ``MessageType`` and
-        empty media list — Phase 4 will populate media URLs by issuing
-        ``GET /{media_id}`` against the Graph API to download the binary.
+        Phase 4 expands beyond text to download inbound media (image,
+        video, audio/voice, document, sticker) by ``media_id`` via the
+        two-step Graph endpoint. Cached files are populated into
+        ``media_urls`` / ``media_types`` so the agent's vision and STT
+        layers see them. Text-readable documents (.txt, .md, .json,
+        source code, etc.) are read and prepended to the message body
+        up to 100KB — same heuristic the Baileys adapter uses.
 
-        Returns None if the message is filtered out by the mixin's gating
-        (broadcast filter, allow-list, mention requirements).
+        Returns None if the message is filtered out by the mixin's
+        gating (broadcast filter, allow-list, mention requirements).
         """
         msg_type_str = str(raw_message.get("type") or "text").lower()
         body = ""
@@ -616,6 +1116,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 # button_reply / list_reply both expose ``title``
                 inner = inter.get("button_reply") or inter.get("list_reply") or {}
                 body = str(inner.get("title") or "")
+        elif msg_type_str in {"image", "video", "audio", "voice", "document", "sticker"}:
+            # Captions live on image / video / document. Other media types
+            # don't carry a caption in Meta's spec, but be defensive.
+            inner = raw_message.get(msg_type_str) or {}
+            body = str(inner.get("caption") or "")
 
         message_type = {
             "text": MessageType.TEXT,
@@ -649,6 +1154,73 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not self._should_process_message(gating_data):
             return None
 
+        # Download media if this is a non-text message type. Inbound media
+        # arrives as ``{type: "image", image: {id, mime_type, sha256, ...}}``.
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        if msg_type_str in {"image", "video", "audio", "voice", "document", "sticker"}:
+            inner = raw_message.get(msg_type_str) or {}
+            media_id = str(inner.get("id") or "").strip()
+            inbound_mime = str(inner.get("mime_type") or "").strip()
+            if media_id:
+                ext_hint = None
+                if inbound_mime:
+                    ext_hint = _ext_for_mime(inbound_mime)
+                local_path, dl_mime = await self._download_media_to_cache(
+                    media_id, ext_hint=ext_hint
+                )
+                if local_path:
+                    media_urls.append(local_path)
+                    media_types.append(dl_mime or inbound_mime or "application/octet-stream")
+                    logger.info(
+                        "[whatsapp_cloud] cached inbound %s media: %s",
+                        msg_type_str, local_path,
+                    )
+                else:
+                    logger.warning(
+                        "[whatsapp_cloud] failed to download inbound %s (id=%s) — "
+                        "agent will see message metadata but not the binary",
+                        msg_type_str, media_id,
+                    )
+                # Document: original filename for the agent's UX.
+                if msg_type_str == "document":
+                    fname = str(inner.get("filename") or "").strip()
+                    if fname and not body:
+                        body = f"[Document: {fname}]"
+
+        # For text-readable documents, inject the file content directly into
+        # the message body so the agent can reason about it without a
+        # separate read_file call. Same heuristic the Baileys adapter uses.
+        # 100KB cap matches Telegram/Discord/Slack.
+        MAX_TEXT_INJECT_BYTES = 100 * 1024
+        if msg_type_str == "document" and media_urls:
+            for doc_path in media_urls:
+                ext = Path(doc_path).suffix.lower()
+                if ext in {
+                    ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
+                    ".log", ".py", ".js", ".ts", ".html", ".css",
+                }:
+                    try:
+                        file_size = Path(doc_path).stat().st_size
+                        if file_size > MAX_TEXT_INJECT_BYTES:
+                            logger.info(
+                                "[whatsapp_cloud] skipping text injection for %s "
+                                "(%d bytes > %d)",
+                                doc_path, file_size, MAX_TEXT_INJECT_BYTES,
+                            )
+                            continue
+                        content = Path(doc_path).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        display_name = Path(doc_path).name
+                        injection = f"[Content of {display_name}]:\n{content}"
+                        body = f"{injection}\n\n{body}" if body else injection
+                    except OSError:
+                        logger.exception(
+                            "[whatsapp_cloud] failed to read document text: %s",
+                            doc_path,
+                        )
+
         # context.id is set when the user replied to one of our messages.
         context = raw_message.get("context") or {}
         reply_to_id = str(context.get("id") or "").strip() or None
@@ -670,4 +1242,6 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             raw_message=raw_message,
             message_id=str(raw_message.get("id") or "") or None,
             reply_to_message_id=reply_to_id,
+            media_urls=media_urls,
+            media_types=media_types,
         )

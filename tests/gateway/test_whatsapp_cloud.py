@@ -66,6 +66,9 @@ def _make_adapter(**overrides):
     adapter._accepted_count = 0
     adapter._rejected_signature_count = 0
 
+    # Phase 4 state — one-shot warnings.
+    adapter._warned_no_ffmpeg = False
+
     # BasePlatformAdapter contract — minimum to keep send/lifecycle happy
     adapter._running = True
     adapter._message_handler = None
@@ -795,6 +798,10 @@ class TestHealth:
         assert body["accepted"] == 0
         assert body["duplicates"] == 0
         assert body["rejected_signature"] == 0
+        # ffmpeg_present is True/False depending on the test host;
+        # just verify the key is exposed.
+        assert "ffmpeg_present" in body
+        assert isinstance(body["ffmpeg_present"], bool)
 
     @pytest.mark.asyncio
     async def test_health_flags_missing_secrets(self):
@@ -848,3 +855,631 @@ class TestMixinInherited:
             "isGroup": False,
             "body": "x",
         }) is False
+
+
+# ---------------------------------------------------------------------------
+# Outbound media — link mode + upload mode (Phase 4)
+# ---------------------------------------------------------------------------
+
+import os as _os
+import tempfile as _tempfile
+from unittest.mock import patch as _patch
+
+
+def _mock_upload_response(media_id: str = "media_abc123"):
+    """Graph /media POST response shape."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json = MagicMock(return_value={"id": media_id})
+    resp.text = json.dumps({"id": media_id})
+    return resp
+
+
+def _mock_message_response(wamid: str = "wamid.outbound1"):
+    """Graph /messages POST response shape."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json = MagicMock(return_value={"messages": [{"id": wamid}]})
+    resp.text = json.dumps({"messages": [{"id": wamid}]})
+    return resp
+
+
+def _tmpfile(suffix: str = ".jpg", content: bytes = b"\xff\xd8\xff\xe0") -> str:
+    """Write a small temp file and return its path. Caller cleans up."""
+    fd, path = _tempfile.mkstemp(suffix=suffix)
+    with _os.fdopen(fd, "wb") as fh:
+        fh.write(content)
+    return path
+
+
+class TestSendImage:
+    """send_image — public URL takes the link path; local file uploads first."""
+
+    @pytest.mark.asyncio
+    async def test_send_image_link_mode_skips_upload(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_message_response())
+
+        result = await adapter.send_image("15551234567", "https://cdn.example.com/cat.jpg")
+
+        assert result.success is True
+        # Exactly one POST — straight to /messages, no /media upload
+        assert adapter._http_client.post.call_count == 1
+        url = adapter._http_client.post.call_args.args[0]
+        assert url.endswith("/messages")
+        payload = adapter._http_client.post.call_args.kwargs["json"]
+        assert payload["type"] == "image"
+        assert payload["image"] == {"link": "https://cdn.example.com/cat.jpg"}
+
+    @pytest.mark.asyncio
+    async def test_send_image_local_path_uploads_then_sends(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_upload_response("media_uploaded_id"),
+            _mock_message_response(),
+        ])
+        path = _tmpfile(".jpg")
+        try:
+            result = await adapter.send_image_file("15551234567", path)
+            assert result.success is True
+            assert adapter._http_client.post.call_count == 2
+
+            upload_url = adapter._http_client.post.call_args_list[0].args[0]
+            send_url = adapter._http_client.post.call_args_list[1].args[0]
+            assert upload_url.endswith("/media")
+            assert send_url.endswith("/messages")
+
+            send_payload = adapter._http_client.post.call_args_list[1].kwargs["json"]
+            assert send_payload["image"] == {"id": "media_uploaded_id"}
+        finally:
+            _os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_send_image_caption_attached(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_message_response())
+
+        await adapter.send_image(
+            "15551234567", "https://cdn.example.com/cat.jpg", caption="cute cat"
+        )
+        payload = adapter._http_client.post.call_args.kwargs["json"]
+        assert payload["image"]["caption"] == "cute cat"
+
+    @pytest.mark.asyncio
+    async def test_send_image_oversize_rejected_locally(self):
+        """Don't round-trip to Graph just to be told the file's too big."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+        # 6MB > 5MB image cap
+        path = _tmpfile(".jpg", content=b"x" * (6 * 1024 * 1024))
+        try:
+            result = await adapter.send_image_file("15551234567", path)
+            assert result.success is False
+            assert "5242880" in result.error or "cap is" in result.error
+            # Never even POSTed
+            adapter._http_client.post.assert_not_called()
+        finally:
+            _os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_send_image_missing_local_file_returns_failure(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock()
+
+        result = await adapter.send_image_file(
+            "15551234567", "/nonexistent/path/foo.jpg"
+        )
+        assert result.success is False
+        assert "File not found" in result.error
+        adapter._http_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_image_upload_failure_returns_failure(self):
+        adapter = _make_adapter()
+        # First call (upload) fails with a Graph error
+        upload_fail = MagicMock()
+        upload_fail.status_code = 400
+        upload_fail.json = MagicMock(return_value={
+            "error": {"code": 100, "message": "Bad media"}
+        })
+        upload_fail.text = '{"error":{"code":100,"message":"Bad media"}}'
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=upload_fail)
+
+        path = _tmpfile(".jpg")
+        try:
+            result = await adapter.send_image_file("15551234567", path)
+            assert result.success is False
+            assert "graph error 100" in result.error
+            # Only the upload call — never reached /messages
+            assert adapter._http_client.post.call_count == 1
+        finally:
+            _os.unlink(path)
+
+
+class TestSendVideo:
+    @pytest.mark.asyncio
+    async def test_send_video_link_mode(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_message_response())
+
+        await adapter.send_video("15551234567", "https://cdn.example.com/v.mp4", caption="clip")
+        payload = adapter._http_client.post.call_args.kwargs["json"]
+        assert payload["type"] == "video"
+        assert payload["video"]["link"] == "https://cdn.example.com/v.mp4"
+        assert payload["video"]["caption"] == "clip"
+
+
+class TestSendMethodsAcceptBaseClassKwargs:
+    """Regression: every send_* method must absorb ``metadata=`` (and any
+    other future kwargs) without raising TypeError.
+
+    base.BasePlatformAdapter.send_multiple_images and friends pass
+    ``metadata=...`` to send_image; if a subclass forgets ``**kwargs``,
+    the agent crashes mid-send_multiple_images instead of just sending
+    the image. This test guards against that for every Cloud send_*
+    surface.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_image_accepts_metadata(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_message_response())
+        # Should not raise TypeError.
+        result = await adapter.send_image(
+            "15551234567", "https://cdn.example.com/x.jpg",
+            metadata={"trace_id": "abc"},
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_accepts_metadata(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_upload_response(),
+            _mock_message_response(),
+        ])
+        path = _tmpfile(".jpg")
+        try:
+            result = await adapter.send_image_file(
+                "15551234567", path, metadata={"x": 1},
+            )
+            assert result.success is True
+        finally:
+            _os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_send_video_accepts_metadata(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_message_response())
+        result = await adapter.send_video(
+            "15551234567", "https://cdn.example.com/v.mp4",
+            metadata={"x": 1},
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_voice_accepts_metadata(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=_mock_message_response())
+        result = await adapter.send_voice(
+            "15551234567", "https://cdn.example.com/a.ogg",
+            metadata={"x": 1},
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_document_accepts_metadata(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_upload_response(),
+            _mock_message_response(),
+        ])
+        path = _tmpfile(".pdf", content=b"%PDF")
+        try:
+            result = await adapter.send_document(
+                "15551234567", path, metadata={"x": 1},
+            )
+            assert result.success is True
+        finally:
+            _os.unlink(path)
+
+
+class TestSendDocument:
+    @pytest.mark.asyncio
+    async def test_send_document_filename_attached(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_upload_response("doc_id"),
+            _mock_message_response(),
+        ])
+        path = _tmpfile(".pdf", content=b"%PDF-1.4 ...")
+        try:
+            await adapter.send_document(
+                "15551234567", path, caption="Q3 report",
+                file_name="report.pdf",
+            )
+            send_payload = adapter._http_client.post.call_args_list[1].kwargs["json"]
+            assert send_payload["type"] == "document"
+            assert send_payload["document"]["id"] == "doc_id"
+            assert send_payload["document"]["caption"] == "Q3 report"
+            assert send_payload["document"]["filename"] == "report.pdf"
+        finally:
+            _os.unlink(path)
+
+
+class TestSendVoice:
+    """MP3 voice with ffmpeg present -> opus; without ffmpeg -> MP3 fallback."""
+
+    @pytest.mark.asyncio
+    async def test_send_voice_no_ffmpeg_falls_back_to_mp3(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_upload_response("audio_id"),
+            _mock_message_response(),
+        ])
+        # Simulate ffmpeg absent — adapter._convert_to_opus returns None
+        adapter._convert_to_opus = AsyncMock(return_value=None)
+
+        path = _tmpfile(".mp3", content=b"ID3\x04\x00\x00\x00\x00")
+        try:
+            result = await adapter.send_voice("15551234567", path)
+            assert result.success is True
+            # Adapter still uploaded + sent the MP3 as audio
+            assert adapter._http_client.post.call_count == 2
+            send_payload = adapter._http_client.post.call_args_list[1].kwargs["json"]
+            assert send_payload["type"] == "audio"
+            assert send_payload["audio"]["id"] == "audio_id"
+        finally:
+            _os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_ffmpeg_present_uses_opus(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(side_effect=[
+            _mock_upload_response("voice_id"),
+            _mock_message_response(),
+        ])
+        # Pretend ffmpeg conversion succeeded by returning a fake opus path.
+        opus_path = _tmpfile(".ogg", content=b"OggS")
+        adapter._convert_to_opus = AsyncMock(return_value=opus_path)
+
+        mp3_path = _tmpfile(".mp3", content=b"ID3")
+        try:
+            result = await adapter.send_voice("15551234567", mp3_path)
+            assert result.success is True
+            # Conversion was invoked with the original MP3
+            uploaded_path = adapter._convert_to_opus.call_args.args[0]
+            assert uploaded_path == mp3_path
+            send_payload = adapter._http_client.post.call_args_list[1].kwargs["json"]
+            assert send_payload["type"] == "audio"
+        finally:
+            _os.unlink(mp3_path)
+            if _os.path.exists(opus_path):
+                _os.unlink(opus_path)
+
+    @pytest.mark.asyncio
+    async def test_warn_once_no_ffmpeg_actually_only_warns_once(self):
+        adapter = _make_adapter()
+        adapter._warned_no_ffmpeg = False
+        adapter._warn_once_no_ffmpeg()
+        assert adapter._warned_no_ffmpeg is True
+        # Second call: no-op (we just verify no exception + flag stays True)
+        adapter._warn_once_no_ffmpeg()
+        assert adapter._warned_no_ffmpeg is True
+
+
+# ---------------------------------------------------------------------------
+# Inbound media — Graph two-step download (Phase 4)
+# ---------------------------------------------------------------------------
+
+class TestDownloadMedia:
+    """Two-step Graph media download: meta -> temp URL -> bytes."""
+
+    @pytest.mark.asyncio
+    async def test_two_step_download_writes_cache_file(self, tmp_path):
+        from gateway.platforms import whatsapp_cloud as wac
+
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+
+        # Step 1 — metadata returns temp URL + mime
+        meta_resp = MagicMock(status_code=200)
+        meta_resp.json = MagicMock(return_value={
+            "url": "https://lookaside.fbsbx.com/whatsapp/m/...",
+            "mime_type": "image/jpeg",
+            "sha256": "abc",
+            "file_size": 12345,
+            "id": "media_xyz",
+            "messaging_product": "whatsapp",
+        })
+        # Step 2 — bytes
+        blob_resp = MagicMock(status_code=200, content=b"\xff\xd8\xff\xe0jpegdata")
+
+        adapter._http_client.get = AsyncMock(side_effect=[meta_resp, blob_resp])
+
+        with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
+            local_path, mime = await adapter._download_media_to_cache("media_xyz")
+
+        assert mime == "image/jpeg"
+        assert local_path is not None
+        assert _os.path.exists(local_path)
+        assert _os.path.basename(local_path).startswith("media_xyz")
+        assert _os.path.basename(local_path).endswith(".jpg")
+        with open(local_path, "rb") as fh:
+            assert fh.read() == b"\xff\xd8\xff\xe0jpegdata"
+
+    @pytest.mark.asyncio
+    async def test_metadata_failure_returns_none(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        meta_fail = MagicMock(status_code=404)
+        meta_fail.json = MagicMock(return_value={"error": {"code": 100}})
+        adapter._http_client.get = AsyncMock(return_value=meta_fail)
+
+        local_path, mime = await adapter._download_media_to_cache("missing")
+        assert local_path is None and mime is None
+
+    @pytest.mark.asyncio
+    async def test_bytes_failure_returns_none(self, tmp_path):
+        from gateway.platforms import whatsapp_cloud as wac
+
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        meta_resp = MagicMock(status_code=200)
+        meta_resp.json = MagicMock(return_value={
+            "url": "https://lookaside.fbsbx.com/...",
+            "mime_type": "image/jpeg",
+        })
+        blob_fail = MagicMock(status_code=403, content=b"")
+        adapter._http_client.get = AsyncMock(side_effect=[meta_resp, blob_fail])
+
+        with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
+            local_path, mime = await adapter._download_media_to_cache("x")
+        assert local_path is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_includes_auth_header(self):
+        adapter = _make_adapter(access_token="bearer-tok")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(return_value=MagicMock(status_code=500))
+        await adapter._download_media_to_cache("x")
+        headers = adapter._http_client.get.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer bearer-tok"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mime,expected_ext", [
+        # Regression for the ".oga vs .ogg" voice-note bug — Python's
+        # mimetypes module returns the RFC-correct .oga which downstream
+        # STT pipelines reject.
+        ("audio/ogg", ".ogg"),
+        ("audio/ogg; codecs=opus", ".ogg"),
+        ("audio/x-opus+ogg", ".ogg"),
+        ("audio/opus", ".ogg"),
+        # iOS voice memos arrive as audio/mp4 — must become .m4a, not .mp4.
+        ("audio/mp4", ".m4a"),
+        ("audio/x-m4a", ".m4a"),
+        # JPEG should never land as .jpe (legacy IANA).
+        ("image/jpeg", ".jpg"),
+    ])
+    async def test_extension_overrides_for_real_world_mimes(self, tmp_path, mime, expected_ext):
+        from gateway.platforms import whatsapp_cloud as wac
+
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        meta_resp = MagicMock(status_code=200)
+        meta_resp.json = MagicMock(return_value={
+            "url": "https://lookaside.fbsbx.com/test",
+            "mime_type": mime,
+        })
+        blob_resp = MagicMock(status_code=200, content=b"x")
+        adapter._http_client.get = AsyncMock(side_effect=[meta_resp, blob_resp])
+
+        with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
+            local_path, _ = await adapter._download_media_to_cache("media_x")
+
+        assert local_path is not None
+        assert local_path.endswith(expected_ext), (
+            f"mime {mime!r} should map to {expected_ext} but got {local_path}"
+        )
+
+
+class TestInboundMediaDispatch:
+    """End-to-end: webhook with image_id -> adapter downloads -> MessageEvent.media_urls populated."""
+
+    @pytest.mark.asyncio
+    async def test_inbound_image_populates_media_urls(self, tmp_path):
+        from gateway.platforms import whatsapp_cloud as wac
+
+        adapter = _make_adapter(app_secret="key")
+        captured: list = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+
+        # Mock the two-step Graph download
+        meta_resp = MagicMock(status_code=200)
+        meta_resp.json = MagicMock(return_value={
+            "url": "https://lookaside.fbsbx.com/whatsapp/m/abc",
+            "mime_type": "image/jpeg",
+        })
+        blob_resp = MagicMock(status_code=200, content=b"\xff\xd8\xff\xe0fake_jpeg")
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(side_effect=[meta_resp, blob_resp])
+
+        # Build an inbound image webhook payload
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "x",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {"phone_number_id": "1"},
+                        "contacts": [{"profile": {"name": "U"}, "wa_id": "1555"}],
+                        "messages": [{
+                            "from": "1555",
+                            "id": "wamid.img1",
+                            "timestamp": "0",
+                            "type": "image",
+                            "image": {
+                                "id": "media_image_abc",
+                                "mime_type": "image/jpeg",
+                                "sha256": "...",
+                                "caption": "look at this",
+                            },
+                        }],
+                    },
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
+            response = await adapter._handle_webhook(
+                _post_request(body, {"X-Hub-Signature-256": sig})
+            )
+
+        assert response.status == 200
+        assert len(captured) == 1
+        event = captured[0]
+        # Caption became the body
+        assert event.text == "look at this"
+        # Cached file path populated
+        assert len(event.media_urls) == 1
+        assert _os.path.exists(event.media_urls[0])
+        assert event.media_types[0] == "image/jpeg"
+        from gateway.platforms.base import MessageType
+        assert event.message_type == MessageType.PHOTO
+
+    @pytest.mark.asyncio
+    async def test_inbound_text_document_injected_into_body(self, tmp_path):
+        """A .txt document should have its content prepended to the body."""
+        from gateway.platforms import whatsapp_cloud as wac
+
+        adapter = _make_adapter(app_secret="key")
+        captured: list = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+
+        text_content = b"hello\nthis is the file\n"
+        meta_resp = MagicMock(status_code=200)
+        meta_resp.json = MagicMock(return_value={
+            "url": "https://lookaside.fbsbx.com/whatsapp/m/doc",
+            "mime_type": "text/plain",
+        })
+        blob_resp = MagicMock(status_code=200, content=text_content)
+        adapter._http_client = MagicMock()
+        adapter._http_client.get = AsyncMock(side_effect=[meta_resp, blob_resp])
+
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "x",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {"phone_number_id": "1"},
+                        "contacts": [{"profile": {"name": "U"}, "wa_id": "1555"}],
+                        "messages": [{
+                            "from": "1555",
+                            "id": "wamid.doc1",
+                            "timestamp": "0",
+                            "type": "document",
+                            "document": {
+                                "id": "media_doc_abc",
+                                "mime_type": "text/plain",
+                                "filename": "notes.txt",
+                            },
+                        }],
+                    },
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
+            await adapter._handle_webhook(
+                _post_request(body, {"X-Hub-Signature-256": sig})
+            )
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert "hello\nthis is the file" in event.text
+        assert "[Content of" in event.text
+        # File still available in media_urls for the agent's other tools
+        assert len(event.media_urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_inbound_image_download_failure_still_dispatches(self, tmp_path):
+        """If the binary fetch fails we still want the agent to see the
+        message metadata + caption — better than silently dropping."""
+        from gateway.platforms import whatsapp_cloud as wac
+
+        adapter = _make_adapter(app_secret="key")
+        captured: list = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        adapter.handle_message = _capture
+        adapter._http_client = MagicMock()
+        # Metadata fetch fails
+        adapter._http_client.get = AsyncMock(return_value=MagicMock(status_code=500))
+
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "x",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {"phone_number_id": "1"},
+                        "contacts": [{"profile": {"name": "U"}, "wa_id": "1555"}],
+                        "messages": [{
+                            "from": "1555",
+                            "id": "wamid.bad_img",
+                            "timestamp": "0",
+                            "type": "image",
+                            "image": {"id": "borked", "mime_type": "image/jpeg"},
+                        }],
+                    },
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+
+        with _patch.object(wac, "_INBOUND_MEDIA_CACHE", tmp_path):
+            response = await adapter._handle_webhook(
+                _post_request(body, {"X-Hub-Signature-256": sig})
+            )
+
+        assert response.status == 200
+        assert len(captured) == 1
+        # Agent gets the event, just with empty media_urls
+        assert captured[0].media_urls == []
