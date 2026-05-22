@@ -420,26 +420,44 @@ def _compute_notifier_health(
         conn,
         db_path=db_path,
         now=as_of,
+        min_last_seen_at=as_of - kanban_db.NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
+        limit=kanban_db.NOTIFIER_HEARTBEAT_LIST_LIMIT,
     )
     active_count = sum(1 for row in rows if row.get("active"))
     stale_count = max(0, len(rows) - active_count)
     overlap_count = max(0, active_count - 1)
+    latest_notifier = rows[0] if rows else None
+
+    def _notifier_label(row: Optional[dict[str, Any]]) -> str:
+        if not row:
+            return ""
+        profile = row.get("notifier_profile") or "unknown profile"
+        host = row.get("host") or "unknown host"
+        age = row.get("age_seconds")
+        age_text = f"{int(age)}s ago" if age is not None else "unknown age"
+        return f"{profile} on {host} ({age_text})"
+
+    counts = f"{active_count} active / {stale_count} stale retained"
 
     if subscription_count <= 0:
         severity = "no_subscriptions"
         message = "No profile wake subscriptions in this board scope."
     elif active_count <= 0:
         severity = "no_notifier"
-        message = "No active notifier heartbeat for this board."
+        last_seen = _notifier_label(latest_notifier)
+        message = (
+            f"No active notifier heartbeat for this board ({counts})"
+            + (f"; last seen {last_seen}." if last_seen else ".")
+        )
     elif overlap_count > 0:
         severity = "overlap"
         message = (
-            f"{active_count} active notifiers for this board; "
-            "duplicate wake races possible."
+            f"{active_count} active notifiers for this board "
+            f"({counts}); duplicate wake races possible."
         )
     else:
         severity = "healthy"
-        message = "One active notifier heartbeat for this board."
+        message = f"One active notifier heartbeat for this board ({counts})."
 
     return {
         "active_count": active_count,
@@ -447,6 +465,7 @@ def _compute_notifier_health(
         "stale_count": stale_count,
         "severity": severity,
         "message": message,
+        "latest_notifier": latest_notifier,
         "rows": rows[:10],
         "as_of": as_of,
     }

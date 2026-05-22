@@ -292,6 +292,43 @@ def test_notifier_health_uses_db_path_for_pinned_board_aliases(client, tmp_path,
     assert resp["notifier_health"]["active_count"] == 1
 
 
+def test_notifier_health_no_notifier_reports_latest_stale_row(client):
+    """Operator diagnostics include active/stale counts plus latest stale owner."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "stale notifier diag"},
+    ).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/profile-subs",
+        json={"profile": "jensen"},
+    )
+    assert r.status_code == 200, r.text
+
+    conn = kb.connect()
+    try:
+        stale_seen = int(time.time()) - kb.NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS - 5
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="diag-host:999:1",
+            board_slug="default",
+            db_path=str(kb.kanban_db_path().expanduser().resolve()),
+            notifier_profile="default",
+            host="diag-host",
+            pid=999,
+            started_at=1,
+            now=stale_seen,
+        )
+    finally:
+        conn.close()
+
+    resp = client.get("/api/plugins/kanban/wake-health/details").json()
+    health = resp["notifier_health"]
+    assert health["severity"] == "no_notifier"
+    assert health["active_count"] == 0
+    assert health["stale_count"] == 1
+    assert health["latest_notifier"]["host"] == "diag-host"
+    assert "last seen default on diag-host" in health["message"]
+
+
 def test_wake_health_details_returns_failing_and_stale_rows(client):
     """/wake-health/details surfaces per-row drilldown for the pill popover.
 

@@ -108,6 +108,11 @@ DEFAULT_NOTIFY_TERMINAL_KINDS: tuple[str, ...] = (
 # window stay in the table for forensic context — the dashboard reports them
 # as stale but does not treat that as the same problem as "no notifier".
 NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS = 30
+# Retain enough stale notifier rows for operator forensics without letting one
+# row per gateway restart accumulate forever. Active rows are never old enough
+# to match this cutoff, so pruning by last_seen_at preserves live coverage.
+NOTIFIER_HEARTBEAT_RETENTION_SECONDS = 14 * 24 * 3600
+NOTIFIER_HEARTBEAT_LIST_LIMIT = 50
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
@@ -7103,6 +7108,7 @@ def record_notifier_heartbeat(
     pid: int,
     started_at: int,
     now: Optional[int] = None,
+    retention_seconds: int = NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
 ) -> None:
     """Upsert one gateway notifier heartbeat for a scanned board DB.
 
@@ -7132,6 +7138,10 @@ def record_notifier_heartbeat(
                 int(started_at), when,
             ),
         )
+        conn.execute(
+            "DELETE FROM kanban_notifier_heartbeats WHERE last_seen_at < ?",
+            (when - max(1, int(retention_seconds)),),
+        )
 
 
 def list_notifier_heartbeats(
@@ -7142,6 +7152,8 @@ def list_notifier_heartbeats(
     notifier_profile: Optional[str] = None,
     now: Optional[int] = None,
     active_window_seconds: int = NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS,
+    min_last_seen_at: Optional[int] = None,
+    limit: Optional[int] = NOTIFIER_HEARTBEAT_LIST_LIMIT,
 ) -> list[dict]:
     """List notifier heartbeat rows with active/stale classification."""
     as_of = int(now if now is not None else time.time())
@@ -7157,6 +7169,9 @@ def list_notifier_heartbeats(
     if notifier_profile is not None:
         where.append("notifier_profile = ?")
         params.append(str(notifier_profile))
+    if min_last_seen_at is not None:
+        where.append("last_seen_at >= ?")
+        params.append(int(min_last_seen_at))
     sql = (
         "SELECT notifier_id, board_slug, db_path, notifier_profile, "
         "       host, pid, started_at, last_seen_at "
@@ -7165,6 +7180,9 @@ def list_notifier_heartbeats(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY last_seen_at DESC, notifier_id ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(max(1, int(limit)))
     out: list[dict] = []
     for row in conn.execute(sql, params).fetchall():
         item = dict(row)
@@ -7174,6 +7192,22 @@ def list_notifier_heartbeats(
         item["active"] = bool(last_seen and age is not None and age <= window)
         out.append(item)
     return out
+
+
+def prune_notifier_heartbeats(
+    conn: sqlite3.Connection,
+    *,
+    older_than_seconds: int = NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
+    now: Optional[int] = None,
+) -> int:
+    """Delete stale notifier heartbeat rows older than the retention window."""
+    cutoff = int(now if now is not None else time.time()) - max(1, int(older_than_seconds))
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_notifier_heartbeats WHERE last_seen_at < ?",
+            (cutoff,),
+        )
+    return int(cur.rowcount or 0)
 
 
 # ---------------------------------------------------------------------------

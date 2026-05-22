@@ -382,6 +382,74 @@ def test_record_and_list_notifier_heartbeats_classifies_active_and_stale(kanban_
     assert other == []
 
 
+def test_notifier_heartbeat_retention_prunes_old_rows_but_keeps_active(kanban_home):
+    """Heartbeat upsert prunes rows beyond retention without deleting live rows."""
+    with kb.connect() as conn:
+        now = 2_000_000
+        old = now - kb.NOTIFIER_HEARTBEAT_RETENTION_SECONDS - 5
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="old-host:1:1",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="old",
+            host="old-host",
+            pid=1,
+            started_at=1,
+            now=old,
+        )
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="live-host:2:2",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="live",
+            host="live-host",
+            pid=2,
+            started_at=2,
+            now=now,
+        )
+        rows = kb.list_notifier_heartbeats(
+            conn, db_path="/tmp/board.db", now=now, limit=None,
+        )
+
+    assert [row["notifier_id"] for row in rows] == ["live-host:2:2"]
+    assert rows[0]["active"] is True
+
+
+def test_prune_notifier_heartbeats_and_list_bounds(kanban_home):
+    """Explicit pruning and list limits bound stale heartbeat history."""
+    with kb.connect() as conn:
+        now = 3_000_000
+        for idx in range(4):
+            kb.record_notifier_heartbeat(
+                conn,
+                notifier_id=f"host-{idx}:1:{idx}",
+                board_slug="default",
+                db_path="/tmp/board.db",
+                notifier_profile="default",
+                host=f"host-{idx}",
+                pid=idx,
+                started_at=idx,
+                now=now - idx,
+                retention_seconds=999_999,
+            )
+        limited = kb.list_notifier_heartbeats(
+            conn, db_path="/tmp/board.db", now=now, limit=2,
+        )
+        removed = kb.prune_notifier_heartbeats(
+            conn, older_than_seconds=1, now=now,
+        )
+        remaining = kb.list_notifier_heartbeats(
+            conn, db_path="/tmp/board.db", now=now, limit=None,
+        )
+
+    assert len(limited) == 2
+    assert [row["notifier_id"] for row in limited] == ["host-0:1:0", "host-1:1:1"]
+    assert removed == 2
+    assert [row["notifier_id"] for row in remaining] == ["host-0:1:0", "host-1:1:1"]
+
+
 def test_profile_wake_error_sanitizer_is_single_line_and_capped():
     err = RuntimeError("line1\nline2 " + ("x" * 800))
     text = kb._sanitize_wake_error(err)
