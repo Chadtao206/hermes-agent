@@ -234,3 +234,293 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Event-driven kanban subscriptions: per-sub event_kinds + include_children.
+# These pin the first-pass orchestration contract — legacy subs still see only
+# terminal events, custom kinds let a sub tail lifecycle moments (created,
+# claimed, etc.), and include_children fans descendant events up to a parent.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_subscription_only_sees_terminal_events(tmp_path, monkeypatch):
+    """A sub registered without event_kinds keeps the old terminal-only filter.
+
+    `created` and `claimed` fire on every task during its lifecycle but the
+    legacy gateway watcher only surfaces terminal kinds — that must stay
+    true even after the event_kinds column lands.
+    """
+    db_path = tmp_path / "legacy-sub.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Only `created` exists on the task; legacy filter must drop it.
+    assert adapter.sent == [], (
+        f"Legacy subscription should ignore non-terminal events, got "
+        f"{[s['text'] for s in adapter.sent]}"
+    )
+
+    # Now complete the task — that *is* a terminal event and must deliver.
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, summary="ok")
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert "done" in adapter.sent[0]["text"].lower()
+
+
+def test_custom_event_kinds_delivers_lifecycle_events(tmp_path, monkeypatch):
+    """A sub with explicit ``event_kinds`` receives non-terminal lifecycle pings.
+
+    Pins that the gateway watcher honors per-sub kind filters instead of the
+    hardcoded terminal set, and that the renderer doesn't drop `created` /
+    `claimed`.
+    """
+    db_path = tmp_path / "custom-kinds.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="lifecycle task", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            event_kinds=["created", "claimed"],
+        )
+        # The `create_task` call above already emitted a `created` event
+        # before the sub existed (cursor starts at 0, so it'll still be
+        # picked up). Add a `claimed` to exercise both kinds in one tick.
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    kinds_delivered = [s["text"] for s in adapter.sent]
+    assert any("created" in t for t in kinds_delivered), kinds_delivered
+    assert any("claimed" in t for t in kinds_delivered), kinds_delivered
+    # No terminal event ever fired, so the only deliveries are the two
+    # lifecycle pings we asked for.
+    assert len(adapter.sent) == 2, kinds_delivered
+
+
+def test_include_children_subscription_receives_child_completion(tmp_path, monkeypatch):
+    """A parent-level sub with include_children sees descendant completions.
+
+    Verifies the subtree fetch path: events from a child task linked under
+    the parent via a dependency edge are claimed under the parent's single
+    cursor and rendered against the child task's title.
+    """
+    db_path = tmp_path / "subtree.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="epic-parent", assignee="lead")
+        child_id = kb.create_task(conn, title="leaf-child", assignee="worker")
+        kb.link_tasks(conn, parent_id, child_id)
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="chat-1",
+            include_children=True,
+        )
+        # Stamp a `completed` event onto the CHILD directly. Driving it
+        # through `complete_task` would require running the full
+        # ready/claim/run lifecycle, which is out of scope for this test
+        # — we're pinning the subtree-fetch contract: a parent sub with
+        # include_children sees the child's event.
+        kb._append_event(
+            conn, child_id, kind="completed", payload={"summary": "child done"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        f"Parent sub with include_children should receive the child's "
+        f"completion event; got {[s['text'] for s in adapter.sent]}"
+    )
+    text = adapter.sent[0]["text"]
+    assert "done" in text.lower()
+    assert child_id in text, (
+        f"Rendered message should identify the descendant task; got {text!r}"
+    )
+    assert "leaf-child" in text, (
+        f"Rendered message should use the child's title, not the parent's; "
+        f"got {text!r}"
+    )
+
+
+
+def test_include_children_subscription_survives_parent_completion(tmp_path, monkeypatch):
+    """Subtree subscriptions stay alive after root completion.
+
+    In dependency graphs the parent often completes before children become
+    ready. A root-level orchestration subscription must therefore survive the
+    root's completed event so descendant lane completions still notify Jensen
+    or another orchestrator.
+    """
+    db_path = tmp_path / "subtree-survives-root.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="root lane", assignee="lead")
+        child_id = kb.create_task(
+            conn, title="child lane", assignee="worker", parents=[parent_id],
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="chat-1",
+            include_children=True,
+        )
+        assert kb.complete_task(conn, parent_id, summary="root done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert parent_id in adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, parent_id)
+        assert len(subs) == 1, (
+            "include_children subscription must survive root completion so "
+            "downstream child lane events can still notify"
+        )
+        assert kb.complete_task(conn, child_id, summary="child done")
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2
+    assert child_id in adapter.sent[1]["text"]
+    assert "child lane" in adapter.sent[1]["text"]
+
+
+
+class FailOnSecondSendAdapter:
+    """Adapter that fails only on its second send call."""
+
+    def __init__(self):
+        self.calls = 0
+        self.sent = []
+
+    async def send(self, chat_id, text, metadata=None):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("simulated second-send failure")
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+
+def test_multi_event_subscription_rewinds_to_last_success(tmp_path, monkeypatch):
+    """Retry after a partial batch failure must not duplicate successes.
+
+    Custom event subscriptions make multi-event batches normal. If the first
+    event sends successfully and the second send fails, the notifier should
+    rewind only to the first event id, not all the way back to the pre-claim
+    cursor. Otherwise the first event is delivered twice on retry.
+    """
+    db_path = tmp_path / "partial-batch-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="partial failure", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            event_kinds=["created", "claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    adapter = FailOnSecondSendAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "created" in adapter.sent[0]["text"]
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [item["text"] for item in adapter.sent]
+    assert len(texts) == 2, texts
+    assert sum("created" in text for text in texts) == 1, texts
+    assert sum("claimed" in text for text in texts) == 1, texts
+
+
+
+def test_include_children_subscription_unsubs_when_root_archived(tmp_path, monkeypatch):
+    """Archive is the explicit cleanup path for subtree subscriptions."""
+    db_path = tmp_path / "subtree-archive-cleanup.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="root cleanup", assignee="lead")
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="chat-1",
+            include_children=True,
+        )
+        assert kb.archive_task(conn, parent_id)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "archived" in adapter.sent[0]["text"].lower()
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, parent_id) == []
+    finally:
+        conn.close()

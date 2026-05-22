@@ -94,6 +94,13 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+# Default terminal kinds the kanban-notifier watcher delivers when a
+# subscription doesn't specify its own ``event_kinds`` list. Exposed so
+# callers (gateway watcher, tests) share one source of truth.
+DEFAULT_NOTIFY_TERMINAL_KINDS: tuple[str, ...] = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "archived",
+)
+
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -952,6 +959,14 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    -- JSON array of event kinds this sub wants delivered. NULL/empty falls
+    -- back to the legacy terminal-only kinds in the gateway watcher.
+    event_kinds   TEXT,
+    -- When 1, the gateway watcher also considers events from tasks that
+    -- are descendants via task_links.relation_type='dependency'. The
+    -- last_event_id cursor stays a single global value (max task_events.id),
+    -- so a parent sub still serializes through one cursor.
+    include_children INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -1310,6 +1325,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
+        if "event_kinds" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "event_kinds", "event_kinds TEXT"
+            )
+        if "include_children" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "include_children",
+                "include_children INTEGER NOT NULL DEFAULT 0",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -6048,6 +6074,55 @@ def task_age(task: Task) -> dict:
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
 
+def _normalize_event_kinds(
+    event_kinds: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Normalize a caller-supplied ``event_kinds`` iterable.
+
+    Returns ``None`` when the caller passed ``None`` (the legacy "use
+    default terminal kinds" sentinel). Returns a de-duplicated list of
+    stripped, non-empty string kinds otherwise. Each entry is coerced to
+    ``str`` so callers passing JSON-decoded payloads with mixed types
+    don't smuggle nulls/numbers into the column.
+    """
+    if event_kinds is None:
+        return None
+    seen: dict[str, None] = {}
+    for raw in event_kinds:
+        if raw is None:
+            continue
+        kind = str(raw).strip()
+        if not kind:
+            continue
+        seen.setdefault(kind, None)
+    return list(seen)
+
+
+def _parse_event_kinds_column(value: Any) -> Optional[list[str]]:
+    """Parse a stored ``event_kinds`` column back into a list of kinds.
+
+    Tolerates NULL, empty string, malformed JSON, and accidental
+    non-array JSON values. Returns ``None`` whenever the row should be
+    treated as "use the default terminal kinds".
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return _normalize_event_kinds(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        decoded = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(decoded, list):
+        return None
+    return _normalize_event_kinds(decoded)
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -6057,18 +6132,37 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    event_kinds: Optional[Iterable[str]] = None,
+    include_children: Optional[bool] = None,
 ) -> None:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    """Register a gateway source that wants notifications for ``task_id``.
+
+    Idempotent on (task, platform, chat, thread).
+
+    ``event_kinds`` is an optional list of event kinds the subscription
+    wants delivered. ``None`` (the default) preserves legacy behavior —
+    the gateway watcher falls back to its terminal-only kind set.
+
+    ``include_children`` opts the subscription into descendant fan-out:
+    when true, the watcher also surfaces events from tasks reachable via
+    ``task_links.relation_type='dependency'`` edges rooted at ``task_id``.
+    """
     now = int(time.time())
+    normalized_kinds = _normalize_event_kinds(event_kinds)
+    kinds_json = json.dumps(normalized_kinds) if normalized_kinds is not None else None
+    include_children_flag = 1 if include_children else 0
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id,
+                 notifier_profile, created_at, event_kinds, include_children)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, thread_id or "", user_id,
+                notifier_profile, now, kinds_json, include_children_flag,
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
@@ -6081,6 +6175,27 @@ def add_notify_sub(
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+            )
+        if event_kinds is not None:
+            # Caller passed an explicit kinds list — overwrite any prior
+            # value (including NULL from a legacy row). Callers wanting to
+            # keep the existing value should simply omit the argument.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET event_kinds = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (kinds_json, task_id, platform, chat_id, thread_id or ""),
+            )
+        if include_children is not None:
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET include_children = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                (include_children_flag, task_id, platform, chat_id, thread_id or ""),
             )
 
 
@@ -6113,6 +6228,41 @@ def remove_notify_sub(
     return cur.rowcount > 0
 
 
+def _dependency_descendants(
+    conn: sqlite3.Connection, root_id: str,
+) -> list[str]:
+    """Return all task ids reachable from ``root_id`` via dependency edges.
+
+    Walks ``task_links.relation_type='dependency'`` children iteratively
+    until the frontier is empty, deduping on the way to keep cycles
+    (defensive — the rest of the system bans them) from looping forever.
+    The ``root_id`` itself is NOT included in the returned list.
+    """
+    seen: set[str] = {root_id}
+    frontier: list[str] = [root_id]
+    descendants: list[str] = []
+    while frontier:
+        next_frontier: list[str] = []
+        # Chunked IN-clause so large subtrees don't trip SQLite's variable cap.
+        for i in range(0, len(frontier), 200):
+            batch = frontier[i:i + 200]
+            placeholders = ",".join("?" * len(batch))
+            rows = conn.execute(
+                f"SELECT DISTINCT child_id FROM task_links "
+                f"WHERE relation_type = ? AND parent_id IN ({placeholders})",
+                (LINK_RELATION_DEPENDENCY, *batch),
+            ).fetchall()
+            for r in rows:
+                cid = r["child_id"]
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                descendants.append(cid)
+                next_frontier.append(cid)
+        frontier = next_frontier
+    return descendants
+
+
 def unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -6121,12 +6271,19 @@ def unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    include_children: bool = False,
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
     Only events with ``id > last_event_id`` are returned. The subscription's
     cursor is NOT advanced here; call :func:`advance_notify_cursor` after
     the gateway has successfully delivered the notifications.
+
+    When ``include_children`` is true, events from descendant tasks linked
+    to ``task_id`` via dependency edges are also surfaced. The cursor stays
+    a single global ``task_events.id`` value across the whole subtree, so
+    delivery progress is still monotonic even though we read from many
+    task ids.
     """
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
@@ -6137,28 +6294,41 @@ def unseen_events_for_sub(
         return 0, []
     cursor = int(row["last_event_id"])
     kind_list = list(kinds) if kinds else None
-    q = (
-        "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
-        + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
-        + "ORDER BY id ASC"
-    )
-    params: list[Any] = [task_id, cursor]
-    if kind_list:
-        params.extend(kind_list)
-    rows = conn.execute(q, params).fetchall()
+    task_ids: list[str] = [task_id]
+    if include_children:
+        task_ids.extend(_dependency_descendants(conn, task_id))
     out: list[Event] = []
     max_id = cursor
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(Event(
-            id=r["id"], task_id=r["task_id"], kind=r["kind"],
-            payload=payload, created_at=r["created_at"],
-            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-        ))
-        max_id = max(max_id, int(r["id"]))
+    # Chunked IN-clause keeps the subtree query under SQLite's variable cap
+    # even for very large dependency trees.
+    for i in range(0, len(task_ids), 200):
+        batch = task_ids[i:i + 200]
+        placeholders = ",".join("?" * len(batch))
+        q = (
+            f"SELECT * FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND id > ? "
+            + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+            + "ORDER BY id ASC"
+        )
+        params: list[Any] = [*batch, cursor]
+        if kind_list:
+            params.extend(kind_list)
+        rows = conn.execute(q, params).fetchall()
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append(Event(
+                id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                payload=payload, created_at=r["created_at"],
+                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+            ))
+            max_id = max(max_id, int(r["id"]))
+    if len(task_ids) > 1:
+        # Multi-batch reads can interleave by id; re-sort so callers see
+        # the same monotonic ordering the single-task path produces.
+        out.sort(key=lambda e: e.id)
     return max_id, out
 
 
@@ -6170,6 +6340,7 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    include_children: bool = False,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -6180,6 +6351,10 @@ def claim_unseen_events_for_sub(
     processes pointed at the same board DB: concurrent watchers serialize on
     SQLite's writer lock, and only the first process sees and claims a given
     event range.
+
+    ``include_children`` propagates the subtree-fetch flag through to
+    :func:`unseen_events_for_sub`; the cursor remains a single global value
+    across the subtree so atomicity is preserved.
 
     Callers should send the claimed events, then either leave the cursor at
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
@@ -6201,6 +6376,7 @@ def claim_unseen_events_for_sub(
             chat_id=chat_id,
             thread_id=thread_id,
             kinds=kinds,
+            include_children=include_children,
         )
         if not events:
             return old_cursor, old_cursor, []

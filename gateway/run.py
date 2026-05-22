@@ -4679,7 +4679,16 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        # Default kinds for subscriptions that don't pin their own list.
+        # Mirrors ``kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS``; imported here
+        # lazily so a missing kanban_db import doesn't break the watcher.
+        TERMINAL_KINDS = tuple(
+            getattr(
+                _kb,
+                "DEFAULT_NOTIFY_TERMINAL_KINDS",
+                ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived"),
+            )
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4781,17 +4790,50 @@ class GatewayRunner:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
+                                # Per-sub event_kinds (custom subscriptions like
+                                # lifecycle tailers) override the default
+                                # terminal-only list. NULL/empty in the DB
+                                # falls back to the legacy terminal kinds so
+                                # pre-existing subscriptions keep their old
+                                # behavior. include_children opts into subtree
+                                # fan-out for parent subscriptions.
+                                sub_kinds = _kb._parse_event_kinds_column(
+                                    sub.get("event_kinds")
+                                )
+                                effective_kinds = (
+                                    tuple(sub_kinds) if sub_kinds else TERMINAL_KINDS
+                                )
+                                include_children = bool(sub.get("include_children"))
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=effective_kinds,
+                                    include_children=include_children,
                                 )
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                # For include_children subscriptions, events
+                                # may reference descendant tasks; resolve each
+                                # one inside the open conn so the renderer
+                                # gets the right title/assignee per event.
+                                event_tasks: dict[str, Any] = {}
+                                if include_children:
+                                    for ev in events:
+                                        if ev.task_id in event_tasks:
+                                            continue
+                                        if ev.task_id == sub["task_id"]:
+                                            event_tasks[ev.task_id] = task
+                                        else:
+                                            try:
+                                                event_tasks[ev.task_id] = _kb.get_task(
+                                                    conn, ev.task_id,
+                                                )
+                                            except Exception:
+                                                event_tasks[ev.task_id] = None
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -4802,6 +4844,7 @@ class GatewayRunner:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "event_tasks": event_tasks,
                                     "board": slug,
                                 })
                         finally:
@@ -4837,13 +4880,31 @@ class GatewayRunner:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
+                    event_tasks = d.get("event_tasks") or {}
+                    # The DB claim advances the subscription cursor to the
+                    # batch max before delivery, giving this watcher exclusive
+                    # ownership of the event range. If a later send in the
+                    # batch fails after earlier sends succeeded, rewind only
+                    # to the last successfully delivered event id; otherwise
+                    # retry would duplicate already-sent lifecycle pings.
+                    last_success_cursor = int(d.get("old_cursor", 0) or 0)
                     for ev in d["events"]:
                         kind = ev.kind
+                        # Resolve per-event task so subtree subscriptions
+                        # render the descendant's title/assignee, not the
+                        # parent's. Falls back to the subscription task when
+                        # the event isn't from a descendant (the common
+                        # single-task case).
+                        ev_task = event_tasks.get(ev.task_id) or task
+                        ev_title = (
+                            ev_task.title if ev_task and ev_task.title
+                            else ev.task_id
+                        )[:120]
+                        ev_id = ev.task_id or sub["task_id"]
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
+                        who = (ev_task.assignee if ev_task and ev_task.assignee else None)
                         tag = f"@{who} " if who else ""
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
@@ -4858,29 +4919,29 @@ class GatewayRunner:
                             if payload_summary:
                                 h = payload_summary.strip().splitlines()[0][:200]
                                 handoff = f"\n{h}"
-                            elif task and task.result:
-                                r = task.result.strip().splitlines()[0][:160]
+                            elif ev_task and ev_task.result:
+                                r = ev_task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"✔ {tag}Kanban {ev_id} done"
+                                f" — {ev_title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban {ev_id} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban {ev_id} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban {ev_id} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -4888,11 +4949,29 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban {ev_id} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "archived":
+                            msg = f"🗄 {tag}Kanban {ev_id} archived — {ev_title}"
+                        elif kind == "created":
+                            msg = f"➕ {tag}Kanban {ev_id} created — {ev_title}"
+                        elif kind == "claimed":
+                            msg = f"▶ {tag}Kanban {ev_id} claimed — {ev_title}"
+                        elif kind == "unblocked":
+                            msg = f"▶ {tag}Kanban {ev_id} unblocked — {ev_title}"
+                        elif kind == "promoted":
+                            msg = f"⤴ {tag}Kanban {ev_id} promoted to ready — {ev_title}"
+                        elif kind == "review_requested":
+                            msg = f"👀 {tag}Kanban {ev_id} review requested — {ev_title}"
                         else:
-                            continue
+                            # Unknown kind, but the subscription explicitly
+                            # asked for it (or a future event kind landed
+                            # in the DB before the renderer learned it).
+                            # Surface a generic event line instead of
+                            # silently dropping so users still see the
+                            # signal they asked for.
+                            msg = f"• {tag}Kanban {ev_id} {kind} — {ev_title}"
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
@@ -4924,13 +5003,16 @@ class GatewayRunner:
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
-                                        task=task,
+                                        task=ev_task,
                                     )
                                 except Exception as art_exc:
                                     logger.debug(
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            last_success_cursor = max(
+                                last_success_cursor, int(getattr(ev, "id", 0) or 0),
+                            )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -4955,7 +5037,7 @@ class GatewayRunner:
                                     self._kanban_rewind,
                                     sub,
                                     d["cursor"],
-                                    d.get("old_cursor", 0),
+                                    last_success_cursor,
                                     board_slug,
                                 )
                             # Rewind the pre-send claim on transient failure so
@@ -4976,8 +5058,21 @@ class GatewayRunner:
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
+                        # Single-task legacy subscriptions can unsubscribe
+                        # when that task is done/archived. Subtree
+                        # subscriptions intentionally stay alive after the
+                        # root completes: dependency children often start
+                        # after their parent finishes, and the whole point of
+                        # include_children is to keep the orchestrator
+                        # subscribed to those downstream lane events.
+                        # Archive remains an explicit terminal cleanup.
+                        include_children = bool(sub.get("include_children"))
                         task_terminal = task and task.status in {"done", "archived"}
-                        if task_terminal:
+                        should_unsub = bool(
+                            task_terminal
+                            and (not include_children or task.status == "archived")
+                        )
+                        if should_unsub:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
