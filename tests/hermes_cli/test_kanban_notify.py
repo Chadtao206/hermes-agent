@@ -638,3 +638,349 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: profile-level Kanban event subscriptions (DB-layer behavior).
+# These exercise the helpers directly; gateway-side wake spawning is covered
+# in tests/gateway/test_kanban_notifier.py.
+# ---------------------------------------------------------------------------
+
+
+def test_profile_event_sub_claim_custom_kind_advances_cursor(kanban_home):
+    """A profile sub with an explicit kind claims that event and advances."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile-claim", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+
+        old_c, new_c, events = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert old_c == 0
+        assert new_c > 0
+        assert [e.kind for e in events] == ["claimed"]
+
+        # Cursor has been atomically advanced inside the claim txn.
+        subs = kb.list_profile_event_subs(conn, task_id=tid)
+        assert len(subs) == 1
+        assert int(subs[0]["last_event_id"]) == new_c
+
+        # A second claim with no new events is a no-op.
+        old2, new2, ev2 = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert ev2 == []
+        assert old2 == new_c
+        assert new2 == new_c
+    finally:
+        conn.close()
+
+
+def test_profile_event_sub_include_children_claims_descendant(kanban_home):
+    """include_children fans dependency-descendant events up to the parent sub."""
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="root", assignee="lead")
+        child_id = kb.create_task(conn, title="leaf", assignee="worker")
+        kb.link_tasks(conn, parent_id, child_id)
+        kb.add_profile_event_sub(
+            conn,
+            task_id=parent_id,
+            profile="jensen",
+            include_children=True,
+        )
+        # Child completes — default kinds include 'completed'.
+        kb._append_event(
+            conn, child_id, kind="completed", payload={"summary": "child done"},
+        )
+
+        _, new_c, events = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=parent_id, profile="jensen",
+        )
+        assert new_c > 0
+        assert any(
+            e.task_id == child_id and e.kind == "completed" for e in events
+        ), [(e.task_id, e.kind) for e in events]
+    finally:
+        conn.close()
+
+
+def test_profile_event_sub_rewind_restores_cursor(kanban_home):
+    """Rewind after claim leaves the event reclaimable on next tick."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="rewind", assignee="worker")
+        kb.add_profile_event_sub(
+            conn, task_id=tid, profile="jensen", event_kinds=["claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+
+        old_c, new_c, events = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert events  # sanity: we did claim something
+
+        ok = kb.rewind_profile_event_cursor(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            claimed_cursor=new_c,
+            old_cursor=old_c,
+        )
+        assert ok
+
+        # Re-claim sees the event again.
+        _, _, events2 = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert [e.kind for e in events2] == ["claimed"]
+    finally:
+        conn.close()
+
+
+def test_profile_event_sub_disabled_returns_empty(kanban_home):
+    """enabled=0 short-circuits the claim path; events are not consumed."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="disabled", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+            enabled=False,
+        )
+        kb._append_event(conn, tid, kind="claimed")
+
+        old_c, new_c, events = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert events == []
+        assert old_c == new_c == 0
+
+        # enabled_only=True (default) hides this sub from listing.
+        assert kb.list_profile_event_subs(conn, task_id=tid) == []
+        # enabled_only=False surfaces it.
+        all_subs = kb.list_profile_event_subs(
+            conn, task_id=tid, enabled_only=False,
+        )
+        assert len(all_subs) == 1
+        assert int(all_subs[0]["enabled"]) == 0
+    finally:
+        conn.close()
+
+
+def test_profile_event_sub_remove_returns_existence(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="remove", assignee="worker")
+        kb.add_profile_event_sub(
+            conn, task_id=tid, profile="jensen", name="lane-a",
+        )
+        assert kb.remove_profile_event_sub(
+            conn, task_id=tid, profile="jensen", name="lane-a",
+        )
+        assert not kb.remove_profile_event_sub(
+            conn, task_id=tid, profile="jensen", name="lane-a",
+        )
+    finally:
+        conn.close()
+
+
+def test_profile_event_sub_legacy_db_migrates_table(tmp_path, monkeypatch):
+    """Legacy DBs without ``kanban_profile_event_subs`` get the table on init."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+    # Hand-craft a pre-Phase-2 DB by initializing then dropping the new table.
+    kb.init_db()
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute("DROP TABLE IF EXISTS kanban_profile_event_subs")
+        raw.commit()
+    finally:
+        raw.close()
+
+    # Bust the per-process init cache so the next connect() re-runs migrations.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        # Smoke-test by inserting + listing — fails loudly if table is missing.
+        tid = kb.create_task(conn, title="legacy", assignee="worker")
+        kb.add_profile_event_sub(
+            conn, task_id=tid, profile="jensen", event_kinds=["claimed"],
+        )
+        assert len(kb.list_profile_event_subs(conn, task_id=tid)) == 1
+    finally:
+        conn.close()
+
+
+
+def test_profile_event_sub_readd_preserves_existing_options(kanban_home):
+    """Re-adding the same profile sub without options is an idempotent ensure."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile preserve", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+            include_children=True,
+            wake_agent=False,
+            wake_prompt="custom hint",
+            enabled=False,
+        )
+        kb.add_profile_event_sub(conn, task_id=tid, profile="jensen")
+        sub = kb.list_profile_event_subs(
+            conn, task_id=tid, profile="jensen", enabled_only=False,
+        )[0]
+    finally:
+        conn.close()
+
+    assert sub["event_kinds"] == '["claimed"]'
+    assert int(sub["include_children"]) == 1
+    assert int(sub["wake_agent"]) == 0
+    assert sub["wake_prompt"] == "custom hint"
+    assert int(sub["enabled"]) == 0
+
+
+def test_profile_event_sub_readd_can_update_explicit_fields(kanban_home):
+    """Explicit optional args still update the profile sub in place."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile update", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+            include_children=True,
+            wake_agent=False,
+            wake_prompt="old hint",
+            enabled=False,
+        )
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["completed"],
+            include_children=False,
+            wake_agent=True,
+            wake_prompt=None,
+            enabled=True,
+        )
+        sub = kb.list_profile_event_subs(
+            conn, task_id=tid, profile="jensen", enabled_only=False,
+        )[0]
+    finally:
+        conn.close()
+
+    assert sub["event_kinds"] == '["completed"]'
+    assert int(sub["include_children"]) == 0
+    assert int(sub["wake_agent"]) == 1
+    assert sub["wake_prompt"] is None
+    assert int(sub["enabled"]) == 1
+
+
+
+def test_profile_event_late_success_ack_does_not_move_cursor_backwards(kanban_home):
+    """A late successful wake ack must not clobber a newer claim cursor."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile cursor monotonic", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["created", "claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+        old1, cur1, events1 = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert old1 == 0
+        assert len(events1) == 2
+        kb._append_event(conn, tid, kind="claimed")
+        old2, cur2, events2 = kb.claim_unseen_events_for_profile_sub(
+            conn, task_id=tid, profile="jensen",
+        )
+        assert old2 == cur1
+        assert len(events2) == 1
+        assert cur2 > cur1
+
+        # Simulate the first wake's success callback arriving after the second
+        # claim already advanced the cursor. It may stamp last_wake_at but must
+        # not move last_event_id backwards.
+        kb.advance_profile_event_cursor(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            new_cursor=cur1,
+            last_wake_at=123,
+        )
+        sub = kb.list_profile_event_subs(conn, task_id=tid, profile="jensen")[0]
+    finally:
+        conn.close()
+
+    assert int(sub["last_event_id"]) == cur2
+    assert int(sub["last_wake_at"]) == 123
+
+
+def test_notify_late_success_ack_does_not_move_cursor_backwards(kanban_home):
+    """Chat notify cursor advance is also monotonic under late acks."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="chat cursor monotonic", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            event_kinds=["created", "claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+        old1, cur1, events1 = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["created", "claimed"],
+        )
+        assert old1 == 0
+        assert len(events1) == 2
+        kb._append_event(conn, tid, kind="claimed")
+        old2, cur2, events2 = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["created", "claimed"],
+        )
+        assert old2 == cur1
+        assert len(events2) == 1
+        assert cur2 > cur1
+
+        kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            new_cursor=cur1,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+
+    assert int(sub["last_event_id"]) == cur2

@@ -970,6 +970,34 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Profile-level Kanban event subscription: when matching events land on
+-- ``task_id`` (or any dependency descendant when ``include_children=1``),
+-- the gateway notifier wakes ``profile`` via a one-shot ``hermes -p <profile>
+-- chat -q <prompt>`` subprocess. Distinct from ``kanban_notify_subs`` which
+-- pushes platform/chat messages; this row drives agent-level orchestration.
+-- ``name`` lets the same profile carry multiple subscriptions on one task
+-- without clobbering each other on the PK.
+CREATE TABLE IF NOT EXISTS kanban_profile_event_subs (
+    task_id          TEXT NOT NULL,
+    profile          TEXT NOT NULL,
+    name             TEXT NOT NULL DEFAULT '',
+    -- JSON array of event kinds; NULL/empty falls back to
+    -- DEFAULT_NOTIFY_TERMINAL_KINDS just like kanban_notify_subs.
+    event_kinds      TEXT,
+    include_children INTEGER NOT NULL DEFAULT 0,
+    -- ``wake_agent`` is a forward-looking switch. Set to 0 to record events
+    -- without spawning a subprocess (e.g. for a future poller). Default 1.
+    wake_agent       INTEGER NOT NULL DEFAULT 1,
+    -- Optional override for the body of the wake prompt; the gateway
+    -- prepends the boilerplate "this is a Kanban event wake" framing.
+    wake_prompt      TEXT,
+    created_at       INTEGER NOT NULL,
+    last_event_id    INTEGER NOT NULL DEFAULT 0,
+    last_wake_at     INTEGER,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (task_id, profile, name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -979,6 +1007,8 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_profile_event_subs_task ON kanban_profile_event_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_profile_event_subs_profile ON kanban_profile_event_subs(profile);
 """
 
 
@@ -1337,6 +1367,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "include_children",
                 "include_children INTEGER NOT NULL DEFAULT 0",
             )
+
+    # Profile-level event subscriptions land in their own table in SCHEMA_SQL,
+    # but legacy DBs that opened against the gateway before Phase 2 won't
+    # have it. Create the table + indexes here so an upgrade-in-place picks
+    # them up without forcing a board reset. Idempotent via IF NOT EXISTS.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_profile_event_subs (
+            task_id          TEXT NOT NULL,
+            profile          TEXT NOT NULL,
+            name             TEXT NOT NULL DEFAULT '',
+            event_kinds      TEXT,
+            include_children INTEGER NOT NULL DEFAULT 0,
+            wake_agent       INTEGER NOT NULL DEFAULT 1,
+            wake_prompt      TEXT,
+            created_at       INTEGER NOT NULL,
+            last_event_id    INTEGER NOT NULL DEFAULT 0,
+            last_wake_at     INTEGER,
+            enabled          INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (task_id, profile, name)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_profile_event_subs_task "
+        "ON kanban_profile_event_subs(task_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_profile_event_subs_profile "
+        "ON kanban_profile_event_subs(profile)"
+    )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -6400,7 +6461,7 @@ def advance_notify_cursor(
 ) -> None:
     with write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs SET last_event_id = MAX(last_event_id, ?) "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
@@ -6429,6 +6490,306 @@ def rewind_notify_cursor(
             "AND last_event_id = ?",
             (
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
+                int(claimed_cursor),
+            ),
+        )
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Profile-level event subscriptions (gateway wakes a Hermes profile)
+# ---------------------------------------------------------------------------
+#
+# These rows are the orchestration analogue of ``kanban_notify_subs``: instead
+# of pushing chat messages, the gateway notifier spawns ``hermes -p <profile>
+# chat -q <prompt>`` when matching events land. The wake is fire-and-forget,
+# the cursor is the same monotonic global ``task_events.id`` used by the chat
+# subs, and ``include_children`` reuses the subtree fan-out helper so a
+# parent-level orchestrator sees descendant lifecycle events.
+#
+# Subscriptions are NEVER auto-created. Operators add them via the helpers
+# below (or future CLI), and a worker spawned via a wake MUST NOT add another
+# (the gateway sets ``HERMES_KANBAN_EVENT_WAKE=1`` so the spawned profile can
+# detect and refuse recursive setup).
+_PROFILE_EVENT_UNSET = object()
+
+def add_profile_event_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+    event_kinds: Optional[Iterable[str]] = None,
+    include_children: Optional[bool] = None,
+    wake_agent: Optional[bool] = None,
+    wake_prompt: Any = _PROFILE_EVENT_UNSET,
+    enabled: Optional[bool] = None,
+) -> None:
+    """Register a profile-level event subscription.
+
+    Idempotent on ``(task_id, profile, name)``. Re-adding the same triple
+    without optional arguments behaves like "ensure this subscription exists":
+    it leaves the existing cursor and subscription options untouched. Passing
+    an optional argument explicitly updates only that field. This mirrors
+    ``add_notify_sub`` and prevents accidental re-adds from disabling subtree
+    fan-out or wake settings.
+    """
+    now = int(time.time())
+    normalized_kinds = _normalize_event_kinds(event_kinds)
+    kinds_json = json.dumps(normalized_kinds) if normalized_kinds is not None else None
+    include_children_flag = 1 if include_children else 0
+    wake_agent_flag = 0 if wake_agent is False else 1
+    enabled_flag = 0 if enabled is False else 1
+    prompt_value = None if wake_prompt is _PROFILE_EVENT_UNSET else wake_prompt
+    sub_name = name or ""
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_profile_event_subs (
+                task_id, profile, name, event_kinds, include_children,
+                wake_agent, wake_prompt, created_at, last_event_id,
+                last_wake_at, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+            """,
+            (
+                task_id, profile, sub_name, kinds_json,
+                include_children_flag, wake_agent_flag, prompt_value,
+                now, enabled_flag,
+            ),
+        )
+
+        sets: list[str] = []
+        params: list[Any] = []
+        if event_kinds is not None:
+            sets.append("event_kinds = ?")
+            params.append(kinds_json)
+        if include_children is not None:
+            sets.append("include_children = ?")
+            params.append(include_children_flag)
+        if wake_agent is not None:
+            sets.append("wake_agent = ?")
+            params.append(wake_agent_flag)
+        if wake_prompt is not _PROFILE_EVENT_UNSET:
+            sets.append("wake_prompt = ?")
+            params.append(wake_prompt)
+        if enabled is not None:
+            sets.append("enabled = ?")
+            params.append(enabled_flag)
+        if sets:
+            params.extend([task_id, profile, sub_name])
+            conn.execute(
+                "UPDATE kanban_profile_event_subs SET "
+                + ", ".join(sets)
+                + " WHERE task_id = ? AND profile = ? AND name = ?",
+                params,
+            )
+
+
+def list_profile_event_subs(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    profile: Optional[str] = None,
+    enabled_only: bool = True,
+) -> list[dict]:
+    """List profile event subscriptions, optionally filtered by task/profile."""
+    where: list[str] = []
+    params: list[Any] = []
+    if task_id is not None:
+        where.append("task_id = ?")
+        params.append(task_id)
+    if profile is not None:
+        where.append("profile = ?")
+        params.append(profile)
+    if enabled_only:
+        where.append("enabled = 1")
+    sql = "SELECT * FROM kanban_profile_event_subs"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at ASC"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def remove_profile_event_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_profile_event_subs "
+            "WHERE task_id = ? AND profile = ? AND name = ?",
+            (task_id, profile, name or ""),
+        )
+    return cur.rowcount > 0
+
+
+def _unseen_events_for_profile_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str,
+    cursor: int,
+    kinds: Optional[Iterable[str]],
+    include_children: bool,
+) -> tuple[int, list[Event]]:
+    """Helper that fetches unseen events for a profile sub against ``cursor``.
+
+    Identical scan semantics to :func:`unseen_events_for_sub` (single-cursor,
+    chunked-IN subtree expansion, monotonic re-sort across batches). Kept
+    separate because the chat-sub variant reads its cursor from
+    ``kanban_notify_subs`` first; here the caller passes the cursor it just
+    locked.
+    """
+    kind_list = list(kinds) if kinds else None
+    task_ids: list[str] = [task_id]
+    if include_children:
+        task_ids.extend(_dependency_descendants(conn, task_id))
+    out: list[Event] = []
+    max_id = cursor
+    for i in range(0, len(task_ids), 200):
+        batch = task_ids[i:i + 200]
+        placeholders = ",".join("?" * len(batch))
+        q = (
+            f"SELECT * FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND id > ? "
+            + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+            + "ORDER BY id ASC"
+        )
+        params: list[Any] = [*batch, cursor]
+        if kind_list:
+            params.extend(kind_list)
+        rows = conn.execute(q, params).fetchall()
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append(Event(
+                id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                payload=payload, created_at=r["created_at"],
+                run_id=(
+                    int(r["run_id"])
+                    if "run_id" in r.keys() and r["run_id"] is not None else None
+                ),
+            ))
+            max_id = max(max_id, int(r["id"]))
+    if len(task_ids) > 1:
+        out.sort(key=lambda e: e.id)
+    return max_id, out
+
+
+def claim_unseen_events_for_profile_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen events for a profile event subscription.
+
+    Returns ``(old_cursor, new_cursor, events)``. The subscription's
+    ``last_event_id`` is advanced to ``new_cursor`` inside the same
+    ``BEGIN IMMEDIATE`` transaction as the scan, giving this caller exclusive
+    ownership of the event range. Disabled subscriptions return empty.
+
+    On spawn (or any downstream) failure, callers should rewind via
+    :func:`rewind_profile_event_cursor` with the CAS old/claimed pair.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT last_event_id, event_kinds, include_children, enabled
+            FROM kanban_profile_event_subs
+            WHERE task_id = ? AND profile = ? AND name = ?
+            """,
+            (task_id, profile, name or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        if not int(row["enabled"]):
+            return int(row["last_event_id"]), int(row["last_event_id"]), []
+        old_cursor = int(row["last_event_id"])
+        sub_kinds = _parse_event_kinds_column(row["event_kinds"])
+        effective_kinds = sub_kinds if sub_kinds else DEFAULT_NOTIFY_TERMINAL_KINDS
+        include_children = bool(row["include_children"])
+        new_cursor, events = _unseen_events_for_profile_sub(
+            conn,
+            task_id=task_id,
+            profile=profile,
+            name=name or "",
+            cursor=old_cursor,
+            kinds=effective_kinds,
+            include_children=include_children,
+        )
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_profile_event_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND profile = ? AND name = ? "
+            "AND last_event_id = ?",
+            (
+                int(new_cursor), task_id, profile, name or "",
+                int(old_cursor),
+            ),
+        )
+        return old_cursor, new_cursor, events
+
+
+def advance_profile_event_cursor(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+    new_cursor: int,
+    last_wake_at: Optional[int] = None,
+) -> None:
+    """Bump the cursor (and optionally ``last_wake_at``) after a successful wake."""
+    with write_txn(conn):
+        if last_wake_at is None:
+            conn.execute(
+                "UPDATE kanban_profile_event_subs SET "
+                "last_event_id = MAX(last_event_id, ?) "
+                "WHERE task_id = ? AND profile = ? AND name = ?",
+                (int(new_cursor), task_id, profile, name or ""),
+            )
+        else:
+            conn.execute(
+                "UPDATE kanban_profile_event_subs "
+                "SET last_event_id = MAX(last_event_id, ?), last_wake_at = ? "
+                "WHERE task_id = ? AND profile = ? AND name = ?",
+                (
+                    int(new_cursor), int(last_wake_at),
+                    task_id, profile, name or "",
+                ),
+            )
+
+
+def rewind_profile_event_cursor(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    profile: str,
+    name: str = "",
+    claimed_cursor: int,
+    old_cursor: int,
+) -> bool:
+    """Undo a profile-event claim when spawn/delivery fails.
+
+    CAS-guarded on ``claimed_cursor`` so a concurrent claim that already
+    advanced further isn't clobbered.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_profile_event_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND profile = ? AND name = ? "
+            "AND last_event_id = ?",
+            (
+                int(old_cursor), task_id, profile, name or "",
                 int(claimed_cursor),
             ),
         )

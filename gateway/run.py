@@ -4721,14 +4721,22 @@ class GatewayRunner:
         while self._running:
             try:
                 def _collect():
-                    deliveries: list[dict] = []
+                    chat_deliveries: list[dict] = []
+                    profile_deliveries: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
+                    # Profile-level event subs (Phase 2) wake a Hermes profile
+                    # subprocess directly and do not require any connected
+                    # chat adapter. Keep iterating boards even when
+                    # ``active_platforms`` is empty so the profile wake path
+                    # still runs on adapter-less gateways.
                     if not active_platforms:
-                        logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        logger.debug(
+                            "kanban notifier: no connected adapters; "
+                            "chat subscriptions skipped this tick"
+                        )
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -4772,8 +4780,8 @@ class GatewayRunner:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(conn)
-                            if not subs:
+                            subs = _kb.list_notify_subs(conn) if active_platforms else []
+                            if active_platforms and not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 owner_profile = sub.get("notifier_profile") or None
@@ -4838,7 +4846,7 @@ class GatewayRunner:
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
                                 )
-                                deliveries.append({
+                                chat_deliveries.append({
                                     "sub": sub,
                                     "old_cursor": old_cursor,
                                     "cursor": cursor,
@@ -4847,11 +4855,76 @@ class GatewayRunner:
                                     "event_tasks": event_tasks,
                                     "board": slug,
                                 })
+
+                            # ---- Profile-level event subscriptions (Phase 2) ----
+                            # Adapter-independent. Helper not present on a legacy
+                            # build (extremely defensive — the import alias above
+                            # already resolved kanban_db) -> skip the block.
+                            list_pro = getattr(_kb, "list_profile_event_subs", None)
+                            claim_pro = getattr(
+                                _kb, "claim_unseen_events_for_profile_sub", None,
+                            )
+                            if list_pro and claim_pro:
+                                try:
+                                    pro_subs = list_pro(conn, enabled_only=True)
+                                except Exception as exc:
+                                    logger.debug(
+                                        "kanban notifier: profile-event sub listing "
+                                        "failed for board %s: %s", slug, exc,
+                                    )
+                                    pro_subs = []
+                                for psub in pro_subs:
+                                    try:
+                                        old_pc, pc, p_events = claim_pro(
+                                            conn,
+                                            task_id=psub["task_id"],
+                                            profile=psub["profile"],
+                                            name=psub.get("name") or "",
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "kanban notifier: profile-event claim "
+                                            "failed for %s/%s on board %s: %s",
+                                            psub.get("task_id"), psub.get("profile"),
+                                            slug, exc,
+                                        )
+                                        continue
+                                    if not p_events:
+                                        continue
+                                    p_task = _kb.get_task(conn, psub["task_id"])
+                                    p_event_tasks: dict[str, Any] = {}
+                                    if bool(psub.get("include_children")):
+                                        for ev in p_events:
+                                            if ev.task_id in p_event_tasks:
+                                                continue
+                                            if ev.task_id == psub["task_id"]:
+                                                p_event_tasks[ev.task_id] = p_task
+                                            else:
+                                                try:
+                                                    p_event_tasks[ev.task_id] = _kb.get_task(
+                                                        conn, ev.task_id,
+                                                    )
+                                                except Exception:
+                                                    p_event_tasks[ev.task_id] = None
+                                    logger.debug(
+                                        "kanban notifier: claimed %d profile event(s) "
+                                        "for %s on board %s cursor %s→%s",
+                                        len(p_events), psub["task_id"], slug, old_pc, pc,
+                                    )
+                                    profile_deliveries.append({
+                                        "sub": psub,
+                                        "old_cursor": old_pc,
+                                        "cursor": pc,
+                                        "events": p_events,
+                                        "task": p_task,
+                                        "event_tasks": p_event_tasks,
+                                        "board": slug,
+                                    })
                         finally:
                             conn.close()
-                    return deliveries
+                    return chat_deliveries, profile_deliveries
 
-                deliveries = await asyncio.to_thread(_collect)
+                deliveries, profile_deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -5076,6 +5149,53 @@ class GatewayRunner:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
+
+                # ---- Profile-level event subscription wakes (Phase 2) ----
+                # Each profile delivery is a single fire-and-forget
+                # ``hermes -p <profile> chat -q <prompt>`` spawn covering the
+                # entire claimed batch. On spawn success, advance the cursor
+                # (already at ``new`` from the claim) and stamp
+                # ``last_wake_at``. On failure, rewind to ``old`` so the next
+                # tick retries.
+                for pd in profile_deliveries:
+                    psub = pd["sub"]
+                    p_board = pd.get("board")
+                    if not int(psub.get("wake_agent") or 0):
+                        # Subscription recorded events but is configured not to
+                        # wake an agent — just advance the cursor to ack the
+                        # range and continue.
+                        await asyncio.to_thread(
+                            self._kanban_profile_advance,
+                            psub, pd["cursor"], p_board, None,
+                        )
+                        continue
+                    try:
+                        ok = await asyncio.to_thread(
+                            self._kanban_profile_wake,
+                            psub,
+                            pd["events"],
+                            pd["task"],
+                            pd["event_tasks"],
+                            p_board,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "kanban notifier: profile wake spawn raised for "
+                            "%s/%s on board %s: %s",
+                            psub.get("task_id"), psub.get("profile"),
+                            p_board, exc,
+                        )
+                        ok = False
+                    if ok:
+                        await asyncio.to_thread(
+                            self._kanban_profile_advance,
+                            psub, pd["cursor"], p_board, int(time.time()),
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self._kanban_profile_rewind,
+                            psub, pd["cursor"], pd.get("old_cursor", 0), p_board,
+                        )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
@@ -5142,6 +5262,279 @@ class GatewayRunner:
             )
         finally:
             conn.close()
+
+    # ---- Profile-level event subscription helpers (Phase 2) ----
+
+    def _kanban_profile_advance(
+        self,
+        sub: dict,
+        cursor: int,
+        board: Optional[str],
+        last_wake_at: Optional[int],
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.advance_profile_event_cursor(
+                conn,
+                task_id=sub["task_id"],
+                profile=sub["profile"],
+                name=sub.get("name") or "",
+                new_cursor=cursor,
+                last_wake_at=last_wake_at,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_profile_rewind(
+        self,
+        sub: dict,
+        claimed_cursor: int,
+        old_cursor: int,
+        board: Optional[str] = None,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.rewind_profile_event_cursor(
+                conn,
+                task_id=sub["task_id"],
+                profile=sub["profile"],
+                name=sub.get("name") or "",
+                claimed_cursor=claimed_cursor,
+                old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _build_kanban_event_wake_prompt(
+        self,
+        sub: dict,
+        events: list,
+        task,
+        event_tasks: dict,
+        board: Optional[str],
+    ) -> str:
+        """Build the compact prompt body for a profile event wake.
+
+        One prompt per claimed batch. Explicit framing keeps the woken
+        agent from re-arming cron / subscriptions and limits its remit to
+        whatever orchestration the events demand. Per-event payloads are
+        clipped so a single noisy run can't blow up the worker's context.
+        """
+        import json as _json
+
+        root_id = sub.get("task_id") or "<unknown>"
+        root_title = (task.title if task else "") or ""
+        root_status = (task.status if task else "") or ""
+        root_assignee = (task.assignee if task else "") or ""
+        profile = sub.get("profile") or ""
+        name = sub.get("name") or ""
+
+        lines: list[str] = []
+        lines.append(
+            "This is a Kanban event wake from the gateway notifier. "
+            "DO NOT create cron jobs, subscriptions, or any other "
+            "recurring trigger as a response to this wake."
+        )
+        lines.append(
+            "Take only the necessary orchestration action for the events "
+            "below (e.g. promote a follow-up, post a comment, unblock a "
+            "dependent), then exit."
+        )
+        lines.append("")
+        lines.append(f"board: {board or 'default'}")
+        lines.append(f"root_task: {root_id}")
+        if root_title:
+            lines.append(f"root_title: {root_title[:200]}")
+        if root_status:
+            lines.append(f"root_status: {root_status}")
+        if root_assignee:
+            lines.append(f"root_assignee: {root_assignee}")
+        lines.append(f"watched_profile: {profile}")
+        if name:
+            lines.append(f"watched_name: {name}")
+        custom = (sub.get("wake_prompt") or "").strip()
+        if custom:
+            lines.append("")
+            lines.append("orchestrator hint:")
+            lines.append(custom[:1000])
+        lines.append("")
+        lines.append("events:")
+        for ev in events[:50]:
+            ev_task = event_tasks.get(ev.task_id) or task
+            ev_title = (
+                ev_task.title if ev_task and getattr(ev_task, "title", None)
+                else ""
+            )
+            ev_assignee = (
+                ev_task.assignee if ev_task and getattr(ev_task, "assignee", None)
+                else ""
+            )
+            try:
+                payload_preview = _json.dumps(
+                    ev.payload, ensure_ascii=False,
+                )[:240] if ev.payload else ""
+            except Exception:
+                payload_preview = ""
+            try:
+                ev_summary = ""
+                if ev.payload and isinstance(ev.payload, dict):
+                    raw = ev.payload.get("summary") or ev.payload.get("reason")
+                    if raw:
+                        ev_summary = str(raw).strip().splitlines()[0][:200]
+            except Exception:
+                ev_summary = ""
+            parts = [
+                f"event_id={ev.id}",
+                f"task_id={ev.task_id}",
+                f"kind={ev.kind}",
+            ]
+            if ev_title:
+                parts.append(f"title={ev_title[:120]!r}")
+            if ev_assignee:
+                parts.append(f"assignee={ev_assignee}")
+            if ev_summary:
+                parts.append(f"summary={ev_summary!r}")
+            if payload_preview:
+                parts.append(f"payload={payload_preview}")
+            lines.append("- " + " ".join(parts))
+        if len(events) > 50:
+            lines.append(f"... ({len(events) - 50} more events truncated)")
+        return "\n".join(lines)
+
+    def _kanban_profile_wake(
+        self,
+        sub: dict,
+        events: list,
+        task,
+        event_tasks: dict,
+        board: Optional[str],
+    ) -> bool:
+        """Spawn ``hermes -p <profile> chat -q <prompt>`` for a profile sub.
+
+        Fire-and-forget: returns True on Popen success (the child detaches
+        and continues in the background), False on any spawn failure. The
+        cursor advance / rewind is the caller's responsibility.
+
+        The spawned process gets ``HERMES_KANBAN_EVENT_WAKE=1`` so the
+        woken agent (or any wrapper code it runs) can detect a wake
+        context and refuse to set up further auto-triggers.
+        """
+        import subprocess
+        from pathlib import Path as _Path
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            resolve_profile_env,
+        )
+
+        profile_raw = sub.get("profile") or ""
+        if not profile_raw:
+            logger.warning(
+                "kanban notifier: profile wake skipped — no profile on sub %r",
+                sub,
+            )
+            return False
+        try:
+            profile = normalize_profile_name(profile_raw)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: invalid profile %r on sub: %s",
+                profile_raw, exc,
+            )
+            return False
+
+        prompt = self._build_kanban_event_wake_prompt(
+            sub, events, task, event_tasks, board,
+        )
+
+        env = dict(os.environ)
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile)
+        except FileNotFoundError as exc:
+            # Missing profiles fail immediately at CLI startup. Treat that as
+            # a spawn failure before Popen so the subscription cursor rewinds
+            # and the operator can fix/retry instead of losing the wake.
+            logger.warning(
+                "kanban notifier: profile wake skipped for missing profile %s: %s",
+                profile, exc,
+            )
+            return False
+        env["HERMES_PROFILE"] = profile
+        env["HERMES_KANBAN_EVENT_WAKE"] = "1"
+        resolved_board = board or _kb.get_current_board()
+        env["HERMES_KANBAN_BOARD"] = resolved_board
+        env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=resolved_board))
+
+        # Per-profile-per-root log under the board's logs dir. Keeps wake
+        # output discoverable next to worker logs without conflating with
+        # any active worker for the same task.
+        try:
+            log_dir = _kb.worker_logs_dir(board=resolved_board)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            safe_profile = "".join(
+                ch if ch.isalnum() or ch in "._-" else "_" for ch in profile
+            )
+            safe_name = "".join(
+                ch if ch.isalnum() or ch in "._-" else "_"
+                for ch in (sub.get("name") or "")
+            )
+            base = f"event-wake-{safe_profile}-{sub.get('task_id')}"
+            if safe_name:
+                base += f"-{safe_name}"
+            log_path = log_dir / f"{base}.log"
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: cannot resolve wake log path for %s/%s: %s",
+                sub.get("task_id"), profile, exc,
+            )
+            log_path = None
+
+        cmd = [
+            *_kb._resolve_hermes_argv(),
+            "-p", profile,
+            "--accept-hooks",
+            "chat",
+            "-q", prompt,
+        ]
+
+        log_f = None
+        try:
+            if log_path is not None:
+                log_f = open(log_path, "ab")
+                stdout = log_f
+                stderr = subprocess.STDOUT
+            else:
+                stdout = subprocess.DEVNULL
+                stderr = subprocess.DEVNULL
+            subprocess.Popen(  # noqa: S603 -- argv is a fixed list
+                cmd,
+                cwd=None,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: profile wake Popen failed for %s/%s: %s",
+                sub.get("task_id"), profile, exc,
+            )
+            if log_f is not None:
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+            return False
+        # Intentionally leave log_f open for the child to inherit; the
+        # parent reference goes out of scope after we return.
+        logger.info(
+            "kanban notifier: woke profile %s for %s on board %s (%d events)",
+            profile, sub.get("task_id"), resolved_board, len(events),
+        )
+        return True
 
     async def _deliver_kanban_artifacts(
         self,

@@ -524,3 +524,349 @@ def test_include_children_subscription_unsubs_when_root_archived(tmp_path, monke
         assert kb.list_notify_subs(conn, parent_id) == []
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: profile-level event subscriptions drive a fire-and-forget
+# ``hermes -p <profile> chat -q <prompt>`` wake instead of a chat message.
+# These tests pin: (a) the wake fires without any active adapter, (b) the
+# spawned command/prompt/env match the contract, (c) spawn failure rewinds
+# the cursor so the next tick retries, (d) include_children fans descendant
+# events into the wake batch.
+# ---------------------------------------------------------------------------
+
+
+def _make_runner_no_adapters():
+    """Runner with the kanban notifier wired but zero connected adapters.
+
+    Phase 2 requires profile wakes to run on adapter-less gateways — this
+    fixture pins that invariant.
+    """
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    return runner
+
+
+def test_profile_event_wake_spawns_without_adapters(tmp_path, monkeypatch):
+    """A profile event sub spawns the wake command with no chat adapter connected."""
+    db_path = tmp_path / "profile-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile target", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed", "completed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    captured: dict = {}
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        captured["sub"] = sub
+        captured["events"] = list(events)
+        captured["board"] = board
+        captured["task_id"] = sub["task_id"]
+        captured["profile"] = sub["profile"]
+        # Reuse the real prompt builder so we exercise it.
+        captured["prompt"] = self._build_kanban_event_wake_prompt(
+            sub, events, task, event_tasks, board,
+        )
+        return True
+
+    monkeypatch.setattr(
+        GatewayRunner, "_kanban_profile_wake", fake_wake,
+    )
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert captured.get("profile") == "jensen", (
+        "Wake should fire even with zero connected adapters"
+    )
+    assert captured["task_id"] == tid
+    assert any(ev.kind == "claimed" for ev in captured["events"])
+    prompt = captured["prompt"]
+    assert "Kanban event wake" in prompt
+    assert "DO NOT create cron" in prompt
+    assert tid in prompt
+    assert "jensen" in prompt
+    assert "claimed" in prompt
+
+    # Cursor advanced past the wake batch.
+    conn = kb.connect()
+    try:
+        subs = kb.list_profile_event_subs(conn, task_id=tid)
+        assert len(subs) == 1
+        assert int(subs[0]["last_event_id"]) > 0
+        assert int(subs[0]["last_wake_at"] or 0) > 0
+    finally:
+        conn.close()
+
+
+def test_profile_event_wake_includes_child_event(tmp_path, monkeypatch):
+    """include_children profile sub picks up a descendant lifecycle event."""
+    db_path = tmp_path / "profile-subtree.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="parent", assignee="lead")
+        child_id = kb.create_task(conn, title="child", assignee="worker")
+        kb.link_tasks(conn, parent_id, child_id)
+        kb.add_profile_event_sub(
+            conn,
+            task_id=parent_id,
+            profile="jensen",
+            include_children=True,
+        )
+        kb._append_event(
+            conn, child_id, kind="completed", payload={"summary": "child done"},
+        )
+    finally:
+        conn.close()
+
+    captured: dict = {}
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        captured["events"] = list(events)
+        captured["event_tasks"] = dict(event_tasks)
+        return True
+
+    monkeypatch.setattr(
+        GatewayRunner, "_kanban_profile_wake", fake_wake,
+    )
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    events = captured.get("events") or []
+    assert any(e.task_id == child_id and e.kind == "completed" for e in events), (
+        f"include_children parent sub should see child completion; got "
+        f"{[(e.task_id, e.kind) for e in events]}"
+    )
+    ev_tasks = captured.get("event_tasks") or {}
+    assert child_id in ev_tasks
+    assert ev_tasks[child_id] is not None
+    assert ev_tasks[child_id].title == "child"
+
+
+def test_profile_event_wake_failure_rewinds_cursor(tmp_path, monkeypatch):
+    """Spawn failure must rewind the cursor so the next tick retries."""
+    db_path = tmp_path / "profile-rewind.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry target", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    def fake_wake_fail(self, sub, events, task, event_tasks, board):
+        return False
+
+    monkeypatch.setattr(
+        GatewayRunner, "_kanban_profile_wake", fake_wake_fail,
+    )
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_profile_event_subs(conn, task_id=tid)
+        assert len(subs) == 1
+        # Cursor rewound to 0; last_wake_at untouched.
+        assert int(subs[0]["last_event_id"]) == 0
+        assert subs[0]["last_wake_at"] in (None, 0)
+    finally:
+        conn.close()
+
+
+def test_profile_event_wake_command_and_env_via_popen(tmp_path, monkeypatch):
+    """The real wake path constructs the expected argv + env via subprocess.Popen."""
+    db_path = tmp_path / "profile-popen.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="popen target", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="default",  # 'default' avoids the profile-dir existence check
+            event_kinds=["claimed"],
+            wake_prompt="please orchestrate",
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    popen_calls: list[dict] = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            popen_calls.append({"cmd": cmd, "kwargs": kwargs})
+
+    monkeypatch.setattr("subprocess.Popen", FakePopen)
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(popen_calls) == 1, (
+        f"Expected exactly one Popen for the wake spawn; got {len(popen_calls)}"
+    )
+    call = popen_calls[0]
+    cmd = call["cmd"]
+    # Profile, accept-hooks, and the chat -q invocation must all appear.
+    assert "-p" in cmd and cmd[cmd.index("-p") + 1] == "default"
+    assert "--accept-hooks" in cmd
+    assert "chat" in cmd and "-q" in cmd
+    prompt_arg = cmd[cmd.index("-q") + 1]
+    assert "Kanban event wake" in prompt_arg
+    assert tid in prompt_arg
+    assert "please orchestrate" in prompt_arg
+
+    env = call["kwargs"]["env"]
+    assert env.get("HERMES_KANBAN_EVENT_WAKE") == "1"
+    assert env.get("HERMES_PROFILE") == "default"
+    assert env.get("HERMES_KANBAN_BOARD")
+    assert env.get("HERMES_KANBAN_DB")
+
+    # Cursor advanced + last_wake_at stamped on Popen success.
+    conn = kb.connect()
+    try:
+        sub = kb.list_profile_event_subs(conn, task_id=tid)[0]
+        assert int(sub["last_event_id"]) > 0
+        assert int(sub["last_wake_at"] or 0) > 0
+    finally:
+        conn.close()
+
+
+def test_profile_event_wake_disabled_via_wake_agent_zero(tmp_path, monkeypatch):
+    """wake_agent=0 advances the cursor but never spawns."""
+    db_path = tmp_path / "profile-no-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="no-wake", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            event_kinds=["claimed"],
+            wake_agent=False,
+        )
+        kb._append_event(conn, tid, kind="claimed")
+    finally:
+        conn.close()
+
+    wake_calls: list = []
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        wake_calls.append(sub)
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_kanban_profile_wake", fake_wake)
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert wake_calls == [], (
+        "wake_agent=0 subscriptions must not spawn a wake"
+    )
+    conn = kb.connect()
+    try:
+        sub = kb.list_profile_event_subs(conn, task_id=tid)[0]
+        assert int(sub["last_event_id"]) > 0  # cursor still advances
+        assert sub["last_wake_at"] in (None, 0)
+    finally:
+        conn.close()
+
+
+def test_chat_subscription_unaffected_when_profile_sub_present(tmp_path, monkeypatch):
+    """Adding a profile sub does not change chat-subscription delivery."""
+    db_path = tmp_path / "mixed-subs.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="mixed", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_profile_event_sub(
+            conn, task_id=tid, profile="jensen", event_kinds=["completed"],
+        )
+        kb.complete_task(conn, tid, summary="ok")
+    finally:
+        conn.close()
+
+    wake_calls: list = []
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        wake_calls.append(sub)
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_kanban_profile_wake", fake_wake)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Chat sub still delivers the terminal event.
+    assert len(adapter.sent) == 1
+    assert "done" in adapter.sent[0]["text"].lower()
+    # Profile sub also fires for the same event.
+    assert len(wake_calls) == 1
+    assert wake_calls[0]["profile"] == "jensen"
+
+
+
+def test_profile_wake_missing_profile_returns_false_and_does_not_popen(tmp_path, monkeypatch):
+    """Missing profiles must be treated as spawn failure before cursor ack."""
+    db_path = tmp_path / "missing-profile-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="missing profile wake", assignee="worker")
+        task = kb.get_task(conn, tid)
+        ev = kb.list_events(conn, tid)[0]
+    finally:
+        conn.close()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    sub = {"task_id": tid, "profile": "does-not-exist", "name": ""}
+    with pytest.MonkeyPatch.context() as mp:
+        popen_calls = []
+        def fake_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+            raise AssertionError("Popen should not be reached for missing profile")
+        mp.setattr("subprocess.Popen", fake_popen)
+        ok = runner._kanban_profile_wake(sub, [ev], task, {}, "default")
+
+    assert ok is False
+    assert popen_calls == []
