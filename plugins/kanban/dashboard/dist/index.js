@@ -458,6 +458,45 @@
     }
   }
 
+  function normalizeWakeHealth(raw) {
+    const w = raw || {};
+    return {
+      subscription_count: Number(w.subscription_count || 0),
+      failing_count: Number(w.failing_count || 0),
+      stale_count: Number(w.stale_count || 0),
+      severity: w.severity || "none",
+      as_of: Number(w.as_of || 0),
+    };
+  }
+
+  function wakeHealthPillText(wakeHealth) {
+    const w = normalizeWakeHealth(wakeHealth);
+    if (w.subscription_count <= 0) return "";
+    if (w.failing_count > 0 && w.stale_count > 0) return `${w.failing_count} failing • ${w.stale_count} stale`;
+    if (w.failing_count > 0) return `${w.failing_count} failing`;
+    if (w.stale_count > 0) return `${w.stale_count} stale`;
+    return "Wakes healthy";
+  }
+
+  function wakeHealthTitle(wakeHealth) {
+    const w = normalizeWakeHealth(wakeHealth);
+    if (w.subscription_count <= 0) return "";
+    const stale = w.stale_count === 1 ? "1 stale" : `${w.stale_count} stale`;
+    const failing = w.failing_count === 1 ? "1 failing" : `${w.failing_count} failing`;
+    let summary = "all healthy";
+    if (w.failing_count > 0 && w.stale_count > 0) summary = `${failing}, ${stale}`;
+    else if (w.failing_count > 0) summary = failing;
+    else if (w.stale_count > 0) summary = stale;
+    return `Wake health: ${summary}. Failing = last wake errored. Stale = no successful wake yet.`;
+  }
+
+  function wakeHealthPillClass(wakeHealth) {
+    const w = normalizeWakeHealth(wakeHealth);
+    if (w.failing_count > 0) return "hermes-kanban-wake-health--failing";
+    if (w.stale_count > 0) return "hermes-kanban-wake-health--stale";
+    return "hermes-kanban-wake-health--healthy";
+  }
+
   // -------------------------------------------------------------------------
   // Root page
   // -------------------------------------------------------------------------
@@ -626,9 +665,8 @@
             }
             if (msg && Array.isArray(msg.wake_events) && msg.wake_events.length > 0) {
               wakeCursorRef.current = msg.wake_cursor || wakeCursorRef.current;
-              // Wake events only affect profile-wake rows in an open drawer.
-              // Avoid a full board reload; TaskDrawer refreshes profile-subs
-              // from its own wakeTick signal.
+              // Keep drawer-level wake rows fresh, and also refresh board-level
+              // wake-health rollup (toolbar pill + attention summary).
               setProfileWakeTick(function (prev) {
                 const next = Object.assign({}, prev);
                 for (const e of msg.wake_events) {
@@ -636,6 +674,7 @@
                 }
                 return next;
               });
+              scheduleReload();
             }
           } catch (_e) { /* ignore */ }
         };
@@ -1110,7 +1149,12 @@
       function () { return collectDiagTasks(props.boardData); },
       [props.boardData]
     );
-    if (dismissed || diagTasks.length === 0) return null;
+    const wakeHealth = normalizeWakeHealth(props.boardData && props.boardData.wake_health);
+    const wakeFailingCount = wakeHealth.failing_count;
+    const wakeStaleCount = wakeHealth.stale_count;
+    const showWakeFailureSummary = wakeFailingCount > 0;
+    if (dismissed || (diagTasks.length === 0 && !showWakeFailureSummary)) return null;
+
     // Pick the highest severity present so we can colour the strip.
     let topSev = "warning";
     for (const td of diagTasks) {
@@ -1118,6 +1162,15 @@
       if (s === "critical") { topSev = "critical"; break; }
       if (s === "error" && topSev !== "critical") topSev = "error";
     }
+    if (showWakeFailureSummary && topSev === "warning") topSev = "error";
+
+    const diagSummary = diagTasks.length === 1
+      ? tx(t, "taskNeedsAttention", "1 task needs attention")
+      : tx(t, "tasksNeedAttention", "{n} tasks need attention", { n: diagTasks.length });
+    const wakeSummary = wakeFailingCount === 1
+      ? "1 profile wake failing"
+      : `${wakeFailingCount} profile wakes failing`;
+
     return h("div", {
       className: cn(
         "hermes-kanban-attention",
@@ -1128,11 +1181,11 @@
         h("span", { className: "hermes-kanban-attention-icon" },
           topSev === "critical" ? "!!!" : topSev === "error" ? "!!" : "⚠"),
         h("span", { className: "hermes-kanban-attention-text" },
-          diagTasks.length === 1
-            ? tx(t, "taskNeedsAttention", "1 task needs attention")
-            : tx(t, "tasksNeedAttention", "{n} tasks need attention",
-                { n: diagTasks.length }),
+          diagTasks.length > 0 ? diagSummary : wakeSummary,
         ),
+        (diagTasks.length > 0 && showWakeFailureSummary)
+          ? h("span", { className: "hermes-kanban-attention-wake" }, wakeSummary)
+          : null,
         h("button", {
           className: "hermes-kanban-attention-toggle",
           onClick: function () { setExpanded(function (x) { return !x; }); },
@@ -1147,6 +1200,19 @@
       ),
       expanded
         ? h("div", { className: "hermes-kanban-attention-list" },
+            showWakeFailureSummary ? h("div", {
+              key: "wake-health-summary",
+              className: "hermes-kanban-attention-row hermes-kanban-attention-row--error",
+            },
+              h("span", { className: "hermes-kanban-attention-row-sev" }, "!!"),
+              h("span", { className: "hermes-kanban-attention-row-id" }, "wake"),
+              h("span", { className: "hermes-kanban-attention-row-title" }, wakeSummary),
+              h("span", { className: "hermes-kanban-attention-row-meta" },
+                wakeStaleCount > 0
+                  ? `${wakeStaleCount} stale wake path${wakeStaleCount === 1 ? "" : "s"}`
+                  : "check profile wake routes",
+              ),
+            ) : null,
             diagTasks.map(function (task) {
               const sev = (task.warnings && task.warnings.highest_severity) || "warning";
               const kinds = task.warnings && task.warnings.kinds ? Object.keys(task.warnings.kinds) : [];
@@ -1974,6 +2040,9 @@
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
     const assignees = (props.board && props.board.assignees) || [];
+    const wakeHealth = normalizeWakeHealth(props.board && props.board.wake_health);
+    const wakeHealthText = wakeHealthPillText(wakeHealth);
+    const wakeHealthLabel = wakeHealthTitle(wakeHealth);
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "flex flex-col gap-1",
                  title: "Fuzzy-match tasks by id, title, or description. Matches across all columns." },
@@ -2028,6 +2097,11 @@
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
       h("div", { className: "flex-1" }),
+      wakeHealth.subscription_count > 0 ? h("span", {
+        className: cn("hermes-kanban-wake-health", wakeHealthPillClass(wakeHealth)),
+        title: wakeHealthLabel,
+        "aria-label": wakeHealthLabel,
+      }, wakeHealthText) : null,
       h(Button, {
         onClick: props.onNudgeDispatch,
         size: "sm",

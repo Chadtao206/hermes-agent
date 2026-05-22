@@ -153,6 +153,77 @@ def test_tenant_filter(client):
     assert total == 1
 
 
+def test_board_wake_health_rollup_and_tenant_scope(client):
+    """/board includes wake_health and scopes counts to visible board tasks."""
+    t_healthy = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "healthy", "tenant": "t1"},
+    ).json()["task"]
+    t_stale = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "stale", "tenant": "t1"},
+    ).json()["task"]
+    t_failing = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "failing", "tenant": "t1"},
+    ).json()["task"]
+    t_other = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "other", "tenant": "t2"},
+    ).json()["task"]
+
+    for task in (t_healthy, t_stale, t_failing, t_other):
+        r = client.post(
+            f"/api/plugins/kanban/tasks/{task['id']}/profile-subs",
+            json={"profile": "jensen"},
+        )
+        assert r.status_code == 200, r.text
+
+    conn = kb.connect()
+    try:
+        now = int(time.time())
+        kb.record_profile_wake_success(
+            conn,
+            task_id=t_healthy["id"],
+            profile="jensen",
+            new_cursor=5,
+            last_wake_at=now,
+        )
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=t_failing["id"],
+            profile="jensen",
+            claimed_cursor=9,
+            old_cursor=0,
+            error=RuntimeError("spawn refused"),
+        )
+        kb.record_profile_wake_failure(
+            conn,
+            task_id=t_other["id"],
+            profile="jensen",
+            claimed_cursor=10,
+            old_cursor=0,
+            error=RuntimeError("spawn refused"),
+        )
+    finally:
+        conn.close()
+
+    all_board = client.get("/api/plugins/kanban/board").json()
+    assert all_board["wake_health"]["subscription_count"] == 4
+    assert all_board["wake_health"]["failing_count"] == 2
+    assert all_board["wake_health"]["stale_count"] == 1
+    assert all_board["wake_health"]["severity"] == "failing"
+    assert all_board["wake_health"]["as_of"] > 0
+
+    scoped = client.get("/api/plugins/kanban/board?tenant=t1").json()
+    assert scoped["wake_health"]["subscription_count"] == 3
+    assert scoped["wake_health"]["failing_count"] == 1
+    assert scoped["wake_health"]["stale_count"] == 1
+    assert scoped["wake_health"]["severity"] == "failing"
+
+    none_visible = client.get("/api/plugins/kanban/board?tenant=missing").json()
+    assert none_visible["wake_health"]["subscription_count"] == 0
+    assert none_visible["wake_health"]["failing_count"] == 0
+    assert none_visible["wake_health"]["stale_count"] == 0
+    assert none_visible["wake_health"]["severity"] == "none"
+
+
 def test_board_query_param_default_overrides_current_board_pointer(client):
     """Dashboard ``?board=default`` must win even if the CLI's current-board
     pointer targets a non-default board.
@@ -2525,6 +2596,31 @@ def test_dashboard_renders_profile_wake_subscriptions_section():
     # Field labels per Iris handoff.
     assert "Default terminal events" in js
     assert "Include dependency subtree" in js
+
+
+def test_dashboard_wake_health_toolbar_and_attention_echo_present():
+    """Board toolbar renders wake-health pill copy and attention echoes failures."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "wake_health" in js
+    assert "Wakes healthy" in js
+    assert "failing •" in js
+    assert "hermes-kanban-wake-health" in js
+    assert "Wake health:" in js
+    assert "profile wakes failing" in js
+    assert "hermes-kanban-wake-health--failing" in css
+
+
+def test_dashboard_wake_events_trigger_rollup_reload():
+    """wake_events path should refresh board-level wake rollup as well."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert "msg.wake_events" in js
+    assert "wake-health rollup" in js
+    assert "scheduleReload();" in js
 
 
 def test_dashboard_profile_subs_uses_backend_routes():

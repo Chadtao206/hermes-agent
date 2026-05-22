@@ -326,6 +326,72 @@ def _warnings_summary_from_diagnostics(
     }
 
 
+def _compute_wake_health(
+    conn: sqlite3.Connection,
+    *,
+    task_ids: list[str],
+) -> dict[str, Any]:
+    """Return board-level profile wake-health for the current board task scope."""
+    out = {
+        "subscription_count": 0,
+        "failing_count": 0,
+        "stale_count": 0,
+        "severity": "none",
+        "as_of": int(time.time()),
+    }
+    if not task_ids:
+        return out
+
+    subscription_count = 0
+    failing_count = 0
+    stale_count = 0
+
+    # Chunk ``IN`` batches to stay under SQLite's bind variable limit.
+    for i in range(0, len(task_ids), 200):
+        batch = task_ids[i:i + 200]
+        placeholders = ",".join(["?"] * len(batch))
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS subscription_count,
+                SUM(CASE
+                    WHEN (last_wake_error_at IS NOT NULL OR COALESCE(wake_failure_count, 0) > 0)
+                    THEN 1 ELSE 0 END
+                ) AS failing_count,
+                SUM(CASE
+                    WHEN (last_wake_error_at IS NULL)
+                         AND COALESCE(wake_failure_count, 0) = 0
+                         AND COALESCE(last_wake_at, 0) = 0
+                    THEN 1 ELSE 0 END
+                ) AS stale_count
+            FROM kanban_profile_event_subs
+            WHERE enabled = 1
+              AND wake_agent = 1
+              AND task_id IN ({placeholders})
+            """,
+            tuple(batch),
+        ).fetchone()
+        subscription_count += int(row["subscription_count"] or 0)
+        failing_count += int(row["failing_count"] or 0)
+        stale_count += int(row["stale_count"] or 0)
+
+    severity = "healthy"
+    if subscription_count == 0:
+        severity = "none"
+    elif failing_count > 0:
+        severity = "failing"
+    elif stale_count > 0:
+        severity = "stale"
+
+    out.update({
+        "subscription_count": subscription_count,
+        "failing_count": failing_count,
+        "stale_count": stale_count,
+        "severity": severity,
+    })
+    return out
+
+
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     """Return {'parents': [...], 'children': [...]} for a task."""
     parents = [
@@ -380,6 +446,9 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
+        task_ids = [t.id for t in tasks]
+        wake_health = _compute_wake_health(conn, task_ids=task_ids)
+
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
@@ -431,7 +500,7 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -477,6 +546,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "wake_health": wake_health,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }

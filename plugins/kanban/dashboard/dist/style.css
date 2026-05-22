@@ -1166,6 +1166,35 @@
   margin-top: 1rem;
 }
 
+/* Board toolbar wake-health rollup pill. */
+.hermes-kanban-wake-health {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  padding: 0.2rem 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.hermes-kanban-wake-health--healthy {
+  background: color-mix(in srgb, #3fb97d 20%, transparent);
+  border-color: color-mix(in srgb, #3fb97d 45%, var(--color-border));
+  color: var(--color-foreground);
+}
+.hermes-kanban-wake-health--stale {
+  background: color-mix(in srgb, #d4b348 18%, transparent);
+  border-color: color-mix(in srgb, #d4b348 45%, var(--color-border));
+  color: var(--color-foreground);
+}
+.hermes-kanban-wake-health--failing {
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 14%, transparent);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, var(--color-border));
+  color: var(--color-foreground);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Hallucination warnings: per-card badge, events callout, attention      */
 /* strip, recovery popover. Orange/red palette but muted so the board     */
@@ -1197,6 +1226,11 @@
 }
 .hermes-kanban-attention-icon { color: #ff9e3b; font-size: 1rem; }
 .hermes-kanban-attention-text { flex: 1; }
+.hermes-kanban-attention-wake {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground, #888);
+  white-space: nowrap;
+}
 .hermes-kanban-attention-toggle,
 .hermes-kanban-attention-dismiss,
 .hermes-kanban-attention-row-btn {
