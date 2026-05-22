@@ -2195,3 +2195,300 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+# ---------------------------------------------------------------------------
+# Profile wake subscriptions — per-task dashboard CRUD
+# ---------------------------------------------------------------------------
+#
+# Native UI for ``kanban_profile_event_subs`` (the same rows the
+# ``hermes kanban profile-subs`` CLI writes). The dashboard exposes them
+# inside the TaskDrawer so operators can wake a Hermes profile when this
+# task hits selected events without dropping back to a terminal.
+
+
+def test_profile_subs_list_empty_for_task(client):
+    """GET .../profile-subs returns an empty list and surfaces the
+    default event kinds so the UI can render the 'Default terminal
+    events' summary without a second round-trip.
+    """
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["profile_subs"] == []
+    assert data["default_event_kinds"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
+
+
+def test_profile_subs_add_creates_row_with_defaults(client):
+    """POSTing only profile creates a row carrying the Iris-handoff defaults:
+    enabled=true, wake_agent=true, include_children=false, default event kinds,
+    empty wake_prompt."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    sub = body["sub"]
+    assert sub["task_id"] == t["id"]
+    assert sub["profile"] == "jensen"
+    assert sub["name"] == ""
+    assert sub["enabled"] == 1
+    assert sub["wake_agent"] == 1
+    assert sub["include_children"] == 0
+    # event_kinds NULL ⇒ resolved equals DEFAULT_NOTIFY_TERMINAL_KINDS
+    assert sub["event_kinds"] is None
+    assert sub["event_kinds_resolved"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
+    assert sub["wake_prompt"] in (None, "")
+
+    # Round-trip via GET.
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
+    assert r.status_code == 200
+    rows = r.json()["profile_subs"]
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "jensen"
+
+
+def test_profile_subs_add_with_custom_events_and_subtree(client):
+    """Custom event_kinds + include_children + wake_prompt round-trip."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={
+            "profile": "jensen",
+            "name": "lane-a",
+            "event_kinds": ["completed", "blocked"],
+            "include_children": True,
+            "wake_prompt": "Pick up the work",
+        },
+    )
+    assert r.status_code == 200, r.text
+    sub = r.json()["sub"]
+    assert sub["event_kinds"] == ["completed", "blocked"]
+    assert sub["event_kinds_resolved"] == ["completed", "blocked"]
+    assert sub["include_children"] == 1
+    assert sub["wake_prompt"] == "Pick up the work"
+    assert sub["name"] == "lane-a"
+
+
+def test_profile_subs_default_events_explicit_reset(client):
+    """Sending use_default_events=true after a custom list resets event_kinds
+    to NULL so the gateway falls back to DEFAULT_NOTIFY_TERMINAL_KINDS."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "event_kinds": ["completed"]},
+    )
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "use_default_events": True},
+    )
+    assert r.status_code == 200, r.text
+    sub = r.json()["sub"]
+    assert sub["event_kinds"] is None
+    assert sub["event_kinds_resolved"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
+
+
+def test_profile_subs_update_toggle_enabled_preserves_other_fields(client):
+    """Toggling ``enabled`` via POST must preserve event_kinds, wake_prompt,
+    include_children and wake_agent — same semantics as the kanban_db helper
+    (omitted = preserve)."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={
+            "profile": "jensen",
+            "event_kinds": ["completed"],
+            "include_children": True,
+            "wake_prompt": "do it",
+        },
+    )
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "enabled": False},
+    )
+    assert r.status_code == 200, r.text
+    sub = r.json()["sub"]
+    assert sub["enabled"] == 0
+    assert sub["event_kinds"] == ["completed"]
+    assert sub["include_children"] == 1
+    assert sub["wake_prompt"] == "do it"
+
+
+def test_profile_subs_clear_wake_prompt(client):
+    """Explicit clear_wake_prompt=true must NULL out the stored wake_prompt."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "wake_prompt": "first"},
+    )
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "clear_wake_prompt": True},
+    )
+    assert r.status_code == 200
+    assert r.json()["sub"]["wake_prompt"] in (None, "")
+
+
+def test_profile_subs_remove(client):
+    """DELETE removes the row and returns ok=true; second DELETE returns 404."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen"},
+    )
+    r = client.delete(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs/jensen"
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    # Gone from list.
+    rows = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs"
+    ).json()["profile_subs"]
+    assert rows == []
+
+    # Second delete reports not found.
+    r = client.delete(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs/jensen"
+    )
+    assert r.status_code == 404
+
+
+def test_profile_subs_remove_named(client):
+    """DELETE on (profile, name) only removes the specific named row."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "name": "lane-a"},
+    )
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "name": "lane-b"},
+    )
+
+    r = client.delete(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs/jensen?name=lane-a"
+    )
+    assert r.status_code == 200
+
+    rows = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs"
+    ).json()["profile_subs"]
+    assert [r["name"] for r in rows] == ["lane-b"]
+
+
+def test_profile_subs_unknown_task_returns_404_on_post(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks/t_nonexistent/profile-subs",
+        json={"profile": "jensen"},
+    )
+    assert r.status_code == 404
+
+
+def test_profile_subs_post_requires_profile(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    # Missing profile.
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"name": "lane-a"},
+    )
+    assert r.status_code == 422
+    # Empty profile.
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": ""},
+    )
+    assert r.status_code == 400
+
+
+def test_profile_subs_list_returns_disabled_rows_too(client):
+    """The dashboard renders disabled subs (greyed out), so the list
+    endpoint must NOT filter on ``enabled``."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
+        json={"profile": "jensen", "enabled": False},
+    )
+    rows = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs"
+    ).json()["profile_subs"]
+    assert len(rows) == 1
+    assert rows[0]["enabled"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Profile wake subscriptions — frontend dist bundle smoke checks
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_renders_profile_wake_subscriptions_section():
+    """The TaskDrawer must include a 'Profile wake subscriptions' section
+    with Iris' empty-state copy and key field labels so operators can
+    add/edit/remove rows from the drawer."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert "ProfileSubsSection" in js
+    assert "Profile wake subscriptions" in js
+    assert "Wake Hermes profiles when this task reaches selected events" in js
+    assert "No profiles wake on this task" in js
+    # Field labels per Iris handoff.
+    assert "Default terminal events" in js
+    assert "Include dependency subtree" in js
+
+
+def test_dashboard_profile_subs_uses_backend_routes():
+    """The drawer must call the new REST surface for list/add/remove."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert "/profile-subs" in js
+    # POST upsert + DELETE row.
+    assert "method: \"DELETE\"" in js  # generic, but combined with /profile-subs proves usage
+    assert "use_default_events" in js
+    assert "clear_wake_prompt" in js
+
+
+def test_dashboard_profile_sub_edit_preserves_disabled_state():
+    """Editing a disabled row must not silently re-enable it.
+
+    Enabled is managed by the row toggle. The edit form may save event/prompt
+    fields, but it must carry forward the current enabled value rather than
+    forcing ``enabled: true`` for every edit.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert "enabled: initial.profile ? !!initial.enabled : true" in js
+    assert "enabled: true,\n      };" not in js
+
+
+def test_dashboard_profile_sub_edit_locks_identity_fields():
+    """Edit mode must not allow profile/name identity changes.
+
+    The backend key is (task_id, profile, name). Until rename semantics exist,
+    the edit form should lock those identity fields so changing a label cannot
+    accidentally create a second subscription row.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert "lockProfile: true" in js
+    assert "Label is part of this subscription’s identity" in js
+    assert "remove and re-add to rename" in js
+
+
+def test_dashboard_profile_sub_load_errors_only_suppress_legacy_404():
+    """A real load failure must not masquerade as an empty subscription list."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert "if (/^404:/.test(rawProfileSubErr))" in js
+    assert "setProfileSubsErr(parseApiErrorMessage(e));" in js
+    assert "false \"no subscriptions\" empty state" in js

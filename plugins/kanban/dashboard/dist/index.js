@@ -2747,6 +2747,12 @@
     // us whether this task is currently subscribed via that platform's home.
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
+    // Profile wake subscriptions (per-task rows in kanban_profile_event_subs).
+    // The UI renders these in a dedicated section between HomeSubsSection and
+    // the body editor; the gateway wakes ``profile`` when matching events land.
+    const [profileSubs, setProfileSubs] = useState([]);
+    const [defaultEventKinds, setDefaultEventKinds] = useState([]);
+    const [profileSubsErr, setProfileSubsErr] = useState(null);
     const boardSlug = props.boardSlug;
 
     const load = useCallback(function () {
@@ -2764,11 +2770,73 @@
         .catch(function () { /* silent — endpoint optional on older gateways */ });
     }, [props.taskId, boardSlug]);
 
+    const loadProfileSubs = useCallback(function () {
+      const url = withBoard(
+        `${API}/tasks/${encodeURIComponent(props.taskId)}/profile-subs`,
+        boardSlug,
+      );
+      return SDK.fetchJSON(url)
+        .then(function (d) {
+          setProfileSubs(d.profile_subs || []);
+          setDefaultEventKinds(d.default_event_kinds || []);
+          setProfileSubsErr(null);
+        })
+        .catch(function (e) {
+          // Older gateways pre-dating /profile-subs surface 404 here.
+          // Suppress only that compatibility case. Other failures should
+          // keep prior rows visible and surface an error instead of showing
+          // a false "no subscriptions" empty state.
+          const rawProfileSubErr = (e && e.message) ? String(e.message) : String(e || "");
+          if (/^404:/.test(rawProfileSubErr)) {
+            setProfileSubs([]);
+            setDefaultEventKinds([]);
+            setProfileSubsErr(null);
+            return;
+          }
+          setProfileSubsErr(parseApiErrorMessage(e));
+        });
+    }, [props.taskId, boardSlug]);
+
+    const upsertProfileSub = function (payload) {
+      const url = withBoard(
+        `${API}/tasks/${encodeURIComponent(props.taskId)}/profile-subs`,
+        boardSlug,
+      );
+      setProfileSubsErr(null);
+      return SDK.fetchJSON(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      })
+        .then(function () { return loadProfileSubs(); })
+        .catch(function (e) {
+          setProfileSubsErr(parseApiErrorMessage(e));
+          throw e;
+        });
+    };
+
+    const removeProfileSub = function (profile, name) {
+      const qs = name ? `?name=${encodeURIComponent(name)}` : "";
+      const url = withBoard(
+        `${API}/tasks/${encodeURIComponent(props.taskId)}` +
+          `/profile-subs/${encodeURIComponent(profile)}${qs}`,
+        boardSlug,
+      );
+      setProfileSubsErr(null);
+      return SDK.fetchJSON(url, { method: "DELETE" })
+        .then(function () { return loadProfileSubs(); })
+        .catch(function (e) {
+          setProfileSubsErr(parseApiErrorMessage(e));
+          throw e;
+        });
+    };
+
     // Reload when the WS stream reports new events for this task id
     // (completion, block, crash, etc. — anything that'd make the drawer
     // show stale data if we only loaded on mount).
     useEffect(function () { load(); }, [load, props.eventTick]);
     useEffect(function () { loadHomeChannels(); }, [loadHomeChannels]);
+    useEffect(function () { loadProfileSubs(); }, [loadProfileSubs, props.eventTick]);
     useEffect(function () {
       function onKey(e) { if (e.key === "Escape" && !editing) props.onClose(); }
       window.addEventListener("keydown", onKey);
@@ -2945,6 +3013,11 @@
           homeChannels: homeChannels,
           homeBusy: homeBusy,
           onToggleHomeSub: toggleHomeSubscription,
+          profileSubs: profileSubs,
+          defaultEventKinds: defaultEventKinds,
+          profileSubsErr: profileSubsErr,
+          onUpsertProfileSub: upsertProfileSub,
+          onRemoveProfileSub: removeProfileSub,
           onRefresh: props.onRefresh,
         }) : null,
         data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
@@ -3024,6 +3097,14 @@
         homeChannels: props.homeChannels || [],
         homeBusy: props.homeBusy || {},
         onToggle: props.onToggleHomeSub,
+      }),
+      h(ProfileSubsSection, {
+        subs: props.profileSubs || [],
+        defaultEventKinds: props.defaultEventKinds || [],
+        assignees: props.assignees || [],
+        err: props.profileSubsErr,
+        onUpsert: props.onUpsertProfileSub,
+        onRemove: props.onRemoveProfileSub,
       }),
       h(BodyEditor, {
         task: t,
@@ -3640,6 +3721,388 @@
       )
     );
   }
+
+  // -------------------------------------------------------------------------
+  // ProfileSubsSection — per-task profile wake subscriptions
+  // -------------------------------------------------------------------------
+  //
+  // Native UI for ``kanban_profile_event_subs``. Each row tells the gateway
+  // notifier to wake a Hermes profile via ``hermes -p <profile> chat -q
+  // <prompt>`` when matching kanban events land on this task (or its
+  // dependency subtree). Sits inside TaskDrawer between HomeSubsSection and
+  // the body editor per the Iris design handoff — not a board-level surface.
+  //
+  // Defaults mirror the kanban_db helper:
+  //   enabled=true, wake_agent=true, include_children=false,
+  //   event_kinds=null (gateway uses DEFAULT_NOTIFY_TERMINAL_KINDS),
+  //   wake_prompt empty.
+
+  const PROFILE_SUB_CUSTOM_EVENT_OPTIONS = [
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "archived",
+  ];
+
+  function summarizeProfileSubEvents(sub) {
+    const kinds = sub.event_kinds;
+    if (!kinds || kinds.length === 0) {
+      return "Default terminal events";
+    }
+    if (kinds.length <= 3) return kinds.join(", ");
+    return `${kinds.slice(0, 3).join(", ")} +${kinds.length - 3}`;
+  }
+
+  function ProfileSubsSection(props) {
+    const { t } = useI18n();
+    const subs = props.subs || [];
+    const [adding, setAdding] = useState(false);
+    const [editingKey, setEditingKey] = useState(null);
+    const [pendingRemove, setPendingRemove] = useState(null);
+    const [busy, setBusy] = useState(false);
+
+    function rowKey(sub) { return `${sub.profile}::${sub.name || ""}`; }
+
+    const closeForms = function () {
+      setAdding(false);
+      setEditingKey(null);
+    };
+
+    const handleSubmit = function (payload) {
+      setBusy(true);
+      return props.onUpsert(payload)
+        .then(function () { closeForms(); })
+        .catch(function () { /* err already surfaced via props.err */ })
+        .finally(function () { setBusy(false); });
+    };
+
+    const handleToggle = function (sub, field, value) {
+      const payload = { profile: sub.profile, name: sub.name || "" };
+      payload[field] = value;
+      setBusy(true);
+      return props.onUpsert(payload)
+        .catch(function () { /* err surfaced via props.err */ })
+        .finally(function () { setBusy(false); });
+    };
+
+    const confirmRemove = function (sub) {
+      setBusy(true);
+      return props.onRemove(sub.profile, sub.name || "")
+        .then(function () { setPendingRemove(null); })
+        .catch(function () { /* err surfaced via props.err */ })
+        .finally(function () { setBusy(false); });
+    };
+
+    return h("div", { className: "hermes-kanban-section hermes-kanban-profile-subs" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" },
+          tx(t, "profileWakeSubs", "Profile wake subscriptions")),
+        !adding && !editingKey
+          ? h(Button, {
+              size: "sm",
+              className: "hermes-kanban-profile-subs-add-btn",
+              onClick: function () { setAdding(true); setPendingRemove(null); },
+            }, tx(t, "addProfileSub", "Add"))
+          : null,
+      ),
+      h("div", { className: "hermes-kanban-profile-subs-help" },
+        tx(t, "profileWakeSubsHelp",
+           "Wake Hermes profiles when this task reaches selected events.")),
+      props.err
+        ? h("div", { className: "hermes-kanban-msg-err" }, props.err)
+        : null,
+      subs.length === 0 && !adding
+        ? h("div", { className: "hermes-kanban-profile-subs-empty" },
+            tx(t, "profileWakeSubsEmpty",
+               "No profiles wake on this task’s events. Add one to wake an agent when this task changes state."))
+        : null,
+      h("div", { className: "hermes-kanban-profile-subs-list" },
+        subs.map(function (sub) {
+          const key = rowKey(sub);
+          if (editingKey === key) {
+            return h(ProfileSubForm, {
+              key: key,
+              initial: sub,
+              assignees: props.assignees,
+              defaultEventKinds: props.defaultEventKinds,
+              busy: busy,
+              submitLabel: tx(t, "save", "Save"),
+              lockProfile: true,
+              onSubmit: handleSubmit,
+              onCancel: closeForms,
+            });
+          }
+          return h(ProfileSubRow, {
+            key: key,
+            sub: sub,
+            pendingRemove: pendingRemove === key,
+            busy: busy,
+            onEdit: function () { setAdding(false); setEditingKey(key); },
+            onRequestRemove: function () { setPendingRemove(key); },
+            onConfirmRemove: function () { return confirmRemove(sub); },
+            onCancelRemove: function () { setPendingRemove(null); },
+            onToggle: function (field, value) { return handleToggle(sub, field, value); },
+          });
+        }),
+        adding
+          ? h(ProfileSubForm, {
+              key: "__new__",
+              initial: null,
+              assignees: props.assignees,
+              defaultEventKinds: props.defaultEventKinds,
+              busy: busy,
+              submitLabel: tx(t, "create", "Create"),
+              lockProfile: false,
+              onSubmit: handleSubmit,
+              onCancel: closeForms,
+            })
+          : null,
+      ),
+    );
+  }
+
+  function ProfileSubRow(props) {
+    const { t } = useI18n();
+    const sub = props.sub;
+    const lastWake = sub.last_wake_at
+      ? `${tx(t, "lastWoke", "Last woke")} ${timeAgo ? timeAgo(sub.last_wake_at) : ""}`
+      : tx(t, "neverWoke", "Never");
+    return h("div", { className: "hermes-kanban-profile-sub-row" },
+      h("div", { className: "hermes-kanban-profile-sub-head" },
+        h("span", { className: "hermes-kanban-profile-sub-name" }, sub.profile),
+        sub.name
+          ? h("span", { className: "hermes-kanban-profile-sub-label" },
+              `· ${sub.name}`)
+          : null,
+        h("span", { className: "hermes-kanban-profile-sub-events" },
+          summarizeProfileSubEvents(sub)),
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-toggles" },
+        h("label", { className: "hermes-kanban-profile-sub-toggle" },
+          h(Checkbox, {
+            checked: !!sub.enabled,
+            disabled: props.busy,
+            onCheckedChange: function (v) { props.onToggle("enabled", !!v); },
+          }),
+          h("span", null, tx(t, "enabled", "Enabled")),
+        ),
+        h("label", { className: "hermes-kanban-profile-sub-toggle" },
+          h(Checkbox, {
+            checked: !!sub.wake_agent,
+            disabled: props.busy,
+            onCheckedChange: function (v) { props.onToggle("wake_agent", !!v); },
+          }),
+          h("span", null, tx(t, "wakeProfile", "Wake profile")),
+        ),
+        h("label", { className: "hermes-kanban-profile-sub-toggle" },
+          h(Checkbox, {
+            checked: !!sub.include_children,
+            disabled: props.busy,
+            onCheckedChange: function (v) { props.onToggle("include_children", !!v); },
+          }),
+          h("span", null, tx(t, "includeSubtree", "Include dependency subtree")),
+        ),
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-foot" },
+        h("span", { className: "hermes-kanban-profile-sub-last" }, lastWake),
+        props.pendingRemove
+          ? h("span", { className: "hermes-kanban-profile-sub-confirm" },
+              h("span", null, tx(t, "removeProfileSubConfirm", "Remove this subscription?")),
+              h(Button, {
+                size: "sm",
+                disabled: props.busy,
+                className: "hermes-kanban-profile-sub-remove-yes",
+                onClick: props.onConfirmRemove,
+              }, tx(t, "yesRemove", "Yes, remove")),
+              h(Button, {
+                size: "sm",
+                disabled: props.busy,
+                onClick: props.onCancelRemove,
+              }, tx(t, "cancel", "Cancel")),
+            )
+          : h("span", { className: "hermes-kanban-profile-sub-actions" },
+              h(Button, {
+                size: "sm",
+                disabled: props.busy,
+                onClick: props.onEdit,
+              }, tx(t, "edit", "Edit")),
+              h(Button, {
+                size: "sm",
+                disabled: props.busy,
+                className: "hermes-kanban-profile-sub-remove",
+                onClick: props.onRequestRemove,
+              }, tx(t, "remove", "Remove")),
+            ),
+      ),
+    );
+  }
+
+  function ProfileSubForm(props) {
+    const { t } = useI18n();
+    const initial = props.initial || {};
+    const initialCustom = !!(initial.event_kinds && initial.event_kinds.length);
+    const [profile, setProfile] = useState(initial.profile || "");
+    const [name, setName] = useState(initial.name || "");
+    const [useCustomEvents, setUseCustomEvents] = useState(initialCustom);
+    const [customEvents, setCustomEvents] = useState(
+      initialCustom ? initial.event_kinds : (props.defaultEventKinds || []).slice(),
+    );
+    const [includeChildren, setIncludeChildren] = useState(
+      !!initial.include_children,
+    );
+    const [wakeAgent, setWakeAgent] = useState(
+      initial.wake_agent === undefined ? true : !!initial.wake_agent,
+    );
+    const [wakePrompt, setWakePrompt] = useState(initial.wake_prompt || "");
+    const [showAdvanced, setShowAdvanced] = useState(!!(initial.wake_prompt));
+
+    const toggleCustomKind = function (kind) {
+      setCustomEvents(function (prev) {
+        if (prev.indexOf(kind) >= 0) return prev.filter(function (k) { return k !== kind; });
+        return prev.concat([kind]);
+      });
+    };
+
+    const onSave = function () {
+      const trimmedProfile = (profile || "").trim();
+      if (!trimmedProfile) return;
+      const payload = {
+        profile: trimmedProfile,
+        name: (name || "").trim(),
+        include_children: !!includeChildren,
+        wake_agent: !!wakeAgent,
+        // New subs default enabled; edits preserve the existing enabled state
+        // so changing events/prompt does not accidentally re-enable a muted row.
+        enabled: initial.profile ? !!initial.enabled : true,
+      };
+      if (useCustomEvents) {
+        payload.event_kinds = customEvents;
+      } else {
+        payload.use_default_events = true;
+      }
+      const promptText = (wakePrompt || "").trim();
+      if (promptText) {
+        payload.wake_prompt = promptText;
+      } else {
+        payload.clear_wake_prompt = true;
+      }
+      props.onSubmit(payload);
+    };
+
+    const assigneeNames = (props.assignees || [])
+      .map(function (a) { return typeof a === "string" ? a : a.name; })
+      .filter(Boolean);
+
+    return h("div", { className: "hermes-kanban-profile-sub-form" },
+      h("div", { className: "hermes-kanban-profile-sub-form-row" },
+        h(Label, { className: "hermes-kanban-profile-sub-form-label" },
+          tx(t, "profile", "Profile")),
+        props.lockProfile
+          ? h("span", { className: "hermes-kanban-profile-sub-form-locked" }, profile)
+          : h(Input, {
+              value: profile,
+              onChange: function (e) { setProfile(e.target.value); },
+              list: "hermes-kanban-profile-sub-assignees",
+              placeholder: tx(t, "profilePlaceholder", "profile name"),
+              className: "h-8 text-sm",
+            }),
+        !props.lockProfile && assigneeNames.length > 0
+          ? h("datalist", { id: "hermes-kanban-profile-sub-assignees" },
+              assigneeNames.map(function (n) {
+                return h("option", { key: n, value: n });
+              }))
+          : null,
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-form-row" },
+        h(Label, { className: "hermes-kanban-profile-sub-form-label" },
+          tx(t, "label", "Label")),
+        props.lockProfile
+          ? h("span", { className: "hermes-kanban-profile-sub-form-locked" },
+              name || tx(t, "defaultLabel", "(default)"))
+          : h(Input, {
+              value: name,
+              onChange: function (e) { setName(e.target.value); },
+              placeholder: tx(t, "labelPlaceholder", "optional"),
+              className: "h-8 text-sm",
+            }),
+        props.lockProfile
+          ? h("div", { className: "hermes-kanban-profile-sub-form-help" },
+              tx(t, "profileSubLabelImmutable",
+                 "Label is part of this subscription’s identity; remove and re-add to rename."))
+          : null,
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-form-events" },
+        h("label", { className: "hermes-kanban-profile-sub-toggle" },
+          h(Checkbox, {
+            checked: !useCustomEvents,
+            onCheckedChange: function (v) { setUseCustomEvents(!v); },
+          }),
+          h("span", null, tx(t, "defaultEventsLabel", "Default terminal events")),
+        ),
+        useCustomEvents
+          ? h("div", { className: "hermes-kanban-profile-sub-form-custom-events" },
+              PROFILE_SUB_CUSTOM_EVENT_OPTIONS.map(function (kind) {
+                return h("label", {
+                  key: kind,
+                  className: "hermes-kanban-profile-sub-toggle",
+                },
+                  h(Checkbox, {
+                    checked: customEvents.indexOf(kind) >= 0,
+                    onCheckedChange: function () { toggleCustomKind(kind); },
+                  }),
+                  h("span", null, kind),
+                );
+              }),
+            )
+          : null,
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-form-flags" },
+        h("label", { className: "hermes-kanban-profile-sub-toggle" },
+          h(Checkbox, {
+            checked: includeChildren,
+            onCheckedChange: function (v) { setIncludeChildren(!!v); },
+          }),
+          h("span", null, tx(t, "includeSubtree", "Include dependency subtree")),
+        ),
+        h("label", { className: "hermes-kanban-profile-sub-toggle" },
+          h(Checkbox, {
+            checked: wakeAgent,
+            onCheckedChange: function (v) { setWakeAgent(!!v); },
+          }),
+          h("span", null, tx(t, "wakeProfile", "Wake profile")),
+        ),
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-form-advanced" },
+        h("button", {
+          type: "button",
+          className: "hermes-kanban-section-toggle",
+          onClick: function () { setShowAdvanced(function (x) { return !x; }); },
+        }, showAdvanced
+            ? tx(t, "hideAdvanced", "Hide advanced")
+            : tx(t, "showAdvanced", "Advanced")),
+        showAdvanced
+          ? h("textarea", {
+              className: "hermes-kanban-profile-sub-form-prompt",
+              value: wakePrompt,
+              onChange: function (e) { setWakePrompt(e.target.value); },
+              placeholder: tx(t, "customWakePromptPlaceholder",
+                "Optional custom wake prompt"),
+              rows: 3,
+            })
+          : null,
+      ),
+      h("div", { className: "hermes-kanban-profile-sub-form-buttons" },
+        h(Button, {
+          size: "sm",
+          disabled: props.busy || !(profile || "").trim(),
+          onClick: onSave,
+        }, props.submitLabel),
+        h(Button, {
+          size: "sm",
+          onClick: props.onCancel,
+          disabled: props.busy,
+        }, tx(t, "cancel", "Cancel")),
+      ),
+    );
+  }
+
 
   // -------------------------------------------------------------------------
   // Register

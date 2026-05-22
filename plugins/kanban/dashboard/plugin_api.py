@@ -1632,6 +1632,185 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
 
 
 # ---------------------------------------------------------------------------
+# Profile wake subscriptions (per-task; gateway wakes a Hermes profile)
+# ---------------------------------------------------------------------------
+#
+# Dashboard CRUD for ``kanban_profile_event_subs``. Each row tells the
+# kanban-notifier to spawn ``hermes -p <profile> chat -q <prompt>`` when
+# matching events land on ``task_id`` (or its dependency subtree when
+# ``include_children=1``). The Iris handoff places this section inside
+# TaskDrawer between HomeSubsSection and the body editor, so the API is
+# scoped per-task — no board-level/global surface here.
+
+
+def _serialize_profile_sub(row: dict) -> dict[str, Any]:
+    """Shape a ``kanban_profile_event_subs`` row for the dashboard.
+
+    Resolves ``event_kinds`` (NULL → default terminal kinds) so the UI
+    can render the "Default terminal events" summary without round-tripping
+    the gateway's fallback rule.
+    """
+    parsed_kinds = kanban_db._parse_event_kinds_column(row.get("event_kinds"))
+    resolved = parsed_kinds if parsed_kinds else list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS)
+    return {
+        "task_id": row.get("task_id"),
+        "profile": row.get("profile"),
+        "name": row.get("name") or "",
+        "event_kinds": parsed_kinds,
+        "event_kinds_resolved": resolved,
+        "include_children": int(row.get("include_children") or 0),
+        "wake_agent": int(row.get("wake_agent") or 0),
+        "wake_prompt": row.get("wake_prompt"),
+        "enabled": int(row.get("enabled") or 0),
+        "created_at": row.get("created_at"),
+        "last_wake_at": row.get("last_wake_at"),
+    }
+
+
+class ProfileSubBody(BaseModel):
+    """POST body for upserting a ``kanban_profile_event_subs`` row.
+
+    Mirrors the CLI's preserve-vs-reset semantics:
+
+    - Omitted fields preserve the existing column on a re-add.
+    - ``use_default_events=True`` resets ``event_kinds`` to NULL (gateway
+      falls back to ``DEFAULT_NOTIFY_TERMINAL_KINDS``). Mutually exclusive
+      with a non-empty ``event_kinds`` list.
+    - ``clear_wake_prompt=True`` resets ``wake_prompt`` to NULL.
+    """
+
+    profile: str
+    name: str = ""
+    event_kinds: Optional[list[str]] = None
+    use_default_events: Optional[bool] = None
+    include_children: Optional[bool] = None
+    wake_agent: Optional[bool] = None
+    wake_prompt: Optional[str] = None
+    clear_wake_prompt: Optional[bool] = None
+    enabled: Optional[bool] = None
+
+
+@router.get("/tasks/{task_id}/profile-subs")
+def list_profile_subs(task_id: str, board: Optional[str] = Query(None)):
+    """List every profile wake subscription registered against ``task_id``.
+
+    Includes disabled rows so the dashboard can render them greyed out;
+    the gateway-side ``enabled_only=True`` filter happens during dispatch,
+    not here. ``default_event_kinds`` echoes the fallback list so the UI
+    can render the "Default terminal events" summary without a second
+    round-trip.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        rows = kanban_db.list_profile_event_subs(
+            conn, task_id=task_id, enabled_only=False,
+        )
+    finally:
+        conn.close()
+    return {
+        "profile_subs": [_serialize_profile_sub(r) for r in rows],
+        "default_event_kinds": list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS),
+    }
+
+
+@router.post("/tasks/{task_id}/profile-subs")
+def upsert_profile_sub(
+    task_id: str,
+    payload: ProfileSubBody,
+    board: Optional[str] = Query(None),
+):
+    """Add or update a profile wake subscription for ``task_id``.
+
+    Idempotent on ``(task_id, profile, name)``: re-posting only the fields
+    the operator changed (e.g. just ``enabled``) preserves the rest, same
+    as the kanban_db helper. ``use_default_events`` / ``clear_wake_prompt``
+    are explicit reset switches; without them the dashboard can't tell
+    "leave the existing custom kinds alone" from "fall back to default".
+    """
+    profile = (payload.profile or "").strip()
+    if not profile:
+        raise HTTPException(status_code=400, detail="profile is required")
+    if payload.use_default_events and payload.event_kinds:
+        raise HTTPException(
+            status_code=400,
+            detail="event_kinds and use_default_events are mutually exclusive",
+        )
+
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        add_kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "profile": profile,
+            "name": payload.name or "",
+        }
+        if payload.use_default_events:
+            add_kwargs["event_kinds"] = None
+        elif payload.event_kinds is not None:
+            add_kwargs["event_kinds"] = payload.event_kinds
+        if payload.include_children is not None:
+            add_kwargs["include_children"] = bool(payload.include_children)
+        if payload.wake_agent is not None:
+            add_kwargs["wake_agent"] = bool(payload.wake_agent)
+        if payload.clear_wake_prompt:
+            add_kwargs["wake_prompt"] = None
+        elif payload.wake_prompt is not None:
+            add_kwargs["wake_prompt"] = payload.wake_prompt
+        if payload.enabled is not None:
+            add_kwargs["enabled"] = bool(payload.enabled)
+
+        kanban_db.add_profile_event_sub(conn, **add_kwargs)
+        rows = kanban_db.list_profile_event_subs(
+            conn, task_id=task_id, profile=profile, enabled_only=False,
+        )
+    finally:
+        conn.close()
+
+    stored = next(
+        (r for r in rows if (r.get("name") or "") == (payload.name or "")),
+        None,
+    )
+    return {
+        "ok": True,
+        "sub": _serialize_profile_sub(stored) if stored else None,
+        "default_event_kinds": list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS),
+    }
+
+
+@router.delete("/tasks/{task_id}/profile-subs/{profile}")
+def remove_profile_sub(
+    task_id: str,
+    profile: str,
+    name: str = Query("", description="Subscription label; empty for the default lane"),
+    board: Optional[str] = Query(None),
+):
+    """Remove a profile wake subscription. 404 if the row does not exist."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok = kanban_db.remove_profile_event_sub(
+            conn, task_id=task_id, profile=profile, name=name or "",
+        )
+    finally:
+        conn.close()
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no profile-sub for task {task_id!r} profile {profile!r} "
+                f"name {name!r}"
+            ),
+        )
+    return {"ok": True, "task_id": task_id, "profile": profile, "name": name or ""}
+
+
+# ---------------------------------------------------------------------------
 # Stats (per-profile / per-status counts + oldest-ready age)
 # ---------------------------------------------------------------------------
 
