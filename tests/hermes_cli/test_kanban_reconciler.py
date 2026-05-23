@@ -275,6 +275,25 @@ def _scheduled_completed_parent_packet(now: int, *, assignee: str = "reviewer") 
     return child, packet["packet_signature"]
 
 
+def _blocked_completed_parent_packet(now: int, *, assignee: str = "reviewer") -> tuple[str, str]:
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="engineer")
+        child = kb.create_task(conn, title="child", assignee=assignee)
+        kb.complete_task(conn, parent, result="parent done")
+        kb.block_task(conn, child, reason="waiting on remediation")
+        kb.link_tasks(conn, parent, child)
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (now - 3600, child),
+        )
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    packet = next(
+        packet for packet in result["wake_triage"]["decision_packets"]
+        if packet["task_id"] == child
+    )
+    return child, packet["packet_signature"]
+
+
 def test_apply_reconcile_decision_keep_parked_comment_only(kanban_home):
     now = 1_700_000_000
     child, packet_signature = _scheduled_completed_parent_packet(now)
@@ -288,11 +307,24 @@ def test_apply_reconcile_decision_keep_parked_comment_only(kanban_home):
         now=now,
         ready_age_seconds=60,
     )
+    retry = rec.apply_reconcile_decision(
+        task_id=child,
+        option="keep_parked",
+        packet_signature=packet_signature,
+        confirm_dry_run=True,
+        author="jensen-test-retry",
+        now=now,
+        ready_age_seconds=60,
+    )
 
     assert result["ok"] is True
     assert result["mutation_applied"] is True
     assert result["mutation"] == "comment_only"
     assert result["packet_signature"] == packet_signature
+    assert retry["ok"] is True
+    assert retry["mutation_applied"] is False
+    assert retry["idempotent"] is True
+    assert retry["comment_id"] == result["comment_id"]
     with kb.connect() as conn:
         task = kb.get_task(conn, child)
         comments = kb.list_comments(conn, child)
@@ -326,7 +358,7 @@ def test_apply_reconcile_decision_requires_confirmation_and_current_signature(ka
     )
     unsupported = rec.apply_reconcile_decision(
         task_id=child,
-        option="unblock",
+        option="remediate_parent_closeout",
         packet_signature=packet_signature,
         confirm_dry_run=True,
         now=now,
@@ -339,10 +371,106 @@ def test_apply_reconcile_decision_requires_confirmation_and_current_signature(ka
     assert "does not match" in stale_signature["error"]
     assert stale_signature["packet"]["packet_signature"] == packet_signature
     assert unsupported["ok"] is False
-    assert "only keep_parked" in unsupported["error"]
+    assert "unsupported reconcile apply option" in unsupported["error"]
     with kb.connect() as conn:
         comments = kb.list_comments(conn, child)
     assert comments == []
+
+
+def test_apply_reconcile_decision_keep_blocked_comment_only(kanban_home):
+    now = 1_700_000_000
+    child, packet_signature = _blocked_completed_parent_packet(now)
+
+    result = rec.apply_reconcile_decision(
+        task_id=child,
+        option="keep_blocked",
+        packet_signature=packet_signature,
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+        ready_age_seconds=60,
+    )
+
+    assert result["ok"] is True
+    assert result["mutation_applied"] is True
+    assert result["mutation"] == "comment_only"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, child)
+        comments = kb.list_comments(conn, child)
+    assert task is not None
+    assert task.status == "blocked"
+    assert len(comments) == 1
+    assert any("option=keep_blocked" in comment.body for comment in comments)
+
+
+def test_apply_reconcile_decision_unblock_close_and_manual_review_mutate_status(kanban_home):
+    now = 1_700_000_000
+    child, packet_signature = _scheduled_completed_parent_packet(now)
+
+    unblock = rec.apply_reconcile_decision(
+        task_id=child,
+        option="unblock",
+        packet_signature=packet_signature,
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+        ready_age_seconds=60,
+    )
+
+    assert unblock["ok"] is True
+    assert unblock["mutation"] == "comment_and_unblock"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, child)
+        comments = kb.list_comments(conn, child)
+    assert task is not None
+    assert task.status == "ready"
+    assert any("option=unblock" in comment.body for comment in comments)
+
+    close_child, close_sig = _scheduled_completed_parent_packet(now)
+    close = rec.apply_reconcile_decision(
+        task_id=close_child,
+        option="close",
+        packet_signature=close_sig,
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+        ready_age_seconds=60,
+    )
+
+    assert close["ok"] is True
+    assert close["mutation"] == "comment_and_close"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, close_child)
+        comments = kb.list_comments(conn, close_child)
+        runs = kb.list_runs(conn, close_child)
+    assert task is not None
+    assert task.status == "done"
+    assert task.result == "Closed by explicit Jensen reconcile decision after completed dependencies."
+    assert any("option=close" in comment.body for comment in comments)
+    assert any(
+        run.metadata and run.metadata.get("reconcile_decision") == "close"
+        for run in runs
+    )
+
+    review_child, review_sig = _scheduled_completed_parent_packet(now)
+    manual_review = rec.apply_reconcile_decision(
+        task_id=review_child,
+        option="manual_review_with_stale_pr_risk",
+        packet_signature=review_sig,
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+        ready_age_seconds=60,
+    )
+
+    assert manual_review["ok"] is True
+    assert manual_review["mutation"] == "comment_and_unblock"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, review_child)
+        comments = kb.list_comments(conn, review_child)
+    assert task is not None
+    assert task.status == "ready"
+    assert any("option=manual_review_with_stale_pr_risk" in comment.body for comment in comments)
 
 
 def test_reconciler_splits_dead_expired_and_stale_heartbeat(kanban_home):

@@ -1230,6 +1230,47 @@ def _apply_error(
     }
 
 
+def _reconcile_decision_applied_comment(
+    *,
+    option: str,
+    packet_signature: str,
+    category: Any,
+    mutation: str,
+) -> str:
+    return (
+        f"Jensen reconcile decision applied: option={option}; "
+        f"packet_signature={packet_signature}; category={category}; "
+        f"mutation={mutation}"
+    )
+
+
+def _find_existing_reconcile_decision_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    option: str,
+    packet_signature: str,
+) -> Optional[kb.Comment]:
+    """Return the first existing audit comment for an applied decision.
+
+    Reconcile apply gates are safe to retry: a scheduler/operator may submit the
+    same still-current packet more than once.  Treat an existing task comment
+    with the same option and packet signature as the durable idempotency record
+    rather than appending another comment.
+    """
+    marker = "Jensen reconcile decision applied:"
+    option_marker = f"option={option};"
+    signature_marker = f"packet_signature={packet_signature};"
+    for comment in kb.list_comments(conn, task_id):
+        if (
+            marker in comment.body
+            and option_marker in comment.body
+            and signature_marker in comment.body
+        ):
+            return comment
+    return None
+
+
 def apply_reconcile_decision(
     *,
     task_id: str,
@@ -1251,9 +1292,9 @@ def apply_reconcile_decision(
     option = str(option or "").strip()
     task_id = str(task_id or "").strip()
     packet_signature = str(packet_signature or "").strip()
-    if option != "keep_parked":
+    if option not in {"keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk"}:
         return _apply_error(
-            "only keep_parked is enabled for reconcile apply gate phase 1",
+            "unsupported reconcile apply option for gated apply",
             board=board,
             task_id=task_id or None,
             option=option or None,
@@ -1316,12 +1357,73 @@ def apply_reconcile_decision(
                 packet=packet,
             )
 
-        comment = (
-            f"Jensen reconcile decision applied: option={option}; "
-            f"packet_signature={packet_signature}; category={packet.get('primary_category')}; "
-            "mutation=comment_only"
+        mutation = (
+            "comment_only"
+            if option in {"keep_parked", "keep_blocked"}
+            else ("comment_and_unblock" if option in {"unblock", "manual_review_with_stale_pr_risk"} else "comment_and_close")
         )
+        comment = _reconcile_decision_applied_comment(
+            option=option,
+            packet_signature=packet_signature,
+            category=packet.get("primary_category"),
+            mutation=mutation,
+        )
+        existing_comment = _find_existing_reconcile_decision_comment(
+            conn,
+            task_id,
+            option=option,
+            packet_signature=packet_signature,
+        )
+        if existing_comment is not None:
+            return {
+                "ok": True,
+                "board": board or kb.get_current_board(),
+                "db_path": str(path),
+                "task_id": task_id,
+                "option": option,
+                "packet_signature": packet_signature,
+                "packet": packet,
+                "plan": plan,
+                "comment_id": existing_comment.id,
+                "comment": existing_comment.body,
+                "mutation_applied": False,
+                "mutation": mutation,
+                "idempotent": True,
+                "as_of": as_of,
+            }
+
         comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
+        if option in {"unblock", "manual_review_with_stale_pr_risk"}:
+            if not kb.unblock_task(conn, task_id):
+                return _apply_error(
+                    "selected option could not unblock task in its current state",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                    packet=packet,
+                )
+        elif option == "close":
+            result_text = "Closed by explicit Jensen reconcile decision after completed dependencies."
+            metadata = {
+                "reconcile_decision": "close",
+                "source": "kanban_reconcile_apply",
+                "packet_id": packet.get("packet_id"),
+                "packet_signature": packet_signature,
+            }
+            if not kb.complete_task(
+                conn,
+                task_id,
+                result=result_text,
+                summary=result_text,
+                metadata=metadata,
+            ):
+                return _apply_error(
+                    "selected option could not close task in its current state",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                    packet=packet,
+                )
         return {
             "ok": True,
             "board": board or kb.get_current_board(),
@@ -1334,7 +1436,7 @@ def apply_reconcile_decision(
             "comment_id": comment_id,
             "comment": comment,
             "mutation_applied": True,
-            "mutation": "comment_only",
+            "mutation": mutation,
             "as_of": as_of,
         }
 
@@ -1356,6 +1458,8 @@ def format_reconcile_apply_text(result: dict[str, Any]) -> str:
         f"- task_id={result.get('task_id')}",
         f"- option={result.get('option')}",
         f"- mutation={result.get('mutation')}",
+        f"- mutation_applied={result.get('mutation_applied')}",
+        f"- idempotent={bool(result.get('idempotent'))}",
         f"- comment_id={result.get('comment_id')}",
         "- postcheck: hermes kanban reconcile --json",
     ])

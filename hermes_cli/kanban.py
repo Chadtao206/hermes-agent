@@ -515,9 +515,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_reconcile.add_argument(
         "--apply-option",
-        choices=["keep_parked"],
+        choices=["keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk"],
         default=None,
-        help="Apply one explicitly gated reconcile decision option (phase 1: keep_parked only)",
+        help="Apply one explicitly gated reconcile decision option",
     )
     p_reconcile.add_argument(
         "--task-id",

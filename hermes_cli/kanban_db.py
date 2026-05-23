@@ -3548,11 +3548,11 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|scheduled -> done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    Accepts tasks that are merely ``ready`` or intentionally parked in
+    ``blocked``/``scheduled`` too, so manual/gated closeout flows can close
+    operator decisions without requiring a claim/start/complete sequence.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -3634,7 +3634,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'scheduled')
                 """,
                 (result, now, task_id),
             )
@@ -3649,7 +3649,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'scheduled')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
