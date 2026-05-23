@@ -39,11 +39,11 @@ import tempfile
 import threading
 import time
 import sqlite3
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union, cast
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1448,6 +1448,71 @@ def _preserve_queued_followup_history_offset(
     merged = dict(followup_result)
     merged["history_offset"] = current_offset
     return merged
+
+
+def _format_kanban_dispatch_summary(slug: str, summary: dict[str, Any]) -> str:
+    """Return a bounded single-line dispatcher summary for gateway logs."""
+    parts = [
+        f"kanban dispatcher [{slug}]",
+        f"ready={summary.get('ready_count', 0)}",
+        f"review={summary.get('review_count', 0)}",
+        f"spawnable_ready={summary.get('spawnable_ready', 0)}",
+        f"spawnable_review={summary.get('spawnable_review', 0)}",
+        f"spawned={summary.get('spawned', 0)}",
+        f"spawn_attempts={summary.get('spawn_attempts', 0)}",
+        f"spawn_failures={summary.get('spawn_failures', 0)}",
+        f"respawn_guarded={summary.get('respawn_guarded', 0)}",
+        f"skipped_nonspawnable={summary.get('skipped_nonspawnable', 0)}",
+        f"skipped_unassigned={summary.get('skipped_unassigned', 0)}",
+        f"auto_blocked={summary.get('auto_blocked', 0)}",
+    ]
+    if summary.get("max_in_progress_blocked"):
+        parts.append("max_in_progress_blocked=1")
+    guard_counts = summary.get("respawn_guarded_by_reason") or {}
+    if guard_counts:
+        parts.append(f"respawn_guarded_by_reason={guard_counts}")
+    examples: list[str] = []
+    for reason, tids in (summary.get("respawn_guarded_examples") or {}).items():
+        if not isinstance(tids, list):
+            continue
+        for tid in tids[:1]:
+            examples.append(f"{tid}:{reason}")
+            if len(examples) >= 3:
+                break
+        if len(examples) >= 3:
+            break
+    if examples:
+        parts.append(f"examples={examples}")
+    return " ".join(parts)
+
+
+def _collect_kanban_dispatch_warning_details(
+    summaries_by_board: dict[str, dict[str, Any]],
+    *,
+    example_cap: int = 3,
+) -> tuple[dict[str, int], list[str]]:
+    """Aggregate bounded guard reasons/examples for stuck warnings."""
+    reason_counts: Counter[str] = Counter()
+    examples: list[str] = []
+    cap = max(1, int(example_cap))
+    for slug, summary in summaries_by_board.items():
+        for reason, count in (summary.get("respawn_guarded_by_reason") or {}).items():
+            try:
+                reason_counts[str(reason)] += int(count)
+            except Exception:
+                continue
+        if len(examples) >= cap:
+            continue
+        for reason, tids in (summary.get("respawn_guarded_examples") or {}).items():
+            if not isinstance(tids, list):
+                continue
+            for tid in tids[:1]:
+                examples.append(f"{slug}:{tid}:{reason}")
+                if len(examples) >= cap:
+                    break
+            if len(examples) >= cap:
+                break
+    return dict(reason_counts.most_common(5)), examples
 
 
 class GatewayRunner:
@@ -6136,37 +6201,73 @@ class GatewayRunner:
                     await asyncio.to_thread(_auto_decompose_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
+                summaries_by_board: dict[str, dict[str, Any]] = {}
+                interesting_by_board: dict[str, bool] = {}
                 for slug, res in (results or []):
-                    if res is not None and getattr(res, "spawned", None):
+                    if res is None:
+                        continue
+                    dispatch_res = cast(Any, res)
+                    summary = dispatch_res.summary()
+                    summaries_by_board[slug] = summary
+                    if summary.get("spawned", 0):
                         any_spawned = True
-                        # Quiet by default — only log when something actually
-                        # happened, so an idle gateway stays silent.
-                        logger.info(
-                            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                            slug,
-                            len(res.spawned),
-                            res.reclaimed,
-                            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                            res.promoted,
-                            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-                        )
+                    interesting_by_board[slug] = bool(
+                        summary.get("spawned")
+                        or summary.get("spawn_failures")
+                        or summary.get("respawn_guarded")
+                        or summary.get("auto_blocked")
+                        or summary.get("reclaimed")
+                        or summary.get("promoted")
+                        or summary.get("crashed")
+                        or summary.get("timed_out")
+                        or summary.get("stale")
+                        or summary.get("max_in_progress_blocked")
+                    )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                health_tick = bool(ready_pending and not any_spawned)
+                if health_tick:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0
+
+                for slug, summary in summaries_by_board.items():
+                    if not (interesting_by_board.get(slug, False) or health_tick):
+                        continue
+                    log_fn = logger.info if interesting_by_board.get(slug, False) else logger.debug
+                    log_fn(_format_kanban_dispatch_summary(slug, summary))
+
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
+                        total_ready = sum(
+                            int(s.get("ready_count", 0))
+                            for s in summaries_by_board.values()
+                        )
+                        total_review = sum(
+                            int(s.get("review_count", 0))
+                            for s in summaries_by_board.values()
+                        )
+                        total_spawned = sum(
+                            int(s.get("spawned", 0))
+                            for s in summaries_by_board.values()
+                        )
+                        guard_counts, examples = _collect_kanban_dispatch_warning_details(
+                            summaries_by_board,
+                            example_cap=3,
+                        )
                         logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
+                            "kanban dispatcher health: bad_ticks=%d ready=%d review=%d "
+                            "spawned=%d respawn_guarded_by_reason=%s examples=%s. "
+                            "Ready queue is non-empty but no workers spawned this window. "
+                            "Check profile health (venv, PATH, credentials) and "
                             "`hermes kanban list --status ready`.",
                             bad_ticks,
+                            total_ready,
+                            total_review,
+                            total_spawned,
+                            guard_counts or {},
+                            examples or [],
                         )
                         last_warn_at = now
             except asyncio.CancelledError:

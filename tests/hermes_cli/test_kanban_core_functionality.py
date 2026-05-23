@@ -920,6 +920,24 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
         assert out.strip() != "", f"empty output for `/kanban {cmd}`"
 
 
+def test_dispatch_json_preserves_legacy_lists_and_adds_summary(kanban_home):
+    """dispatch --json remains backward-compatible while exposing diagnostics."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs assignment")
+
+    payload = json.loads(run_slash("dispatch --dry-run --json"))
+
+    assert payload["spawned"] == []
+    assert payload["skipped_unassigned"] == [tid]
+    assert isinstance(payload["crashed"], list)
+    assert isinstance(payload["timed_out"], list)
+    assert isinstance(payload["stale"], list)
+    assert isinstance(payload["auto_blocked"], list)
+    assert payload["summary"]["ready_count"] == 1
+    assert payload["summary"]["spawned"] == 0
+    assert payload["summary"]["skipped_unassigned"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
@@ -3538,6 +3556,56 @@ def test_cli_daemon_help_marks_deprecated():
 # ---------------------------------------------------------------------------
 # Gateway embedded dispatcher watcher
 # ---------------------------------------------------------------------------
+
+def test_format_kanban_dispatch_summary_includes_guard_counts():
+    from gateway.run import _format_kanban_dispatch_summary
+
+    summary = {
+        "ready_count": 2,
+        "review_count": 1,
+        "spawnable_ready": 1,
+        "spawnable_review": 0,
+        "spawned": 0,
+        "spawn_attempts": 1,
+        "spawn_failures": 1,
+        "respawn_guarded": 2,
+        "respawn_guarded_by_reason": {"blocker_auth": 2},
+        "respawn_guarded_examples": {"blocker_auth": ["t_a", "t_b"]},
+        "skipped_nonspawnable": 3,
+        "skipped_unassigned": 1,
+        "auto_blocked": 0,
+        "max_in_progress_blocked": False,
+    }
+    line = _format_kanban_dispatch_summary("default", summary)
+    assert "kanban dispatcher [default]" in line
+    assert "spawn_failures=1" in line
+    assert "respawn_guarded=2" in line
+    assert "respawn_guarded_by_reason={'blocker_auth': 2}" in line
+    assert "examples=['t_a:blocker_auth']" in line
+
+
+def test_collect_kanban_dispatch_warning_details_caps_examples():
+    from gateway.run import _collect_kanban_dispatch_warning_details
+
+    reasons, examples = _collect_kanban_dispatch_warning_details(
+        {
+            "default": {
+                "respawn_guarded_by_reason": {"blocker_auth": 2, "active_pr": 1},
+                "respawn_guarded_examples": {
+                    "blocker_auth": ["t_1", "t_2"],
+                    "active_pr": ["t_3"],
+                },
+            },
+            "staging": {
+                "respawn_guarded_by_reason": {"blocker_auth": 3},
+                "respawn_guarded_examples": {"blocker_auth": ["t_9"]},
+            },
+        },
+        example_cap=2,
+    )
+    assert reasons == {"blocker_auth": 5, "active_pr": 1}
+    assert examples == ["default:t_1:blocker_auth", "default:t_3:active_pr"]
+
 
 def test_gateway_dispatcher_watcher_respects_config_flag_off(monkeypatch):
     """dispatch_in_gateway=false -> watcher exits fast, no loop."""

@@ -2383,6 +2383,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "summary": res.summary(),
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2482,8 +2483,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        spawned_any = bool(res.spawned)
+        diag = res.summary()
+        ready_pending = bool(diag.get("skipped_unassigned")) or _ready_queue_nonempty()
+        spawned_any = bool(diag.get("spawned"))
         if ready_pending and not spawned_any:
             health_state["bad_ticks"] += 1
         else:
@@ -2494,10 +2496,25 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             now = int(time.time())
             # Rate-limit repeats: at most one warning per 5 minutes.
             if now - health_state["last_warn_at"] >= 300:
+                examples: list[str] = []
+                for reason, tids in (diag.get("respawn_guarded_examples") or {}).items():
+                    if not isinstance(tids, list):
+                        continue
+                    for tid in tids[:1]:
+                        examples.append(f"{tid}:{reason}")
+                        if len(examples) >= 3:
+                            break
+                    if len(examples) >= 3:
+                        break
                 print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
-                    f"ready queue non-empty for {health_state['bad_ticks']} "
-                    f"consecutive ticks but 0 workers spawned successfully. "
+                    f"[{_fmt_ts(now)}] WARN dispatcher health: "
+                    f"bad_ticks={health_state['bad_ticks']} "
+                    f"ready={diag.get('ready_count', 0)} "
+                    f"review={diag.get('review_count', 0)} "
+                    f"spawned={diag.get('spawned', 0)} "
+                    f"respawn_guarded_by_reason={diag.get('respawn_guarded_by_reason', {})} "
+                    f"examples={examples}. "
+                    f"Ready queue is non-empty but no workers spawned this window. "
                     f"Check profile health (venv, PATH, credentials) and "
                     f"`hermes kanban list --status ready` / "
                     f"`hermes kanban list --status blocked` for recent "

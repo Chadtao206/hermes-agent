@@ -81,6 +81,7 @@ import sys
 import threading
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -4215,6 +4216,53 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    ready_count: int = 0
+    """Ready rows considered this tick before skip/guard decisions."""
+    review_count: int = 0
+    """Review rows considered this tick before skip decisions."""
+    spawnable_ready: int = 0
+    """Ready rows assigned to an existing Hermes profile."""
+    spawnable_review: int = 0
+    """Review rows assigned to an existing Hermes profile."""
+    spawn_attempts: int = 0
+    """Spawn attempts after claim succeeded."""
+    spawn_failures: int = 0
+    """Spawn pipeline failures recorded by dispatch_once."""
+    max_in_progress_blocked: bool = False
+    """True when max_in_progress short-circuited spawning this tick."""
+
+    def summary(self, *, example_cap: int = 3, reason_cap: int = 10) -> dict[str, Any]:
+        """Return bounded, secret-safe dispatcher diagnostics for logs/CLI JSON."""
+        cap = max(1, int(example_cap))
+        reason_limit = max(1, int(reason_cap))
+        guard_counts = Counter(reason for _, reason in self.respawn_guarded)
+        guard_examples: dict[str, list[str]] = {}
+        for task_id, reason in self.respawn_guarded:
+            bucket = guard_examples.setdefault(reason, [])
+            if len(bucket) < cap:
+                bucket.append(task_id)
+        return {
+            "ready_count": self.ready_count,
+            "review_count": self.review_count,
+            "spawnable_ready": self.spawnable_ready,
+            "spawnable_review": self.spawnable_review,
+            "spawn_attempts": self.spawn_attempts,
+            "spawn_failures": self.spawn_failures,
+            "spawned": len(self.spawned),
+            "spawned_examples": [task_id for task_id, _, _ in self.spawned[:cap]],
+            "respawn_guarded": len(self.respawn_guarded),
+            "respawn_guarded_by_reason": dict(guard_counts.most_common(reason_limit)),
+            "respawn_guarded_examples": guard_examples,
+            "skipped_unassigned": len(self.skipped_unassigned),
+            "skipped_nonspawnable": len(self.skipped_nonspawnable),
+            "reclaimed": self.reclaimed,
+            "promoted": self.promoted,
+            "crashed": len(self.crashed),
+            "timed_out": len(self.timed_out),
+            "stale": len(self.stale),
+            "auto_blocked": len(self.auto_blocked),
+            "max_in_progress_blocked": self.max_in_progress_blocked,
+        }
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -5349,6 +5397,7 @@ def dispatch_once(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    result.ready_count = len(ready_rows)
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -5358,6 +5407,7 @@ def dispatch_once(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
+            result.max_in_progress_blocked = True
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
         remaining = max_in_progress - in_progress
@@ -5393,6 +5443,7 @@ def dispatch_once(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        result.spawnable_ready += 1
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -5459,9 +5510,11 @@ def dispatch_once(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        result.spawn_attempts += 1
         try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            result.spawn_failures += 1
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -5497,6 +5550,7 @@ def dispatch_once(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            result.spawn_failures += 1
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -5518,6 +5572,7 @@ def dispatch_once(
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    result.review_count = len(review_rows)
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -5531,15 +5586,18 @@ def dispatch_once(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        result.spawnable_review += 1
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        result.spawn_attempts += 1
         try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            result.spawn_failures += 1
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -5571,6 +5629,7 @@ def dispatch_once(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            result.spawn_failures += 1
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,

@@ -2088,6 +2088,87 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     assert guarded_evt.payload.get("reason") == "recent_success"
 
 
+def test_dispatch_result_summary_defaults():
+    """DispatchResult.summary returns stable zero defaults for diagnostics."""
+    diag = kb.DispatchResult().summary()
+    assert diag["ready_count"] == 0
+    assert diag["review_count"] == 0
+    assert diag["spawnable_ready"] == 0
+    assert diag["spawnable_review"] == 0
+    assert diag["spawn_attempts"] == 0
+    assert diag["spawn_failures"] == 0
+    assert diag["respawn_guarded"] == 0
+    assert diag["respawn_guarded_by_reason"] == {}
+    assert diag["respawn_guarded_examples"] == {}
+
+
+def test_dispatch_result_summary_aggregates_guard_reasons_and_caps_examples():
+    res = kb.DispatchResult(
+        spawned=[
+            ("t_a", "alice", "/tmp/a"),
+            ("t_b", "alice", "/tmp/b"),
+            ("t_c", "alice", "/tmp/c"),
+            ("t_d", "alice", "/tmp/d"),
+        ],
+        respawn_guarded=[
+            ("t_1", "blocker_auth"),
+            ("t_2", "blocker_auth"),
+            ("t_3", "recent_success"),
+            ("t_4", "recent_success"),
+            ("t_5", "recent_success"),
+        ],
+    )
+    diag = res.summary(example_cap=2)
+    assert diag["spawned"] == 4
+    assert diag["spawned_examples"] == ["t_a", "t_b"]
+    assert diag["respawn_guarded"] == 5
+    assert diag["respawn_guarded_by_reason"] == {
+        "recent_success": 3,
+        "blocker_auth": 2,
+    }
+    assert diag["respawn_guarded_examples"] == {
+        "blocker_auth": ["t_1", "t_2"],
+        "recent_success": ["t_3", "t_4"],
+    }
+
+
+def test_dispatch_once_summary_counts_real_ready_paths(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once populates diagnostic counters through real ready paths."""
+    with kb.connect() as conn:
+        unassigned = kb.create_task(conn, title="needs owner")
+        spawnable = kb.create_task(conn, title="spawnable", assignee="alice")
+        res = kb.dispatch_once(conn, dry_run=True)
+
+    diag = res.summary()
+    assert diag["ready_count"] == 2
+    assert diag["spawnable_ready"] == 1
+    assert diag["spawned"] == 1
+    assert diag["spawned_examples"] == [spawnable]
+    assert diag["skipped_unassigned"] == 1
+    assert unassigned in res.skipped_unassigned
+
+
+def test_dispatch_once_summary_counts_spawn_failures(
+    kanban_home, all_assignees_spawnable
+):
+    """spawn_attempts/failures are populated by the actual spawn path."""
+    def fail_spawn(task, workspace):
+        raise RuntimeError("boom")
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="fails", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fail_spawn)
+
+    diag = res.summary()
+    assert diag["ready_count"] == 1
+    assert diag["spawnable_ready"] == 1
+    assert diag["spawn_attempts"] == 1
+    assert diag["spawn_failures"] == 1
+    assert diag["spawned"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
