@@ -4194,6 +4194,10 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    pre_spawn_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks blocked before claim/spawn because deterministic local
+    prerequisites (profile skill availability, workspace path shape, etc.)
+    failed validation. Stored as ``(task_id, reason)`` pairs."""
     ready_count: int = 0
     """Ready rows considered this tick before skip/guard decisions."""
     review_count: int = 0
@@ -4219,6 +4223,12 @@ class DispatchResult:
             bucket = guard_examples.setdefault(reason, [])
             if len(bucket) < cap:
                 bucket.append(task_id)
+        pre_spawn_counts = Counter(reason for _, reason in self.pre_spawn_blocked)
+        pre_spawn_examples: dict[str, list[str]] = {}
+        for task_id, reason in self.pre_spawn_blocked:
+            bucket = pre_spawn_examples.setdefault(reason, [])
+            if len(bucket) < cap:
+                bucket.append(task_id)
         return {
             "ready_count": self.ready_count,
             "review_count": self.review_count,
@@ -4231,6 +4241,9 @@ class DispatchResult:
             "respawn_guarded": len(self.respawn_guarded),
             "respawn_guarded_by_reason": dict(guard_counts.most_common(reason_limit)),
             "respawn_guarded_examples": guard_examples,
+            "pre_spawn_blocked": len(self.pre_spawn_blocked),
+            "pre_spawn_blocked_by_reason": dict(pre_spawn_counts.most_common(reason_limit)),
+            "pre_spawn_blocked_examples": pre_spawn_examples,
             "skipped_unassigned": len(self.skipped_unassigned),
             "skipped_nonspawnable": len(self.skipped_nonspawnable),
             "reclaimed": self.reclaimed,
@@ -5092,6 +5105,157 @@ def _record_spawn_failure(
     )
 
 
+def _skill_available_for_home(skill_name: str, hermes_home: Optional[str]) -> bool:
+    """Best-effort check that a forced skill can resolve for a worker home.
+
+    This intentionally mirrors the dispatcher failure mode instead of doing a
+    full skill load: ``hermes --skills X`` aborts at CLI startup when ``X`` is
+    absent from the worker's profile-scoped ``skills/`` tree.  A cheap file
+    check catches that deterministic failure before we claim/spawn the task.
+    Plugin-qualified skills are skipped because their availability depends on
+    runtime plugin state rather than a local ``SKILL.md`` path.
+    """
+    name = (skill_name or "").strip()
+    if not name:
+        return True
+    if ":" in name and not os.path.isabs(name):
+        return True
+
+    raw_path = Path(name).expanduser()
+    if raw_path.is_absolute():
+        return raw_path.is_file() or (raw_path / "SKILL.md").is_file()
+
+    base = Path(hermes_home).expanduser() if hermes_home else kanban_home()
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+
+    direct = skills_root / raw_path
+    if direct.is_file() or (direct / "SKILL.md").is_file():
+        return True
+
+    # Bare skill names are commonly nested under category directories, e.g.
+    # ``software-development/ticket-hub/SKILL.md``.  Bound the scan to the
+    # local profile skill tree and avoid interpreting path-like names as globs.
+    if "/" not in name and "\\" not in name:
+        try:
+            for candidate in skills_root.rglob(f"{name}/SKILL.md"):
+                if candidate.is_file():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _profile_home_for_spawn(task: Task) -> Optional[str]:
+    if not task.assignee:
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+        profile_arg = normalize_profile_name(task.assignee)
+        return resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Test fixtures often monkeypatch ``profile_exists`` without creating
+        # profile dirs.  Match _default_spawn's tolerant behaviour: if the CLI
+        # would fall back to the current home in that fixture, validate there.
+        return str(kanban_home())
+    except Exception:
+        return None
+
+
+def _workspace_pre_spawn_errors(task: Task) -> list[str]:
+    """Return deterministic workspace-shape errors without creating dirs."""
+    kind = task.workspace_kind or "scratch"
+    path = task.workspace_path
+    errors: list[str] = []
+    if kind not in VALID_WORKSPACE_KINDS:
+        return [f"unknown workspace_kind: {kind}"]
+    if kind == "dir" and not path:
+        errors.append("workspace_kind=dir requires workspace_path")
+    if path and kind in {"scratch", "dir"}:
+        if not Path(path).expanduser().is_absolute():
+            errors.append("workspace_path must be absolute")
+    if path and kind == "worktree":
+        if not Path(path).expanduser().is_absolute():
+            errors.append("worktree workspace_path must be absolute")
+    return errors
+
+
+def _pre_spawn_validation_errors(task: Task) -> list[str]:
+    errors = _workspace_pre_spawn_errors(task)
+    if task.skills:
+        home = _profile_home_for_spawn(task)
+        missing = [
+            skill for skill in task.skills
+            if skill and not _skill_available_for_home(str(skill), home)
+        ]
+        if missing:
+            errors.append("missing forced skill(s): " + ", ".join(missing))
+    return errors
+
+
+def _record_pre_spawn_validation_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    errors: list[str],
+) -> bool:
+    reason = "pre-spawn validation failed: " + "; ".join(errors)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT consecutive_failures, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] not in {"ready", "review"}:
+            return False
+        failures = int(row["consecutive_failures"] or 0) + 1
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   consecutive_failures = ?,
+                   last_failure_error = ?
+             WHERE id = ?
+               AND status IN ('ready', 'review')
+               AND claim_lock IS NULL
+            """,
+            (failures, reason[:500], task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        metadata = {
+            "failure_class": "pre_spawn_validation",
+            "validation_errors": list(errors),
+            "failures": failures,
+            "effective_limit": 1,
+            "limit_source": "pre_spawn_validation",
+        }
+        run_id = _synthesize_ended_run(
+            conn, task_id,
+            outcome="spawn_failed",
+            summary=reason,
+            error=reason[:500],
+            metadata=metadata,
+        )
+        payload = dict(metadata)
+        payload["error"] = reason[:500]
+        _append_event(
+            conn, task_id, "pre_spawn_validation_failed", payload,
+            run_id=run_id,
+        )
+        _append_event(
+            conn, task_id, "gave_up", payload,
+            run_id=run_id,
+        )
+        _append_event(
+            conn, task_id, "blocked", {"reason": reason},
+            run_id=run_id,
+        )
+        return True
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -5422,6 +5586,17 @@ def dispatch_once(
             result.skipped_nonspawnable.append(row["id"])
             continue
         result.spawnable_ready += 1
+        task_for_validation = get_task(conn, row["id"])
+        if task_for_validation is None:
+            continue
+        validation_errors = _pre_spawn_validation_errors(task_for_validation)
+        if validation_errors:
+            reason = "; ".join(validation_errors)
+            result.pre_spawn_blocked.append((row["id"], reason))
+            if not dry_run:
+                if _record_pre_spawn_validation_failure(conn, row["id"], validation_errors):
+                    result.auto_blocked.append(row["id"])
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -5565,6 +5740,17 @@ def dispatch_once(
             result.skipped_nonspawnable.append(row["id"])
             continue
         result.spawnable_review += 1
+        task_for_validation = get_task(conn, row["id"])
+        if task_for_validation is None:
+            continue
+        validation_errors = _workspace_pre_spawn_errors(task_for_validation)
+        if validation_errors:
+            reason = "; ".join(validation_errors)
+            result.pre_spawn_blocked.append((row["id"], reason))
+            if not dry_run:
+                if _record_pre_spawn_validation_failure(conn, row["id"], validation_errors):
+                    result.auto_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue

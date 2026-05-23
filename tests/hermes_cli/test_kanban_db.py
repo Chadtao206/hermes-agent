@@ -1722,6 +1722,107 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
     assert not res.spawned
 
 
+def test_dispatch_blocks_missing_forced_skill_before_claim(
+    kanban_home, all_assignees_spawnable
+):
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="needs skill", assignee="alice", skills=["missing-skill"]
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert spawns == []
+    assert res.pre_spawn_blocked == [(t, "missing forced skill(s): missing-skill")]
+    assert t in res.auto_blocked
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert "missing forced skill(s): missing-skill" in (task.last_failure_error or "")
+    assert [e.kind for e in events][-3:] == [
+        "pre_spawn_validation_failed", "gave_up", "blocked",
+    ]
+
+
+def test_dispatch_allows_present_forced_skill(
+    kanban_home, all_assignees_spawnable
+):
+    skill_dir = kanban_home / "skills" / "software-development" / "present-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: present-skill\ndescription: test\n---\n# Present\n",
+        encoding="utf-8",
+    )
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="has skill", assignee="alice", skills=["present-skill"]
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert spawns == [t]
+    assert res.pre_spawn_blocked == []
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_dispatch_blocks_bad_workspace_before_claim(
+    kanban_home, all_assignees_spawnable
+):
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="bad workspace",
+            assignee="alice",
+            workspace_kind="dir",
+            workspace_path="relative/path",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert spawns == []
+    assert res.pre_spawn_blocked == [(t, "workspace_path must be absolute")]
+    assert t in res.auto_blocked
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+
+
+def test_dispatch_pre_spawn_validation_dry_run_does_not_block(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="dry missing skill", assignee="alice", skills=["missing-skill"]
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+        task = kb.get_task(conn, t)
+
+    assert res.pre_spawn_blocked == [(t, "missing forced skill(s): missing-skill")]
+    assert t not in res.auto_blocked
+    assert not res.spawned
+    assert task is not None
+    assert task.status == "ready"
+
+
 def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeypatch):
     """``has_spawnable_ready`` returns False when every ready task is
     assigned to a control-plane lane — used by gateway/CLI dispatchers
