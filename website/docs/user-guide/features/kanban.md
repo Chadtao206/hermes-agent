@@ -464,11 +464,12 @@ For best results, pair it with a profile whose toolsets are restricted to board 
 
 ## Reliability checks and wake triage
 
-Kanban includes two deterministic, script-friendly health surfaces:
+Kanban includes three deterministic, script-friendly health surfaces:
 
 ```bash
 hermes kanban doctor --json
 hermes kanban reconcile --json
+hermes kanban metrics --json
 ```
 
 `doctor` is the DB/board-integrity surface: SQLite header/quick-check, orphan
@@ -501,6 +502,22 @@ and the decision surfaces again. Important action kinds include:
   otherwise cause retry storms.
 - `review_parent_pr_head_evidence_missing` — final review cannot be trusted
   against the current PR head yet.
+
+`metrics` is the stability surface. It derives run/task aggregates from
+`task_runs`, `task_events`, and the current `doctor`/`reconcile` outputs:
+24-hour, 7-day, all-time, and optional `--since-epoch` windows include run
+counts, tasks attempted, average/max attempts per task, completion/block/failure
+rates, p50/p95/max run duration, failure-event counts, current running/pending
+state, consecutive-failure totals, wake mode, and suppressed decision packets.
+By default it is read-only. Pass `--write-snapshot` to persist the payload into
+`$HERMES_HOME/kanban_metrics_snapshots.db`, a sidecar SQLite database outside
+authoritative `kanban.db`, so stability can be trended without mutating the
+board:
+
+```bash
+hermes kanban metrics --json --write-snapshot
+hermes kanban metrics --json --since-epoch 1779578460
+```
 
 For cron/watchdogs, prefer the script-first wrapper:
 

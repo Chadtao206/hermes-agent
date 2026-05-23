@@ -27,6 +27,7 @@ from hermes_constants import get_default_hermes_root
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_board_doctor as kdoc
+from hermes_cli import kanban_metrics as kmet
 from hermes_cli import kanban_reconciler as krec
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
@@ -549,6 +550,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--confirm-dry-run",
         action="store_true",
         help="Required with --apply-option after reviewing the dry-run plan",
+    )
+
+    # --- metrics (deterministic reliability aggregates + optional snapshot) ---
+    p_metrics = sub.add_parser(
+        "metrics",
+        help="Report deterministic Kanban reliability metrics and optional sidecar snapshot",
+    )
+    p_metrics.add_argument("--json", action="store_true", help="Emit structured JSON")
+    p_metrics.add_argument(
+        "--ready-age-seconds",
+        type=int,
+        default=15 * 60,
+        help="Threshold passed through to doctor/reconcile health checks (default: 900)",
+    )
+    p_metrics.add_argument(
+        "--since-epoch",
+        type=int,
+        default=None,
+        help="Also include a custom 'since' window starting at this epoch second",
+    )
+    p_metrics.add_argument(
+        "--write-snapshot",
+        action="store_true",
+        help="Persist this metrics payload to the sidecar kanban_metrics_snapshots.db",
+    )
+    p_metrics.add_argument(
+        "--snapshot-db",
+        default=None,
+        help="Override sidecar snapshot DB path for --write-snapshot",
     )
 
     # --- link / unlink ---
@@ -1241,6 +1271,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "diag":     _cmd_diagnostics,
         "doctor":   _cmd_doctor,
         "reconcile": _cmd_reconcile,
+        "metrics":  _cmd_metrics,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
         "claim":    _cmd_claim,
@@ -1336,6 +1367,21 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
             max_examples=max(0, int(getattr(args, "examples", 5) or 0)),
         ))
     return 0
+
+
+def _cmd_metrics(args: argparse.Namespace) -> int:
+    result = kmet.collect_metrics(
+        board=getattr(args, "board", None),
+        ready_age_seconds=max(1, int(getattr(args, "ready_age_seconds", 900) or 900)),
+        since_epoch=getattr(args, "since_epoch", None),
+        write_snapshot=bool(getattr(args, "write_snapshot", False)),
+        snapshot_db=Path(getattr(args, "snapshot_db")) if getattr(args, "snapshot_db", None) else None,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(kmet.format_metrics_text(result))
+    return 0 if result.get("ok") else 2
 
 
 def _profile_author() -> str:
