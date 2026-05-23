@@ -101,6 +101,91 @@ def test_wake_triage_routes_ambiguous_handoffs_to_jensen_decision():
     assert triage["summary"][rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED] == 1
 
 
+def test_wake_triage_groups_duplicate_decision_actions_by_task():
+    actions = [
+        {
+            "kind": "review_parent_pr_head_evidence_missing",
+            "task_id": "t_review",
+            "severity": "warning",
+            "reason": "missing PR head evidence",
+            "safe_to_apply": False,
+            "signature": "review_parent_pr_head_evidence_missing:t_review:abc",
+            "details": {},
+        },
+        {
+            "kind": "scheduled_with_completed_parents_decision",
+            "task_id": "t_review",
+            "severity": "warning",
+            "reason": "needs keep-parked/unblock/close decision",
+            "safe_to_apply": False,
+            "signature": "scheduled_with_completed_parents_decision:t_review:def",
+            "details": {},
+        },
+        {
+            "kind": "scheduled_with_completed_parents_decision",
+            "task_id": "t_other",
+            "severity": "warning",
+            "reason": "needs keep-parked/unblock/close decision",
+            "safe_to_apply": False,
+            "signature": "scheduled_with_completed_parents_decision:t_other:ghi",
+            "details": {},
+        },
+    ]
+
+    triage = rec.classify_wake_triage(actions)
+
+    assert triage["summary"][rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED] == 3
+    assert triage["decision_packet_count"] == 2
+    first_packet = triage["decision_packets"][0]
+    assert first_packet["task_id"] == "t_other"
+    second_packet = triage["decision_packets"][1]
+    assert second_packet["task_id"] == "t_review"
+    assert second_packet["action_count"] == 2
+    assert second_packet["kinds"] == [
+        "review_parent_pr_head_evidence_missing",
+        "scheduled_with_completed_parents_decision",
+    ]
+    assert second_packet["safe_to_apply"] is False
+
+
+def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
+    actions = [
+        {
+            "kind": "review_parent_pr_head_evidence_missing",
+            "task_id": "t_review",
+            "severity": "warning",
+            "reason": "missing PR head evidence",
+            "safe_to_apply": False,
+            "signature": "review_parent_pr_head_evidence_missing:t_review:abc",
+            "details": {},
+        },
+        {
+            "kind": "scheduled_with_completed_parents_decision",
+            "task_id": "t_review",
+            "severity": "warning",
+            "reason": "needs keep-parked/unblock/close decision",
+            "safe_to_apply": False,
+            "signature": "scheduled_with_completed_parents_decision:t_review:def",
+            "details": {},
+        },
+    ]
+    result = {
+        "board": "default",
+        "db_path": "/tmp/kanban.db",
+        "actions": actions,
+        "wake_triage": rec.classify_wake_triage(actions),
+    }
+
+    text = rec.format_reconcile_text(result, max_examples=1)
+
+    assert "decision_packets=1" in text
+    assert "Decision packets (first 1; grouped by task" in text
+    assert "packet [t_review] (decision-only; 2 action(s))" in text
+    assert "review_parent_pr_head_evidence_missing" in text
+    assert "scheduled_with_completed_parents_decision" in text
+    assert "Examples (first" not in text
+
+
 def test_reconciler_splits_dead_expired_and_stale_heartbeat(kanban_home):
     now = 1_700_000_000
     with kb.connect() as conn:

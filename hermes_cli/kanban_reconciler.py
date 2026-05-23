@@ -77,6 +77,70 @@ def _action_summary_for_wake_triage(action: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _highest_severity(severities: list[str]) -> str:
+    if not severities:
+        return "warning"
+    return min(
+        (str(severity or "warning") for severity in severities),
+        key=lambda severity: _SEVERITY_RANK.get(severity, 99),
+    )
+
+
+def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group Jensen decision-required actions into operator decision packets.
+
+    The underlying reconcile actions remain separate and read-only for auditability,
+    signatures, and compatibility. This projection gives cron/watch output one
+    packet per task (or one board-level packet) so duplicate signals such as
+    "scheduled with completed parents" plus "missing PR-head evidence" do not
+    wake Jensen as separate decisions for the same card.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        if _wake_bucket_for_action(action) != WAKE_BUCKET_JENSEN_DECISION_REQUIRED:
+            continue
+        task_id = action.get("task_id")
+        packet_key = str(task_id or "board")
+        packet = grouped.setdefault(
+            packet_key,
+            {
+                "packet_id": f"task:{task_id}" if task_id else "board",
+                "task_id": task_id,
+                "severity": "warning",
+                "action_count": 0,
+                "kinds": [],
+                "signatures": [],
+                "reasons": [],
+                "safe_to_apply": True,
+                "actions": [],
+            },
+        )
+        summary = _action_summary_for_wake_triage(action)
+        packet["actions"].append(summary)
+        packet["action_count"] = int(packet["action_count"]) + 1
+        packet["kinds"] = sorted({*packet["kinds"], str(action.get("kind") or "")})
+        signature = action.get("signature")
+        if signature:
+            packet["signatures"].append(signature)
+        reason = action.get("reason")
+        if reason and reason not in packet["reasons"]:
+            packet["reasons"].append(reason)
+        packet["safe_to_apply"] = bool(packet["safe_to_apply"] and action.get("safe_to_apply"))
+        packet["severity"] = _highest_severity([
+            str(packet.get("severity") or "warning"),
+            str(action.get("severity") or "warning"),
+        ])
+
+    return sorted(
+        grouped.values(),
+        key=lambda packet: (
+            _SEVERITY_RANK.get(str(packet.get("severity") or "warning"), 99),
+            str(packet.get("task_id") or ""),
+            str(packet.get("packet_id") or ""),
+        ),
+    )
+
+
 def _wake_bucket_for_action(action: dict[str, Any]) -> str:
     kind = str(action.get("kind") or "")
     severity = str(action.get("severity") or "warning")
@@ -111,6 +175,8 @@ def classify_wake_triage(actions: list[dict[str, Any]]) -> dict[str, Any]:
             "wake_agent": False,
             "reason": "no reconcile actions",
             "total_actions": 0,
+            "decision_packet_count": 0,
+            "decision_packets": [],
             "summary": {
                 WAKE_BUCKET_AUTO_SILENT: 0,
                 WAKE_BUCKET_COMPACT_NOTIFY: 0,
@@ -122,6 +188,8 @@ def classify_wake_triage(actions: list[dict[str, Any]]) -> dict[str, Any]:
     for action in actions:
         bucket = _wake_bucket_for_action(action)
         buckets[bucket].append(_action_summary_for_wake_triage(action))
+
+    decision_packets = group_decision_actions_by_task(actions)
 
     if buckets[WAKE_BUCKET_JENSEN_DECISION_REQUIRED]:
         mode = WAKE_BUCKET_JENSEN_DECISION_REQUIRED
@@ -138,6 +206,8 @@ def classify_wake_triage(actions: list[dict[str, Any]]) -> dict[str, Any]:
         "wake_agent": mode == WAKE_BUCKET_JENSEN_DECISION_REQUIRED,
         "reason": reason,
         "total_actions": len(actions),
+        "decision_packet_count": len(decision_packets),
+        "decision_packets": decision_packets,
         "summary": {bucket: len(items) for bucket, items in buckets.items()},
         "buckets": buckets,
     }
@@ -953,6 +1023,44 @@ def _detail_highlights_for_reconcile_text(action: dict[str, Any]) -> str:
     return "; ".join(fragments[:8])
 
 
+def _decision_packet_lines_for_reconcile_text(
+    packets: list[dict[str, Any]],
+    *,
+    max_examples: int,
+) -> list[str]:
+    bounded_packets = packets[: max(0, int(max_examples or 0))]
+    omitted = max(0, len(packets) - len(bounded_packets))
+    lines = [
+        f"Decision packets (first {len(bounded_packets)}; grouped by task; full payload: rerun with --json):"
+    ]
+    for packet in bounded_packets:
+        loc = packet.get("task_id") or "board"
+        safe = "safe" if packet.get("safe_to_apply") else "decision-only"
+        kinds = ", ".join(str(kind) for kind in packet.get("kinds") or [])
+        lines.append(
+            f"- {str(packet.get('severity')).upper()} packet [{loc}] "
+            f"({safe}; {int(packet.get('action_count') or 0)} action(s)): {kinds}"
+        )
+        reasons = packet.get("reasons") or []
+        if isinstance(reasons, list) and reasons:
+            shown_reasons = [
+                _truncate_for_reconcile_text(reason, limit=150)
+                for reason in reasons[:2]
+            ]
+            if len(reasons) > len(shown_reasons):
+                shown_reasons.append(f"+{len(reasons) - len(shown_reasons)} more")
+            lines.append("  reasons: " + " | ".join(shown_reasons))
+        signatures = packet.get("signatures") or []
+        if isinstance(signatures, list) and signatures:
+            shown_signatures = [str(signature) for signature in signatures[:3]]
+            if len(signatures) > len(shown_signatures):
+                shown_signatures.append(f"+{len(signatures) - len(shown_signatures)} more")
+            lines.append("  signatures: " + ", ".join(shown_signatures))
+    if omitted:
+        lines.append(f"... {omitted} more decision packet(s) omitted from compact output; rerun with --json for full details.")
+    return lines
+
+
 def format_reconcile_text(result: dict[str, Any], *, max_examples: int = 5) -> str:
     actions = result.get("actions") or []
     if not actions:
@@ -987,8 +1095,19 @@ def format_reconcile_text(result: dict[str, Any], *, max_examples: int = 5) -> s
         f"{WAKE_BUCKET_AUTO_SILENT}={int(triage_summary.get(WAKE_BUCKET_AUTO_SILENT) or 0)}, "
         f"{WAKE_BUCKET_COMPACT_NOTIFY}={int(triage_summary.get(WAKE_BUCKET_COMPACT_NOTIFY) or 0)}, "
         f"{WAKE_BUCKET_JENSEN_DECISION_REQUIRED}={int(triage_summary.get(WAKE_BUCKET_JENSEN_DECISION_REQUIRED) or 0)}",
-        f"- reason: {_truncate_for_reconcile_text(triage.get('reason'), limit=180)}",
     ])
+    packet_count = int(triage.get("decision_packet_count") or 0)
+    if packet_count:
+        lines.append(f"- decision_packets={packet_count}")
+    lines.append(f"- reason: {_truncate_for_reconcile_text(triage.get('reason'), limit=180)}")
+
+    decision_packets = triage.get("decision_packets") or []
+    if triage.get("mode") == WAKE_BUCKET_JENSEN_DECISION_REQUIRED and decision_packets:
+        lines.extend(_decision_packet_lines_for_reconcile_text(
+            decision_packets,
+            max_examples=max_examples,
+        ))
+        return "\n".join(lines)
 
     bounded_examples = actions[: max(0, int(max_examples or 0))]
     omitted = max(0, len(actions) - len(bounded_examples))
