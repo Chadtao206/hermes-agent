@@ -101,6 +101,25 @@ DEFAULT_NOTIFY_TERMINAL_KINDS: tuple[str, ...] = (
     "completed", "blocked", "gave_up", "crashed", "timed_out", "archived",
 )
 
+# Opinionated profile wake preset used by both `hermes kanban wake-arm` and
+# optional auto-arming of root orchestration cards. Kept narrower than
+# DEFAULT_NOTIFY_TERMINAL_KINDS: archiving a root should not wake the
+# orchestrator after the operator has deliberately closed it out.
+WAKE_ARM_EVENT_KINDS: tuple[str, ...] = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+)
+WAKE_ARM_PROMPT = (
+    "A task under an armed kanban root triggered a terminal event "
+    "(completed / blocked / gave_up / crashed / timed_out). Read the event "
+    "payload, then advance the root or parent task by reviewing, unblocking, "
+    "or completing it as appropriate. Do NOT create cron jobs, profile event "
+    "subscriptions, or any other recurring triggers from inside this wake — "
+    "this profile is already armed for the root task by an operator and "
+    "arming again recursively will cause a wake loop."
+)
+DEFAULT_WAKE_ARM_PROFILE = "default"
+DEFAULT_WAKE_ARM_NAME = "jensen-orchestrator"
+
 # Window after a notifier's last heartbeat in which we still consider that
 # notifier "live" for the board DB it was scanning. The watcher ticks every
 # 5s by default, so 30s tolerates a couple of missed ticks (slow disk, GC
@@ -1136,10 +1155,16 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    readonly: bool = False,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
+    When ``readonly`` is true, open with SQLite ``mode=ro`` and skip WAL,
+    schema initialization, and migrations. Dashboard read endpoints and
+    watchdog/cron probes should use this path so high-frequency reads cannot
+    mutate journal mode or sidecar files on the hot board database.
+
+    WAL mode is enabled on every writable connection; it's a no-op after the first
     time but keeps the code robust if the DB file is ever re-created.
 
     The first connection to a given path auto-runs :func:`init_db` so
@@ -1159,9 +1184,17 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not readonly:
+        path.parent.mkdir(parents=True, exist_ok=True)
     _validate_sqlite_header(path)
     resolved = str(path.resolve())
+    if readonly:
+        uri = f"file:{path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
@@ -1608,12 +1641,24 @@ def write_txn(conn: sqlite3.Connection):
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
+
+    If SQLite aborts the transaction before our error handler runs, ROLLBACK
+    can itself raise ``cannot rollback - no transaction is active``.  That
+    secondary failure must not mask the primary database error; operators need
+    the first SQLite exception to diagnose corruption, I/O, or lock failures.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as rollback_exc:
+            _log.warning(
+                "Kanban write transaction rollback failed after primary error; "
+                "preserving the original exception: %s",
+                rollback_exc,
+            )
         raise
     else:
         conn.execute("COMMIT")
@@ -1657,6 +1702,88 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _auto_wake_arm_config() -> dict[str, Any]:
+    """Return kanban auto-wake-arm settings from config.yaml.
+
+    Defaults are intentionally conservative: the feature is opt-in so normal
+    one-shot boards do not start waking the orchestrator until the operator
+    explicitly enables ``kanban.auto_wake_arm_roots``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        kanban_cfg = {}
+
+    enabled = bool(kanban_cfg.get("auto_wake_arm_roots", False))
+    profile = (
+        kanban_cfg.get("wake_arm_profile")
+        or kanban_cfg.get("orchestrator_profile")
+        or DEFAULT_WAKE_ARM_PROFILE
+    )
+    name = kanban_cfg.get("wake_arm_name") or DEFAULT_WAKE_ARM_NAME
+    return {
+        "enabled": enabled,
+        "profile": str(profile).strip() or DEFAULT_WAKE_ARM_PROFILE,
+        "name": str(name).strip() or DEFAULT_WAKE_ARM_NAME,
+    }
+
+
+def _maybe_auto_wake_arm_root(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    parents: Iterable[str],
+) -> None:
+    """Idempotently arm the configured orchestrator on new root cards.
+
+    A "root" here means the task has no dependency parents. The subscription
+    itself uses ``include_children=true``, so any dependency descendants created
+    under that root later will wake the orchestrator on terminal events. The
+    runtime event-wake guard prevents recursive auto-arming from a woken
+    profile session.
+    """
+    if os.environ.get("HERMES_KANBAN_EVENT_WAKE") == "1":
+        return
+    if tuple(p for p in parents if p):
+        return
+    existing_parent = conn.execute(
+        "SELECT 1 FROM task_links "
+        "WHERE child_id = ? AND relation_type = ? LIMIT 1",
+        (task_id, LINK_RELATION_DEPENDENCY),
+    ).fetchone()
+    if existing_parent:
+        return
+
+    cfg = _auto_wake_arm_config()
+    if not cfg["enabled"]:
+        return
+
+    try:
+        add_profile_event_sub(
+            conn,
+            task_id=task_id,
+            profile=cfg["profile"],
+            name=cfg["name"],
+            event_kinds=list(WAKE_ARM_EVENT_KINDS),
+            include_children=True,
+            wake_agent=True,
+            wake_prompt=WAKE_ARM_PROMPT,
+            enabled=True,
+        )
+    except Exception as exc:
+        # Task creation must remain reliable even if the optional orchestration
+        # wake hook is misconfigured. Surface the defect in logs/doctor output
+        # rather than failing the user's card creation.
+        _log.warning(
+            "kanban auto-wake-arm failed for root %s: %s",
+            task_id,
+            exc,
+        )
 
 
 def create_task(
@@ -1781,7 +1908,9 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
-            return row["id"]
+            existing_id = row["id"]
+            _maybe_auto_wake_arm_root(conn, task_id=existing_id, parents=parents)
+            return existing_id
 
     now = int(time.time())
 
@@ -1889,6 +2018,7 @@ def create_task(
                         "blocked",
                         {"reason": "initial_status=blocked"},
                     )
+            _maybe_auto_wake_arm_root(conn, task_id=task_id, parents=parents)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -7097,6 +7227,49 @@ def list_profile_wake_events(
 # Kanban notifier heartbeat telemetry
 # ---------------------------------------------------------------------------
 
+
+
+def _recreate_notifier_heartbeats(conn: sqlite3.Connection) -> None:
+    """Drop and recreate the ephemeral notifier-heartbeat telemetry table.
+
+    The table is derived runtime health telemetry, not durable board state. If
+    it becomes corrupt or schema-incompatible, resetting it is safer than
+    allowing dashboard refreshes or gateway notifier loops to fail the board.
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_board")
+    conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_seen")
+    conn.execute("DROP TABLE IF EXISTS kanban_notifier_heartbeats")
+    conn.execute(
+        """
+        CREATE TABLE kanban_notifier_heartbeats (
+            notifier_id      TEXT NOT NULL,
+            board_slug       TEXT NOT NULL,
+            db_path          TEXT NOT NULL,
+            notifier_profile TEXT,
+            host             TEXT NOT NULL,
+            pid              INTEGER NOT NULL,
+            started_at       INTEGER NOT NULL,
+            last_seen_at     INTEGER NOT NULL,
+            PRIMARY KEY (notifier_id, board_slug, db_path)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX idx_notifier_heartbeats_board "
+        "ON kanban_notifier_heartbeats(board_slug, db_path)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_notifier_heartbeats_seen "
+        "ON kanban_notifier_heartbeats(last_seen_at)"
+    )
+
+
+def reset_notifier_heartbeats(conn: sqlite3.Connection) -> None:
+    """Public repair hook for the non-critical notifier heartbeat table."""
+    with write_txn(conn):
+        _recreate_notifier_heartbeats(conn)
+
+
 def record_notifier_heartbeat(
     conn: sqlite3.Connection,
     *,
@@ -7118,30 +7291,46 @@ def record_notifier_heartbeat(
     from overlapping notifier processes that may race wake claims.
     """
     when = int(now if now is not None else time.time())
-    with write_txn(conn):
-        conn.execute(
-            """
-            INSERT INTO kanban_notifier_heartbeats (
-                notifier_id, board_slug, db_path, notifier_profile,
-                host, pid, started_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(notifier_id, board_slug, db_path) DO UPDATE SET
-                notifier_profile = excluded.notifier_profile,
-                host             = excluded.host,
-                pid              = excluded.pid,
-                started_at       = excluded.started_at,
-                last_seen_at     = excluded.last_seen_at
-            """,
-            (
-                str(notifier_id), str(board_slug or DEFAULT_BOARD), str(db_path),
-                notifier_profile, str(host or "unknown"), int(pid),
-                int(started_at), when,
-            ),
+
+    def _write_heartbeat() -> None:
+        with write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_notifier_heartbeats (
+                    notifier_id, board_slug, db_path, notifier_profile,
+                    host, pid, started_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(notifier_id, board_slug, db_path) DO UPDATE SET
+                    notifier_profile = excluded.notifier_profile,
+                    host             = excluded.host,
+                    pid              = excluded.pid,
+                    started_at       = excluded.started_at,
+                    last_seen_at     = excluded.last_seen_at
+                """,
+                (
+                    str(notifier_id), str(board_slug or DEFAULT_BOARD), str(db_path),
+                    notifier_profile, str(host or "unknown"), int(pid),
+                    int(started_at), when,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM kanban_notifier_heartbeats WHERE last_seen_at < ?",
+                (when - max(1, int(retention_seconds)),),
+            )
+
+    try:
+        _write_heartbeat()
+    except sqlite3.DatabaseError as exc:
+        _log.warning(
+            "kanban notifier heartbeat table unhealthy; resetting ephemeral "
+            "telemetry table and retrying once: %s",
+            exc,
         )
-        conn.execute(
-            "DELETE FROM kanban_notifier_heartbeats WHERE last_seen_at < ?",
-            (when - max(1, int(retention_seconds)),),
-        )
+        try:
+            reset_notifier_heartbeats(conn)
+            _write_heartbeat()
+        except Exception as reset_exc:
+            raise reset_exc from exc
 
 
 def list_notifier_heartbeats(

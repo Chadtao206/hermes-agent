@@ -1554,6 +1554,14 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # When true, newly-created root cards (no dependency parents) are
+        # automatically armed with a bounded profile wake subscription so the
+        # orchestrator is woken when the root or any descendant reaches a
+        # terminal event. Off by default; enable deliberately on boards where
+        # Jensen/default should supervise child-lane completion/blockers.
+        "auto_wake_arm_roots": False,
+        "wake_arm_profile": "default",
+        "wake_arm_name": "jensen-orchestrator",
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

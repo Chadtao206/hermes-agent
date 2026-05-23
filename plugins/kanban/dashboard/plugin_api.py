@@ -105,7 +105,7 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
-def _conn(board: Optional[str] = None):
+def _conn(board: Optional[str] = None, *, readonly: bool = False):
     """Open a kanban_db connection, creating the schema on first use.
 
     Every handler that mutates the DB goes through this so the plugin
@@ -117,6 +117,14 @@ def _conn(board: Optional[str] = None):
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
+    if readonly:
+        try:
+            path = kanban_db.kanban_db_path(board=board)
+            if not path.exists():
+                kanban_db.init_db(board=board)
+        except Exception as exc:
+            log.warning("kanban readonly init preflight failed: %s", exc)
+        return kanban_db.connect(board=board, readonly=True)
     try:
         kanban_db.init_db(board=board)
     except Exception as exc:
@@ -416,13 +424,35 @@ def _compute_notifier_health(
     as_of = int(time.time())
     subscription_count = int(wake_health.get("subscription_count") or 0)
     _board_slug, db_path = _resolved_board_slug_and_db_path(board)
-    rows = kanban_db.list_notifier_heartbeats(
-        conn,
-        db_path=db_path,
-        now=as_of,
-        min_last_seen_at=as_of - kanban_db.NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
-        limit=kanban_db.NOTIFIER_HEARTBEAT_LIST_LIMIT,
-    )
+    try:
+        rows = kanban_db.list_notifier_heartbeats(
+            conn,
+            db_path=db_path,
+            now=as_of,
+            min_last_seen_at=as_of - kanban_db.NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
+            limit=kanban_db.NOTIFIER_HEARTBEAT_LIST_LIMIT,
+        )
+    except sqlite3.DatabaseError as exc:
+        log.warning(
+            "kanban notifier health unavailable for board %s (%s): %s",
+            board or kanban_db.DEFAULT_BOARD,
+            db_path,
+            exc,
+        )
+        return {
+            "active_count": 0,
+            "overlap_count": 0,
+            "stale_count": 0,
+            "severity": "unavailable",
+            "message": (
+                "Notifier heartbeat health is temporarily unavailable; "
+                "board tasks are still shown from the main task tables."
+            ),
+            "latest_notifier": None,
+            "rows": [],
+            "as_of": as_of,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     active_count = sum(1 for row in rows if row.get("active"))
     stale_count = max(0, len(rows) - active_count)
     overlap_count = max(0, active_count - 1)
@@ -516,7 +546,7 @@ def get_board(
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -755,7 +785,7 @@ def get_wake_health_details(
     first. ``overflow_count`` reports rows beyond ``limit``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -803,7 +833,7 @@ def get_task(
     ),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         if (run_state_type is None) ^ (run_state_name is None):
             raise HTTPException(

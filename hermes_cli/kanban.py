@@ -26,6 +26,8 @@ from typing import Any, Optional
 from hermes_constants import get_default_hermes_root
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_board_doctor as kdoc
+from hermes_cli import kanban_reconciler as krec
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
 
@@ -477,6 +479,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_diag.add_argument(
         "--json", action="store_true",
         help="Emit JSON (structured) instead of the default human table",
+    )
+
+
+    # --- doctor (read-only deterministic board health) ---
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Run read-only deterministic board health/stall checks",
+    )
+    p_doctor.add_argument("--json", action="store_true", help="Emit structured JSON")
+    p_doctor.add_argument(
+        "--ready-age-seconds",
+        type=int,
+        default=15 * 60,
+        help="Warn when ready tasks are older than this threshold (default: 900)",
+    )
+
+    # --- reconcile (read-only deterministic stalled-transition actions) ---
+    p_reconcile = sub.add_parser(
+        "reconcile",
+        help="Classify stalled-transition actions without mutating the board",
+    )
+    p_reconcile.add_argument("--json", action="store_true", help="Emit structured JSON")
+    p_reconcile.add_argument(
+        "--ready-age-seconds",
+        type=int,
+        default=15 * 60,
+        help="Classify ready/review tasks older than this threshold (default: 900)",
     )
 
     # --- link / unlink ---
@@ -1034,6 +1063,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     psubs_rm.add_argument("--json", action="store_true")
 
+    # --- wake-arm (profile-subs preset for the orchestrator) ---
+    p_wake_arm = sub.add_parser(
+        "wake-arm",
+        help="Arm a profile to wake on terminal events for TASK_ID and its "
+             "dependency descendants (thin wrapper over profile-subs add)",
+        description=(
+            "Convenience wrapper over `profile-subs add` that pins a profile "
+            "to wake on terminal kanban events for TASK_ID and its dependency "
+            "descendants. Idempotent: writes a single profile event "
+            "subscription with include_children=true, wake_agent=true, "
+            "enabled=true, event_kinds=[completed,blocked,gave_up,crashed,"
+            "timed_out], and a wake prompt that forbids the woken profile "
+            "from creating cron jobs, profile event subscriptions, or any "
+            "other recurring triggers."
+        ),
+    )
+    p_wake_arm.add_argument("task_id")
+    p_wake_arm.add_argument(
+        "--profile", default="default",
+        help="Profile to wake on matching events (default: default)",
+    )
+    p_wake_arm.add_argument(
+        "--name", default="jensen-orchestrator",
+        help="Sub name used to disambiguate multiple wake-arms on the same "
+             "(task, profile) pair (default: jensen-orchestrator)",
+    )
+    p_wake_arm.add_argument("--json", action="store_true")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1068,6 +1125,12 @@ def kanban_command(args: argparse.Namespace) -> int:
     # alpha.
     if action == "boards":
         return _dispatch_boards(args)
+
+    # Doctor must be able to report malformed DBs without first running
+    # init_db(), which itself opens a writable connection and may fail on the
+    # same corruption the operator is trying to diagnose.
+    if action == "doctor":
+        return _cmd_doctor(args)
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -1113,12 +1176,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # HERMES_HOME. Previously only `init` and `daemon` triggered
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
-    try:
-        kb.init_db()
-    except Exception as exc:
-        print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-        _restore_board_env()
-        return 1
+    if action != "reconcile":
+        try:
+            kb.init_db()
+        except Exception as exc:
+            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+            _restore_board_env()
+            return 1
 
     handlers = {
         "init":     _cmd_init,
@@ -1132,6 +1196,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         "reassign": _cmd_reassign,
         "diagnostics": _cmd_diagnostics,
         "diag":     _cmd_diagnostics,
+        "doctor":   _cmd_doctor,
+        "reconcile": _cmd_reconcile,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
         "claim":    _cmd_claim,
@@ -1155,6 +1221,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "notify-list":        _cmd_notify_list,
         "notify-unsubscribe": _cmd_notify_unsubscribe,
         "profile-subs":       _dispatch_profile_subs,
+        "wake-arm":           _cmd_kanban_wake_arm,
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
@@ -1179,6 +1246,34 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    result = kdoc.run_board_doctor(
+        board=getattr(args, "board", None),
+        ready_age_seconds=max(1, int(getattr(args, "ready_age_seconds", 900) or 900)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(kdoc.format_doctor_text(result))
+    # Diagnostics command exits non-zero only for DB-corruption/critical issues
+    # so cron/operator scripts can alert loudly without treating advisory
+    # stalled-work findings as command failures.
+    return 2 if any(i.get("severity") == "critical" for i in result.get("issues", [])) else 0
+
+
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    result = krec.run_reconciler(
+        board=getattr(args, "board", None),
+        ready_age_seconds=max(1, int(getattr(args, "ready_age_seconds", 900) or 900)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(krec.format_reconcile_text(result))
+    return 0
+
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
@@ -2791,6 +2886,95 @@ def _cmd_profile_subs_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# wake-arm: opinionated preset over `profile-subs add`
+# ---------------------------------------------------------------------------
+
+# Terminal kanban event kinds the orchestrator wakes on. Kept literal (not
+# imported from kanban_db) so the on-disk subscription stays stable even if
+# the DB module later widens its default terminal-kind set.
+_WAKE_ARM_EVENT_KINDS: list[str] = list(kb.WAKE_ARM_EVENT_KINDS)
+
+# Body the gateway sends when waking the orchestrator. The "do NOT create"
+# clause exists because the orchestrator profile is being woken FROM an
+# event-wake — creating more subs from inside that wake would compound into
+# a wake loop. The HERMES_KANBAN_EVENT_WAKE=1 env guard below is the runtime
+# enforcement; this prompt is the human-facing reminder.
+_WAKE_ARM_PROMPT = kb.WAKE_ARM_PROMPT
+
+
+def _cmd_kanban_wake_arm(args: argparse.Namespace) -> int:
+    """Arm a profile-sub on TASK_ID with the orchestrator preset.
+
+    Idempotent: re-running snaps every preset field back to canonical even
+    if the underlying profile-sub has drifted (e.g. someone disabled it).
+    """
+    if os.environ.get("HERMES_KANBAN_EVENT_WAKE") == "1":
+        print(
+            "kanban wake-arm: refusing to arm subscriptions from inside an "
+            "event-wake run (HERMES_KANBAN_EVENT_WAKE=1). Arm the orchestrator "
+            "from a human session, not from a woken worker.",
+            file=sys.stderr,
+        )
+        return 1
+
+    task_id = args.task_id
+    profile = (getattr(args, "profile", None) or "default")
+    name = (getattr(args, "name", None) or "jensen-orchestrator")
+
+    profiles = kb.list_profiles_on_disk()
+    if profile not in profiles:
+        print(
+            f"kanban wake-arm: profile {profile!r} not found on disk. "
+            f"Create it with `hermes -p {profile} setup` first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    with kb.connect() as conn:
+        if kb.get_task(conn, task_id) is None:
+            print(f"kanban wake-arm: no such task: {task_id}", file=sys.stderr)
+            return 1
+        existed = any(
+            (s.get("name") or "") == name
+            for s in kb.list_profile_event_subs(
+                conn, task_id=task_id, profile=profile, enabled_only=False,
+            )
+        )
+        kb.add_profile_event_sub(
+            conn,
+            task_id=task_id,
+            profile=profile,
+            name=name,
+            event_kinds=list(_WAKE_ARM_EVENT_KINDS),
+            include_children=True,
+            wake_agent=True,
+            wake_prompt=_WAKE_ARM_PROMPT,
+            enabled=True,
+        )
+        stored = [
+            s for s in kb.list_profile_event_subs(
+                conn, task_id=task_id, profile=profile, enabled_only=False,
+            )
+            if (s.get("name") or "") == name
+        ]
+
+    sub_id = _format_profile_sub_id(task_id, profile, name)
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "sub_id": sub_id,
+            "task_id": task_id,
+            "profile": profile,
+            "name": name,
+            "existed": existed,
+            "sub": stored[0] if stored else None,
+        }, indent=2, ensure_ascii=False, default=str))
+        return 0
+    verb = "Updated" if existed else "Added"
+    print(f"{verb} kanban wake-arm {sub_id}")
+    return 0
+
+
 def _cmd_log(args: argparse.Namespace) -> int:
     content = kb.read_worker_log(args.task_id, tail_bytes=args.tail)
     if content is None:
@@ -3243,6 +3427,7 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `wake-arm <task_id>`  Arm bounded orchestrator wake preset on a task
   `profile-subs <list|add|remove>`  Wake a profile on matching task events
 
 Run `/kanban <subcommand> -h` for arguments. \

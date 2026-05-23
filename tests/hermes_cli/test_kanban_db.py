@@ -70,6 +70,33 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
 
 
+
+
+def test_write_txn_preserves_primary_error_when_rollback_fails(caplog):
+    """Secondary rollback failures must not mask the original SQLite fault."""
+
+    class RollbackFailsConnection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, sql, *args):
+            self.statements.append(sql)
+            if sql == "ROLLBACK":
+                raise sqlite3.OperationalError("cannot rollback - no transaction is active")
+            return None
+
+    conn = RollbackFailsConnection()
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(sqlite3.OperationalError, match="primary disk I/O error"):
+            with kb.write_txn(conn):
+                raise sqlite3.OperationalError("primary disk I/O error")
+
+    assert conn.statements == ["BEGIN IMMEDIATE", "ROLLBACK"]
+    assert "rollback failed after primary error" in caplog.text
+    assert "cannot rollback - no transaction is active" in caplog.text
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 
@@ -380,6 +407,42 @@ def test_record_and_list_notifier_heartbeats_classifies_active_and_stale(kanban_
             now=now,
         )
     assert other == []
+
+
+
+
+def test_record_notifier_heartbeat_repairs_ephemeral_table_schema(kanban_home):
+    """A corrupt/incompatible heartbeat table should self-heal on next write."""
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_board")
+            conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_seen")
+            conn.execute("DROP TABLE kanban_notifier_heartbeats")
+            conn.execute("CREATE TABLE kanban_notifier_heartbeats(notifier_id TEXT, board_slug INTEGER)")
+
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-a:1111:900",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="jensen",
+            host="host-a",
+            pid=1111,
+            started_at=900,
+            now=1_000_000,
+        )
+
+        rows = kb.list_notifier_heartbeats(
+            conn, board_slug="default", db_path="/tmp/board.db", now=1_000_000,
+        )
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_notifier_heartbeats)")
+        }
+
+    assert len(rows) == 1
+    assert rows[0]["notifier_id"] == "host-a:1111:900"
+    assert {"db_path", "host", "pid", "started_at", "last_seen_at"} <= cols
 
 
 def test_notifier_heartbeat_retention_prunes_old_rows_but_keeps_active(kanban_home):

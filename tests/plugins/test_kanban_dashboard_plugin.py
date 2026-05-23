@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -151,6 +152,25 @@ def test_tenant_filter(client):
     r = client.get("/api/plugins/kanban/board?tenant=t2")
     total = sum(len(c["tasks"]) for c in r.json()["columns"])
     assert total == 1
+
+
+
+
+def test_board_degrades_when_notifier_heartbeat_table_is_unreadable(client, monkeypatch):
+    """Notifier heartbeat corruption must not take down the board payload."""
+    client.post("/api/plugins/kanban/tasks", json={"title": "visible task"})
+
+    def boom(*args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_notifier_heartbeats", boom)
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    assert sum(len(c["tasks"]) for c in data["columns"]) == 1
+    assert data["notifier_health"]["severity"] == "unavailable"
+    assert "DatabaseError" in data["notifier_health"]["error"]
 
 
 def test_board_wake_health_rollup_and_tenant_scope(client):
