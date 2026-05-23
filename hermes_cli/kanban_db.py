@@ -2532,15 +2532,16 @@ def _closeout_packet(
 ) -> dict:
     """Build the deterministic handoff packet attached to terminal runs."""
     row = conn.execute(
-        "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,),
+        "SELECT assignee, status, branch_name FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     assignee = row["assignee"] if row else None
     status = row["status"] if row else None
+    task_branch = row["branch_name"] if row else None
     md_keys = []
     if isinstance(metadata, dict):
         md_keys = sorted(str(k) for k in metadata.keys() if k != "closeout_packet")
     preview = (summary or "").strip().splitlines()[0][:400] if summary else None
-    return {
+    packet = {
         "schema_version": 1,
         "task_id": task_id,
         "run_id": int(run_id) if run_id is not None else None,
@@ -2551,6 +2552,9 @@ def _closeout_packet(
         "summary_preview": preview,
         "metadata_keys": md_keys,
     }
+    pr_evidence = _closeout_pr_evidence(metadata, task_branch=task_branch)
+    packet.update(pr_evidence)
+    return packet
 
 
 def _metadata_with_closeout_packet(
@@ -2581,6 +2585,80 @@ _PR_HEAD_METADATA_KEYS = (
     "pr_head_sha",
     "head_sha",
 )
+_PR_URL_METADATA_KEYS = (
+    "pr_url",
+    "pull_request_url",
+    "pullRequestUrl",
+    "github_pr_url",
+    "review_url",
+)
+_PR_BRANCH_METADATA_KEYS = (
+    "branch_name",
+    "branch",
+    "head_ref",
+    "headRefName",
+    "pr_branch",
+)
+
+
+def _metadata_string(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _extract_first_metadata_string(value: Any, keys: tuple[str, ...]) -> Optional[str]:
+    if isinstance(value, dict):
+        for key in keys:
+            found = _metadata_string(value.get(key))
+            if found:
+                return found
+        for nested_key in ("pr", "pull_request", "pullRequest", "github"):
+            nested = value.get(nested_key)
+            if isinstance(nested, dict):
+                found = _extract_first_metadata_string(nested, keys)
+                if found:
+                    return found
+        head = value.get("head")
+        if isinstance(head, dict):
+            found = _extract_first_metadata_string(head, keys)
+            if found:
+                return found
+    return None
+
+
+def _extract_pr_url(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        direct = _metadata_string(value)
+        if direct and "/pull/" in direct:
+            return direct
+    return _extract_first_metadata_string(value, _PR_URL_METADATA_KEYS)
+
+
+def _extract_pr_branch(value: Any) -> Optional[str]:
+    return _extract_first_metadata_string(value, _PR_BRANCH_METADATA_KEYS)
+
+
+def _closeout_pr_evidence(
+    metadata: Optional[dict],
+    *,
+    task_branch: Optional[str],
+) -> dict:
+    """Project common PR evidence into the stable closeout packet."""
+    evidence: dict[str, str] = {}
+    if not isinstance(metadata, dict):
+        if task_branch:
+            evidence["branch_name"] = task_branch
+        return evidence
+    pr_url = _extract_pr_url(metadata)
+    if pr_url:
+        evidence["pr_url"] = pr_url
+    pr_head_sha = _extract_pr_head_sha(metadata)
+    if pr_head_sha:
+        evidence["pr_head_sha"] = pr_head_sha
+    branch_name = _extract_pr_branch(metadata) or task_branch
+    if branch_name:
+        evidence["branch_name"] = branch_name
+    return evidence
 
 
 def _looks_like_git_sha(value: Any) -> Optional[str]:
@@ -6819,7 +6897,18 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
 
     expected_review_head = None
-    if _lane_type_for_assignee(task.assignee) == "review":
+    lane_type = _lane_type_for_assignee(task.assignee)
+    if lane_type == "implementation":
+        lines.append("## Implementation PR evidence")
+        lines.append(
+            "If this task opens or updates a PR, include structured PR evidence "
+            "in `kanban_complete(..., metadata=...)`: `pr_url`, "
+            "`pull_request_head_sha`, and `branch_name`. Downstream final-review "
+            "tasks use that SHA to prevent stale approvals. If no PR exists yet, "
+            "say so explicitly in the summary/metadata."
+        )
+        lines.append("")
+    if lane_type == "review":
         expected_review_head = _expected_parent_pr_head_sha(conn, task_id)
     if expected_review_head is not None:
         expected_sha, parent_task_id, parent_run_id = expected_review_head

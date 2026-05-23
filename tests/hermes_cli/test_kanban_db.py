@@ -1251,6 +1251,23 @@ def test_worker_context_advertises_closeout_requirement(kanban_home):
     assert "protocol_violation_clean_exit" in ctx
 
 
+def test_implementation_worker_context_requests_pr_metadata(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="implement PR-backed change",
+            assignee="engineer",
+            workspace_kind="worktree",
+            branch_name="feature/pr-backed-change",
+        )
+        ctx = kb.build_worker_context(conn, tid)
+
+    assert "## Implementation PR evidence" in ctx
+    assert "pr_url" in ctx
+    assert "pull_request_head_sha" in ctx
+    assert "branch_name" in ctx
+
+
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 
@@ -1404,6 +1421,46 @@ def test_complete_records_closeout_packet_and_is_idempotent_by_run_id(kanban_hom
     assert len(completed_events) == 1
     assert completed_events[0].payload is not None
     assert completed_events[0].payload["closeout_packet"]["run_id"] == run_id
+
+
+def test_implementation_closeout_packet_surfaces_pr_evidence(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="x",
+            assignee="engineer",
+            workspace_kind="worktree",
+            branch_name="feature/fallback-branch",
+        )
+        kb.claim_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        assert kb.complete_task(
+            conn, t,
+            summary="Implemented and opened PR.",
+            metadata={
+                "pr_url": "https://github.com/NousResearch/hermes-agent/pull/123",
+                "pull_request_head_sha": "abcdef1234567890",
+                "branch_name": "feature/explicit-branch",
+            },
+            expected_run_id=run_id,
+        )
+        run = kb.latest_run(conn, t)
+        completed_events = [e for e in kb.list_events(conn, t) if e.kind == "completed"]
+
+    assert run is not None
+    assert run.metadata is not None
+    packet = run.metadata["closeout_packet"]
+    assert packet["pr_url"] == "https://github.com/NousResearch/hermes-agent/pull/123"
+    assert packet["pr_head_sha"] == "abcdef1234567890"
+    assert packet["branch_name"] == "feature/explicit-branch"
+    assert completed_events[0].payload is not None
+    event_packet = completed_events[0].payload["closeout_packet"]
+    assert event_packet["pr_url"] == packet["pr_url"]
+    assert event_packet["pr_head_sha"] == packet["pr_head_sha"]
 
 
 def test_block_records_closeout_packet_and_is_idempotent_by_run_id(kanban_home):

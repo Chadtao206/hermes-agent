@@ -917,7 +917,10 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    "\"findings\": [...]}. For implementation PR handoffs, "
+                    "include pr_url, pull_request_head_sha, and branch_name; "
+                    "for final-review closeouts, include reviewed_pr_head_sha "
+                    "matching the current parent PR head. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
             },

@@ -171,6 +171,12 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def _strip_closeout_packet(metadata):
+    cleaned = dict(metadata or {})
+    cleaned.pop("closeout_packet", None)
+    return cleaned
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
@@ -304,9 +310,10 @@ def test_complete_happy_path(worker_env):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
+        assert run is not None
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        assert _strip_closeout_packet(run.metadata) == {"files": 2}
     finally:
         conn.close()
 
@@ -334,7 +341,7 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     shown = json.loads(show_out)
     assert shown["task"]["status"] == "done"
     assert shown["runs"][-1]["summary"] == "finished with structured evidence"
-    assert shown["runs"][-1]["metadata"] == handoff
+    assert _strip_closeout_packet(shown["runs"][-1]["metadata"]) == handoff
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
@@ -354,7 +361,8 @@ def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata == {
+        assert run is not None
+        assert _strip_closeout_packet(run.metadata) == {
             "files": 2,
             "worker_session_id": "session-trusted",
         }
@@ -381,7 +389,8 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata == {
+        assert run is not None
+        assert _strip_closeout_packet(run.metadata) == {
             "files": 2,
             "worker_session_id": "user-provided",
         }
@@ -1062,8 +1071,9 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.status == "done"
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
+        assert run is not None
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert _strip_closeout_packet(run.metadata) == {"child_task": child_out["task_id"]}
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
