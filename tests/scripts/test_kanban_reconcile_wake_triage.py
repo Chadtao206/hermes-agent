@@ -292,3 +292,50 @@ def test_corrupt_dedupe_state_does_not_block_emit(tmp_path):
     assert emit is True
     assert metadata["dedupe"] == "emitted"
     assert json.loads(state_path.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_cron_setup_instructions_are_non_mutating_and_actionable(monkeypatch, tmp_path):
+    module = _load_module()
+    script_dir = tmp_path / "scripts"
+    monkeypatch.setattr(module, "default_cron_script_dir", lambda: script_dir)
+
+    text = module.cron_setup_instructions(
+        schedule="every 20m",
+        deliver="slack",
+    )
+
+    assert "example only; does not create a job" in text
+    assert "mkdir -p" in text
+    assert "cp " in text
+    assert str(script_dir / "kanban_reconcile_wake_triage.py") in text
+    assert "hermes cron create 'every 20m'" in text
+    assert "--script kanban_reconcile_wake_triage.py" in text
+    assert "--no-agent" in text
+    assert "--deliver slack" in text
+    assert "Equivalent cronjob tool payload:" in text
+    assert '"no_agent": true' in text
+    assert '"deliver": "slack"' in text
+    assert "Do not enable this automatically" in text
+
+
+def test_print_cron_setup_exits_before_reconcile(monkeypatch, capsys, tmp_path):
+    module = _load_module()
+    monkeypatch.setattr(module, "default_cron_script_dir", lambda: tmp_path / "scripts")
+
+    def fail_reconcile(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("reconcile should not run for --print-cron-setup")
+
+    monkeypatch.setattr(module.rec, "run_reconciler", fail_reconcile)
+
+    exit_code = module.main([
+        "--print-cron-setup",
+        "--setup-schedule",
+        "every 30m",
+        "--setup-deliver",
+        "origin",
+    ])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "hermes cron create 'every 30m'" in out
+    assert "--deliver origin" in out

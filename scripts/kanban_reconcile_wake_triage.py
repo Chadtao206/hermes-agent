@@ -19,14 +19,52 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shlex
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 # Make the repository importable when the script is executed directly from the
-# checked-out scripts/ directory or copied into a profile-local scripts folder.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# checked-out scripts/ directory or copied into HERMES_HOME/scripts/ for cron.
+def _candidate_repo_roots() -> list[Path]:
+    script_path = Path(__file__).resolve()
+    candidates: list[Path] = []
+    env_repo = os.environ.get("HERMES_AGENT_REPO")
+    if env_repo:
+        candidates.append(Path(env_repo).expanduser())
+    # Repo checkout: <repo>/scripts/this_file.py
+    candidates.append(script_path.parents[1])
+    # Cron copy: <HERMES_HOME>/scripts/this_file.py, repo often sits beside it.
+    candidates.append(script_path.parents[1] / "hermes-agent")
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        candidates.append(Path(hermes_home).expanduser() / "hermes-agent")
+    candidates.append(Path.home() / ".hermes" / "hermes-agent")
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(candidate)
+    return unique
+
+
+def _resolve_repo_root() -> Path:
+    for candidate in _candidate_repo_roots():
+        if (candidate / "hermes_cli" / "kanban_reconciler.py").is_file():
+            return candidate
+    # Preserve the old behavior as a final fallback; import will fail loudly if
+    # no installed package / checkout is available.
+    return Path(__file__).resolve().parents[1]
+
+
+REPO_ROOT = _resolve_repo_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -51,6 +89,75 @@ def _bucket_counts(triage: dict[str, Any]) -> str:
         f"compact_notify={int(summary.get(rec.WAKE_BUCKET_COMPACT_NOTIFY) or 0)}, "
         f"jensen_decision_required={int(summary.get(rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED) or 0)}"
     )
+
+
+def default_cron_script_dir() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "scripts"
+    except Exception:
+        return Path.home() / ".hermes" / "scripts"
+
+
+def cron_setup_instructions(
+    *,
+    schedule: str = "every 15m",
+    deliver: str = "origin",
+    script_name: str = "kanban_reconcile_wake_triage.py",
+    job_name: str = "Kanban reconcile wake triage",
+) -> str:
+    """Return a non-mutating operator runbook for creating the cron job."""
+    source_script = Path(__file__).resolve()
+    script_dir = default_cron_script_dir()
+    target_script = script_dir / script_name
+    prompt = (
+        "Script-only Kanban reconcile wake triage. The script emits nothing/"
+        "wakeAgent=false for suppressed repeats and compact text only when "
+        "operator action is needed."
+    )
+    cron_command = " \\\n  ".join([
+        "hermes cron create " + shlex.quote(schedule),
+        shlex.quote(prompt),
+        "--name " + shlex.quote(job_name),
+        "--script " + shlex.quote(script_name),
+        "--no-agent",
+        "--deliver " + shlex.quote(deliver),
+    ])
+    payload = {
+        "action": "create",
+        "name": job_name,
+        "schedule": schedule,
+        "prompt": prompt,
+        "script": script_name,
+        "no_agent": True,
+        "deliver": deliver,
+    }
+    lines = [
+        "Kanban reconcile wake-triage cron setup (example only; does not create a job)",
+        "",
+        "1. Mirror the script into the cron script directory:",
+        "```bash",
+        f"mkdir -p {shlex.quote(str(script_dir))}",
+        f"cp {shlex.quote(str(source_script))} {shlex.quote(str(target_script))}",
+        "```",
+        "",
+        "2. Create the script-only cron job after approving cadence and delivery:",
+        "```bash",
+        cron_command,
+        "```",
+        "",
+        "Equivalent cronjob tool payload:",
+        "```json",
+        json.dumps(payload, indent=2, sort_keys=True),
+        "```",
+        "",
+        "Notes:",
+        "- The job is script-only (`--no-agent`): no LLM runs for compact/suppressed signals.",
+        "- Repeated unchanged signals are deduped in a sidecar JSON file outside kanban.db.",
+        "- Do not enable this automatically without explicit approval of schedule and delivery target.",
+    ]
+    return "\n".join(lines)
 
 
 def default_state_path() -> Path:
@@ -317,11 +424,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable sidecar dedupe/rate-limit state for this run",
     )
+    parser.add_argument(
+        "--print-cron-setup",
+        action="store_true",
+        help="Print a non-mutating cron setup runbook and exit without reconciling",
+    )
+    parser.add_argument(
+        "--setup-schedule",
+        default="every 15m",
+        help="Schedule to include in --print-cron-setup output (default: every 15m)",
+    )
+    parser.add_argument(
+        "--setup-deliver",
+        default="origin",
+        help="Delivery target to include in --print-cron-setup output (default: origin)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.print_cron_setup:
+        print(cron_setup_instructions(
+            schedule=str(args.setup_schedule or "every 15m"),
+            deliver=str(args.setup_deliver or "origin"),
+        ))
+        return 0
+
     result = rec.run_reconciler(
         board=args.board,
         ready_age_seconds=max(1, int(args.ready_age_seconds or 900)),
