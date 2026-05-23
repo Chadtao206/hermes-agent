@@ -280,6 +280,14 @@ def should_emit_with_dedupe(
         "state_path": str(state_path),
     }
     if suppressed:
+        previous["suppressed_count"] = int(previous.get("suppressed_count") or 0) + 1
+        previous["last_suppressed_at"] = as_of
+        previous["last_suppressed_age_seconds"] = age
+        entries[key] = previous
+        state["version"] = 1
+        state["updated_at"] = as_of
+        save_state(state_path, state)
+        metadata["suppressed_count"] = previous["suppressed_count"]
         return False, metadata
 
     entries[key] = {
@@ -396,6 +404,7 @@ def render_suppressed_output(result: dict[str, Any], metadata: dict[str, Any]) -
         "dedupe_key": metadata.get("dedupe_key"),
         "age_seconds": metadata.get("age_seconds"),
         "min_repeat_seconds": metadata.get("min_repeat_seconds"),
+        "suppressed_count": metadata.get("suppressed_count"),
     })
 
 

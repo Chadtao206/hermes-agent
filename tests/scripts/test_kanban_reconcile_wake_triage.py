@@ -244,10 +244,16 @@ def test_dedupe_suppresses_unchanged_signal_inside_repeat_window(tmp_path):
     assert first_meta["dedupe"] == "emitted"
     assert emit_second is False
     assert second_meta["dedupe"] == "suppressed"
-    assert json.loads(module.render_suppressed_output(result, second_meta))["wakeAgent"] is False
+    assert second_meta["suppressed_count"] == 1
+    suppressed_output = json.loads(module.render_suppressed_output(result, second_meta))
+    assert suppressed_output["wakeAgent"] is False
+    assert suppressed_output["suppressed_count"] == 1
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["version"] == 1
     assert state["entries"]
+    entry = next(iter(state["entries"].values()))
+    assert entry["suppressed_count"] == 1
+    assert entry["last_suppressed_at"] == 1100
 
 
 def test_dedupe_reemits_after_repeat_window_or_changed_signal(tmp_path):
