@@ -320,6 +320,52 @@ def collect_reconcile_actions(
             },
         ))
 
+    # Scheduled tasks are intentionally non-dispatchable, so do not auto-unblock
+    # them.  But when all dependency parents are terminal and the card has no
+    # active claim/run, an old scheduled task is often a parked decision rather
+    # than healthy idle work.  Surface it as decision-only so Jensen/operator
+    # wakes can inspect and choose unblock, keep parked, or close out.
+    for row in conn.execute(
+        """
+        SELECT c.id, c.title, c.assignee, c.created_at, c.started_at,
+               c.current_run_id, c.last_heartbeat_at,
+               COUNT(l.parent_id) AS parents,
+               SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) AS terminal_parents,
+               GROUP_CONCAT(p.id || ':' || p.status, ', ') AS parent_state
+          FROM tasks c
+          JOIN task_links l ON l.child_id = c.id
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE c.status = 'scheduled'
+           AND c.claim_lock IS NULL
+           AND c.current_run_id IS NULL
+           AND c.worker_pid IS NULL
+           AND COALESCE(l.relation_type, 'dependency') = 'dependency'
+         GROUP BY c.id
+        HAVING parents > 0 AND parents = terminal_parents
+         ORDER BY c.created_at, c.id
+        """
+    ):
+        age = as_of - int(row["created_at"])
+        if age < ready_age_seconds:
+            continue
+        actions.append(_action(
+            "scheduled_with_completed_parents_decision",
+            row["id"],
+            "warning",
+            "scheduled task has all dependency parents completed and needs an explicit keep-parked/unblock/close decision",
+            safe_to_apply=False,
+            details={
+                "assignee": row["assignee"],
+                "parents": row["parent_state"],
+                "parent_count": row["parents"],
+                "age_seconds": age,
+                "created_at": row["created_at"],
+                "started_at": row["started_at"],
+                "current_run_id": row["current_run_id"],
+                "last_heartbeat_at": row["last_heartbeat_at"],
+            },
+        ))
+
     for status in ("ready", "review"):
         for row in conn.execute(
             """

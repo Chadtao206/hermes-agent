@@ -109,6 +109,70 @@ def test_blocked_with_completed_parents_is_decision_only(kanban_home):
     )
 
 
+def test_scheduled_with_completed_parents_is_decision_only(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="engineer")
+        kb.complete_task(conn, parent, summary="done")
+        child = kb.create_task(
+            conn,
+            title="scheduled child",
+            assignee="reviewer",
+            parents=[parent],
+            initial_status="scheduled",
+        )
+        conn.execute(
+            "UPDATE tasks SET created_at = ?, started_at = ? WHERE id = ?",
+            (now - 3600, now - 1800, child),
+        )
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    actions = _actions(result, "scheduled_with_completed_parents_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] == child
+    assert actions[0]["safe_to_apply"] is False
+    assert actions[0]["details"]["parent_count"] == 1
+    assert actions[0]["details"]["age_seconds"] == 3600
+    assert actions[0]["signature"].startswith(
+        f"scheduled_with_completed_parents_decision:{child}:"
+    )
+    with kb.connect() as conn:
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "scheduled"
+
+
+def test_scheduled_with_completed_parents_respects_age_and_active_run_guards(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="engineer")
+        kb.complete_task(conn, parent, summary="done")
+        young = kb.create_task(
+            conn,
+            title="young scheduled child",
+            assignee="reviewer",
+            parents=[parent],
+            initial_status="scheduled",
+        )
+        active = kb.create_task(
+            conn,
+            title="active scheduled child",
+            assignee="reviewer",
+            parents=[parent],
+            initial_status="scheduled",
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 10, young))
+        conn.execute(
+            "UPDATE tasks SET created_at = ?, current_run_id = ? WHERE id = ?",
+            (now - 3600, 12345, active),
+        )
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+
+    assert _actions(result, "scheduled_with_completed_parents_decision") == []
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")
