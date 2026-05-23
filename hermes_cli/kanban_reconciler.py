@@ -161,6 +161,73 @@ def _host_prefix() -> str:
         return ""
 
 
+def _is_review_lane(assignee: Optional[str]) -> bool:
+    try:
+        return kb._lane_type_for_assignee(assignee) == "review"
+    except Exception:
+        return str(assignee or "").strip().casefold() in {"reviewer", "boris"}
+
+
+def _parent_pr_head_evidence_details(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Summarize parent closeout PR-head evidence without mutating the board."""
+    details: list[dict[str, Any]] = []
+    for parent_id in kb.parent_ids(conn, task_id, relation_type=kb.LINK_RELATION_DEPENDENCY):
+        task_row = conn.execute(
+            "SELECT status, result FROM tasks WHERE id = ?",
+            (parent_id,),
+        ).fetchone()
+        status = task_row["status"] if task_row else None
+        rows = conn.execute(
+            """
+            SELECT id, metadata
+              FROM task_runs
+             WHERE task_id = ?
+               AND outcome = 'completed'
+             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+            """,
+            (parent_id,),
+        ).fetchall()
+        latest_run_id = int(rows[0]["id"]) if rows else None
+        latest_metadata_keys: list[str] = []
+        evidence_run_id: Optional[int] = None
+        has_pr_head = False
+        for idx, run in enumerate(rows):
+            try:
+                metadata = json.loads(run["metadata"]) if run["metadata"] else None
+            except Exception:
+                metadata = None
+            if idx == 0 and isinstance(metadata, dict):
+                latest_metadata_keys = sorted(str(k) for k in metadata.keys())
+            try:
+                sha = kb._extract_pr_head_sha(metadata)
+            except Exception:
+                sha = None
+            if sha:
+                has_pr_head = True
+                evidence_run_id = int(run["id"])
+                break
+        result_fallback_present = False
+        if not has_pr_head and task_row:
+            try:
+                result_fallback_present = bool(kb._extract_pr_head_sha(task_row["result"]))
+            except Exception:
+                result_fallback_present = False
+            has_pr_head = result_fallback_present
+        details.append({
+            "parent_task_id": parent_id,
+            "parent_status": status,
+            "latest_completed_run_id": latest_run_id,
+            "evidence_run_id": evidence_run_id,
+            "pr_head_sha_present": has_pr_head,
+            "result_fallback_present": result_fallback_present,
+            "latest_metadata_keys": latest_metadata_keys,
+        })
+    return details
+
+
 def _snapshot_sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
@@ -363,6 +430,50 @@ def collect_reconcile_actions(
                 "started_at": row["started_at"],
                 "current_run_id": row["current_run_id"],
                 "last_heartbeat_at": row["last_heartbeat_at"],
+            },
+        ))
+
+    # Final-review cards can only enforce the current-PR-head gate when at
+    # least one completed dependency parent exposes PR head evidence in its
+    # closeout metadata (or the legacy explicit-SHA result fallback).  If no
+    # such evidence exists, reviewer completion can still proceed, but stale-PR
+    # safety is unenforceable.  Surface this before a reviewer is spawned or a
+    # parked reviewer card is treated as healthy idle work.
+    for row in conn.execute(
+        """
+        SELECT c.id, c.title, c.assignee, c.status, c.created_at,
+               COUNT(l.parent_id) AS parents,
+               SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) AS terminal_parents,
+               GROUP_CONCAT(p.id || ':' || p.status, ', ') AS parent_state
+          FROM tasks c
+          JOIN task_links l ON l.child_id = c.id
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE c.status NOT IN ('done','archived')
+           AND COALESCE(l.relation_type, 'dependency') = 'dependency'
+         GROUP BY c.id
+        HAVING parents > 0 AND parents = terminal_parents
+         ORDER BY c.created_at, c.id
+        """
+    ):
+        if not _is_review_lane(row["assignee"]):
+            continue
+        if kb._expected_parent_pr_head_sha(conn, row["id"]) is not None:
+            continue
+        age = as_of - int(row["created_at"])
+        parent_details = _parent_pr_head_evidence_details(conn, row["id"])
+        actions.append(_action(
+            "review_parent_pr_head_evidence_missing",
+            row["id"],
+            "warning",
+            "review task's completed dependency parents lack PR-head evidence; final-review stale-PR gate cannot enforce current-head coverage",
+            safe_to_apply=False,
+            details={
+                "assignee": row["assignee"],
+                "status": row["status"],
+                "parents": row["parent_state"],
+                "parent_count": row["parents"],
+                "age_seconds": age,
+                "parent_closeouts": parent_details,
             },
         ))
 

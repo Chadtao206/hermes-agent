@@ -173,6 +173,82 @@ def test_scheduled_with_completed_parents_respects_age_and_active_run_guards(kan
     assert _actions(result, "scheduled_with_completed_parents_decision") == []
 
 
+def test_review_parent_pr_head_evidence_missing_is_decision_only(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        kb.complete_task(conn, parent, summary="Implemented but forgot PR metadata.")
+        child = kb.create_task(
+            conn,
+            title="final review",
+            assignee="reviewer",
+            parents=[parent],
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, child))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    actions = _actions(result, "review_parent_pr_head_evidence_missing")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] == child
+    assert actions[0]["safe_to_apply"] is False
+    assert actions[0]["details"]["assignee"] == "reviewer"
+    assert actions[0]["details"]["status"] == "ready"
+    assert actions[0]["details"]["parent_count"] == 1
+    closeout = actions[0]["details"]["parent_closeouts"][0]
+    assert closeout["parent_task_id"] == parent
+    assert closeout["pr_head_sha_present"] is False
+    assert closeout["latest_completed_run_id"] is not None
+    assert actions[0]["signature"].startswith(
+        f"review_parent_pr_head_evidence_missing:{child}:"
+    )
+    with kb.connect() as conn:
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_review_parent_pr_head_evidence_present_suppresses_warning(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        kb.complete_task(
+            conn,
+            parent,
+            summary="Implemented and opened PR.",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+        child = kb.create_task(
+            conn,
+            title="final review",
+            assignee="boris",
+            parents=[parent],
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, child))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+
+    assert _actions(result, "review_parent_pr_head_evidence_missing") == []
+
+
+def test_review_parent_pr_head_evidence_missing_ignores_non_review_lanes(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        kb.complete_task(conn, parent, summary="done")
+        child = kb.create_task(
+            conn,
+            title="engineering followup",
+            assignee="engineer",
+            parents=[parent],
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, child))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+
+    assert _actions(result, "review_parent_pr_head_evidence_missing") == []
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")
