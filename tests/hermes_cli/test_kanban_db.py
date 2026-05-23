@@ -1441,6 +1441,119 @@ def test_block_records_closeout_packet_and_is_idempotent_by_run_id(kanban_home):
     assert blocked_events[0].payload["closeout_packet"]["run_id"] == run_id
 
 
+def test_reviewer_completion_requires_current_parent_pr_head(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(
+            conn, parent,
+            summary="Opened PR for review.",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+        review = kb.create_task(
+            conn, title="final review", assignee="reviewer", parents=[parent],
+        )
+        kb.claim_task(conn, review)
+        task = kb.get_task(conn, review)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        with pytest.raises(ValueError, match="reviewed_pr_head_sha"):
+            kb.complete_task(
+                conn, review,
+                summary="LGTM based on local inspection.",
+                metadata={"verdict": "accept"},
+                expected_run_id=run_id,
+            )
+        task_after = kb.get_task(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert task_after is not None
+    assert task_after.status == "running"
+    gate_events = [e for e in events if e.kind == "completion_blocked_pr_head_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0].payload is not None
+    assert gate_events[0].payload["expected_pr_head_sha"] == "abcdef1234567890"
+    assert gate_events[0].payload["reviewed_pr_head_sha"] is None
+    assert not [e for e in events if e.kind == "completed"]
+
+
+def test_reviewer_completion_rejects_stale_pr_head(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(
+            conn, parent,
+            summary="Opened PR for review.",
+            metadata={"pull_request": {"head": {"sha": "abcdef1234567890"}}},
+        )
+        review = kb.create_task(
+            conn, title="final review", assignee="boris", parents=[parent],
+        )
+        kb.claim_task(conn, review)
+        task = kb.get_task(conn, review)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        with pytest.raises(ValueError, match="current parent PR head"):
+            kb.complete_task(
+                conn, review,
+                summary="Approved stale PR head.",
+                metadata={"reviewed_pr_head_sha": "1111111222222222"},
+                expected_run_id=run_id,
+            )
+        task_after = kb.get_task(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert task_after is not None
+    assert task_after.status == "running"
+    gate_events = [e for e in events if e.kind == "completion_blocked_pr_head_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0].payload is not None
+    assert gate_events[0].payload["expected_pr_head_sha"] == "abcdef1234567890"
+    assert gate_events[0].payload["reviewed_pr_head_sha"] == "1111111222222222"
+
+
+def test_reviewer_completion_accepts_matching_current_pr_head(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(
+            conn, parent,
+            summary="Opened PR for review.",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+        review = kb.create_task(
+            conn, title="final review", assignee="reviewer", parents=[parent],
+        )
+        kb.claim_task(conn, review)
+        task = kb.get_task(conn, review)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+        context = kb.build_worker_context(conn, review)
+        assert "## Final-review PR-head gate" in context
+        assert "reviewed_pr_head_sha: abcdef1234567890" in context
+
+        assert kb.complete_task(
+            conn, review,
+            summary="Approved current PR head.",
+            metadata={"reviewed_pr_head_sha": "abcdef1234567890"},
+            expected_run_id=run_id,
+        )
+        task_after = kb.get_task(conn, review)
+        run = kb.latest_run(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert task_after is not None
+    assert task_after.status == "done"
+    assert run is not None
+    assert run.metadata is not None
+    assert run.metadata["closeout_packet"]["lane_type"] == "review"
+    assert run.metadata["reviewed_pr_head_sha"] == "abcdef1234567890"
+    assert not [e for e in events if e.kind == "completion_blocked_pr_head_gate"]
+    assert len([e for e in events if e.kind == "completed"]) == 1
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:

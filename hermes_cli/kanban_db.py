@@ -2574,6 +2574,158 @@ def _metadata_with_closeout_packet(
     return enriched
 
 
+_PR_HEAD_METADATA_KEYS = (
+    "reviewed_pr_head_sha",
+    "current_pr_head_sha",
+    "pull_request_head_sha",
+    "pr_head_sha",
+    "head_sha",
+)
+
+
+def _looks_like_git_sha(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", text):
+        return text.lower()
+    return None
+
+
+def _extract_pr_head_sha(value: Any) -> Optional[str]:
+    """Extract a PR head SHA from common structured metadata shapes."""
+    direct = _looks_like_git_sha(value)
+    if direct:
+        return direct
+    if isinstance(value, dict):
+        for key in _PR_HEAD_METADATA_KEYS:
+            if key in value:
+                found = _extract_pr_head_sha(value.get(key))
+                if found:
+                    return found
+        for nested_key in ("pr", "pull_request", "pullRequest", "github"):
+            nested = value.get(nested_key)
+            if isinstance(nested, dict):
+                found = _extract_pr_head_sha(nested)
+                if found:
+                    return found
+        head = value.get("head")
+        if isinstance(head, dict):
+            found = _extract_pr_head_sha(head.get("sha"))
+            if found:
+                return found
+    return None
+
+
+def _extract_reviewed_pr_head_sha(metadata: Optional[dict]) -> Optional[str]:
+    """Return the SHA the reviewer explicitly claims to have reviewed."""
+    if not isinstance(metadata, dict):
+        return None
+    return _extract_pr_head_sha(metadata.get("reviewed_pr_head_sha"))
+
+
+def _expected_parent_pr_head_sha(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[str, str, Optional[int]]]:
+    """Return ``(sha, parent_task_id, parent_run_id)`` from done parents."""
+    for parent_id in parent_ids(conn, task_id, relation_type=LINK_RELATION_DEPENDENCY):
+        rows = conn.execute(
+            """
+            SELECT id, metadata
+              FROM task_runs
+             WHERE task_id = ?
+               AND outcome = 'completed'
+             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+            """,
+            (parent_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                parent_metadata = json.loads(row["metadata"]) if row["metadata"] else None
+            except Exception:
+                parent_metadata = None
+            sha = _extract_pr_head_sha(parent_metadata)
+            if sha:
+                return sha, parent_id, int(row["id"])
+        task_row = conn.execute(
+            "SELECT result FROM tasks WHERE id = ? AND status = 'done'",
+            (parent_id,),
+        ).fetchone()
+        # Legacy/manual fallback: only honor explicit SHA-looking result text.
+        if task_row:
+            sha = _extract_pr_head_sha(task_row["result"])
+            if sha:
+                return sha, parent_id, None
+    return None
+
+
+class PRHeadGateError(ValueError):
+    """Raised when reviewer completion is not tied to the current PR head."""
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        expected_sha: str,
+        reviewed_sha: Optional[str],
+        parent_task_id: str,
+        parent_run_id: Optional[int],
+    ) -> None:
+        self.task_id = task_id
+        self.expected_sha = expected_sha
+        self.reviewed_sha = reviewed_sha
+        self.parent_task_id = parent_task_id
+        self.parent_run_id = parent_run_id
+        if reviewed_sha:
+            msg = (
+                "completion blocked: reviewer closeout references PR head "
+                f"{reviewed_sha}, but current parent PR head is {expected_sha}"
+            )
+        else:
+            msg = (
+                "completion blocked: reviewer closeout must include "
+                f"reviewed_pr_head_sha={expected_sha} to prove final review "
+                "covered the current PR head"
+            )
+        super().__init__(msg)
+
+
+def _enforce_review_pr_head_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str],
+) -> None:
+    task = get_task(conn, task_id)
+    if not task or _lane_type_for_assignee(task.assignee) != "review":
+        return
+    expected = _expected_parent_pr_head_sha(conn, task_id)
+    if expected is None:
+        return
+    expected_sha, parent_task_id, parent_run_id = expected
+    reviewed_sha = _extract_reviewed_pr_head_sha(metadata)
+    if reviewed_sha == expected_sha:
+        return
+    payload = {
+        "expected_pr_head_sha": expected_sha,
+        "reviewed_pr_head_sha": reviewed_sha,
+        "parent_task_id": parent_task_id,
+        "parent_run_id": parent_run_id,
+        "summary_preview": (
+            (summary or "").strip().splitlines()[0][:200] if summary else None
+        ),
+    }
+    with write_txn(conn):
+        _append_event(conn, task_id, "completion_blocked_pr_head_gate", payload)
+    raise PRHeadGateError(
+        task_id=task_id,
+        expected_sha=expected_sha,
+        reviewed_sha=reviewed_sha,
+        parent_task_id=parent_task_id,
+        parent_run_id=parent_run_id,
+    )
+
+
 def _terminal_run_already_closed(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3355,6 +3507,15 @@ def complete_task(
         task_status="done",
     ):
         return True
+
+    # Gate: reviewer/final-review tasks with an upstream PR head must
+    # prove the reviewed SHA matches the current parent PR head before
+    # terminal completion. This is deterministic and mutation-free except
+    # for an auditable rejection event, matching the phantom-card gate.
+    _enforce_review_pr_head_gate(
+        conn, task_id, metadata,
+        summary=handoff_summary,
+    )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6656,6 +6817,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         "block this task on the first occurrence."
     )
     lines.append("")
+
+    expected_review_head = None
+    if _lane_type_for_assignee(task.assignee) == "review":
+        expected_review_head = _expected_parent_pr_head_sha(conn, task_id)
+    if expected_review_head is not None:
+        expected_sha, parent_task_id, parent_run_id = expected_review_head
+        lines.append("## Final-review PR-head gate")
+        lines.append(
+            "This review has a parent implementation closeout with current "
+            f"PR head `{expected_sha}` (parent `{parent_task_id}`"
+            + (f", run `{parent_run_id}`" if parent_run_id is not None else "")
+            + "). To complete this task, your `kanban_complete` metadata "
+            f"MUST include `reviewed_pr_head_sha: {expected_sha}`. If the "
+            "PR head has changed or you cannot verify it, call `kanban_block` "
+            "instead of approving stale evidence."
+        )
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")
