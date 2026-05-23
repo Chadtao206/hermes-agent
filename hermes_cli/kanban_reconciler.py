@@ -228,6 +228,39 @@ def _parent_pr_head_evidence_details(
     return details
 
 
+def _pre_spawn_validation_errors_for_reconcile(task: kb.Task) -> list[str]:
+    """Return deterministic spawn prerequisite failures without DB writes."""
+    errors: list[str] = []
+    profile_ok = True
+    if not task.assignee:
+        return errors
+    if not _profile_spawnable(task.assignee):
+        profile_ok = False
+        errors.append(f"profile not found: {task.assignee}")
+
+    try:
+        errors.extend(kb._workspace_pre_spawn_errors(task))
+    except Exception as exc:
+        errors.append(f"workspace validation failed: {exc}")
+
+    if profile_ok:
+        skills = list(task.skills or [])
+        if task.status == "review" and "sdlc-review" not in skills:
+            # Review dispatch force-loads sdlc-review immediately before
+            # spawn. Validate that implicit skill too, otherwise the worker
+            # can fail at CLI startup before doing any review work.
+            skills.append("sdlc-review")
+        if skills:
+            home = kb._profile_home_for_spawn(task)
+            missing = [
+                str(skill) for skill in skills
+                if skill and not kb._skill_available_for_home(str(skill), home)
+            ]
+            if missing:
+                errors.append("missing forced skill(s): " + ", ".join(missing))
+    return errors
+
+
 def _snapshot_sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.name + suffix)
 
@@ -474,6 +507,42 @@ def collect_reconcile_actions(
                 "parent_count": row["parents"],
                 "age_seconds": age,
                 "parent_closeouts": parent_details,
+            },
+        ))
+
+    # Spawn prerequisite validation mirrors the dispatcher's deterministic
+    # pre-spawn checks without claiming tasks or writing failure rows.  This
+    # gives Jensen/operator wakes an actionable decision queue for profile,
+    # skill, and workspace defects before the dispatcher burns retries.
+    for row in conn.execute(
+        """
+        SELECT id, status, title, assignee, created_at
+          FROM tasks
+         WHERE status IN ('ready','review')
+           AND claim_lock IS NULL
+         ORDER BY priority DESC, created_at, id
+        """
+    ):
+        task = kb.get_task(conn, row["id"])
+        if task is None:
+            continue
+        errors = _pre_spawn_validation_errors_for_reconcile(task)
+        if not errors:
+            continue
+        actions.append(_action(
+            "pre_spawn_validation_decision",
+            row["id"],
+            "warning",
+            "task is eligible to spawn but deterministic profile/skill/workspace prerequisites are not satisfied",
+            safe_to_apply=False,
+            details={
+                "assignee": row["assignee"],
+                "status": row["status"],
+                "age_seconds": as_of - int(row["created_at"]),
+                "workspace_kind": task.workspace_kind,
+                "workspace_path": task.workspace_path,
+                "skills": task.skills or [],
+                "validation_errors": errors,
             },
         ))
 

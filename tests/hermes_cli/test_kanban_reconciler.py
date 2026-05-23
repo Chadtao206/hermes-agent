@@ -249,6 +249,108 @@ def test_review_parent_pr_head_evidence_missing_ignores_non_review_lanes(kanban_
     assert _actions(result, "review_parent_pr_head_evidence_missing") == []
 
 
+def test_pre_spawn_validation_surfaces_missing_profile(kanban_home, monkeypatch):
+    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: False)
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ready", assignee="missing-profile")
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, task_id))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    actions = _actions(result, "pre_spawn_validation_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] == task_id
+    assert actions[0]["safe_to_apply"] is False
+    assert actions[0]["details"]["assignee"] == "missing-profile"
+    assert "profile not found: missing-profile" in actions[0]["details"]["validation_errors"]
+
+
+def test_pre_spawn_validation_surfaces_missing_forced_skill(kanban_home, monkeypatch):
+    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: True)
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ready with missing skill",
+            assignee="engineer",
+            skills=["definitely-missing-skill"],
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, task_id))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    actions = _actions(result, "pre_spawn_validation_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] == task_id
+    assert actions[0]["details"]["skills"] == ["definitely-missing-skill"]
+    assert "missing forced skill(s): definitely-missing-skill" in actions[0]["details"]["validation_errors"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+
+def test_pre_spawn_validation_surfaces_review_sdlc_skill_gap(kanban_home, monkeypatch):
+    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: True)
+    monkeypatch.setattr(rec, "_has_sdlc_review_skill", lambda: True)
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review", assignee="reviewer")
+        conn.execute(
+            "UPDATE tasks SET status = 'review', created_at = ? WHERE id = ?",
+            (now - 3600, task_id),
+        )
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    actions = _actions(result, "pre_spawn_validation_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] == task_id
+    assert "missing forced skill(s): sdlc-review" in actions[0]["details"]["validation_errors"]
+
+
+def test_pre_spawn_validation_surfaces_workspace_shape_error(kanban_home, monkeypatch):
+    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: True)
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dir without path",
+            assignee="engineer",
+            workspace_kind="dir",
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, task_id))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+    actions = _actions(result, "pre_spawn_validation_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] == task_id
+    assert actions[0]["details"]["workspace_kind"] == "dir"
+    assert "workspace_kind=dir requires workspace_path" in actions[0]["details"]["validation_errors"]
+
+
+def test_pre_spawn_validation_suppresses_when_forced_skill_exists(kanban_home, monkeypatch):
+    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: True)
+    skill_dir = kanban_home / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\n---\n", encoding="utf-8")
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ready with available skill",
+            assignee="engineer",
+            skills=["demo-skill"],
+        )
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - 3600, task_id))
+
+    result = rec.run_reconciler(now=now, ready_age_seconds=60)
+
+    assert _actions(result, "pre_spawn_validation_decision") == []
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")
