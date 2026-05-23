@@ -919,6 +919,62 @@ def test_repeated_failure_signature_surfaces_systemic_metadata_below_threshold(k
     assert kb.FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE in details["failure_classes"]
 
 
+def test_orphan_claim_lock_is_reported_for_non_running_task(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        # Non-terminal, non-running orphan lock blocks future claim CAS.
+        ready_id = kb.create_task(conn, title="ready orphan", assignee="engineer")
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', claim_lock = ?, claim_expires = ?,
+                   worker_pid = ?, created_at = ?
+             WHERE id = ?
+            """,
+            ("dead-host:abc", now - 60, 99999999, now - 3600, ready_id),
+        )
+        # Terminal residue is excluded so the watchdog signal stays actionable.
+        done_id = kb.create_task(conn, title="done residue", assignee="engineer")
+        kb.complete_task(conn, done_id, summary="done")
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ? WHERE id = ?",
+            ("residue:xyz", done_id),
+        )
+        # Healthy running task with an active lock is still allowed.
+        running_id = kb.create_task(conn, title="healthy running", assignee="engineer")
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'running', claim_lock = ?, claim_expires = ?,
+                   worker_pid = ?, started_at = ?, last_heartbeat_at = ?
+             WHERE id = ?
+            """,
+            ("host:live", now + 3600, os.getpid(), now - 60, now - 30, running_id),
+        )
+
+    result = rec.run_reconciler(now=now)
+    orphans = _actions(result, "orphan_claim_lock_observed")
+
+    assert [action["task_id"] for action in orphans] == [ready_id]
+    assert orphans[0]["severity"] == "error"
+    assert orphans[0]["safe_to_apply"] is False
+    details = orphans[0]["details"]
+    assert details["status"] == "ready"
+    assert details["claim_lock"] == "dead-host:abc"
+    assert details["claim_expired"] is True
+    assert details["pid_alive"] is False
+    assert details["age_seconds"] == 3600
+    assert orphans[0]["signature"].startswith(
+        f"orphan_claim_lock_observed:{ready_id}:"
+    )
+
+    triage = result["wake_triage"]
+    assert triage["mode"] == rec.WAKE_BUCKET_COMPACT_NOTIFY
+    assert triage["wake_agent"] is False
+    summary_bucket = triage["summary"][rec.WAKE_BUCKET_COMPACT_NOTIFY]
+    assert summary_bucket >= 1
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")

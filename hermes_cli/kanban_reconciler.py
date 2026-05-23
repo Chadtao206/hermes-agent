@@ -60,6 +60,7 @@ _COMPACT_NOTIFY_KINDS = {
     "old_ready_spawnable",
     "old_review_nonspawnable",
     "old_review_spawnable",
+    "orphan_claim_lock_observed",
     "pre_spawn_validation_decision",
     "repeated_failure_signature_decision",
     "review_skill_provenance_missing",
@@ -900,6 +901,48 @@ def collect_reconcile_actions(
                 "pid_alive": _pid_alive(row["worker_pid"]),
                 "task_status": row["task_status"],
                 "current_run_id": row["current_run_id"],
+            },
+        ))
+
+    # Orphan claim locks: claim_lock is set but the task is no longer running.
+    # All claim/release/timeout/complete paths clear claim_lock atomically when
+    # they leave 'running', so a non-terminal, non-running row carrying a lock
+    # is an invariant violation that blocks future claim_task CAS attempts
+    # (which require claim_lock IS NULL).  Terminal states (done/archived) can
+    # never be reclaimed, so a residual lock there is cosmetic and excluded to
+    # keep the watchdog signal actionable.
+    for row in conn.execute(
+        """
+        SELECT id, status, assignee, claim_lock, claim_expires, worker_pid,
+               current_run_id, last_heartbeat_at, started_at, created_at
+          FROM tasks
+         WHERE claim_lock IS NOT NULL
+           AND status NOT IN ('running', 'done', 'archived')
+         ORDER BY id
+        """
+    ):
+        claim_expires = row["claim_expires"]
+        actions.append(_action(
+            "orphan_claim_lock_observed",
+            row["id"],
+            "error",
+            "task is not running but still carries a claim_lock; "
+            "future claim_task CAS will fail until the lock is cleared",
+            safe_to_apply=False,
+            details={
+                "status": row["status"],
+                "assignee": row["assignee"],
+                "claim_lock": row["claim_lock"],
+                "claim_expires": claim_expires,
+                "claim_expired": bool(
+                    claim_expires is not None and int(claim_expires) < as_of
+                ),
+                "worker_pid": row["worker_pid"],
+                "pid_alive": _pid_alive(row["worker_pid"]),
+                "current_run_id": row["current_run_id"],
+                "last_heartbeat_at": row["last_heartbeat_at"],
+                "started_at": row["started_at"],
+                "age_seconds": as_of - int(row["created_at"]),
             },
         ))
 
