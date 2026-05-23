@@ -326,12 +326,27 @@ def _jensen_prompt_text(result: dict[str, Any], *, examples: int) -> str:
     return "\n".join(lines).strip()
 
 
+def _slack_safe_truncate(text: str, *, max_chars: int) -> str:
+    """Bound watchdog output so Slack delivery never floods context/channels."""
+    limit = int(max_chars or 0)
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = (
+        "\n\n[truncated: output exceeded "
+        f"{limit} chars; run `hermes kanban reconcile --json` for full details]"
+    )
+    if limit <= len(marker):
+        return marker[-limit:]
+    return text[: limit - len(marker)].rstrip() + marker
+
+
 def render_output(
     result: dict[str, Any],
     *,
     mode: str = "no-agent",
     examples: int = 3,
     json_output: bool = False,
+    max_chars: int = 3500,
 ) -> str:
     """Render cron/script output for a reconciler result."""
     triage = result.get("wake_triage") or rec.classify_wake_triage(result.get("actions") or [])
@@ -347,7 +362,7 @@ def render_output(
                     result,
                     mode=mode,
                     examples=examples,
-                    json_output=False,
+                    max_chars=max_chars,
                 ),
             },
             indent=2,
@@ -362,14 +377,14 @@ def render_output(
         return json.dumps({"wakeAgent": False, "mode": triage_mode})
 
     if triage_mode == rec.WAKE_BUCKET_COMPACT_NOTIFY:
-        return _compact_notify_text(result, examples=examples)
+        return _slack_safe_truncate(_compact_notify_text(result, examples=examples), max_chars=max_chars)
 
     if triage_mode == rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED:
-        return _jensen_prompt_text(result, examples=examples)
+        return _slack_safe_truncate(_jensen_prompt_text(result, examples=examples), max_chars=max_chars)
 
     # Conservative fallback for future modes: produce a compact notification
     # rather than silent failure.
-    return _compact_notify_text(result, examples=examples)
+    return _slack_safe_truncate(_compact_notify_text(result, examples=examples), max_chars=max_chars)
 
 
 def render_suppressed_output(result: dict[str, Any], metadata: dict[str, Any]) -> str:
@@ -400,6 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Maximum examples in compact text output (default: 3)",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=3500,
+        help="Maximum text output characters for Slack-safe delivery (default: 3500; <=0 disables)",
     )
     parser.add_argument(
         "--mode",
@@ -471,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=args.mode,
         examples=max(0, int(args.examples or 0)),
         json_output=bool(args.json),
+        max_chars=int(args.max_chars or 0),
     )
     if output:
         print(output)

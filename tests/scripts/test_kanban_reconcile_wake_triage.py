@@ -72,6 +72,35 @@ def test_no_agent_compact_notify_emits_slack_safe_text():
     assert "should_not_dump" not in output
 
 
+def test_text_output_is_bounded_for_slack_safe_delivery():
+    module = _load_module()
+    actions = []
+    for idx in range(20):
+        actions.append({
+            "kind": "pre_spawn_validation_decision",
+            "task_id": f"t_ready_{idx}",
+            "severity": "warning",
+            "reason": "profile missing before spawn " + ("x" * 200),
+            "safe_to_apply": False,
+            "signature": f"pre_spawn_validation_decision:t_ready_{idx}:abc",
+            "details": {
+                "assignee": "missing-profile",
+                "validation_errors": ["profile not found: missing-profile " + ("y" * 200)],
+            },
+        })
+
+    output = module.render_output(
+        _result(actions, module.rec.WAKE_BUCKET_COMPACT_NOTIFY),
+        mode="no-agent",
+        examples=20,
+        max_chars=700,
+    )
+
+    assert len(output) <= 700
+    assert "[truncated: output exceeded 700 chars" in output
+    assert "hermes kanban reconcile --json" in output
+
+
 def test_agent_gate_suppresses_compact_notify_without_waking_agent():
     module = _load_module()
     actions = [
