@@ -479,7 +479,13 @@ healthy DB can still show that operator decisions are pending without flipping
 
 `reconcile` is the convergence surface. It classifies stalled transitions and
 handoff gaps without mutating the board unless you apply an explicit gated
-option. Important action kinds include:
+option. Decision packet signatures are stable across observation-only age ticks,
+so an operator can inspect a dry-run and then safely pass the printed
+`packet_signature` to `--apply-option` without racing the clock. Applying
+`keep_parked` or `keep_blocked` records an idempotent acknowledgement that
+suppresses future Jensen wakes for the same packet signature; if the underlying
+parents, status, evidence, or run state changes, the packet signature changes
+and the decision surfaces again. Important action kinds include:
 
 - `dead_running_candidate`, `expired_claim_candidate` — safe reclaim candidates
   when worker PIDs are gone or claims expired.

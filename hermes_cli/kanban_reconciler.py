@@ -512,6 +512,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _signature(kind: str, task_id: Optional[str], material: dict[str, Any]) -> str:
+    material = _stable_signature_material(material)
     canonical = json.dumps(
         {k: _jsonable(v) for k, v in sorted(material.items())},
         sort_keys=True,
@@ -520,6 +521,19 @@ def _signature(kind: str, task_id: Optional[str], material: dict[str, Any]) -> s
     )
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
     return f"{kind}:{task_id or 'board'}:{digest}"
+
+
+def _stable_signature_material(material: dict[str, Any]) -> dict[str, Any]:
+    """Drop volatile observation-only fields from reconcile signatures.
+
+    Reconcile apply is a gated two-step flow: operators inspect a dry-run packet
+    and then pass the packet signature back into ``--apply-option``.  Fields like
+    ``age_seconds`` change on every run, so including them made otherwise-current
+    decision packets stale seconds after they were printed.  Keep the signature
+    tied to structural state (status, parents, run ids, claim ids, timestamps,
+    evidence) and leave live age in ``details`` for display only.
+    """
+    return {key: value for key, value in material.items() if key != "age_seconds"}
 
 
 def _action(
@@ -1237,6 +1251,61 @@ def actions_to_dicts(actions: list[ReconcileAction]) -> list[dict[str, Any]]:
     return [asdict(action) for action in actions]
 
 
+def _filter_acknowledged_decision_packets(
+    conn: sqlite3.Connection,
+    action_dicts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Suppress decision packets that Jensen explicitly chose to keep parked.
+
+    ``keep_parked`` / ``keep_blocked`` are real operator decisions.  Without a
+    durable acknowledgement, deterministic wake triage keeps re-waking Jensen for
+    the same intentionally parked card, which turns a no-op decision into token
+    burn.  Treat the idempotency comment written by ``apply_reconcile_decision``
+    as an acknowledgement for the current packet signature.  If any structural
+    fact changes, the packet signature changes and the decision wakes again.
+    """
+    triage = classify_wake_triage(action_dicts)
+    suppressed_action_signatures: set[str] = set()
+    suppressed_packets: list[dict[str, Any]] = []
+    for packet in triage.get("decision_packets") or []:
+        task_id = str(packet.get("task_id") or "").strip()
+        packet_signature = str(packet.get("packet_signature") or "").strip()
+        if not task_id or not packet_signature:
+            continue
+        applied_option: Optional[str] = None
+        for option in ("keep_parked", "keep_blocked"):
+            if _find_existing_reconcile_decision_comment(
+                conn,
+                task_id,
+                option=option,
+                packet_signature=packet_signature,
+            ) is not None:
+                applied_option = option
+                break
+        if not applied_option:
+            continue
+        action_signatures = [
+            str(action.get("signature") or "")
+            for action in packet.get("actions") or []
+            if action.get("signature")
+        ]
+        suppressed_action_signatures.update(action_signatures)
+        suppressed_packets.append({
+            "task_id": task_id,
+            "packet_signature": packet_signature,
+            "option": applied_option,
+            "action_count": int(packet.get("action_count") or len(action_signatures)),
+            "kinds": list(packet.get("kinds") or []),
+        })
+    if not suppressed_action_signatures:
+        return action_dicts, []
+    filtered = [
+        action for action in action_dicts
+        if str(action.get("signature") or "") not in suppressed_action_signatures
+    ]
+    return filtered, suppressed_packets
+
+
 def run_reconciler(
     *,
     board: Optional[str] = None,
@@ -1251,13 +1320,23 @@ def run_reconciler(
             ready_age_seconds=ready_age_seconds,
             now=as_of,
         )
-    action_dicts = actions_to_dicts(actions)
+        action_dicts = actions_to_dicts(actions)
+        action_dicts, suppressed_packets = _filter_acknowledged_decision_packets(
+            conn,
+            action_dicts,
+        )
+    wake_triage = classify_wake_triage(action_dicts)
+    if suppressed_packets:
+        wake_triage["suppressed_decision_packet_count"] = len(suppressed_packets)
+        wake_triage["suppressed_decision_packets"] = suppressed_packets
+    else:
+        wake_triage["suppressed_decision_packet_count"] = 0
     return {
-        "ok": not actions,
+        "ok": not action_dicts,
         "board": board or kb.get_current_board(),
         "db_path": str(path),
         "actions": action_dicts,
-        "wake_triage": classify_wake_triage(action_dicts),
+        "wake_triage": wake_triage,
         "as_of": as_of,
         "mutation_applied": False,
     }
@@ -1904,7 +1983,7 @@ def apply_reconcile_decision(
             option=option,
             packet_signature=packet_signature,
         )
-        if existing_comment is not None:
+        if existing_comment is not None and option in {"keep_parked", "keep_blocked"}:
             return {
                 "ok": True,
                 "board": board or kb.get_current_board(),
@@ -1922,8 +2001,10 @@ def apply_reconcile_decision(
                 "as_of": as_of,
             }
 
-        comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
-        if option in {"unblock", "manual_review_with_stale_pr_risk"}:
+        comment_id = 0
+        if option in {"keep_parked", "keep_blocked"}:
+            comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
+        elif option in {"unblock", "manual_review_with_stale_pr_risk"}:
             if not kb.unblock_task(conn, task_id):
                 return _apply_error(
                     "selected option could not unblock task in its current state",
@@ -1932,6 +2013,7 @@ def apply_reconcile_decision(
                     option=option,
                     packet=packet,
                 )
+            comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
         elif option == "close":
             result_text = "Closed by explicit Jensen reconcile decision after completed dependencies."
             metadata = {
@@ -1940,13 +2022,23 @@ def apply_reconcile_decision(
                 "packet_id": packet.get("packet_id"),
                 "packet_signature": packet_signature,
             }
-            if not kb.complete_task(
-                conn,
-                task_id,
-                result=result_text,
-                summary=result_text,
-                metadata=metadata,
-            ):
+            try:
+                closed = kb.complete_task(
+                    conn,
+                    task_id,
+                    result=result_text,
+                    summary=result_text,
+                    metadata=metadata,
+                )
+            except kb.PRHeadGateError as exc:
+                return _apply_error(
+                    f"selected option could not close task: {exc}",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                    packet=packet,
+                )
+            if not closed:
                 return _apply_error(
                     "selected option could not close task in its current state",
                     board=board,
@@ -1954,6 +2046,7 @@ def apply_reconcile_decision(
                     option=option,
                     packet=packet,
                 )
+            comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
         elif option == "remediate_parent_closeout":
             parent_ids = list(packet.get("affected_parent_task_ids") or [])
             if not parent_ids:
@@ -1983,6 +2076,7 @@ def apply_reconcile_decision(
                     option=option,
                     packet={**packet, "failed_parent_task_ids": failed_parents},
                 )
+            comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
         return {
             "ok": True,
             "board": board or kb.get_current_board(),

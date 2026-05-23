@@ -323,9 +323,10 @@ def test_apply_reconcile_decision_keep_parked_comment_only(kanban_home):
         packet_signature=packet_signature,
         confirm_dry_run=True,
         author="jensen-test-retry",
-        now=now,
+        now=now + 120,
         ready_age_seconds=60,
     )
+    postcheck = rec.run_reconciler(now=now + 240, ready_age_seconds=60)
 
     assert result["ok"] is True
     assert result["mutation_applied"] is True
@@ -335,6 +336,13 @@ def test_apply_reconcile_decision_keep_parked_comment_only(kanban_home):
     assert retry["mutation_applied"] is False
     assert retry["idempotent"] is True
     assert retry["comment_id"] == result["comment_id"]
+    assert postcheck["ok"] is True
+    assert postcheck["actions"] == []
+    assert postcheck["wake_triage"]["mode"] == rec.WAKE_BUCKET_AUTO_SILENT
+    assert postcheck["wake_triage"]["suppressed_decision_packet_count"] == 1
+    suppressed = postcheck["wake_triage"]["suppressed_decision_packets"][0]
+    assert suppressed["task_id"] == child
+    assert suppressed["option"] == "keep_parked"
     with kb.connect() as conn:
         task = kb.get_task(conn, child)
         comments = kb.list_comments(conn, child)
@@ -344,6 +352,20 @@ def test_apply_reconcile_decision_keep_parked_comment_only(kanban_home):
     assert comments[0].author == "jensen-test"
     assert "option=keep_parked" in comments[0].body
     assert packet_signature in comments[0].body
+
+
+def test_reconcile_packet_signature_is_stable_across_age_ticks(kanban_home):
+    now = 1_700_000_000
+    child, first_signature = _scheduled_completed_parent_packet(now)
+    later = rec.run_reconciler(now=now + 120, ready_age_seconds=60)
+    packet = next(
+        packet for packet in later["wake_triage"]["decision_packets"]
+        if packet["task_id"] == child
+    )
+
+    assert packet["packet_signature"] == first_signature
+    scheduled = _actions(later, "scheduled_with_completed_parents_decision")[0]
+    assert scheduled["details"]["age_seconds"] == 3720
 
 
 def test_apply_reconcile_decision_requires_confirmation_and_current_signature(kanban_home):
@@ -461,6 +483,38 @@ def test_apply_reconcile_decision_unblock_close_and_manual_review_mutate_status(
         run.metadata and run.metadata.get("reconcile_decision") == "close"
         for run in runs
     )
+
+    gated_parent, gated_child, _gated_sig = _scheduled_completed_parent_packet_with_parent(now)
+    with kb.connect() as conn:
+        kb.edit_completed_task_result(
+            conn,
+            gated_parent,
+            result="parent done with PR head",
+            summary="parent done with PR head",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+    gated_after_evidence = rec.run_reconciler(now=now, ready_age_seconds=60)
+    gated_packet = next(
+        packet for packet in gated_after_evidence["wake_triage"]["decision_packets"]
+        if packet["task_id"] == gated_child
+    )
+    gated_close = rec.apply_reconcile_decision(
+        task_id=gated_child,
+        option="close",
+        packet_signature=gated_packet["packet_signature"],
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+        ready_age_seconds=60,
+    )
+    assert gated_close["ok"] is False
+    assert "could not close task" in gated_close["error"]
+    with kb.connect() as conn:
+        gated_task = kb.get_task(conn, gated_child)
+        gated_comments = kb.list_comments(conn, gated_child)
+    assert gated_task is not None
+    assert gated_task.status == "scheduled"
+    assert gated_comments == []
 
     review_child, review_sig = _scheduled_completed_parent_packet(now)
     manual_review = rec.apply_reconcile_decision(
