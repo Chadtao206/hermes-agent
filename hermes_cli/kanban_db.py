@@ -200,6 +200,7 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 # free-text ``error`` field. Add new entries here as new deterministic
 # failure modes are recognised by the dispatcher.
 FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT = "protocol_violation_clean_exit"
+FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE = "systemic_spawn_failure"
 
 # Operator/worker-facing guidance attached alongside the failure class.
 # Stays short — meant for a one-line nudge in dashboards and for the
@@ -209,6 +210,11 @@ _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE = (
     "Before exit, the worker MUST call kanban_complete(summary=..., metadata=...) "
     "on success or kanban_block(reason=...) when it cannot continue. "
     "Inspect log_tail for partial progress before unblocking."
+)
+_SYSTEMIC_SPAWN_FAILURE_GUIDANCE = (
+    "Multiple workers failed to spawn with the same error signature in one "
+    "dispatcher tick. Treat this as a platform/profile defect, not separate "
+    "task failures; fix the shared cause before unblocking."
 )
 
 
@@ -4125,6 +4131,12 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# If several task spawns fail with the same normalized error in a single
+# dispatcher tick, the problem is almost certainly shared platform/profile
+# setup rather than independent task-level failure.  Trip those tasks early so
+# the dispatcher does not burn retries across a whole ready queue.
+SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD = 3
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -5105,6 +5117,74 @@ def _record_spawn_failure(
     )
 
 
+def _block_systemic_spawn_failure_signature(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    *,
+    failure_signature: str,
+    error: str,
+    signature_count: int,
+) -> list[str]:
+    """Block ready tasks that share a dispatcher-tick spawn failure signature.
+
+    ``_record_task_failure`` has already incremented each task's normal
+    consecutive-failure counter and closed its spawn attempt.  This helper is
+    the cross-task circuit breaker: once a same-signature group crosses the
+    systemic threshold, park the already-failed tasks without incrementing the
+    per-task counter a second time.
+    """
+    blocked: list[str] = []
+    unique_ids = list(dict.fromkeys(task_ids))
+    reason = (
+        "systemic spawn failure: multiple tasks failed with the same "
+        "spawn error signature; platform/profile fix required before retry"
+    )
+    with write_txn(conn):
+        for task_id in unique_ids:
+            row = conn.execute(
+                "SELECT status, consecutive_failures FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["status"] != "ready":
+                continue
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'blocked',
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       last_failure_error = ?
+                 WHERE id = ?
+                   AND status = 'ready'
+                   AND claim_lock IS NULL
+                """,
+                (error[:500], task_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            failures = int(row["consecutive_failures"] or 0)
+            payload = {
+                "failure_class": FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE,
+                "failure_signature": failure_signature,
+                "signature_count": int(signature_count),
+                "signature_threshold": SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD,
+                "failures": failures,
+                "effective_limit": 1,
+                "limit_source": "systemic_failure_signature",
+                "trigger_outcome": "spawn_failed",
+                "error": error[:500],
+                "guidance": _SYSTEMIC_SPAWN_FAILURE_GUIDANCE,
+            }
+            _append_event(
+                conn, task_id, "systemic_failure_signature", payload,
+            )
+            _append_event(conn, task_id, "gave_up", payload)
+            _append_event(conn, task_id, "blocked", {"reason": reason})
+            blocked.append(task_id)
+    return blocked
+
+
 def _skill_available_for_home(skill_name: str, hermes_home: Optional[str]) -> bool:
     """Best-effort check that a forced skill can resolve for a worker home.
 
@@ -5556,6 +5636,47 @@ def dispatch_once(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    spawn_failure_groups: dict[str, list[str]] = {}
+
+    def _record_dispatch_spawn_failure(task_id: str, error: str) -> None:
+        result.spawn_failures += 1
+        signature = _error_fingerprint(error)
+        group = spawn_failure_groups.setdefault(signature, [])
+        if task_id not in group:
+            group.append(task_id)
+        systemic = len(group) >= SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD
+        event_extra = None
+        if systemic:
+            event_extra = {
+                "failure_class": FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE,
+                "failure_signature": signature,
+                "signature_count": len(group),
+                "signature_threshold": SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD,
+                "limit_source": "systemic_failure_signature",
+                "guidance": _SYSTEMIC_SPAWN_FAILURE_GUIDANCE,
+            }
+        auto = _record_task_failure(
+            conn, task_id, error,
+            outcome="spawn_failed",
+            failure_limit=1 if systemic else failure_limit,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra=event_extra,
+        )
+        newly_blocked: list[str] = []
+        if systemic:
+            newly_blocked = _block_systemic_spawn_failure_signature(
+                conn, group,
+                failure_signature=signature,
+                error=error,
+                signature_count=len(group),
+            )
+        if auto:
+            newly_blocked.append(task_id)
+        for blocked_id in newly_blocked:
+            if blocked_id not in result.auto_blocked:
+                result.auto_blocked.append(blocked_id)
+
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -5667,13 +5788,7 @@ def dispatch_once(
         try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            result.spawn_failures += 1
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            _record_dispatch_spawn_failure(claimed.id, f"workspace: {exc}")
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -5703,13 +5818,7 @@ def dispatch_once(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
-            result.spawn_failures += 1
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            _record_dispatch_spawn_failure(claimed.id, str(exc))
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -5761,13 +5870,7 @@ def dispatch_once(
         try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            result.spawn_failures += 1
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            _record_dispatch_spawn_failure(claimed.id, f"workspace: {exc}")
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -5793,13 +5896,7 @@ def dispatch_once(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
-            result.spawn_failures += 1
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            _record_dispatch_spawn_failure(claimed.id, str(exc))
     return result
 
 

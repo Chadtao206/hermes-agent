@@ -1888,6 +1888,57 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         assert kb.get_task(conn, t).claim_lock is None
 
 
+def test_dispatch_systemic_spawn_failure_signature_blocks_group(
+    kanban_home, all_assignees_spawnable
+):
+    def boom(task, workspace):
+        raise RuntimeError("gateway bootstrap failed: shared platform defect")
+
+    with kb.connect() as conn:
+        task_ids = [
+            kb.create_task(conn, title=f"boom-{i}", assignee="alice")
+            for i in range(3)
+        ]
+        res = kb.dispatch_once(conn, spawn_fn=boom, failure_limit=10)
+        tasks = [kb.get_task(conn, tid) for tid in task_ids]
+        event_payloads = {
+            tid: [
+                e.payload or {}
+                for e in kb.list_events(conn, tid)
+                if e.kind == "gave_up"
+            ]
+            for tid in task_ids
+        }
+
+    assert res.spawn_failures == 3
+    assert set(res.auto_blocked) == set(task_ids)
+    assert all(task is not None and task.status == "blocked" for task in tasks)
+    for tid in task_ids:
+        assert event_payloads[tid]
+        assert event_payloads[tid][-1]["failure_class"] == "systemic_spawn_failure"
+        assert event_payloads[tid][-1]["limit_source"] == "systemic_failure_signature"
+        assert event_payloads[tid][-1]["signature_count"] >= 3
+
+
+def test_dispatch_spawn_failure_signature_below_threshold_retries_normally(
+    kanban_home, all_assignees_spawnable
+):
+    def boom(task, workspace):
+        raise RuntimeError("gateway bootstrap failed: shared platform defect")
+
+    with kb.connect() as conn:
+        task_ids = [
+            kb.create_task(conn, title=f"isolated-{i}", assignee="alice")
+            for i in range(2)
+        ]
+        res = kb.dispatch_once(conn, spawn_fn=boom, failure_limit=10)
+        tasks = [kb.get_task(conn, tid) for tid in task_ids]
+
+    assert res.spawn_failures == 2
+    assert res.auto_blocked == []
+    assert all(task is not None and task.status == "ready" for task in tasks)
+
+
 def test_dispatch_max_spawn_counts_existing_running_tasks(
     kanban_home, all_assignees_spawnable
 ):
