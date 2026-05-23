@@ -4845,28 +4845,28 @@ class GatewayRunner:
                             continue
                         seen_db_paths.add(resolved_db_path)
                         try:
+                            _kb.record_notifier_heartbeat(
+                                None,
+                                notifier_id=notifier_id,
+                                board_slug=slug,
+                                db_path=resolved_db_path,
+                                notifier_profile=notifier_profile,
+                                host=notifier_host,
+                                pid=notifier_pid,
+                                started_at=notifier_started_at,
+                                now=int(time.time()),
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban notifier: heartbeat record failed for board %s: %s",
+                                slug, exc,
+                            )
+                        try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
-                            try:
-                                _kb.record_notifier_heartbeat(
-                                    conn,
-                                    notifier_id=notifier_id,
-                                    board_slug=slug,
-                                    db_path=resolved_db_path,
-                                    notifier_profile=notifier_profile,
-                                    host=notifier_host,
-                                    pid=notifier_pid,
-                                    started_at=notifier_started_at,
-                                    now=int(time.time()),
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "kanban notifier: heartbeat record failed for board %s: %s",
-                                    slug, exc,
-                                )
                             # `connect()` runs the schema + idempotent migration
                             # on first open per process, so an explicit
                             # `init_db()` here would be redundant. Worse:

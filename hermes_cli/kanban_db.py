@@ -87,8 +87,22 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
+from hermes_cli import kanban_notifier_sidecar as _notifier_sidecar
 
 _log = logging.getLogger(__name__)
+_NOTIFIER_SIDECAR_WARNING_RATE_LIMIT_SECONDS = 300
+_notifier_sidecar_warning_last_at: dict[str, float] = {}
+
+
+def _rate_limited_notifier_sidecar_warning(key: str, message: str, *args: Any) -> None:
+    """Rate-limit diagnostics-only notifier sidecar warnings in hot loops."""
+    now = time.monotonic()
+    last = _notifier_sidecar_warning_last_at.get(key, 0.0)
+    if now - last >= _NOTIFIER_SIDECAR_WARNING_RATE_LIMIT_SECONDS:
+        _notifier_sidecar_warning_last_at[key] = now
+        _log.warning(message, *args)
+    else:
+        _log.debug(message, *args)
 
 
 # ---------------------------------------------------------------------------
@@ -121,18 +135,11 @@ WAKE_ARM_PROMPT = (
 DEFAULT_WAKE_ARM_PROFILE = "default"
 DEFAULT_WAKE_ARM_NAME = "jensen-orchestrator"
 
-# Window after a notifier's last heartbeat in which we still consider that
-# notifier "live" for the board DB it was scanning. The watcher ticks every
-# 5s by default, so 30s tolerates a couple of missed ticks (slow disk, GC
-# pause) without flipping a healthy notifier to "stale". Rows older than the
-# window stay in the table for forensic context — the dashboard reports them
-# as stale but does not treat that as the same problem as "no notifier".
-NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS = 30
-# Retain enough stale notifier rows for operator forensics without letting one
-# row per gateway restart accumulate forever. Active rows are never old enough
-# to match this cutoff, so pruning by last_seen_at preserves live coverage.
-NOTIFIER_HEARTBEAT_RETENTION_SECONDS = 14 * 24 * 3600
-NOTIFIER_HEARTBEAT_LIST_LIMIT = 50
+# Notifier heartbeat constants live in the sidecar helper and are exposed here
+# for backward-compatible kanban_db imports.
+NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS = _notifier_sidecar.NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS
+NOTIFIER_HEARTBEAT_RETENTION_SECONDS = _notifier_sidecar.NOTIFIER_HEARTBEAT_RETENTION_SECONDS
+NOTIFIER_HEARTBEAT_LIST_LIMIT = _notifier_sidecar.NOTIFIER_HEARTBEAT_LIST_LIMIT
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
@@ -1533,35 +1540,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task "
         "ON kanban_profile_wake_events(task_id, profile, name)"
-    )
-
-    # Per-gateway notifier heartbeats live in their own additive table.
-    # Legacy boards opened before this slice landed never had the table at
-    # all; the dashboard's notifier health rollup degrades to "no notifier"
-    # for those boards until the gateway logs its first heartbeat against
-    # the new table.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS kanban_notifier_heartbeats (
-            notifier_id      TEXT NOT NULL,
-            board_slug       TEXT NOT NULL,
-            db_path          TEXT NOT NULL,
-            notifier_profile TEXT,
-            host             TEXT NOT NULL,
-            pid              INTEGER NOT NULL,
-            started_at       INTEGER NOT NULL,
-            last_seen_at     INTEGER NOT NULL,
-            PRIMARY KEY (notifier_id, board_slug, db_path)
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_board "
-        "ON kanban_notifier_heartbeats(board_slug, db_path)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen "
-        "ON kanban_notifier_heartbeats(last_seen_at)"
     )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -7288,49 +7266,25 @@ def list_profile_wake_events(
 
 
 
-def _recreate_notifier_heartbeats(conn: sqlite3.Connection) -> None:
-    """Drop and recreate the ephemeral notifier-heartbeat telemetry table.
+def _recreate_notifier_heartbeats(conn: sqlite3.Connection | None = None) -> None:
+    """Reset ephemeral notifier-heartbeat telemetry in the sidecar DB.
 
-    The table is derived runtime health telemetry, not durable board state. If
-    it becomes corrupt or schema-incompatible, resetting it is safer than
-    allowing dashboard refreshes or gateway notifier loops to fail the board.
+    ``conn`` is accepted for legacy call sites only. Runtime heartbeat
+    telemetry intentionally lives outside the authoritative board DB so a
+    heartbeat repair path can never DDL/DML board tables.
     """
-    conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_board")
-    conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_seen")
-    conn.execute("DROP TABLE IF EXISTS kanban_notifier_heartbeats")
-    conn.execute(
-        """
-        CREATE TABLE kanban_notifier_heartbeats (
-            notifier_id      TEXT NOT NULL,
-            board_slug       TEXT NOT NULL,
-            db_path          TEXT NOT NULL,
-            notifier_profile TEXT,
-            host             TEXT NOT NULL,
-            pid              INTEGER NOT NULL,
-            started_at       INTEGER NOT NULL,
-            last_seen_at     INTEGER NOT NULL,
-            PRIMARY KEY (notifier_id, board_slug, db_path)
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX idx_notifier_heartbeats_board "
-        "ON kanban_notifier_heartbeats(board_slug, db_path)"
-    )
-    conn.execute(
-        "CREATE INDEX idx_notifier_heartbeats_seen "
-        "ON kanban_notifier_heartbeats(last_seen_at)"
-    )
+    _ = conn
+    _notifier_sidecar.reset_notifier_heartbeats()
 
 
-def reset_notifier_heartbeats(conn: sqlite3.Connection) -> None:
-    """Public repair hook for the non-critical notifier heartbeat table."""
-    with write_txn(conn):
-        _recreate_notifier_heartbeats(conn)
+def reset_notifier_heartbeats(conn: sqlite3.Connection | None = None) -> None:
+    """Public repair hook for the non-critical notifier heartbeat sidecar."""
+    _ = conn
+    _notifier_sidecar.reset_notifier_heartbeats()
 
 
 def record_notifier_heartbeat(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None = None,
     *,
     notifier_id: str,
     board_slug: str,
@@ -7342,58 +7296,36 @@ def record_notifier_heartbeat(
     now: Optional[int] = None,
     retention_seconds: int = NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
 ) -> None:
-    """Upsert one gateway notifier heartbeat for a scanned board DB.
+    """Upsert one gateway notifier heartbeat in the sidecar DB.
 
-    Identity is intentionally process-scoped: one row per
-    ``(notifier_id, board_slug, db_path)``. The dashboard can then count
-    active rows for the board DB to distinguish missing notifier coverage
-    from overlapping notifier processes that may race wake claims.
+    The optional ``conn`` parameter is ignored for backward compatibility.
+    Heartbeat writes and self-heal retries must not mutate the main board DB.
     """
-    when = int(now if now is not None else time.time())
-
-    def _write_heartbeat() -> None:
-        with write_txn(conn):
-            conn.execute(
-                """
-                INSERT INTO kanban_notifier_heartbeats (
-                    notifier_id, board_slug, db_path, notifier_profile,
-                    host, pid, started_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(notifier_id, board_slug, db_path) DO UPDATE SET
-                    notifier_profile = excluded.notifier_profile,
-                    host             = excluded.host,
-                    pid              = excluded.pid,
-                    started_at       = excluded.started_at,
-                    last_seen_at     = excluded.last_seen_at
-                """,
-                (
-                    str(notifier_id), str(board_slug or DEFAULT_BOARD), str(db_path),
-                    notifier_profile, str(host or "unknown"), int(pid),
-                    int(started_at), when,
-                ),
-            )
-            conn.execute(
-                "DELETE FROM kanban_notifier_heartbeats WHERE last_seen_at < ?",
-                (when - max(1, int(retention_seconds)),),
-            )
-
+    _ = conn
     try:
-        _write_heartbeat()
-    except sqlite3.DatabaseError as exc:
-        _log.warning(
-            "kanban notifier heartbeat table unhealthy; resetting ephemeral "
-            "telemetry table and retrying once: %s",
+        _notifier_sidecar.record_notifier_heartbeat(
+            notifier_id=notifier_id,
+            board_slug=board_slug,
+            db_path=db_path,
+            notifier_profile=notifier_profile,
+            host=host,
+            pid=pid,
+            started_at=started_at,
+            now=now,
+            retention_seconds=retention_seconds,
+        )
+    except Exception as exc:
+        # Heartbeat telemetry is diagnostics-only. Delivery/profile-wake
+        # collection must continue even if the sidecar cannot be repaired.
+        _rate_limited_notifier_sidecar_warning(
+            "write-skipped",
+            "kanban notifier heartbeat sidecar write skipped: %s",
             exc,
         )
-        try:
-            reset_notifier_heartbeats(conn)
-            _write_heartbeat()
-        except Exception as reset_exc:
-            raise reset_exc from exc
 
 
 def list_notifier_heartbeats(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None = None,
     *,
     board_slug: Optional[str] = None,
     db_path: Optional[str] = None,
@@ -7403,59 +7335,31 @@ def list_notifier_heartbeats(
     min_last_seen_at: Optional[int] = None,
     limit: Optional[int] = NOTIFIER_HEARTBEAT_LIST_LIMIT,
 ) -> list[dict]:
-    """List notifier heartbeat rows with active/stale classification."""
-    as_of = int(now if now is not None else time.time())
-    window = max(1, int(active_window_seconds))
-    where: list[str] = []
-    params: list[Any] = []
-    if board_slug is not None:
-        where.append("board_slug = ?")
-        params.append(str(board_slug or DEFAULT_BOARD))
-    if db_path is not None:
-        where.append("db_path = ?")
-        params.append(str(db_path))
-    if notifier_profile is not None:
-        where.append("notifier_profile = ?")
-        params.append(str(notifier_profile))
-    if min_last_seen_at is not None:
-        where.append("last_seen_at >= ?")
-        params.append(int(min_last_seen_at))
-    sql = (
-        "SELECT notifier_id, board_slug, db_path, notifier_profile, "
-        "       host, pid, started_at, last_seen_at "
-        "FROM kanban_notifier_heartbeats"
+    """List notifier heartbeat sidecar rows with active/stale classification."""
+    _ = conn
+    return _notifier_sidecar.list_notifier_heartbeats(
+        board_slug=board_slug,
+        db_path=db_path,
+        notifier_profile=notifier_profile,
+        now=now,
+        active_window_seconds=active_window_seconds,
+        min_last_seen_at=min_last_seen_at,
+        limit=limit,
     )
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY last_seen_at DESC, notifier_id ASC"
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(max(1, int(limit)))
-    out: list[dict] = []
-    for row in conn.execute(sql, params).fetchall():
-        item = dict(row)
-        last_seen = int(item.get("last_seen_at") or 0)
-        age = max(0, as_of - last_seen) if last_seen else None
-        item["age_seconds"] = age
-        item["active"] = bool(last_seen and age is not None and age <= window)
-        out.append(item)
-    return out
 
 
 def prune_notifier_heartbeats(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None = None,
     *,
     older_than_seconds: int = NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
     now: Optional[int] = None,
 ) -> int:
-    """Delete stale notifier heartbeat rows older than the retention window."""
-    cutoff = int(now if now is not None else time.time()) - max(1, int(older_than_seconds))
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notifier_heartbeats WHERE last_seen_at < ?",
-            (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+    """Delete stale notifier heartbeat rows from the sidecar DB."""
+    _ = conn
+    return _notifier_sidecar.prune_notifier_heartbeats(
+        older_than_seconds=older_than_seconds,
+        now=now,
+    )
 
 
 # ---------------------------------------------------------------------------

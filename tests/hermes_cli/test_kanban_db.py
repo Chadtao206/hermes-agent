@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_notifier_sidecar as heartbeat_sidecar
 
 
 @pytest.fixture
@@ -411,8 +412,8 @@ def test_record_and_list_notifier_heartbeats_classifies_active_and_stale(kanban_
 
 
 
-def test_record_notifier_heartbeat_repairs_ephemeral_table_schema(kanban_home):
-    """A corrupt/incompatible heartbeat table should self-heal on next write."""
+def test_record_notifier_heartbeat_uses_sidecar_not_main_table(kanban_home):
+    """Heartbeat writes self-heal the sidecar and leave main DB telemetry untouched."""
     with kb.connect() as conn:
         with kb.write_txn(conn):
             conn.execute("DROP INDEX IF EXISTS idx_notifier_heartbeats_board")
@@ -435,14 +436,46 @@ def test_record_notifier_heartbeat_repairs_ephemeral_table_schema(kanban_home):
         rows = kb.list_notifier_heartbeats(
             conn, board_slug="default", db_path="/tmp/board.db", now=1_000_000,
         )
-        cols = {
+        main_cols = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(kanban_notifier_heartbeats)")
         }
 
+    sidecar_path = heartbeat_sidecar.notifier_heartbeat_sidecar_path()
+    assert sidecar_path.exists()
     assert len(rows) == 1
     assert rows[0]["notifier_id"] == "host-a:1111:900"
-    assert {"db_path", "host", "pid", "started_at", "last_seen_at"} <= cols
+    # The incompatible legacy main table was not repaired or written by the
+    # heartbeat path; repair is confined to the sidecar DB.
+    assert main_cols == {"notifier_id", "board_slug"}
+
+
+def test_corrupt_notifier_sidecar_is_replaced_without_touching_main_db(kanban_home):
+    """A corrupt heartbeat sidecar is replaceable without repairing main DB telemetry."""
+    sidecar = heartbeat_sidecar.notifier_heartbeat_sidecar_path()
+    sidecar.write_bytes(b"not sqlite")
+
+    with kb.connect() as conn:
+        kb.record_notifier_heartbeat(
+            conn,
+            notifier_id="host-a:1111:900",
+            board_slug="default",
+            db_path="/tmp/board.db",
+            notifier_profile="jensen",
+            host="host-a",
+            pid=1111,
+            started_at=900,
+            now=1_000_000,
+        )
+        rows = kb.list_notifier_heartbeats(
+            conn, board_slug="default", db_path="/tmp/board.db", now=1_000_000,
+        )
+        main_count = conn.execute("SELECT COUNT(*) FROM kanban_notifier_heartbeats").fetchone()[0]
+
+    assert len(rows) == 1
+    assert rows[0]["notifier_id"] == "host-a:1111:900"
+    assert main_count == 0
+
 
 
 def test_notifier_heartbeat_retention_prunes_old_rows_but_keeps_active(kanban_home):

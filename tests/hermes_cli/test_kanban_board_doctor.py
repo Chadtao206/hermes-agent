@@ -70,6 +70,18 @@ def test_readonly_connect_does_not_initialize_schema_or_create_sidecars(tmp_path
     assert not db.with_name(db.name + "-shm").exists()
 
 
+def test_doctor_ignores_corrupt_notifier_sidecar_when_board_db_is_clean(kanban_home):
+    """Heartbeat sidecar corruption must not be classified as board DB corruption."""
+    sidecar = kanban_home / "kanban_notifier_heartbeats.db"
+    sidecar.write_bytes(b"not sqlite")
+
+    result = doctor.run_board_doctor()
+
+    assert result["ok"] is True
+    assert result["issues"] == []
+
+
+
 def test_doctor_reports_orphan_links_and_stale_running_runs(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="engineer")
