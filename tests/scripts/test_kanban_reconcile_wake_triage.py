@@ -148,3 +148,147 @@ def test_json_output_contains_triage_and_rendered_text():
     assert payload["mode"] == "no-agent"
     assert payload["triage"]["mode"] == module.rec.WAKE_BUCKET_COMPACT_NOTIFY
     assert "Kanban reconcile compact notification" in payload["rendered_text"]
+
+
+def test_stable_action_digest_ignores_age_and_timestamps():
+    module = _load_module()
+    base_action = {
+        "kind": "scheduled_with_completed_parents_decision",
+        "task_id": "t_review",
+        "severity": "warning",
+        "reason": "needs decision",
+        "safe_to_apply": False,
+        "signature": "age-sensitive-signature-1",
+        "details": {
+            "assignee": "reviewer",
+            "parents": "t_impl:done",
+            "parent_count": 1,
+            "age_seconds": 10,
+            "created_at": 100,
+            "started_at": 200,
+        },
+    }
+    later_action = json.loads(json.dumps(base_action))
+    later_action["signature"] = "age-sensitive-signature-2"
+    later_action["details"]["age_seconds"] = 9999
+    later_action["details"]["created_at"] = 123
+    later_action["details"]["started_at"] = 456
+
+    first = _result([base_action], module.rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED)
+    second = _result([later_action], module.rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED)
+
+    assert module.stable_action_digest(first) == module.stable_action_digest(second)
+
+
+def test_dedupe_suppresses_unchanged_signal_inside_repeat_window(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "wake-triage-state.json"
+    actions = [
+        {
+            "kind": "scheduled_with_completed_parents_decision",
+            "task_id": "t_review",
+            "severity": "warning",
+            "reason": "needs explicit keep-parked/unblock/close decision",
+            "safe_to_apply": False,
+            "signature": "scheduled_with_completed_parents_decision:t_review:abc",
+            "details": {"assignee": "reviewer", "parents": "t_impl:done", "age_seconds": 100},
+        }
+    ]
+    result = _result(actions, module.rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED)
+
+    emit_first, first_meta = module.should_emit_with_dedupe(
+        result,
+        mode="no-agent",
+        state_path=state_path,
+        min_repeat_seconds=3600,
+        now=1000,
+    )
+    emit_second, second_meta = module.should_emit_with_dedupe(
+        result,
+        mode="no-agent",
+        state_path=state_path,
+        min_repeat_seconds=3600,
+        now=1100,
+    )
+
+    assert emit_first is True
+    assert first_meta["dedupe"] == "emitted"
+    assert emit_second is False
+    assert second_meta["dedupe"] == "suppressed"
+    assert json.loads(module.render_suppressed_output(result, second_meta))["wakeAgent"] is False
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["version"] == 1
+    assert state["entries"]
+
+
+def test_dedupe_reemits_after_repeat_window_or_changed_signal(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "wake-triage-state.json"
+    action = {
+        "kind": "pre_spawn_validation_decision",
+        "task_id": "t_ready",
+        "severity": "warning",
+        "reason": "profile missing before spawn",
+        "safe_to_apply": False,
+        "signature": "pre_spawn_validation_decision:t_ready:abc",
+        "details": {"assignee": "missing-profile"},
+    }
+    first = _result([action], module.rec.WAKE_BUCKET_COMPACT_NOTIFY)
+    changed_action = json.loads(json.dumps(action))
+    changed_action["details"]["validation_errors"] = ["profile not found: missing-profile"]
+    changed = _result([changed_action], module.rec.WAKE_BUCKET_COMPACT_NOTIFY)
+
+    emit_first, _ = module.should_emit_with_dedupe(
+        first,
+        mode="no-agent",
+        state_path=state_path,
+        min_repeat_seconds=3600,
+        now=1000,
+    )
+    emit_after_window, _ = module.should_emit_with_dedupe(
+        first,
+        mode="no-agent",
+        state_path=state_path,
+        min_repeat_seconds=3600,
+        now=5000,
+    )
+    emit_changed, _ = module.should_emit_with_dedupe(
+        changed,
+        mode="no-agent",
+        state_path=state_path,
+        min_repeat_seconds=3600,
+        now=5100,
+    )
+
+    assert emit_first is True
+    assert emit_after_window is True
+    assert emit_changed is True
+
+
+def test_corrupt_dedupe_state_does_not_block_emit(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "wake-triage-state.json"
+    state_path.write_text("not json", encoding="utf-8")
+    actions = [
+        {
+            "kind": "old_ready_spawnable",
+            "task_id": "t_ready",
+            "severity": "warning",
+            "reason": "ready too long",
+            "safe_to_apply": False,
+            "signature": "old_ready_spawnable:t_ready:abc",
+            "details": {},
+        }
+    ]
+
+    emit, metadata = module.should_emit_with_dedupe(
+        _result(actions, module.rec.WAKE_BUCKET_COMPACT_NOTIFY),
+        mode="no-agent",
+        state_path=state_path,
+        min_repeat_seconds=3600,
+        now=1000,
+    )
+
+    assert emit is True
+    assert metadata["dedupe"] == "emitted"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["version"] == 1

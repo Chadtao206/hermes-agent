@@ -17,8 +17,10 @@ Default ``--mode no-agent`` is intended for cron ``no_agent=True`` jobs:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,17 @@ if str(REPO_ROOT) not in sys.path:
 
 from hermes_cli import kanban_reconciler as rec  # noqa: E402
 
+_VOLATILE_DETAIL_KEYS = {
+    "age_seconds",
+    "created_at",
+    "started_at",
+    "last_heartbeat_at",
+    "current_run_id",
+    "claim_expires",
+    "worker_pid",
+    "run_id",
+}
+
 
 def _bucket_counts(triage: dict[str, Any]) -> str:
     summary = triage.get("summary") or {}
@@ -38,6 +51,142 @@ def _bucket_counts(triage: dict[str, Any]) -> str:
         f"compact_notify={int(summary.get(rec.WAKE_BUCKET_COMPACT_NOTIFY) or 0)}, "
         f"jensen_decision_required={int(summary.get(rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED) or 0)}"
     )
+
+
+def default_state_path() -> Path:
+    """Return the sidecar state path used for emission dedupe.
+
+    This deliberately lives outside ``kanban.db`` so monitoring state cannot
+    corrupt or contend with the authoritative board database.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "kanban_reconcile_wake_triage_state.json"
+    except Exception:
+        return Path.home() / ".hermes" / "kanban_reconcile_wake_triage_state.json"
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _normalize_for_digest(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_for_digest(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _VOLATILE_DETAIL_KEYS
+        }
+    if isinstance(value, list):
+        return [_normalize_for_digest(item) for item in value]
+    return value
+
+
+def stable_action_digest(result: dict[str, Any]) -> str:
+    """Fingerprint reconcile signal excluding volatile age/timestamp fields."""
+    actions = []
+    for action in result.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        actions.append({
+            "kind": action.get("kind"),
+            "task_id": action.get("task_id"),
+            "severity": action.get("severity"),
+            "safe_to_apply": bool(action.get("safe_to_apply")),
+            "details": _normalize_for_digest(action.get("details") or {}),
+        })
+    actions.sort(key=lambda item: _stable_json(item))
+    triage = result.get("wake_triage") or {}
+    material = {
+        "board": result.get("board"),
+        "mode": triage.get("mode"),
+        "actions": actions,
+    }
+    return hashlib.sha1(_stable_json(material).encode("utf-8")).hexdigest()
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        # Corrupt dedupe state must not block watchdog output. Treat it as
+        # empty; the next emitted signal will replace it atomically.
+        return {}
+
+
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def dedupe_key(*, mode: str, result: dict[str, Any]) -> str:
+    triage = result.get("wake_triage") or {}
+    board = str(result.get("board") or "default")
+    triage_mode = str(triage.get("mode") or "unknown")
+    return f"{mode}:{board}:{triage_mode}"
+
+
+def should_emit_with_dedupe(
+    result: dict[str, Any],
+    *,
+    mode: str,
+    state_path: Path,
+    min_repeat_seconds: int,
+    now: int | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Return whether to emit and persist sidecar dedupe state if needed."""
+    triage = result.get("wake_triage") or {}
+    triage_mode = triage.get("mode")
+    if triage_mode == rec.WAKE_BUCKET_AUTO_SILENT:
+        return True, {"dedupe": "auto_silent_not_tracked"}
+
+    as_of = int(now if now is not None else time.time())
+    repeat_window = max(0, int(min_repeat_seconds or 0))
+    digest = stable_action_digest(result)
+    key = dedupe_key(mode=mode, result=result)
+    state = load_state(state_path)
+    entries = state.setdefault("entries", {})
+    previous = entries.get(key) if isinstance(entries, dict) else None
+    previous = previous if isinstance(previous, dict) else {}
+    previous_digest = previous.get("digest")
+    previous_emitted_at = int(previous.get("emitted_at") or 0)
+    age = as_of - previous_emitted_at if previous_emitted_at else None
+
+    suppressed = (
+        previous_digest == digest
+        and previous_emitted_at > 0
+        and repeat_window > 0
+        and as_of - previous_emitted_at < repeat_window
+    )
+    metadata = {
+        "dedupe": "suppressed" if suppressed else "emitted",
+        "dedupe_key": key,
+        "digest": digest,
+        "previous_emitted_at": previous_emitted_at or None,
+        "age_seconds": age,
+        "min_repeat_seconds": repeat_window,
+        "state_path": str(state_path),
+    }
+    if suppressed:
+        return False, metadata
+
+    entries[key] = {
+        "digest": digest,
+        "mode": mode,
+        "triage_mode": triage_mode,
+        "board": result.get("board"),
+        "emitted_at": as_of,
+        "total_actions": triage.get("total_actions"),
+    }
+    state["version"] = 1
+    state["updated_at"] = as_of
+    save_state(state_path, state)
+    return True, metadata
 
 
 def _compact_notify_text(result: dict[str, Any], *, examples: int) -> str:
@@ -116,6 +265,18 @@ def render_output(
     return _compact_notify_text(result, examples=examples)
 
 
+def render_suppressed_output(result: dict[str, Any], metadata: dict[str, Any]) -> str:
+    triage = result.get("wake_triage") or {}
+    return json.dumps({
+        "wakeAgent": False,
+        "mode": triage.get("mode"),
+        "dedupe": "suppressed",
+        "dedupe_key": metadata.get("dedupe_key"),
+        "age_seconds": metadata.get("age_seconds"),
+        "min_repeat_seconds": metadata.get("min_repeat_seconds"),
+    })
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run kanban reconcile and emit deterministic wake-triage script output."
@@ -140,6 +301,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output contract: no-agent delivers compact text; agent-gate wakes only for Jensen decisions.",
     )
     parser.add_argument("--json", action="store_true", help="Emit diagnostic JSON for tests/debugging")
+    parser.add_argument(
+        "--state-path",
+        default=None,
+        help="Sidecar dedupe state path (default: $HERMES_HOME/kanban_reconcile_wake_triage_state.json)",
+    )
+    parser.add_argument(
+        "--min-repeat-seconds",
+        type=int,
+        default=60 * 60,
+        help="Suppress unchanged emitted signals for this many seconds (default: 3600)",
+    )
+    parser.add_argument(
+        "--no-dedupe",
+        action="store_true",
+        help="Disable sidecar dedupe/rate-limit state for this run",
+    )
     return parser
 
 
@@ -149,6 +326,17 @@ def main(argv: list[str] | None = None) -> int:
         board=args.board,
         ready_age_seconds=max(1, int(args.ready_age_seconds or 900)),
     )
+    if not args.json and not args.no_dedupe:
+        emit, metadata = should_emit_with_dedupe(
+            result,
+            mode=args.mode,
+            state_path=Path(args.state_path).expanduser() if args.state_path else default_state_path(),
+            min_repeat_seconds=max(0, int(args.min_repeat_seconds or 0)),
+        )
+        if not emit:
+            print(render_suppressed_output(result, metadata))
+            return 0
+
     output = render_output(
         result,
         mode=args.mode,
