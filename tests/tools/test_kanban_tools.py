@@ -344,6 +344,61 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert _strip_closeout_packet(shown["runs"][-1]["metadata"]) == handoff
 
 
+def test_complete_pr_head_gate_error_is_actionable(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(
+            conn, parent,
+            summary="Opened PR for review.",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+        review = kb.create_task(
+            conn, title="final review", assignee="reviewer", parents=[parent],
+        )
+        kb.claim_task(conn, review)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review)
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "Approved but forgot PR head metadata.",
+        "metadata": {"verdict": "accept"},
+    })
+    data = json.loads(out)
+    assert data.get("ok") is not True
+    error = data["error"]
+    assert "final-review PR-head gate failed" in error
+    assert "metadata.reviewed_pr_head_sha=abcdef1234567890" in error
+    assert "kanban_block" in error
+    assert "still in-flight" in error
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, review)
+        assert task is not None
+        assert task.status == "running"
+        gate_events = [
+            e for e in kb.list_events(conn, review)
+            if e.kind == "completion_blocked_pr_head_gate"
+        ]
+        assert len(gate_events) == 1
+    finally:
+        conn.close()
+
+
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 

@@ -483,6 +483,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
+            except kb.PRHeadGateError as pr_err:
+                reviewed = pr_err.reviewed_sha or "missing"
+                return tool_error(
+                    f"kanban_complete blocked: final-review PR-head gate failed. "
+                    f"Current parent PR head is {pr_err.expected_sha} "
+                    f"from parent task {pr_err.parent_task_id}; your "
+                    f"reviewed_pr_head_sha was {reviewed}. Your task is still "
+                    f"in-flight (no state change). If you reviewed the current "
+                    f"head, retry kanban_complete with the same summary and "
+                    f"metadata.reviewed_pr_head_sha={pr_err.expected_sha}. "
+                    f"If the PR changed or you cannot verify that SHA, call "
+                    f"kanban_block with the exact verification gap instead."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
