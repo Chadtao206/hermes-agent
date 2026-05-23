@@ -513,6 +513,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=5,
         help="Maximum compact examples to include in human output (default: 5; full data via --json)",
     )
+    p_reconcile.add_argument(
+        "--apply-option",
+        choices=["keep_parked"],
+        default=None,
+        help="Apply one explicitly gated reconcile decision option (phase 1: keep_parked only)",
+    )
+    p_reconcile.add_argument(
+        "--task-id",
+        default=None,
+        help="Task id for --apply-option",
+    )
+    p_reconcile.add_argument(
+        "--packet-signature",
+        default=None,
+        help="Current decision packet signature required for --apply-option",
+    )
+    p_reconcile.add_argument(
+        "--confirm-dry-run",
+        action="store_true",
+        help="Required with --apply-option after reviewing the dry-run plan",
+    )
 
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child relation")
@@ -1270,6 +1291,22 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
+    if getattr(args, "apply_option", None):
+        result = krec.apply_reconcile_decision(
+            board=getattr(args, "board", None),
+            ready_age_seconds=max(1, int(getattr(args, "ready_age_seconds", 900) or 900)),
+            task_id=str(getattr(args, "task_id", None) or ""),
+            option=str(getattr(args, "apply_option", None) or ""),
+            packet_signature=str(getattr(args, "packet_signature", None) or ""),
+            confirm_dry_run=bool(getattr(args, "confirm_dry_run", False)),
+            author=_profile_author(),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(krec.format_reconcile_apply_text(result))
+        return 0 if result.get("ok") else 2
+
     result = krec.run_reconciler(
         board=getattr(args, "board", None),
         ready_age_seconds=max(1, int(getattr(args, "ready_age_seconds", 900) or 900)),

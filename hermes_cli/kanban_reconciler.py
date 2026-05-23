@@ -327,6 +327,31 @@ def _operator_plans_for_packet(packet: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _decision_packet_signature(packet: dict[str, Any]) -> str:
+    # Keep this stable across volatile age/timestamp drift while still changing
+    # when the actionable packet shape changes (kind/category/affected parents).
+    return _signature(
+        "decision_packet",
+        str(packet.get("task_id") or "board"),
+        {
+            "affected_parent_task_ids": list(packet.get("affected_parent_task_ids") or []),
+            "kinds": list(packet.get("kinds") or []),
+            "primary_category": packet.get("primary_category"),
+            "suggested_options": list(packet.get("suggested_options") or []),
+        },
+    )
+
+
+def _find_decision_packet(
+    packets: list[dict[str, Any]],
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    for packet in packets:
+        if str(packet.get("task_id") or "") == str(task_id):
+            return packet
+    return None
+
+
 def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group Jensen decision-required actions into operator decision packets.
 
@@ -379,6 +404,7 @@ def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[s
 
     for packet in grouped.values():
         packet.update(_decision_hint_for_kinds(packet.get("kinds") or []))
+        packet["packet_signature"] = _decision_packet_signature(packet)
         packet["operator_plans"] = _operator_plans_for_packet(packet)
 
     return sorted(
@@ -1185,6 +1211,156 @@ def run_reconciler(
     }
 
 
+def _apply_error(
+    message: str,
+    *,
+    board: Optional[str],
+    task_id: Optional[str],
+    option: Optional[str],
+    packet: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "board": board or kb.get_current_board(),
+        "task_id": task_id,
+        "option": option,
+        "error": message,
+        "packet": packet,
+        "mutation_applied": False,
+    }
+
+
+def apply_reconcile_decision(
+    *,
+    task_id: str,
+    option: str,
+    packet_signature: str,
+    confirm_dry_run: bool,
+    board: Optional[str] = None,
+    ready_age_seconds: int = 15 * 60,
+    author: str = "jensen",
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Apply one explicitly gated reconcile operator decision.
+
+    This first mutation slice intentionally supports only ``keep_parked`` and
+    only as a comment append.  It validates the current packet signature against
+    a fresh reconcile pass before writing, so stale wake output cannot be applied
+    blindly.
+    """
+    option = str(option or "").strip()
+    task_id = str(task_id or "").strip()
+    packet_signature = str(packet_signature or "").strip()
+    if option != "keep_parked":
+        return _apply_error(
+            "only keep_parked is enabled for reconcile apply gate phase 1",
+            board=board,
+            task_id=task_id or None,
+            option=option or None,
+        )
+    if not task_id:
+        return _apply_error(
+            "task_id is required",
+            board=board,
+            task_id=None,
+            option=option,
+        )
+    if not packet_signature:
+        return _apply_error(
+            "packet_signature is required",
+            board=board,
+            task_id=task_id,
+            option=option,
+        )
+    if not confirm_dry_run:
+        return _apply_error(
+            "confirm_dry_run is required before applying a reconcile plan",
+            board=board,
+            task_id=task_id,
+            option=option,
+        )
+
+    path = kb.kanban_db_path(board=board)
+    as_of = int(now if now is not None else time.time())
+    with kb.connect(path) as conn:
+        actions = collect_reconcile_actions(
+            conn,
+            ready_age_seconds=ready_age_seconds,
+            now=as_of,
+        )
+        action_dicts = actions_to_dicts(actions)
+        triage = classify_wake_triage(action_dicts)
+        packet = _find_decision_packet(triage.get("decision_packets") or [], task_id)
+        if packet is None:
+            return _apply_error(
+                "no current decision packet for task",
+                board=board,
+                task_id=task_id,
+                option=option,
+            )
+        if packet.get("packet_signature") != packet_signature:
+            return _apply_error(
+                "packet_signature does not match current decision packet",
+                board=board,
+                task_id=task_id,
+                option=option,
+                packet=packet,
+            )
+        plan = (packet.get("operator_plans") or {}).get(option)
+        if not isinstance(plan, dict):
+            return _apply_error(
+                "selected option is not available for current decision packet",
+                board=board,
+                task_id=task_id,
+                option=option,
+                packet=packet,
+            )
+
+        comment = (
+            f"Jensen reconcile decision applied: option={option}; "
+            f"packet_signature={packet_signature}; category={packet.get('primary_category')}; "
+            "mutation=comment_only"
+        )
+        comment_id = kb.add_comment(conn, task_id, author or "jensen", comment)
+        return {
+            "ok": True,
+            "board": board or kb.get_current_board(),
+            "db_path": str(path),
+            "task_id": task_id,
+            "option": option,
+            "packet_signature": packet_signature,
+            "packet": packet,
+            "plan": plan,
+            "comment_id": comment_id,
+            "comment": comment,
+            "mutation_applied": True,
+            "mutation": "comment_only",
+            "as_of": as_of,
+        }
+
+
+def format_reconcile_apply_text(result: dict[str, Any]) -> str:
+    if not result.get("ok"):
+        lines = [
+            "Kanban reconcile apply rejected",
+            f"- task_id={result.get('task_id')}",
+            f"- option={result.get('option')}",
+            f"- error={result.get('error')}",
+        ]
+        packet = result.get("packet") or {}
+        if packet:
+            lines.append(f"- current_packet_signature={packet.get('packet_signature')}")
+        return "\n".join(lines)
+    return "\n".join([
+        "Kanban reconcile apply complete",
+        f"- task_id={result.get('task_id')}",
+        f"- option={result.get('option')}",
+        f"- mutation={result.get('mutation')}",
+        f"- comment_id={result.get('comment_id')}",
+        "- postcheck: hermes kanban reconcile --json",
+    ])
+
+
 def _truncate_for_reconcile_text(value: Any, *, limit: int = 160) -> str:
     text = str(value or "")
     text = " ".join(text.split())
@@ -1293,6 +1469,8 @@ def _decision_packet_lines_for_reconcile_text(
         )
         if packet.get("primary_category"):
             lines.append(f"  category: {packet.get('primary_category')}")
+        if packet.get("packet_signature"):
+            lines.append(f"  packet_signature: {packet.get('packet_signature')}")
         options = packet.get("suggested_options") or []
         if isinstance(options, list) and options:
             lines.append("  options: " + ", ".join(str(option) for option in options[:5]))
