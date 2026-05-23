@@ -41,6 +41,107 @@ class ReconcileAction:
 
 _SEVERITY_RANK = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 
+WAKE_BUCKET_AUTO_SILENT = "auto_silent"
+WAKE_BUCKET_COMPACT_NOTIFY = "compact_notify"
+WAKE_BUCKET_JENSEN_DECISION_REQUIRED = "jensen_decision_required"
+
+_JENSEN_DECISION_KINDS = {
+    "blocked_with_completed_parents_decision",
+    "scheduled_with_completed_parents_decision",
+    "review_parent_pr_head_evidence_missing",
+}
+
+_COMPACT_NOTIFY_KINDS = {
+    "dead_running_candidate",
+    "expired_claim_candidate",
+    "old_ready_nonspawnable",
+    "old_ready_spawnable",
+    "old_review_nonspawnable",
+    "old_review_spawnable",
+    "pre_spawn_validation_decision",
+    "repeated_failure_signature_decision",
+    "review_skill_provenance_missing",
+    "stale_heartbeat_observed",
+    "stale_run_metadata",
+}
+
+
+def _action_summary_for_wake_triage(action: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": action.get("kind"),
+        "task_id": action.get("task_id"),
+        "severity": action.get("severity"),
+        "signature": action.get("signature"),
+        "safe_to_apply": bool(action.get("safe_to_apply")),
+        "reason": action.get("reason"),
+    }
+
+
+def _wake_bucket_for_action(action: dict[str, Any]) -> str:
+    kind = str(action.get("kind") or "")
+    severity = str(action.get("severity") or "warning")
+    if kind in _JENSEN_DECISION_KINDS:
+        return WAKE_BUCKET_JENSEN_DECISION_REQUIRED
+    if kind in _COMPACT_NOTIFY_KINDS:
+        return WAKE_BUCKET_COMPACT_NOTIFY
+    # Unknown high-severity findings should not be hidden or reduced to a
+    # compact script notice; wake Jensen to classify the new action family.
+    if severity in {"critical", "error"}:
+        return WAKE_BUCKET_JENSEN_DECISION_REQUIRED
+    # Unknown warnings are still actionable but deterministic enough for a
+    # compact operator notice until the classifier grows an explicit rule.
+    return WAKE_BUCKET_COMPACT_NOTIFY
+
+
+def classify_wake_triage(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Classify reconcile actions for script-first wake decisions.
+
+    The contract is intentionally conservative: no reconcile actions means a
+    watcher can stay silent; known deterministic defects can be reported with a
+    compact notification; ambiguous workflow/handoff decisions require Jensen.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {
+        WAKE_BUCKET_AUTO_SILENT: [],
+        WAKE_BUCKET_COMPACT_NOTIFY: [],
+        WAKE_BUCKET_JENSEN_DECISION_REQUIRED: [],
+    }
+    if not actions:
+        return {
+            "mode": WAKE_BUCKET_AUTO_SILENT,
+            "wake_agent": False,
+            "reason": "no reconcile actions",
+            "total_actions": 0,
+            "summary": {
+                WAKE_BUCKET_AUTO_SILENT: 0,
+                WAKE_BUCKET_COMPACT_NOTIFY: 0,
+                WAKE_BUCKET_JENSEN_DECISION_REQUIRED: 0,
+            },
+            "buckets": buckets,
+        }
+
+    for action in actions:
+        bucket = _wake_bucket_for_action(action)
+        buckets[bucket].append(_action_summary_for_wake_triage(action))
+
+    if buckets[WAKE_BUCKET_JENSEN_DECISION_REQUIRED]:
+        mode = WAKE_BUCKET_JENSEN_DECISION_REQUIRED
+        reason = "ambiguous workflow or handoff decision requires Jensen"
+    elif buckets[WAKE_BUCKET_COMPACT_NOTIFY]:
+        mode = WAKE_BUCKET_COMPACT_NOTIFY
+        reason = "deterministic reconcile signal can be delivered compactly without waking Jensen"
+    else:
+        mode = WAKE_BUCKET_AUTO_SILENT
+        reason = "no operator-visible reconcile signal"
+
+    return {
+        "mode": mode,
+        "wake_agent": mode == WAKE_BUCKET_JENSEN_DECISION_REQUIRED,
+        "reason": reason,
+        "total_actions": len(actions),
+        "summary": {bucket: len(items) for bucket, items in buckets.items()},
+        "buckets": buckets,
+    }
+
 
 def _pid_alive(pid: Any) -> bool:
     if not pid:
@@ -752,11 +853,13 @@ def run_reconciler(
             ready_age_seconds=ready_age_seconds,
             now=as_of,
         )
+    action_dicts = actions_to_dicts(actions)
     return {
         "ok": not actions,
         "board": board or kb.get_current_board(),
         "db_path": str(path),
-        "actions": actions_to_dicts(actions),
+        "actions": action_dicts,
+        "wake_triage": classify_wake_triage(action_dicts),
         "as_of": as_of,
         "mutation_applied": False,
     }
@@ -853,7 +956,12 @@ def _detail_highlights_for_reconcile_text(action: dict[str, Any]) -> str:
 def format_reconcile_text(result: dict[str, Any], *, max_examples: int = 5) -> str:
     actions = result.get("actions") or []
     if not actions:
-        return f"Kanban reconcile: no stalled-transition actions ({result.get('board')})"
+        triage = result.get("wake_triage") or classify_wake_triage([])
+        return (
+            f"Kanban reconcile: no stalled-transition actions ({result.get('board')})\n"
+            f"Wake triage: {triage.get('mode')} "
+            f"(wake_agent={str(bool(triage.get('wake_agent'))).lower()})"
+        )
 
     grouped: dict[tuple[str, str], int] = {}
     for action in actions:
@@ -869,6 +977,18 @@ def format_reconcile_text(result: dict[str, Any], *, max_examples: int = 5) -> s
         key=lambda item: (_SEVERITY_RANK.get(item[0][0], 99), item[0][1]),
     ):
         lines.append(f"- {severity.upper()} {kind}: {count}")
+
+    triage = result.get("wake_triage") or classify_wake_triage(actions)
+    triage_summary = triage.get("summary") or {}
+    lines.extend([
+        "Wake triage:",
+        f"- mode={triage.get('mode')} wake_agent={str(bool(triage.get('wake_agent'))).lower()}",
+        "- buckets: "
+        f"{WAKE_BUCKET_AUTO_SILENT}={int(triage_summary.get(WAKE_BUCKET_AUTO_SILENT) or 0)}, "
+        f"{WAKE_BUCKET_COMPACT_NOTIFY}={int(triage_summary.get(WAKE_BUCKET_COMPACT_NOTIFY) or 0)}, "
+        f"{WAKE_BUCKET_JENSEN_DECISION_REQUIRED}={int(triage_summary.get(WAKE_BUCKET_JENSEN_DECISION_REQUIRED) or 0)}",
+        f"- reason: {_truncate_for_reconcile_text(triage.get('reason'), limit=180)}",
+    ])
 
     bounded_examples = actions[: max(0, int(max_examples or 0))]
     omitted = max(0, len(actions) - len(bounded_examples))

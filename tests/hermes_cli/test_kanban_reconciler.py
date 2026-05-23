@@ -37,6 +37,68 @@ def test_reconciler_reports_no_actions_for_healthy_board(kanban_home):
     assert result["mutation_applied"] is False
     assert result["actions"] == []
     assert result["ok"] is True
+    assert result["wake_triage"]["mode"] == rec.WAKE_BUCKET_AUTO_SILENT
+    assert result["wake_triage"]["wake_agent"] is False
+
+
+def test_wake_triage_routes_deterministic_defects_to_compact_notify():
+    actions = [
+        {
+            "kind": "pre_spawn_validation_decision",
+            "task_id": "t_ready",
+            "severity": "warning",
+            "reason": "missing forced skill",
+            "safe_to_apply": False,
+            "signature": "pre_spawn_validation_decision:t_ready:abc",
+            "details": {"validation_errors": ["missing forced skill(s): demo"]},
+        },
+        {
+            "kind": "repeated_failure_signature_decision",
+            "task_id": None,
+            "severity": "error",
+            "reason": "possible platform defect",
+            "safe_to_apply": False,
+            "signature": "repeated_failure_signature_decision:board:def",
+            "details": {"failure_signature": "profile crash"},
+        },
+    ]
+
+    triage = rec.classify_wake_triage(actions)
+
+    assert triage["mode"] == rec.WAKE_BUCKET_COMPACT_NOTIFY
+    assert triage["wake_agent"] is False
+    assert triage["summary"][rec.WAKE_BUCKET_COMPACT_NOTIFY] == 2
+    assert triage["summary"][rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED] == 0
+
+
+def test_wake_triage_routes_ambiguous_handoffs_to_jensen_decision():
+    actions = [
+        {
+            "kind": "scheduled_with_completed_parents_decision",
+            "task_id": "t_review",
+            "severity": "warning",
+            "reason": "needs keep-parked/unblock/close decision",
+            "safe_to_apply": False,
+            "signature": "scheduled_with_completed_parents_decision:t_review:abc",
+            "details": {},
+        },
+        {
+            "kind": "old_ready_spawnable",
+            "task_id": "t_ready",
+            "severity": "warning",
+            "reason": "ready too long",
+            "safe_to_apply": False,
+            "signature": "old_ready_spawnable:t_ready:def",
+            "details": {},
+        },
+    ]
+
+    triage = rec.classify_wake_triage(actions)
+
+    assert triage["mode"] == rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED
+    assert triage["wake_agent"] is True
+    assert triage["summary"][rec.WAKE_BUCKET_COMPACT_NOTIFY] == 1
+    assert triage["summary"][rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED] == 1
 
 
 def test_reconciler_splits_dead_expired_and_stale_heartbeat(kanban_home):
@@ -525,6 +587,8 @@ def test_reconcile_cli_json_is_read_only(kanban_home):
     assert db_path.with_name(db_path.name + "-shm").exists() == shm_before
     assert payload["mutation_applied"] is False
     assert "blocked_with_completed_parents_decision" in _kinds(payload)
+    assert payload["wake_triage"]["mode"] == rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED
+    assert payload["wake_triage"]["wake_agent"] is True
 
 
 def test_reconcile_cli_text_groups_actions(kanban_home):
@@ -537,6 +601,7 @@ def test_reconcile_cli_text_groups_actions(kanban_home):
 
     assert "Kanban reconcile:" in out
     assert "Summary:" in out
+    assert "Wake triage:" in out
     assert "old_ready_nonspawnable" in out
 
 
@@ -578,6 +643,8 @@ def test_reconcile_text_is_compact_and_points_to_json_for_full_payload():
     )
 
     assert "Summary:" in text
+    assert "Wake triage:" in text
+    assert "mode=compact_notify wake_agent=false" in text
     assert "Examples (first 1; full payload: rerun with --json):" in text
     assert "... 2 more action(s) omitted" in text
     assert "highlights:" in text
@@ -605,4 +672,6 @@ def test_reconcile_cli_examples_limits_human_output_but_json_remains_full(kanban
     assert "Examples (first 1; full payload: rerun with --json):" in text
     assert "more action(s) omitted" in text
     assert len(payload["actions"]) >= 3
+    assert payload["wake_triage"]["mode"] == rec.WAKE_BUCKET_COMPACT_NOTIFY
+    assert payload["wake_triage"]["wake_agent"] is False
     assert payload["mutation_applied"] is False
