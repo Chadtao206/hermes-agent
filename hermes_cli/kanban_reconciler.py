@@ -21,6 +21,13 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 
 
+_SYSTEMIC_FAILURE_CLASSES = {
+    kb.FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE,
+    kb.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+    "pre_spawn_validation",
+}
+
+
 @dataclass(frozen=True)
 class ReconcileAction:
     kind: str
@@ -259,6 +266,64 @@ def _pre_spawn_validation_errors_for_reconcile(task: kb.Task) -> list[str]:
             if missing:
                 errors.append("missing forced skill(s): " + ", ".join(missing))
     return errors
+
+
+def _latest_failure_payloads(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return recent structured failure payloads for a task."""
+    rows = conn.execute(
+        """
+        SELECT kind, payload, created_at
+          FROM task_events
+         WHERE task_id = ?
+           AND kind IN (
+               'gave_up', 'spawn_failed', 'crashed', 'timed_out',
+               'pre_spawn_validation_failed', 'systemic_failure_signature',
+               'protocol_violation'
+           )
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?
+        """,
+        (task_id, max(1, int(limit))),
+    ).fetchall()
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload = dict(payload)
+        payload.setdefault("event_kind", row["kind"])
+        payload.setdefault("created_at", row["created_at"])
+        payloads.append(payload)
+    return payloads
+
+
+def _failure_signature_from_payloads(
+    payloads: list[dict[str, Any]],
+    fallback_error: Optional[str],
+) -> Optional[str]:
+    for payload in payloads:
+        sig = str(payload.get("failure_signature") or "").strip()
+        if sig:
+            return sig
+    error = str(fallback_error or "").strip()
+    if not error:
+        return None
+    return kb._error_fingerprint(error)
+
+
+def _count_values(items: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    return counts
 
 
 def _snapshot_sidecar(path: Path, suffix: str) -> Path:
@@ -543,6 +608,84 @@ def collect_reconcile_actions(
                 "workspace_path": task.workspace_path,
                 "skills": task.skills or [],
                 "validation_errors": errors,
+            },
+        ))
+
+    # Repeated same-signature failures across tasks are often platform/profile
+    # defects rather than independent task failures.  The dispatcher already
+    # has a same-tick systemic breaker; this read-only view catches durable
+    # residue across ticks/sessions and preserves structured failure-class
+    # metadata when it exists.
+    failure_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in conn.execute(
+        """
+        SELECT id, status, assignee, consecutive_failures, last_failure_error
+          FROM tasks
+         WHERE status NOT IN ('done','archived')
+           AND consecutive_failures > 0
+           AND last_failure_error IS NOT NULL
+         ORDER BY id
+        """
+    ):
+        payloads = _latest_failure_payloads(conn, row["id"])
+        failure_signature = _failure_signature_from_payloads(
+            payloads, row["last_failure_error"]
+        )
+        if not failure_signature:
+            continue
+        failure_classes = sorted({
+            str(payload.get("failure_class"))
+            for payload in payloads
+            if payload.get("failure_class")
+        })
+        triggers = sorted({
+            str(payload.get("trigger_outcome"))
+            for payload in payloads
+            if payload.get("trigger_outcome")
+        })
+        failure_groups.setdefault(failure_signature, []).append({
+            "task_id": row["id"],
+            "status": row["status"],
+            "assignee": row["assignee"],
+            "consecutive_failures": int(row["consecutive_failures"] or 0),
+            "last_failure_error": str(row["last_failure_error"] or "")[:240],
+            "failure_classes": failure_classes,
+            "trigger_outcomes": triggers,
+        })
+    for failure_signature, tasks in failure_groups.items():
+        failure_classes = sorted({
+            failure_class
+            for task in tasks
+            for failure_class in task.get("failure_classes", [])
+        })
+        systemic_metadata = bool(
+            set(failure_classes).intersection(_SYSTEMIC_FAILURE_CLASSES)
+        )
+        threshold = kb.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD
+        if len(tasks) < threshold and not systemic_metadata:
+            continue
+        status_counts = _count_values([str(task["status"]) for task in tasks])
+        assignee_counts = _count_values([
+            str(task["assignee"] or "unassigned") for task in tasks
+        ])
+        actions.append(_action(
+            "repeated_failure_signature_decision",
+            None,
+            "error" if systemic_metadata else "warning",
+            "multiple non-terminal tasks share a failure signature or systemic failure metadata; treat as possible platform/profile defect before retrying",
+            safe_to_apply=False,
+            details={
+                "failure_signature": failure_signature,
+                "task_count": len(tasks),
+                "signature_threshold": threshold,
+                "systemic_metadata_present": systemic_metadata,
+                "failure_classes": failure_classes,
+                "status_counts": status_counts,
+                "assignee_counts": assignee_counts,
+                "total_consecutive_failures": sum(
+                    int(task["consecutive_failures"]) for task in tasks
+                ),
+                "tasks": tasks[:10],
             },
         ))
 

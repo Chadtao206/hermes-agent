@@ -351,6 +351,82 @@ def test_pre_spawn_validation_suppresses_when_forced_skill_exists(kanban_home, m
     assert _actions(result, "pre_spawn_validation_decision") == []
 
 
+def test_repeated_failure_signature_surfaces_platform_defect_risk(kanban_home):
+    with kb.connect() as conn:
+        task_ids = [
+            kb.create_task(conn, title=f"flaky {idx}", assignee="engineer")
+            for idx in range(kb.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD)
+        ]
+        for idx, task_id in enumerate(task_ids):
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+                (f"pid {10000 + idx} not alive", task_id),
+            )
+
+    result = rec.run_reconciler(now=1_700_000_000, ready_age_seconds=999999)
+    actions = _actions(result, "repeated_failure_signature_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["task_id"] is None
+    assert actions[0]["safe_to_apply"] is False
+    assert actions[0]["severity"] == "warning"
+    details = actions[0]["details"]
+    assert details["failure_signature"] == "pid n not alive"
+    assert details["task_count"] == kb.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD
+    assert details["status_counts"] == {"ready": kb.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD}
+    assert len(details["tasks"]) == kb.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD
+
+
+def test_repeated_failure_signature_respects_threshold(kanban_home):
+    with kb.connect() as conn:
+        for idx in range(kb.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD - 1):
+            task_id = kb.create_task(conn, title=f"flaky {idx}", assignee="engineer")
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+                (f"pid {20000 + idx} not alive", task_id),
+            )
+
+    result = rec.run_reconciler(now=1_700_000_000, ready_age_seconds=999999)
+
+    assert _actions(result, "repeated_failure_signature_decision") == []
+
+
+def test_repeated_failure_signature_surfaces_systemic_metadata_below_threshold(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="systemic", assignee="engineer")
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', consecutive_failures = 1, "
+            "last_failure_error = 'same platform failure' WHERE id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_events(task_id, kind, payload, created_at)
+            VALUES (?, 'gave_up', ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps({
+                    "failure_class": kb.FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE,
+                    "failure_signature": "platform-profile-boom",
+                    "trigger_outcome": "spawn_failed",
+                }),
+                1_700_000_000,
+            ),
+        )
+
+    result = rec.run_reconciler(now=1_700_000_000, ready_age_seconds=999999)
+    actions = _actions(result, "repeated_failure_signature_decision")
+
+    assert len(actions) == 1
+    assert actions[0]["severity"] == "error"
+    details = actions[0]["details"]
+    assert details["failure_signature"] == "platform-profile-boom"
+    assert details["task_count"] == 1
+    assert details["systemic_metadata_present"] is True
+    assert kb.FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE in details["failure_classes"]
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")
