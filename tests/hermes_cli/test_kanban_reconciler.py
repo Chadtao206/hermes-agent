@@ -975,6 +975,61 @@ def test_orphan_claim_lock_is_reported_for_non_running_task(kanban_home):
     assert summary_bucket >= 1
 
 
+def test_apply_reconcile_decision_clear_orphan_claim_lock(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ready orphan", assignee="engineer")
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', claim_lock = ?, claim_expires = ?,
+                   worker_pid = ?, created_at = ?
+             WHERE id = ?
+            """,
+            ("dead-host:abc", now - 60, 99999999, now - 3600, task_id),
+        )
+
+    result = rec.run_reconciler(now=now)
+    action = _actions(result, "orphan_claim_lock_observed")[0]
+    applied = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="clear_orphan_claim_lock",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+    )
+
+    assert applied["ok"] is True
+    assert applied["mutation"] == "clear_claim_lock"
+    assert applied["mutation_applied"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.claim_lock is None
+    assert task.claim_expires is None
+    assert any("option=clear_orphan_claim_lock" in comment.body for comment in comments)
+    clear_events = [event for event in events if event.kind == "reconcile_orphan_claim_lock_cleared"]
+    assert len(clear_events) == 1
+    assert clear_events[0].payload["previous_claim_lock"] == "dead-host:abc"
+
+    post = rec.run_reconciler(now=now)
+    assert _actions(post, "orphan_claim_lock_observed") == []
+
+    stale_retry = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="clear_orphan_claim_lock",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        now=now,
+    )
+    assert stale_retry["ok"] is False
+    assert "no current orphan claim-lock action" in stale_retry["error"]
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")

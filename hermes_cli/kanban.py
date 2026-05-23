@@ -515,7 +515,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_reconcile.add_argument(
         "--apply-option",
-        choices=["keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout"],
+        choices=["keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout", "clear_orphan_claim_lock"],
         default=None,
         help="Apply one explicitly gated reconcile decision option",
     )
@@ -527,7 +527,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reconcile.add_argument(
         "--packet-signature",
         default=None,
-        help="Current decision packet signature required for --apply-option",
+        help="Current decision packet/action signature required for --apply-option",
     )
     p_reconcile.add_argument(
         "--pr-head-sha",

@@ -1368,6 +1368,113 @@ def _remediate_parent_closeout_pr_head(
     )
 
 
+def _find_reconcile_action(
+    actions: list[dict[str, Any]],
+    *,
+    task_id: str,
+    kind: str,
+    signature: str,
+) -> Optional[dict[str, Any]]:
+    for action in actions:
+        if (
+            action.get("kind") == kind
+            and action.get("task_id") == task_id
+            and action.get("signature") == signature
+        ):
+            return action
+    return None
+
+
+def _apply_clear_orphan_claim_lock(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    action_signature: str,
+    action: dict[str, Any],
+    board: Optional[str],
+    path: Path,
+    author: str,
+    as_of: int,
+) -> dict[str, Any]:
+    comment = _reconcile_decision_applied_comment(
+        option="clear_orphan_claim_lock",
+        packet_signature=action_signature,
+        category="orphan_claim_lock",
+        mutation="clear_claim_lock",
+    )
+    with kb.write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT id, status, claim_lock, claim_expires
+              FROM tasks
+             WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["claim_lock"] is None
+            or row["status"] in {"running", "done", "archived"}
+        ):
+            return _apply_error(
+                "orphan claim lock is no longer present",
+                board=board,
+                task_id=task_id,
+                option="clear_orphan_claim_lock",
+                packet=action,
+            )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET claim_lock = NULL,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND claim_lock IS NOT NULL
+               AND status NOT IN ('running', 'done', 'archived')
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return _apply_error(
+                "orphan claim lock could not be cleared in its current state",
+                board=board,
+                task_id=task_id,
+                option="clear_orphan_claim_lock",
+                packet=action,
+            )
+        now = int(time.time())
+        comment_cur = conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, (author or "jensen").strip(), comment, now),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "reconcile_orphan_claim_lock_cleared",
+            {
+                "previous_claim_lock": row["claim_lock"],
+                "previous_claim_expires": row["claim_expires"],
+                "action_signature": action_signature,
+                "source": "kanban_reconcile_apply",
+            },
+        )
+    return {
+        "ok": True,
+        "board": board or kb.get_current_board(),
+        "db_path": str(path),
+        "task_id": task_id,
+        "option": "clear_orphan_claim_lock",
+        "packet_signature": action_signature,
+        "packet": action,
+        "plan": None,
+        "comment_id": int(comment_cur.lastrowid or 0),
+        "comment": comment,
+        "mutation_applied": True,
+        "mutation": "clear_claim_lock",
+        "as_of": as_of,
+    }
+
+
 def apply_reconcile_decision(
     *,
     task_id: str,
@@ -1390,7 +1497,7 @@ def apply_reconcile_decision(
     option = str(option or "").strip()
     task_id = str(task_id or "").strip()
     packet_signature = str(packet_signature or "").strip()
-    if option not in {"keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout"}:
+    if option not in {"keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout", "clear_orphan_claim_lock"}:
         return _apply_error(
             "unsupported reconcile apply option for gated apply",
             board=board,
@@ -1439,6 +1546,31 @@ def apply_reconcile_decision(
             now=as_of,
         )
         action_dicts = actions_to_dicts(actions)
+        if option == "clear_orphan_claim_lock":
+            action = _find_reconcile_action(
+                action_dicts,
+                task_id=task_id,
+                kind="orphan_claim_lock_observed",
+                signature=packet_signature,
+            )
+            if action is None:
+                return _apply_error(
+                    "no current orphan claim-lock action matches task/signature",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                )
+            return _apply_clear_orphan_claim_lock(
+                conn,
+                task_id=task_id,
+                action_signature=packet_signature,
+                action=action,
+                board=board,
+                path=path,
+                author=author,
+                as_of=as_of,
+            )
+
         triage = classify_wake_triage(action_dicts)
         packet = _find_decision_packet(triage.get("decision_packets") or [], task_id)
         if packet is None:
