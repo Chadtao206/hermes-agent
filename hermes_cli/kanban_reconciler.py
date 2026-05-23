@@ -857,13 +857,20 @@ def collect_reconcile_actions(
                 details={**base, "host_local": host_local},
             ))
         if expired:
+            lock = row["claim_lock"] or ""
+            host_local = bool(host_prefix and lock.startswith(host_prefix))
+            safe = (host_local and not pid_alive) or row["worker_pid"] is None
             actions.append(_action(
                 "expired_claim_candidate",
                 row["id"],
                 "warning",
                 "running task claim has expired",
-                safe_to_apply=False,
-                details={**base, "seconds_expired": as_of - int(claim_expires)},
+                safe_to_apply=safe,
+                details={
+                    **base,
+                    "seconds_expired": as_of - int(claim_expires),
+                    "host_local": host_local,
+                },
             ))
         if stale_hb:
             actions.append(_action(
@@ -1475,6 +1482,85 @@ def _apply_clear_orphan_claim_lock(
     }
 
 
+def _apply_reclaim_running_claim(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    option: str,
+    action_kind: str,
+    action_signature: str,
+    action: dict[str, Any],
+    board: Optional[str],
+    path: Path,
+    author: str,
+    as_of: int,
+) -> dict[str, Any]:
+    if not bool(action.get("safe_to_apply")):
+        return _apply_error(
+            f"current {action_kind} action is advisory, not safe to apply",
+            board=board,
+            task_id=task_id,
+            option=option,
+            packet=action,
+        )
+    comment = _reconcile_decision_applied_comment(
+        option=option,
+        packet_signature=action_signature,
+        category=action_kind,
+        mutation="reclaim_running_claim",
+    )
+    if not kb.reclaim_task(
+        conn,
+        task_id,
+        reason=f"kanban_reconcile_apply:{action_kind}:{action_signature}",
+    ):
+        return _apply_error(
+            "running claim could not be reclaimed in its current state",
+            board=board,
+            task_id=task_id,
+            option=option,
+            packet=action,
+        )
+    comment_id = kb.add_comment(conn, task_id, (author or "jensen").strip(), comment)
+    run_id = None
+    try:
+        events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "reclaimed"
+        ]
+        if events:
+            run_id = events[0].run_id
+    except Exception:
+        run_id = None
+    kb._append_event(
+        conn,
+        task_id,
+        "reconcile_running_claim_reclaimed",
+        {
+            "option": option,
+            "action_kind": action_kind,
+            "action_signature": action_signature,
+            "source": "kanban_reconcile_apply",
+        },
+        run_id=run_id,
+    )
+    return {
+        "ok": True,
+        "board": board or kb.get_current_board(),
+        "db_path": str(path),
+        "task_id": task_id,
+        "option": option,
+        "packet_signature": action_signature,
+        "packet": action,
+        "plan": None,
+        "comment_id": comment_id,
+        "comment": comment,
+        "mutation_applied": True,
+        "mutation": "reclaim_running_claim",
+        "as_of": as_of,
+    }
+
+
 def apply_reconcile_decision(
     *,
     task_id: str,
@@ -1489,15 +1575,24 @@ def apply_reconcile_decision(
 ) -> dict[str, Any]:
     """Apply one explicitly gated reconcile operator decision.
 
-    This first mutation slice intentionally supports only ``keep_parked`` and
-    only as a comment append.  It validates the current packet signature against
-    a fresh reconcile pass before writing, so stale wake output cannot be applied
-    blindly.
+    Every mutation path validates the current decision packet/action signature
+    against a fresh reconcile pass before writing, so stale wake output cannot
+    be applied blindly.
     """
     option = str(option or "").strip()
     task_id = str(task_id or "").strip()
     packet_signature = str(packet_signature or "").strip()
-    if option not in {"keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout", "clear_orphan_claim_lock"}:
+    if option not in {
+        "keep_parked",
+        "keep_blocked",
+        "unblock",
+        "close",
+        "manual_review_with_stale_pr_risk",
+        "remediate_parent_closeout",
+        "clear_orphan_claim_lock",
+        "reclaim_dead_running",
+        "reclaim_expired_claim",
+    }:
         return _apply_error(
             "unsupported reconcile apply option for gated apply",
             board=board,
@@ -1563,6 +1658,38 @@ def apply_reconcile_decision(
             return _apply_clear_orphan_claim_lock(
                 conn,
                 task_id=task_id,
+                action_signature=packet_signature,
+                action=action,
+                board=board,
+                path=path,
+                author=author,
+                as_of=as_of,
+            )
+
+        if option in {"reclaim_dead_running", "reclaim_expired_claim"}:
+            action_kind = (
+                "dead_running_candidate"
+                if option == "reclaim_dead_running"
+                else "expired_claim_candidate"
+            )
+            action = _find_reconcile_action(
+                action_dicts,
+                task_id=task_id,
+                kind=action_kind,
+                signature=packet_signature,
+            )
+            if action is None:
+                return _apply_error(
+                    f"no current {action_kind} action matches task/signature",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                )
+            return _apply_reclaim_running_claim(
+                conn,
+                task_id=task_id,
+                option=option,
+                action_kind=action_kind,
                 action_signature=packet_signature,
                 action=action,
                 board=board,

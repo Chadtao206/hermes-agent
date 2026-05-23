@@ -1030,6 +1030,154 @@ def test_apply_reconcile_decision_clear_orphan_claim_lock(kanban_home):
     assert "no current orphan claim-lock action" in stale_retry["error"]
 
 
+def _claimed_running_task(
+    *,
+    now: int,
+    claim_lock: str,
+    worker_pid: int | None,
+    claim_expires: int,
+) -> str:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="running", assignee="engineer")
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute(
+            """
+            UPDATE tasks
+               SET worker_pid = ?, claim_expires = ?, last_heartbeat_at = ?, started_at = ?
+             WHERE id = ?
+            """,
+            (worker_pid, claim_expires, now - 3600, now - 7200, task_id),
+        )
+        if run_id is not None:
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET worker_pid = ?, claim_expires = ?, last_heartbeat_at = ?
+                 WHERE id = ?
+                """,
+                (worker_pid, claim_expires, now - 3600, run_id),
+            )
+    return task_id
+
+
+def test_apply_reconcile_decision_reclaim_dead_running_claim(kanban_home, monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(rec, "_host_prefix", lambda: "local:")
+    task_id = _claimed_running_task(
+        now=now,
+        claim_lock="local:dead-worker",
+        worker_pid=99999999,
+        claim_expires=now + 3600,
+    )
+
+    result = rec.run_reconciler(now=now)
+    action = _actions(result, "dead_running_candidate")[0]
+    assert action["safe_to_apply"] is True
+    applied = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="reclaim_dead_running",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+    )
+
+    assert applied["ok"] is True
+    assert applied["mutation"] == "reclaim_running_claim"
+    assert applied["mutation_applied"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.claim_lock is None
+    assert task.claim_expires is None
+    assert task.current_run_id is None
+    assert any("option=reclaim_dead_running" in comment.body for comment in comments)
+    assert any(event.kind == "reconcile_running_claim_reclaimed" for event in events)
+    assert runs[0].outcome == "reclaimed"
+
+    post = rec.run_reconciler(now=now)
+    assert _actions(post, "dead_running_candidate") == []
+
+    stale_retry = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="reclaim_dead_running",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        now=now,
+    )
+    assert stale_retry["ok"] is False
+    assert "no current dead_running_candidate action" in stale_retry["error"]
+
+
+def test_apply_reconcile_decision_reclaim_expired_claim_without_pid(kanban_home):
+    now = 1_700_000_000
+    task_id = _claimed_running_task(
+        now=now,
+        claim_lock="unknown-host:expired-no-pid",
+        worker_pid=None,
+        claim_expires=now - 60,
+    )
+
+    result = rec.run_reconciler(now=now)
+    action = _actions(result, "expired_claim_candidate")[0]
+    assert action["safe_to_apply"] is True
+    applied = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="reclaim_expired_claim",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+    )
+
+    assert applied["ok"] is True
+    assert applied["mutation"] == "reclaim_running_claim"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.claim_lock is None
+    assert any("option=reclaim_expired_claim" in comment.body for comment in comments)
+
+
+def test_apply_reconcile_decision_rejects_advisory_running_reclaim(kanban_home):
+    now = 1_700_000_000
+    task_id = _claimed_running_task(
+        now=now,
+        claim_lock="other-host:dead-worker",
+        worker_pid=99999999,
+        claim_expires=now - 60,
+    )
+
+    result = rec.run_reconciler(now=now)
+    action = _actions(result, "dead_running_candidate")[0]
+    assert action["safe_to_apply"] is False
+    rejected = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="reclaim_dead_running",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        now=now,
+    )
+
+    assert rejected["ok"] is False
+    assert "advisory, not safe to apply" in rejected["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.claim_lock == "other-host:dead-worker"
+    assert comments == []
+
+
 def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="done task", assignee="engineer")

@@ -515,7 +515,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_reconcile.add_argument(
         "--apply-option",
-        choices=["keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout", "clear_orphan_claim_lock"],
+        choices=[
+            "keep_parked",
+            "keep_blocked",
+            "unblock",
+            "close",
+            "manual_review_with_stale_pr_risk",
+            "remediate_parent_closeout",
+            "clear_orphan_claim_lock",
+            "reclaim_dead_running",
+            "reclaim_expired_claim",
+        ],
         default=None,
         help="Apply one explicitly gated reconcile decision option",
     )
