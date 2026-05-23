@@ -1368,6 +1368,79 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_complete_records_closeout_packet_and_is_idempotent_by_run_id(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="engineer")
+        kb.claim_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        assert kb.complete_task(
+            conn, t,
+            summary="Implemented the requested change.",
+            metadata={"changed_files": ["a.py"]},
+            expected_run_id=run_id,
+        )
+        assert kb.complete_task(
+            conn, t,
+            summary="duplicate closeout should be idempotent",
+            created_cards=["t_deadbeefcafe"],
+            expected_run_id=run_id,
+        )
+        run = kb.latest_run(conn, t)
+        completed_events = [e for e in kb.list_events(conn, t) if e.kind == "completed"]
+
+    assert run is not None
+    assert run.id == run_id
+    assert run.metadata is not None
+    packet = run.metadata["closeout_packet"]
+    assert packet["schema_version"] == 1
+    assert packet["run_id"] == run_id
+    assert packet["outcome"] == "completed"
+    assert packet["lane_type"] == "implementation"
+    assert packet["metadata_keys"] == ["changed_files"]
+    assert len(completed_events) == 1
+    assert completed_events[0].payload is not None
+    assert completed_events[0].payload["closeout_packet"]["run_id"] == run_id
+
+
+def test_block_records_closeout_packet_and_is_idempotent_by_run_id(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="reviewer")
+        kb.claim_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        assert kb.block_task(
+            conn, t,
+            reason="Need PR evidence before final review.",
+            expected_run_id=run_id,
+        )
+        assert kb.block_task(
+            conn, t,
+            reason="duplicate block should be idempotent",
+            expected_run_id=run_id,
+        )
+        run = kb.latest_run(conn, t)
+        blocked_events = [e for e in kb.list_events(conn, t) if e.kind == "blocked"]
+
+    assert run is not None
+    assert run.id == run_id
+    assert run.metadata is not None
+    packet = run.metadata["closeout_packet"]
+    assert packet["run_id"] == run_id
+    assert packet["outcome"] == "blocked"
+    assert packet["lane_type"] == "review"
+    assert packet["summary_preview"] == "Need PR evidence before final review."
+    assert len(blocked_events) == 1
+    assert blocked_events[0].payload is not None
+    assert blocked_events[0].payload["closeout_packet"]["run_id"] == run_id
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:

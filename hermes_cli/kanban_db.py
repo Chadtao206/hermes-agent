@@ -2501,6 +2501,107 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _lane_type_for_assignee(assignee: Optional[str]) -> str:
+    """Return a stable lane label for closeout packets."""
+    name = (assignee or "").strip().casefold()
+    if not name:
+        return "unassigned"
+    if name in {"engineer", "andrej"}:
+        return "implementation"
+    if name in {"reviewer", "boris"}:
+        return "review"
+    if name in {"researcher", "morty"}:
+        return "research"
+    if name in {"ops", "grace"}:
+        return "ops"
+    if name in {"designer", "iris"}:
+        return "design"
+    if name in {"default", "jensen"}:
+        return "orchestration"
+    return name
+
+
+def _closeout_packet(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    outcome: str,
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> dict:
+    """Build the deterministic handoff packet attached to terminal runs."""
+    row = conn.execute(
+        "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assignee = row["assignee"] if row else None
+    status = row["status"] if row else None
+    md_keys = []
+    if isinstance(metadata, dict):
+        md_keys = sorted(str(k) for k in metadata.keys() if k != "closeout_packet")
+    preview = (summary or "").strip().splitlines()[0][:400] if summary else None
+    return {
+        "schema_version": 1,
+        "task_id": task_id,
+        "run_id": int(run_id) if run_id is not None else None,
+        "outcome": outcome,
+        "terminal_status": status,
+        "assignee": assignee,
+        "lane_type": _lane_type_for_assignee(assignee),
+        "summary_preview": preview,
+        "metadata_keys": md_keys,
+    }
+
+
+def _metadata_with_closeout_packet(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    run_id: Optional[int],
+    outcome: str,
+    summary: Optional[str],
+) -> dict:
+    """Return metadata enriched with the standard closeout packet."""
+    enriched = dict(metadata or {})
+    enriched["closeout_packet"] = _closeout_packet(
+        conn, task_id,
+        run_id=run_id,
+        outcome=outcome,
+        summary=summary,
+        metadata=enriched,
+    )
+    return enriched
+
+
+def _terminal_run_already_closed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+    *,
+    outcome: str,
+    task_status: str,
+) -> bool:
+    """Return True for a duplicate closeout call for the same run_id."""
+    if expected_run_id is None:
+        return False
+    row = conn.execute(
+        """
+        SELECT t.status AS task_status, r.outcome, r.ended_at
+          FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.id = ? AND r.task_id = ?
+        """,
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    return bool(
+        row
+        and row["task_status"] == task_status
+        and row["outcome"] == outcome
+        and row["ended_at"] is not None
+    )
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3246,6 +3347,14 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    handoff_summary = summary if summary is not None else result
+
+    if _terminal_run_already_closed(
+        conn, task_id, expected_run_id,
+        outcome="completed",
+        task_status="done",
+    ):
+        return True
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -3308,33 +3417,61 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        active_run_id = _current_run_id(conn, task_id)
+        closeout_metadata = _metadata_with_closeout_packet(
+            conn, task_id, metadata,
+            run_id=active_run_id,
+            outcome="completed",
+            summary=handoff_summary,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
-            summary=summary if summary is not None else result,
-            metadata=metadata,
+            summary=handoff_summary,
+            metadata=closeout_metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
         if run_id is None and (summary or metadata or result):
+            closeout_metadata = _metadata_with_closeout_packet(
+                conn, task_id, metadata,
+                run_id=None,
+                outcome="completed",
+                summary=handoff_summary,
+            )
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
-                summary=summary if summary is not None else result,
-                metadata=metadata,
+                summary=handoff_summary,
+                metadata=closeout_metadata,
             )
+        if run_id is not None:
+            packet = closeout_metadata.get("closeout_packet")
+            if isinstance(packet, dict) and packet.get("run_id") is None:
+                closeout_metadata = _metadata_with_closeout_packet(
+                    conn, task_id, metadata,
+                    run_id=run_id,
+                    outcome="completed",
+                    summary=handoff_summary,
+                )
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(closeout_metadata, ensure_ascii=False), run_id),
+                )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
-        ev_summary = (summary if summary is not None else result) or ""
+        ev_summary = handoff_summary or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if isinstance(closeout_metadata.get("closeout_packet"), dict):
+            completed_payload["closeout_packet"] = closeout_metadata["closeout_packet"]
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -3343,14 +3480,13 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+        md_artifacts = closeout_metadata.get("artifacts")
+        if isinstance(md_artifacts, (list, tuple)):
+            cleaned_artifacts = [
+                str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
+            ]
+            if cleaned_artifacts:
+                completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -3525,6 +3661,13 @@ def block_task(
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running -> blocked``."""
+    if _terminal_run_already_closed(
+        conn, task_id, expected_run_id,
+        outcome="blocked",
+        task_status="blocked",
+    ):
+        return True
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -3555,20 +3698,51 @@ def block_task(
             )
         if cur.rowcount != 1:
             return False
+        active_run_id = _current_run_id(conn, task_id)
+        closeout_metadata = _metadata_with_closeout_packet(
+            conn, task_id, None,
+            run_id=active_run_id,
+            outcome="blocked",
+            summary=reason,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="blocked", status="blocked",
             summary=reason,
+            metadata=closeout_metadata,
         )
         # Synthesize a run when blocking a never-claimed task so the
         # reason is preserved in attempt history.
         if run_id is None and reason:
+            closeout_metadata = _metadata_with_closeout_packet(
+                conn, task_id, None,
+                run_id=None,
+                outcome="blocked",
+                summary=reason,
+            )
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="blocked",
                 summary=reason,
+                metadata=closeout_metadata,
             )
-        _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
+        if run_id is not None:
+            packet = closeout_metadata.get("closeout_packet")
+            if isinstance(packet, dict) and packet.get("run_id") is None:
+                closeout_metadata = _metadata_with_closeout_packet(
+                    conn, task_id, None,
+                    run_id=run_id,
+                    outcome="blocked",
+                    summary=reason,
+                )
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(closeout_metadata, ensure_ascii=False), run_id),
+                )
+        blocked_payload = {"reason": reason}
+        if isinstance(closeout_metadata.get("closeout_packet"), dict):
+            blocked_payload["closeout_packet"] = closeout_metadata["closeout_packet"]
+        _append_event(conn, task_id, "blocked", blocked_payload, run_id=run_id)
         return True
 
 
