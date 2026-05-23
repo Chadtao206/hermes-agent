@@ -146,6 +146,39 @@ def test_wake_triage_groups_duplicate_decision_actions_by_task():
         "scheduled_with_completed_parents_decision",
     ]
     assert second_packet["safe_to_apply"] is False
+    assert second_packet["primary_category"] == "review_evidence_gap"
+    assert second_packet["decision_categories"] == [
+        "parked_completed_dependencies",
+        "review_evidence_gap",
+    ]
+    assert second_packet["suggested_options"][:3] == [
+        "remediate_parent_closeout",
+        "keep_parked",
+        "manual_review_with_stale_pr_risk",
+    ]
+    assert "PR-head evidence" in second_packet["recommended_next_step"]
+
+
+def test_wake_triage_hints_blocked_completed_dependencies():
+    actions = [
+        {
+            "kind": "blocked_with_completed_parents_decision",
+            "task_id": "t_blocked",
+            "severity": "warning",
+            "reason": "blocked parents done",
+            "safe_to_apply": False,
+            "signature": "blocked_with_completed_parents_decision:t_blocked:abc",
+            "details": {},
+        },
+    ]
+
+    triage = rec.classify_wake_triage(actions)
+    packet = triage["decision_packets"][0]
+
+    assert packet["primary_category"] == "blocked_completed_dependencies"
+    assert packet["decision_categories"] == ["blocked_completed_dependencies"]
+    assert packet["suggested_options"] == ["unblock", "keep_blocked", "close"]
+    assert "keep-blocked" in packet["recommended_next_step"]
 
 
 def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
@@ -184,6 +217,9 @@ def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
     assert "review_parent_pr_head_evidence_missing" in text
     assert "scheduled_with_completed_parents_decision" in text
     assert "Examples (first" not in text
+    assert "category: review_evidence_gap" in text
+    assert "options: remediate_parent_closeout, keep_parked" in text
+    assert "next: remediate parent closeout PR-head evidence" in text
 
 
 def test_reconciler_splits_dead_expired_and_stale_heartbeat(kanban_home):

@@ -86,6 +86,70 @@ def _highest_severity(severities: list[str]) -> str:
     )
 
 
+_DECISION_HINTS_BY_KIND: dict[str, dict[str, Any]] = {
+    "review_parent_pr_head_evidence_missing": {
+        "category": "review_evidence_gap",
+        "suggested_options": [
+            "remediate_parent_closeout",
+            "keep_parked",
+            "manual_review_with_stale_pr_risk",
+        ],
+        "next_step": (
+            "remediate parent closeout PR-head evidence before final review, "
+            "or explicitly accept stale-PR-gate risk"
+        ),
+    },
+    "scheduled_with_completed_parents_decision": {
+        "category": "parked_completed_dependencies",
+        "suggested_options": ["keep_parked", "unblock", "close"],
+        "next_step": "choose keep-parked, unblock, or close now that dependency parents are complete",
+    },
+    "blocked_with_completed_parents_decision": {
+        "category": "blocked_completed_dependencies",
+        "suggested_options": ["unblock", "keep_blocked", "close"],
+        "next_step": "choose unblock, keep-blocked, or close now that dependency parents are complete",
+    },
+}
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _decision_hint_for_kinds(kinds: list[str]) -> dict[str, Any]:
+    categories: list[str] = []
+    options: list[str] = []
+    next_steps: list[str] = []
+    for kind in kinds:
+        hint = _DECISION_HINTS_BY_KIND.get(str(kind))
+        if not hint:
+            categories.append("unclassified_decision")
+            options.extend(["inspect", "keep_parked"])
+            next_steps.append("inspect full reconcile payload and classify the operator decision")
+            continue
+        categories.append(str(hint["category"]))
+        options.extend(str(option) for option in hint.get("suggested_options", []))
+        next_steps.append(str(hint["next_step"]))
+
+    categories = sorted(set(categories))
+    options = _unique_preserving_order(options)
+    next_steps = _unique_preserving_order(next_steps)
+    primary_category = "review_evidence_gap" if "review_evidence_gap" in categories else (categories[0] if categories else "unclassified_decision")
+    return {
+        "primary_category": primary_category,
+        "decision_categories": categories,
+        "suggested_options": options,
+        "recommended_next_step": "; ".join(next_steps),
+    }
+
+
 def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group Jensen decision-required actions into operator decision packets.
 
@@ -130,6 +194,9 @@ def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[s
             str(packet.get("severity") or "warning"),
             str(action.get("severity") or "warning"),
         ])
+
+    for packet in grouped.values():
+        packet.update(_decision_hint_for_kinds(packet.get("kinds") or []))
 
     return sorted(
         grouped.values(),
@@ -1041,6 +1108,16 @@ def _decision_packet_lines_for_reconcile_text(
             f"- {str(packet.get('severity')).upper()} packet [{loc}] "
             f"({safe}; {int(packet.get('action_count') or 0)} action(s)): {kinds}"
         )
+        if packet.get("primary_category"):
+            lines.append(f"  category: {packet.get('primary_category')}")
+        options = packet.get("suggested_options") or []
+        if isinstance(options, list) and options:
+            lines.append("  options: " + ", ".join(str(option) for option in options[:5]))
+        next_step = packet.get("recommended_next_step")
+        if next_step:
+            lines.append(
+                "  next: " + _truncate_for_reconcile_text(next_step, limit=180)
+            )
         reasons = packet.get("reasons") or []
         if isinstance(reasons, list) and reasons:
             shown_reasons = [
