@@ -110,7 +110,10 @@ def test_wake_triage_groups_duplicate_decision_actions_by_task():
             "reason": "missing PR head evidence",
             "safe_to_apply": False,
             "signature": "review_parent_pr_head_evidence_missing:t_review:abc",
-            "details": {},
+            "details": {
+                "parents": "t_impl:done",
+                "parent_closeouts": [{"parent_task_id": "t_impl"}],
+            },
         },
         {
             "kind": "scheduled_with_completed_parents_decision",
@@ -157,6 +160,27 @@ def test_wake_triage_groups_duplicate_decision_actions_by_task():
         "manual_review_with_stale_pr_risk",
     ]
     assert "PR-head evidence" in second_packet["recommended_next_step"]
+    assert second_packet["affected_parent_task_ids"] == ["t_impl"]
+    plans = second_packet["operator_plans"]
+    assert set(plans) >= {
+        "remediate_parent_closeout",
+        "keep_parked",
+        "manual_review_with_stale_pr_risk",
+        "unblock",
+        "close",
+    }
+    remediation = plans["remediate_parent_closeout"]
+    assert remediation["dry_run"] is True
+    assert remediation["requires_confirmation"] is True
+    assert remediation["requires_input"] == [
+        "verified current PR head SHA for each remediated parent"
+    ]
+    remediation_commands = [step["command"] for step in remediation["commands"]]
+    assert any("hermes kanban show t_impl" in command for command in remediation_commands)
+    assert any("hermes kanban edit t_impl" in command for command in remediation_commands)
+    assert any("<verified_pr_head_sha>" in command for command in remediation_commands)
+    unblock_commands = [step["command"] for step in plans["unblock"]["commands"]]
+    assert unblock_commands[-1] == "hermes kanban unblock t_review"
 
 
 def test_wake_triage_hints_blocked_completed_dependencies():
@@ -179,6 +203,12 @@ def test_wake_triage_hints_blocked_completed_dependencies():
     assert packet["decision_categories"] == ["blocked_completed_dependencies"]
     assert packet["suggested_options"] == ["unblock", "keep_blocked", "close"]
     assert "keep-blocked" in packet["recommended_next_step"]
+    assert packet["operator_plans"]["keep_blocked"]["commands"][0]["command"].startswith(
+        "hermes kanban comment t_blocked"
+    )
+    assert packet["operator_plans"]["close"]["commands"][0]["command"].startswith(
+        "hermes kanban complete t_blocked"
+    )
 
 
 def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
@@ -190,7 +220,10 @@ def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
             "reason": "missing PR head evidence",
             "safe_to_apply": False,
             "signature": "review_parent_pr_head_evidence_missing:t_review:abc",
-            "details": {},
+            "details": {
+                "parents": "t_impl:done",
+                "parent_closeouts": [{"parent_task_id": "t_impl"}],
+            },
         },
         {
             "kind": "scheduled_with_completed_parents_decision",
@@ -219,6 +252,7 @@ def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
     assert "Examples (first" not in text
     assert "category: review_evidence_gap" in text
     assert "options: remediate_parent_closeout, keep_parked" in text
+    assert "dry-run plans: remediate_parent_closeout:2 cmd(s), keep_parked:1 cmd(s)" in text
     assert "next: remediate parent closeout PR-head evidence" in text
 
 

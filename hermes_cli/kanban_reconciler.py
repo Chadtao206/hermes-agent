@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import tempfile
@@ -141,12 +142,188 @@ def _decision_hint_for_kinds(kinds: list[str]) -> dict[str, Any]:
     categories = sorted(set(categories))
     options = _unique_preserving_order(options)
     next_steps = _unique_preserving_order(next_steps)
-    primary_category = "review_evidence_gap" if "review_evidence_gap" in categories else (categories[0] if categories else "unclassified_decision")
+    primary_category = (
+        "review_evidence_gap"
+        if "review_evidence_gap" in categories
+        else (categories[0] if categories else "unclassified_decision")
+    )
     return {
         "primary_category": primary_category,
         "decision_categories": categories,
         "suggested_options": options,
         "recommended_next_step": "; ".join(next_steps),
+    }
+
+
+def _kanban_cli_command(*args: Any) -> str:
+    return " ".join(shlex.quote(str(arg)) for arg in ("hermes", "kanban", *args))
+
+
+def _plan_step(command: str, purpose: str, *, mutates: bool) -> dict[str, Any]:
+    return {"command": command, "purpose": purpose, "mutates": mutates}
+
+
+def _packet_comment_text(packet: dict[str, Any], option: str) -> str:
+    category = packet.get("primary_category") or "unclassified_decision"
+    return (
+        f"Jensen reconcile decision dry-run option selected: {option}; "
+        f"category={category}; packet={packet.get('packet_id')}"
+    )
+
+
+def _metadata_arg(**values: Any) -> str:
+    clean = {key: value for key, value in values.items() if value is not None}
+    return json.dumps(clean, sort_keys=True, separators=(",", ":"))
+
+
+def _parent_ids_for_action(action: dict[str, Any]) -> list[str]:
+    details = action.get("details") or {}
+    if not isinstance(details, dict):
+        return []
+    parent_ids: list[str] = []
+    closeouts = details.get("parent_closeouts")
+    if isinstance(closeouts, list):
+        for closeout in closeouts:
+            if isinstance(closeout, dict) and closeout.get("parent_task_id"):
+                parent_ids.append(str(closeout["parent_task_id"]))
+    parent_state = details.get("parents")
+    if isinstance(parent_state, str):
+        for item in parent_state.split(","):
+            parent_id = item.strip().split(":", 1)[0].strip()
+            if parent_id:
+                parent_ids.append(parent_id)
+    return _unique_preserving_order(parent_ids)
+
+
+def _operator_plan_for_option(packet: dict[str, Any], option: str) -> dict[str, Any]:
+    task_id = packet.get("task_id")
+    parent_ids = list(packet.get("affected_parent_task_ids") or [])
+    plan: dict[str, Any] = {
+        "option": option,
+        "dry_run": True,
+        "requires_confirmation": True,
+        "mutates_when_applied": option not in {"inspect"},
+        "preflight": [],
+        "commands": [],
+        "postcheck": [_plan_step(
+            _kanban_cli_command("reconcile", "--json"),
+            "verify reconcile signal after any manual action",
+            mutates=False,
+        )],
+        "requires_input": [],
+        "notes": [],
+    }
+    if task_id:
+        plan["preflight"].append(_plan_step(
+            _kanban_cli_command("show", task_id),
+            "inspect current task state before applying an operator decision",
+            mutates=False,
+        ))
+    plan["preflight"].append(_plan_step(
+        _kanban_cli_command("reconcile", "--json"),
+        "confirm the decision packet is still current",
+        mutates=False,
+    ))
+
+    if not task_id:
+        plan["mutates_when_applied"] = False
+        plan["notes"].append("board-level packet has no task-specific mutation plan")
+        return plan
+
+    comment = _packet_comment_text(packet, option)
+    if option in {"keep_parked", "keep_blocked"}:
+        plan["commands"].append(_plan_step(
+            _kanban_cli_command("comment", task_id, comment),
+            "record explicit operator decision without changing task status",
+            mutates=True,
+        ))
+    elif option == "unblock":
+        plan["commands"].extend([
+            _plan_step(
+                _kanban_cli_command("comment", task_id, comment),
+                "record why the parked/blocked task is being released",
+                mutates=True,
+            ),
+            _plan_step(
+                _kanban_cli_command("unblock", task_id),
+                "return task to ready for dispatcher/profile processing",
+                mutates=True,
+            ),
+        ])
+    elif option == "close":
+        result = "Closed by explicit Jensen reconcile decision after completed dependencies."
+        metadata = _metadata_arg(
+            reconcile_decision="close",
+            source="kanban_reconcile_dry_run",
+            packet_id=packet.get("packet_id"),
+        )
+        plan["commands"].append(_plan_step(
+            _kanban_cli_command(
+                "complete",
+                task_id,
+                "--result",
+                result,
+                "--summary",
+                result,
+                "--metadata",
+                metadata,
+            ),
+            "close task with structured reconcile-decision metadata",
+            mutates=True,
+        ))
+    elif option == "remediate_parent_closeout":
+        if not parent_ids:
+            plan["requires_input"].append("parent task id(s) needing PR-head evidence")
+        plan["requires_input"].append("verified current PR head SHA for each remediated parent")
+        for parent_id in parent_ids or ["<parent_task_id>"]:
+            metadata = _metadata_arg(
+                pr_head_sha="<verified_pr_head_sha>",
+                reconcile_remediation_for=task_id,
+                source="kanban_reconcile_dry_run",
+            )
+            plan["commands"].extend([
+                _plan_step(
+                    _kanban_cli_command("show", parent_id),
+                    "inspect parent closeout before backfilling PR-head evidence",
+                    mutates=False,
+                ),
+                _plan_step(
+                    _kanban_cli_command(
+                        "edit",
+                        parent_id,
+                        "--result",
+                        "<existing result plus verified current PR head evidence>",
+                        "--metadata",
+                        metadata,
+                    ),
+                    "backfill structured PR-head evidence on completed parent closeout",
+                    mutates=True,
+                ),
+            ])
+    elif option == "manual_review_with_stale_pr_risk":
+        risk_comment = comment + "; accepted_risk=stale_pr_head_gate_unenforceable"
+        plan["commands"].extend([
+            _plan_step(
+                _kanban_cli_command("comment", task_id, risk_comment),
+                "record explicit acceptance of stale-PR-gate risk",
+                mutates=True,
+            ),
+            _plan_step(
+                _kanban_cli_command("unblock", task_id),
+                "release review despite missing current-PR-head evidence",
+                mutates=True,
+            ),
+        ])
+    else:
+        plan["mutates_when_applied"] = False
+        plan["notes"].append("unclassified option; inspect packet before choosing a mutation")
+    return plan
+
+
+def _operator_plans_for_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(option): _operator_plan_for_option(packet, str(option))
+        for option in packet.get("suggested_options") or []
     }
 
 
@@ -175,6 +352,7 @@ def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[s
                 "kinds": [],
                 "signatures": [],
                 "reasons": [],
+                "affected_parent_task_ids": [],
                 "safe_to_apply": True,
                 "actions": [],
             },
@@ -189,6 +367,10 @@ def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[s
         reason = action.get("reason")
         if reason and reason not in packet["reasons"]:
             packet["reasons"].append(reason)
+        packet["affected_parent_task_ids"] = _unique_preserving_order([
+            *packet.get("affected_parent_task_ids", []),
+            *_parent_ids_for_action(action),
+        ])
         packet["safe_to_apply"] = bool(packet["safe_to_apply"] and action.get("safe_to_apply"))
         packet["severity"] = _highest_severity([
             str(packet.get("severity") or "warning"),
@@ -197,6 +379,7 @@ def group_decision_actions_by_task(actions: list[dict[str, Any]]) -> list[dict[s
 
     for packet in grouped.values():
         packet.update(_decision_hint_for_kinds(packet.get("kinds") or []))
+        packet["operator_plans"] = _operator_plans_for_packet(packet)
 
     return sorted(
         grouped.values(),
@@ -1113,6 +1296,15 @@ def _decision_packet_lines_for_reconcile_text(
         options = packet.get("suggested_options") or []
         if isinstance(options, list) and options:
             lines.append("  options: " + ", ".join(str(option) for option in options[:5]))
+        operator_plans = packet.get("operator_plans") or {}
+        if isinstance(operator_plans, dict) and operator_plans:
+            previews = []
+            for option, plan in list(operator_plans.items())[:4]:
+                if isinstance(plan, dict):
+                    command_count = len(plan.get("commands") or [])
+                    previews.append(f"{option}:{command_count} cmd(s)")
+            if previews:
+                lines.append("  dry-run plans: " + ", ".join(previews))
         next_step = packet.get("recommended_next_step")
         if next_step:
             lines.append(
