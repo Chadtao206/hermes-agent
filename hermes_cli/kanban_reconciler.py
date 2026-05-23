@@ -762,7 +762,95 @@ def run_reconciler(
     }
 
 
-def format_reconcile_text(result: dict[str, Any]) -> str:
+def _truncate_for_reconcile_text(value: Any, *, limit: int = 160) -> str:
+    text = str(value or "")
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _format_count_map_for_reconcile_text(value: Any, *, limit: int = 4) -> Optional[str]:
+    if not isinstance(value, dict) or not value:
+        return None
+    items = sorted(value.items(), key=lambda item: (-int(item[1] or 0), str(item[0])))
+    shown = [f"{key}={count}" for key, count in items[:limit]]
+    omitted = len(items) - len(shown)
+    if omitted > 0:
+        shown.append(f"+{omitted} more")
+    return ", ".join(shown)
+
+
+def _detail_highlights_for_reconcile_text(action: dict[str, Any]) -> str:
+    """Return bounded, human-scannable action details for Slack/terminal output."""
+    details = action.get("details") or {}
+    if not isinstance(details, dict) or not details:
+        return ""
+
+    fragments: list[str] = []
+    for key in (
+        "assignee",
+        "status",
+        "age_seconds",
+        "parent_count",
+        "parents",
+        "workspace_kind",
+        "workspace_path",
+        "failure_signature",
+        "task_count",
+        "signature_threshold",
+        "total_consecutive_failures",
+        "review_task_count",
+        "skill",
+        "run_id",
+    ):
+        if key in details and details.get(key) not in (None, "", [], {}):
+            fragments.append(
+                f"{key}={_truncate_for_reconcile_text(details.get(key), limit=120)}"
+            )
+
+    for key in ("validation_errors", "failure_classes", "trigger_outcomes"):
+        value = details.get(key)
+        if isinstance(value, list) and value:
+            shown = [
+                _truncate_for_reconcile_text(item, limit=90)
+                for item in value[:3]
+            ]
+            if len(value) > len(shown):
+                shown.append(f"+{len(value) - len(shown)} more")
+            fragments.append(f"{key}=[" + "; ".join(shown) + "]")
+
+    for key in ("status_counts", "assignee_counts"):
+        formatted = _format_count_map_for_reconcile_text(details.get(key))
+        if formatted:
+            fragments.append(f"{key}={formatted}")
+
+    task_examples = details.get("tasks")
+    if isinstance(task_examples, list) and task_examples:
+        shown_tasks: list[str] = []
+        for task in task_examples[:3]:
+            if isinstance(task, dict):
+                task_id = task.get("task_id") or task.get("id") or "?"
+                status = task.get("status") or "?"
+                assignee = task.get("assignee") or "unassigned"
+                shown_tasks.append(f"{task_id}/{status}/{assignee}")
+            else:
+                shown_tasks.append(_truncate_for_reconcile_text(task, limit=80))
+        if len(task_examples) > len(shown_tasks):
+            shown_tasks.append(f"+{len(task_examples) - len(shown_tasks)} more")
+        fragments.append("tasks=[" + "; ".join(shown_tasks) + "]")
+
+    if not fragments:
+        # Preserve observability without dumping arbitrarily large nested JSON.
+        keys = sorted(str(key) for key in details.keys())[:8]
+        if keys:
+            suffix = "" if len(details) <= len(keys) else f", +{len(details) - len(keys)} more"
+            fragments.append("detail_keys=" + ",".join(keys) + suffix)
+
+    return "; ".join(fragments[:8])
+
+
+def format_reconcile_text(result: dict[str, Any], *, max_examples: int = 5) -> str:
     actions = result.get("actions") or []
     if not actions:
         return f"Kanban reconcile: no stalled-transition actions ({result.get('board')})"
@@ -782,16 +870,21 @@ def format_reconcile_text(result: dict[str, Any]) -> str:
     ):
         lines.append(f"- {severity.upper()} {kind}: {count}")
 
-    lines.append("Actions:")
-    for action in actions:
+    bounded_examples = actions[: max(0, int(max_examples or 0))]
+    omitted = max(0, len(actions) - len(bounded_examples))
+    lines.append(f"Examples (first {len(bounded_examples)}; full payload: rerun with --json):")
+    for action in bounded_examples:
         loc = action.get("task_id") or "board"
         safe = "safe" if action.get("safe_to_apply") else "decision-only"
+        reason = _truncate_for_reconcile_text(action.get("reason"), limit=180)
         lines.append(
             f"- {str(action.get('severity')).upper()} {action.get('kind')} "
-            f"[{loc}] ({safe}): {action.get('reason')}"
+            f"[{loc}] ({safe}): {reason}"
         )
+        highlights = _detail_highlights_for_reconcile_text(action)
+        if highlights:
+            lines.append(f"  highlights: {highlights}")
         lines.append(f"  signature: {action.get('signature')}")
-        details = action.get("details") or {}
-        if details:
-            lines.append("  details: " + json.dumps(details, sort_keys=True, default=str))
+    if omitted:
+        lines.append(f"... {omitted} more action(s) omitted from compact output; rerun with --json for full details.")
     return "\n".join(lines)

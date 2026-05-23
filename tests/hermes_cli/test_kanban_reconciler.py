@@ -538,3 +538,71 @@ def test_reconcile_cli_text_groups_actions(kanban_home):
     assert "Kanban reconcile:" in out
     assert "Summary:" in out
     assert "old_ready_nonspawnable" in out
+
+
+def test_reconcile_text_is_compact_and_points_to_json_for_full_payload():
+    actions = []
+    for idx in range(3):
+        actions.append({
+            "kind": "repeated_failure_signature_decision",
+            "task_id": None,
+            "severity": "warning",
+            "reason": "multiple non-terminal tasks share a failure signature or systemic failure metadata; treat as possible platform/profile defect before retrying",
+            "safe_to_apply": False,
+            "signature": f"sig-{idx}",
+            "details": {
+                "failure_signature": "spawn failure with a very long normalized platform signature " + ("x" * 200),
+                "task_count": 12,
+                "status_counts": {"ready": 8, "blocked": 4},
+                "assignee_counts": {"engineer": 7, "reviewer": 5},
+                "tasks": [
+                    {
+                        "task_id": f"t_{idx}_{task_idx}",
+                        "status": "ready",
+                        "assignee": "engineer",
+                        "last_failure_error": "full nested error should not be dumped " + ("y" * 500),
+                    }
+                    for task_idx in range(6)
+                ],
+                "large_nested_payload": {"secretly_too_big": "z" * 1000},
+            },
+        })
+
+    text = rec.format_reconcile_text(
+        {
+            "board": "default",
+            "db_path": "/tmp/kanban.db",
+            "actions": actions,
+        },
+        max_examples=1,
+    )
+
+    assert "Summary:" in text
+    assert "Examples (first 1; full payload: rerun with --json):" in text
+    assert "... 2 more action(s) omitted" in text
+    assert "highlights:" in text
+    assert "failure_signature=" in text
+    assert "status_counts=ready=8, blocked=4" in text
+    assert "details:" not in text
+    assert "large_nested_payload" not in text
+    assert "secretly_too_big" not in text
+    assert "full nested error should not be dumped" not in text
+
+
+def test_reconcile_cli_examples_limits_human_output_but_json_remains_full(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        for idx in range(3):
+            task_id = kb.create_task(conn, title=f"ready {idx}", assignee="missing-profile")
+            conn.execute(
+                "UPDATE tasks SET created_at = ? WHERE id = ?",
+                (now - 3600 - idx, task_id),
+            )
+
+    text = kc.run_slash("reconcile --ready-age-seconds 60 --examples 1")
+    payload = json.loads(kc.run_slash("reconcile --ready-age-seconds 60 --json"))
+
+    assert "Examples (first 1; full payload: rerun with --json):" in text
+    assert "more action(s) omitted" in text
+    assert len(payload["actions"]) >= 3
+    assert payload["mutation_applied"] is False

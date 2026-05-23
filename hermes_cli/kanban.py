@@ -507,6 +507,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=15 * 60,
         help="Classify ready/review tasks older than this threshold (default: 900)",
     )
+    p_reconcile.add_argument(
+        "--examples",
+        type=int,
+        default=5,
+        help="Maximum compact examples to include in human output (default: 5; full data via --json)",
+    )
 
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child relation")
@@ -1271,7 +1277,10 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     else:
-        print(krec.format_reconcile_text(result))
+        print(krec.format_reconcile_text(
+            result,
+            max_examples=max(0, int(getattr(args, "examples", 5) or 0)),
+        ))
     return 0
 
 
