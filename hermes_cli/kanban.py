@@ -515,7 +515,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_reconcile.add_argument(
         "--apply-option",
-        choices=["keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk"],
+        choices=["keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout"],
         default=None,
         help="Apply one explicitly gated reconcile decision option",
     )
@@ -528,6 +528,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--packet-signature",
         default=None,
         help="Current decision packet signature required for --apply-option",
+    )
+    p_reconcile.add_argument(
+        "--pr-head-sha",
+        default="",
+        help="Verified current PR head SHA required for --apply-option remediate_parent_closeout",
     )
     p_reconcile.add_argument(
         "--confirm-dry-run",
@@ -1299,6 +1304,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
             option=str(getattr(args, "apply_option", None) or ""),
             packet_signature=str(getattr(args, "packet_signature", None) or ""),
             confirm_dry_run=bool(getattr(args, "confirm_dry_run", False)),
+            pr_head_sha=str(getattr(args, "pr_head_sha", "") or ""),
             author=_profile_author(),
         )
         if getattr(args, "json", False):

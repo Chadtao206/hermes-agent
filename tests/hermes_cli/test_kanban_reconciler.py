@@ -258,6 +258,16 @@ def test_format_reconcile_text_uses_decision_packets_for_jensen_output():
 
 
 def _scheduled_completed_parent_packet(now: int, *, assignee: str = "reviewer") -> tuple[str, str]:
+    parent, child, packet_signature = _scheduled_completed_parent_packet_with_parent(
+        now,
+        assignee=assignee,
+    )
+    return child, packet_signature
+
+
+def _scheduled_completed_parent_packet_with_parent(
+    now: int, *, assignee: str = "reviewer"
+) -> tuple[str, str, str]:
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="engineer")
         child = kb.create_task(conn, title="child", assignee=assignee)
@@ -272,7 +282,7 @@ def _scheduled_completed_parent_packet(now: int, *, assignee: str = "reviewer") 
         packet for packet in result["wake_triage"]["decision_packets"]
         if packet["task_id"] == child
     )
-    return child, packet["packet_signature"]
+    return parent, child, packet["packet_signature"]
 
 
 def _blocked_completed_parent_packet(now: int, *, assignee: str = "reviewer") -> tuple[str, str]:
@@ -358,7 +368,7 @@ def test_apply_reconcile_decision_requires_confirmation_and_current_signature(ka
     )
     unsupported = rec.apply_reconcile_decision(
         task_id=child,
-        option="remediate_parent_closeout",
+        option="bogus_option",
         packet_signature=packet_signature,
         confirm_dry_run=True,
         now=now,
@@ -471,6 +481,54 @@ def test_apply_reconcile_decision_unblock_close_and_manual_review_mutate_status(
     assert task is not None
     assert task.status == "ready"
     assert any("option=manual_review_with_stale_pr_risk" in comment.body for comment in comments)
+
+
+def test_apply_reconcile_decision_remediates_parent_closeout_pr_head(kanban_home):
+    now = 1_700_000_000
+    parent, child, packet_signature = _scheduled_completed_parent_packet_with_parent(now)
+    pr_head_sha = "abcdef1234567890"
+
+    missing_sha = rec.apply_reconcile_decision(
+        task_id=child,
+        option="remediate_parent_closeout",
+        packet_signature=packet_signature,
+        confirm_dry_run=True,
+        now=now,
+        ready_age_seconds=60,
+    )
+    result = rec.apply_reconcile_decision(
+        task_id=child,
+        option="remediate_parent_closeout",
+        packet_signature=packet_signature,
+        confirm_dry_run=True,
+        author="jensen-test",
+        pr_head_sha=pr_head_sha,
+        now=now,
+        ready_age_seconds=60,
+    )
+
+    assert missing_sha["ok"] is False
+    assert "pr_head_sha" in missing_sha["error"]
+    assert result["ok"] is True
+    assert result["mutation"] == "parent_closeout_remediation"
+    with kb.connect() as conn:
+        parent_task = kb.get_task(conn, parent)
+        parent_runs = kb.list_runs(conn, parent)
+        child_task = kb.get_task(conn, child)
+        comments = kb.list_comments(conn, child)
+    assert parent_task is not None
+    assert pr_head_sha in (parent_task.result or "")
+    assert parent_runs[0].metadata["pr_head_sha"] == pr_head_sha
+    assert parent_runs[0].metadata["reconcile_remediation_for"] == child
+    assert child_task is not None
+    assert child_task.status == "scheduled"
+    assert any("option=remediate_parent_closeout" in comment.body for comment in comments)
+
+    post = rec.run_reconciler(now=now, ready_age_seconds=60)
+    child_actions = [
+        action["kind"] for action in post["actions"] if action.get("task_id") == child
+    ]
+    assert "review_parent_pr_head_evidence_missing" not in child_actions
 
 
 def test_reconciler_splits_dead_expired_and_stale_heartbeat(kanban_home):

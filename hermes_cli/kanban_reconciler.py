@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -1271,6 +1272,59 @@ def _find_existing_reconcile_decision_comment(
     return None
 
 
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _validate_reconcile_pr_head_sha(value: str) -> str:
+    sha = str(value or "").strip()
+    if not _GIT_SHA_RE.match(sha):
+        raise ValueError("pr_head_sha must be a 7-64 character hex git SHA")
+    return sha.lower()
+
+
+def _latest_completed_run_metadata(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    rows = kb.list_runs(conn, task_id)
+    completed = [run for run in rows if run.outcome == "completed"]
+    if not completed:
+        return {}
+    metadata = completed[0].metadata if isinstance(completed[0].metadata, dict) else {}
+    return dict(metadata)
+
+
+def _remediate_parent_closeout_pr_head(
+    conn: sqlite3.Connection,
+    *,
+    parent_task_id: str,
+    child_task_id: str,
+    packet_signature: str,
+    pr_head_sha: str,
+) -> bool:
+    parent = kb.get_task(conn, parent_task_id)
+    if parent is None or parent.status not in {"done", "archived"}:
+        return False
+    result = parent.result or ""
+    remediation_line = (
+        f"[Reconcile remediation] Verified current PR head SHA for {child_task_id}: "
+        f"{pr_head_sha}"
+    )
+    if pr_head_sha not in result:
+        result = (result.rstrip() + "\n\n" + remediation_line).strip()
+    metadata = _latest_completed_run_metadata(conn, parent_task_id)
+    metadata.update({
+        "pr_head_sha": pr_head_sha,
+        "reconcile_remediation_for": child_task_id,
+        "source": "kanban_reconcile_apply",
+        "packet_signature": packet_signature,
+    })
+    return kb.edit_completed_task_result(
+        conn,
+        parent_task_id,
+        result=result,
+        summary=result,
+        metadata=metadata,
+    )
+
+
 def apply_reconcile_decision(
     *,
     task_id: str,
@@ -1280,6 +1334,7 @@ def apply_reconcile_decision(
     board: Optional[str] = None,
     ready_age_seconds: int = 15 * 60,
     author: str = "jensen",
+    pr_head_sha: str = "",
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     """Apply one explicitly gated reconcile operator decision.
@@ -1292,7 +1347,7 @@ def apply_reconcile_decision(
     option = str(option or "").strip()
     task_id = str(task_id or "").strip()
     packet_signature = str(packet_signature or "").strip()
-    if option not in {"keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk"}:
+    if option not in {"keep_parked", "keep_blocked", "unblock", "close", "manual_review_with_stale_pr_risk", "remediate_parent_closeout"}:
         return _apply_error(
             "unsupported reconcile apply option for gated apply",
             board=board,
@@ -1320,6 +1375,17 @@ def apply_reconcile_decision(
             task_id=task_id,
             option=option,
         )
+    remediated_pr_head_sha = ""
+    if option == "remediate_parent_closeout":
+        try:
+            remediated_pr_head_sha = _validate_reconcile_pr_head_sha(pr_head_sha)
+        except ValueError as exc:
+            return _apply_error(
+                str(exc),
+                board=board,
+                task_id=task_id,
+                option=option,
+            )
 
     path = kb.kanban_db_path(board=board)
     as_of = int(now if now is not None else time.time())
@@ -1360,7 +1426,11 @@ def apply_reconcile_decision(
         mutation = (
             "comment_only"
             if option in {"keep_parked", "keep_blocked"}
-            else ("comment_and_unblock" if option in {"unblock", "manual_review_with_stale_pr_risk"} else "comment_and_close")
+            else (
+                "comment_and_unblock"
+                if option in {"unblock", "manual_review_with_stale_pr_risk"}
+                else ("parent_closeout_remediation" if option == "remediate_parent_closeout" else "comment_and_close")
+            )
         )
         comment = _reconcile_decision_applied_comment(
             option=option,
@@ -1423,6 +1493,35 @@ def apply_reconcile_decision(
                     task_id=task_id,
                     option=option,
                     packet=packet,
+                )
+        elif option == "remediate_parent_closeout":
+            parent_ids = list(packet.get("affected_parent_task_ids") or [])
+            if not parent_ids:
+                return _apply_error(
+                    "current decision packet has no parent closeouts to remediate",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                    packet=packet,
+                )
+            failed_parents: list[str] = []
+            for parent_id in parent_ids:
+                ok = _remediate_parent_closeout_pr_head(
+                    conn,
+                    parent_task_id=str(parent_id),
+                    child_task_id=task_id,
+                    packet_signature=packet_signature,
+                    pr_head_sha=remediated_pr_head_sha,
+                )
+                if not ok:
+                    failed_parents.append(str(parent_id))
+            if failed_parents:
+                return _apply_error(
+                    "selected option could not remediate all parent closeouts",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                    packet={**packet, "failed_parent_task_ids": failed_parents},
                 )
         return {
             "ok": True,
