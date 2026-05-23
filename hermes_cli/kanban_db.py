@@ -2554,6 +2554,9 @@ def _closeout_packet(
     }
     pr_evidence = _closeout_pr_evidence(metadata, task_branch=task_branch)
     packet.update(pr_evidence)
+    external = _closeout_external_handoff_evidence(metadata)
+    if external:
+        packet["external_handoff"] = external
     return packet
 
 
@@ -2661,6 +2664,50 @@ def _closeout_pr_evidence(
     return evidence
 
 
+_EXTERNAL_HANDOFF_METADATA_KEYS = (
+    "external_handoff_url",
+    "external_handoff_id",
+    "handoff_url",
+    "handoff_id",
+    "jira_issue",
+    "jira_issue_key",
+    "jira_url",
+    "slack_thread",
+    "slack_thread_ts",
+    "delivery_url",
+    "delivery_path",
+)
+
+
+def _closeout_external_handoff_evidence(metadata: Optional[dict]) -> dict[str, str]:
+    """Project opt-in external handoff evidence into closeout packets."""
+    if not isinstance(metadata, dict):
+        return {}
+    evidence: dict[str, str] = {}
+    for key in _EXTERNAL_HANDOFF_METADATA_KEYS:
+        value = _metadata_string(metadata.get(key))
+        if value:
+            evidence[key] = value
+    nested = metadata.get("external_handoff")
+    if isinstance(nested, dict):
+        for key in _EXTERNAL_HANDOFF_METADATA_KEYS:
+            value = _metadata_string(nested.get(key))
+            if value:
+                evidence[key] = value
+    return evidence
+
+
+def _external_handoff_required(metadata: Optional[dict]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get("external_handoff_required")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "required"}
+    return False
+
+
 def _looks_like_git_sha(value: Any) -> Optional[str]:
     text = str(value or "").strip()
     if re.fullmatch(r"[0-9a-fA-F]{7,40}", text):
@@ -2765,6 +2812,41 @@ class PRHeadGateError(ValueError):
                 "covered the current PR head"
             )
         super().__init__(msg)
+
+
+class ExternalHandoffGateError(ValueError):
+    """Raised when an opt-in external handoff lacks durable evidence."""
+
+    def __init__(self, *, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(
+            "completion blocked: external_handoff_required=true but no external "
+            "handoff evidence was provided"
+        )
+
+
+def _enforce_external_handoff_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str],
+) -> None:
+    if not _external_handoff_required(metadata):
+        return
+    evidence = _closeout_external_handoff_evidence(metadata)
+    if evidence:
+        return
+    payload = {
+        "required": True,
+        "accepted_keys": list(_EXTERNAL_HANDOFF_METADATA_KEYS),
+        "summary_preview": (
+            (summary or "").strip().splitlines()[0][:200] if summary else None
+        ),
+    }
+    with write_txn(conn):
+        _append_event(conn, task_id, "completion_blocked_external_handoff_gate", payload)
+    raise ExternalHandoffGateError(task_id=task_id)
 
 
 def _enforce_review_pr_head_gate(
@@ -3591,6 +3673,13 @@ def complete_task(
     # terminal completion. This is deterministic and mutation-free except
     # for an auditable rejection event, matching the phantom-card gate.
     _enforce_review_pr_head_gate(
+        conn, task_id, metadata,
+        summary=handoff_summary,
+    )
+
+    # Gate: opt-in external handoffs (Jira/Slack/PR/user-facing delivery)
+    # must include durable external evidence before the card can close.
+    _enforce_external_handoff_gate(
         conn, task_id, metadata,
         summary=handoff_summary,
     )

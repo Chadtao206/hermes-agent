@@ -525,6 +525,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "clear_orphan_claim_lock",
             "reclaim_dead_running",
             "reclaim_expired_claim",
+            "close_stale_run_metadata",
         ],
         default=None,
         help="Apply one explicitly gated reconcile decision option",

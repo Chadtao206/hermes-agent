@@ -48,8 +48,10 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
 from pydantic import BaseModel, Field
 
+from hermes_cli import kanban_board_doctor
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_reconciler
 
 log = logging.getLogger(__name__)
 
@@ -523,6 +525,54 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
+
+
+@router.get("/reconcile")
+def get_reconcile_health(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    ready_age_seconds: int = Query(
+        15 * 60,
+        ge=1,
+        description="Ready/review/scheduled age threshold passed through to reconcile.",
+    ),
+    max_examples: int = Query(
+        5,
+        ge=0,
+        le=50,
+        description="Maximum compact examples to include for dashboard preview text.",
+    ),
+):
+    """Return deterministic reconcile actions for dashboard/control-plane views."""
+    board = _resolve_board(board)
+    result = kanban_reconciler.run_reconciler(
+        board=board,
+        ready_age_seconds=max(1, int(ready_age_seconds or 900)),
+    )
+    result["text_preview"] = kanban_reconciler.format_reconcile_text(
+        result,
+        max_examples=max(0, int(max_examples or 0)),
+    )
+    return result
+
+
+@router.get("/doctor")
+def get_board_doctor_health(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    ready_age_seconds: int = Query(
+        15 * 60,
+        ge=1,
+        description="Ready age threshold passed through to board doctor.",
+    ),
+):
+    """Return deterministic board doctor output for dashboard/control-plane views."""
+    board = _resolve_board(board)
+    result = kanban_board_doctor.run_board_doctor(
+        board=board,
+        ready_age_seconds=max(1, int(ready_age_seconds or 900)),
+    )
+    result["text_preview"] = kanban_board_doctor.format_doctor_text(result)
+    return result
+
 
 @router.get("/board")
 def get_board(

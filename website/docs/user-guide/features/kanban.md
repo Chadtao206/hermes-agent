@@ -323,6 +323,31 @@ questions quickly:
 3. What can unblock or retry this if it fails?
 4. What risk is still deliberately left open?
 
+Every terminal completion also stores a deterministic `closeout_packet` in the
+run metadata and completion event. The packet includes the task id, run id,
+outcome, lane type, summary preview, metadata keys, and common PR evidence
+(`pr_url`, `pr_head_sha`, `branch_name`) when provided. Reviewer completions
+that depend on an implementation parent with PR-head metadata must include
+`reviewed_pr_head_sha` matching the parent head; otherwise completion is
+blocked and the task stays `running` with an auditable gate event.
+
+For external/user-facing handoffs, opt into a hard evidence gate:
+
+```json
+{
+  "external_handoff_required": true,
+  "external_handoff": {
+    "jira_issue_key": "PROJ-123",
+    "slack_thread": "C123:456.789"
+  }
+}
+```
+
+If `external_handoff_required` is true and no recognized external evidence is
+present (`jira_issue_key`, `jira_url`, `slack_thread`, `handoff_url`,
+`delivery_path`, etc.), completion is rejected. This prevents ambiguous
+"done" cards whose final Jira/Slack/PR/user handoff never actually happened.
+
 Keep secrets, raw logs, tokens, OAuth material, and unrelated transcripts out of
 `metadata`. Store pointers and summaries instead. If a task has no files or
 tests, say so explicitly in `summary` and use `metadata` for the evidence that
@@ -436,6 +461,60 @@ hermes -p orchestrator skills reset kanban-orchestrator --restore
 ```
 
 For best results, pair it with a profile whose toolsets are restricted to board operations (`kanban`, `gateway`, `memory`) so the orchestrator literally cannot execute implementation tasks even if it tries.
+
+## Reliability checks and wake triage
+
+Kanban includes two deterministic, script-friendly health surfaces:
+
+```bash
+hermes kanban doctor --json
+hermes kanban reconcile --json
+```
+
+`doctor` is the DB/board-integrity surface: SQLite header/quick-check, orphan
+links/subscriptions, stale running tasks, stale run metadata, blocked-with-done
+parents, and old ready cards. It also embeds a compact `reconcile_summary` so a
+healthy DB can still show that operator decisions are pending without flipping
+`doctor.ok` to false.
+
+`reconcile` is the convergence surface. It classifies stalled transitions and
+handoff gaps without mutating the board unless you apply an explicit gated
+option. Important action kinds include:
+
+- `dead_running_candidate`, `expired_claim_candidate` — safe reclaim candidates
+  when worker PIDs are gone or claims expired.
+- `stale_run_metadata` — a `task_runs` row says `running` but is not the task's
+  active run; safe to close with `--apply-option close_stale_run_metadata` only
+  when the recorded PID is not alive.
+- `scheduled_with_completed_parents_decision` and
+  `blocked_with_completed_parents_decision` — dependency parents are terminal,
+  but the child is parked; Jensen/operator must choose unblock, keep parked, or
+  close.
+- `pre_spawn_validation_decision` and `repeated_failure_signature_decision` —
+  profile/skill/tool/workdir prerequisites or repeated platform failures would
+  otherwise cause retry storms.
+- `review_parent_pr_head_evidence_missing` — final review cannot be trusted
+  against the current PR head yet.
+
+For cron/watchdogs, prefer the script-first wrapper:
+
+```bash
+python scripts/kanban_reconcile_wake_triage.py --mode no-agent
+```
+
+It runs the reconciler, dedupes unchanged output in a sidecar JSON file outside
+`kanban.db`, emits bounded Slack-safe text, and records zero-LLM token/time SLO
+metadata (`script_slo`) so monitoring can verify the watchdog stayed cheap. Use
+`--mode agent-gate` when an LLM cron job should wake Jensen only for
+`jensen_decision_required`; compact notifications and unchanged repeats return
+`wakeAgent=false`.
+
+The dashboard plugin exposes the same read-only control-plane data through:
+
+- `GET /api/plugins/kanban/doctor`
+- `GET /api/plugins/kanban/reconcile`
+
+Both accept `?board=<slug>` so dashboard, CLI, and cron surfaces stay aligned.
 
 ## Dashboard (GUI)
 

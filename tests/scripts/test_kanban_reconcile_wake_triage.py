@@ -40,6 +40,30 @@ def test_no_agent_auto_silent_emits_wake_agent_false():
     assert json.loads(output) == {"wakeAgent": False, "mode": "auto_silent"}
 
 
+def test_script_slo_annotation_records_zero_llm_burn():
+    module = _load_module()
+    result = _result([], module.rec.WAKE_BUCKET_AUTO_SILENT)
+
+    annotated = module.annotate_script_slo(
+        result,
+        duration_ms=123,
+        max_duration_ms=200,
+        max_chars=3500,
+    )
+
+    assert annotated["script_slo"] == {
+        "schema_version": 1,
+        "script_first": True,
+        "llm_tokens_used": 0,
+        "llm_token_budget": 0,
+        "token_slo_ok": True,
+        "duration_ms": 123,
+        "max_duration_ms": 200,
+        "duration_slo_ok": True,
+        "max_output_chars": 3500,
+    }
+
+
 def test_no_agent_compact_notify_emits_slack_safe_text():
     module = _load_module()
     actions = [
@@ -66,6 +90,7 @@ def test_no_agent_compact_notify_emits_slack_safe_text():
 
     assert "Kanban reconcile compact notification" in output
     assert "Mode: compact_notify | wake_agent=false" in output
+    assert "SLO: script_first=true | llm_tokens=0/0" in output
     assert "pre_spawn_validation_decision" in output
     assert "highlights:" in output
     assert "large_nested_payload" not in output
@@ -149,6 +174,7 @@ def test_jensen_decision_required_emits_compact_prompt_in_both_modes():
         assert "Kanban reconcile requires Jensen decision" in output
         assert "Objective: resolve Kanban reconcile decision-required actions" in output
         assert "mode=jensen_decision_required wake_agent=true" in output
+        assert "SLO: script_first=true | llm_tokens=0/0" in output
         assert "scheduled_with_completed_parents_decision" in output
         assert "Recommended Jensen action:" in output
 

@@ -1195,11 +1195,132 @@ def test_stale_run_metadata_is_reported_without_task_mutation(kanban_home):
 
     assert len(actions) == 1
     assert actions[0]["details"]["run_id"] == run_id
-    assert actions[0]["safe_to_apply"] is False
+    assert actions[0]["safe_to_apply"] is True
     with kb.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "done"
+
+
+def test_apply_reconcile_decision_closes_stale_run_metadata(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="done task", assignee="engineer")
+        kb.complete_task(conn, task_id, summary="done")
+        run_id = conn.execute(
+            """
+            INSERT INTO task_runs(task_id, profile, status, worker_pid, started_at)
+            VALUES (?, 'engineer', 'running', 99999999, ?)
+            """,
+            (task_id, 1),
+        ).lastrowid
+
+    result = rec.run_reconciler(now=now)
+    action = _actions(result, "stale_run_metadata")[0]
+    applied = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="close_stale_run_metadata",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        author="jensen-test",
+        now=now,
+    )
+
+    assert applied["ok"] is True
+    assert applied["mutation"] == "close_stale_run_metadata"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    assert task is not None
+    assert task.status == "done"
+    stale_run = next(run for run in runs if run.id == run_id)
+    assert stale_run.outcome == "reclaimed"
+    assert stale_run.ended_at is not None
+    assert any("option=close_stale_run_metadata" in comment.body for comment in comments)
+    assert any(event.kind == "reconcile_stale_run_metadata_closed" for event in events)
+
+    post = rec.run_reconciler(now=now)
+    assert _actions(post, "stale_run_metadata") == []
+    stale_retry = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="close_stale_run_metadata",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        now=now,
+    )
+    assert stale_retry["ok"] is False
+    assert "no current stale_run_metadata action" in stale_retry["error"]
+
+
+def test_apply_reconcile_decision_rejects_live_stale_run_metadata(kanban_home):
+    now = 1_700_000_000
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ready task", assignee="engineer")
+        run_id = conn.execute(
+            """
+            INSERT INTO task_runs(task_id, profile, status, worker_pid, started_at)
+            VALUES (?, 'engineer', 'running', ?, ?)
+            """,
+            (task_id, os.getpid(), 1),
+        ).lastrowid
+
+    result = rec.run_reconciler(now=now)
+    action = _actions(result, "stale_run_metadata")[0]
+    assert action["details"]["run_id"] == run_id
+    assert action["safe_to_apply"] is False
+    rejected = rec.apply_reconcile_decision(
+        task_id=task_id,
+        option="close_stale_run_metadata",
+        packet_signature=action["signature"],
+        confirm_dry_run=True,
+        now=now,
+    )
+
+    assert rejected["ok"] is False
+    assert "advisory, not safe to apply" in rejected["error"]
+    with kb.connect() as conn:
+        run = next(run for run in kb.list_runs(conn, task_id) if run.id == run_id)
+    assert run.status == "running"
+
+
+def test_bulk_stale_run_metadata_reconcile_apply_converges(kanban_home):
+    now = 1_700_000_000
+    task_ids = []
+    with kb.connect() as conn:
+        for idx in range(25):
+            task_id = kb.create_task(conn, title=f"done task {idx}", assignee="engineer")
+            kb.complete_task(conn, task_id, summary="done")
+            conn.execute(
+                """
+                INSERT INTO task_runs(task_id, profile, status, worker_pid, started_at)
+                VALUES (?, 'engineer', 'running', 99999999, ?)
+                """,
+                (task_id, idx + 1),
+            )
+            task_ids.append(task_id)
+
+    result = rec.run_reconciler(now=now)
+    actions = _actions(result, "stale_run_metadata")
+    assert len(actions) == 25
+    for action in actions:
+        applied = rec.apply_reconcile_decision(
+            task_id=action["task_id"],
+            option="close_stale_run_metadata",
+            packet_signature=action["signature"],
+            confirm_dry_run=True,
+            now=now,
+        )
+        assert applied["ok"] is True
+
+    converged = rec.run_reconciler(now=now)
+    assert _actions(converged, "stale_run_metadata") == []
+    with kb.connect() as conn:
+        for task_id in task_ids:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            assert task.status == "done"
 
 
 def test_old_ready_and_review_spawnable_classification(kanban_home, monkeypatch):

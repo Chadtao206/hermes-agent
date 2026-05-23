@@ -81,6 +81,8 @@ _VOLATILE_DETAIL_KEYS = {
     "run_id",
 }
 
+DEFAULT_RECONCILE_DURATION_SLO_MS = 2_000
+
 
 def _bucket_counts(triage: dict[str, Any]) -> str:
     summary = triage.get("summary") or {}
@@ -88,6 +90,46 @@ def _bucket_counts(triage: dict[str, Any]) -> str:
         f"auto_silent={int(summary.get(rec.WAKE_BUCKET_AUTO_SILENT) or 0)}, "
         f"compact_notify={int(summary.get(rec.WAKE_BUCKET_COMPACT_NOTIFY) or 0)}, "
         f"jensen_decision_required={int(summary.get(rec.WAKE_BUCKET_JENSEN_DECISION_REQUIRED) or 0)}"
+    )
+
+
+def annotate_script_slo(
+    result: dict[str, Any],
+    *,
+    duration_ms: int,
+    max_duration_ms: int = DEFAULT_RECONCILE_DURATION_SLO_MS,
+    max_chars: int | None = None,
+) -> dict[str, Any]:
+    """Attach deterministic script-first burn telemetry to a reconcile result."""
+    budget = max(0, int(max_duration_ms or 0))
+    elapsed = max(0, int(duration_ms or 0))
+    result["script_slo"] = {
+        "schema_version": 1,
+        "script_first": True,
+        "llm_tokens_used": 0,
+        "llm_token_budget": 0,
+        "token_slo_ok": True,
+        "duration_ms": elapsed,
+        "max_duration_ms": budget,
+        "duration_slo_ok": (budget == 0 or elapsed <= budget),
+        "max_output_chars": max_chars,
+    }
+    return result
+
+
+def _slo_line(result: dict[str, Any]) -> str:
+    slo = result.get("script_slo") or {}
+    if not isinstance(slo, dict):
+        return "SLO: script_first=true | llm_tokens=0/0"
+    duration = slo.get("duration_ms")
+    duration_budget = slo.get("max_duration_ms")
+    duration_ok = str(bool(slo.get("duration_slo_ok", True))).lower()
+    tokens = slo.get("llm_tokens_used", 0)
+    token_budget = slo.get("llm_token_budget", 0)
+    return (
+        "SLO: script_first=true | "
+        f"llm_tokens={tokens}/{token_budget} | "
+        f"duration_ms={duration}/{duration_budget} ok={duration_ok}"
     )
 
 
@@ -310,6 +352,7 @@ def _compact_notify_text(result: dict[str, Any], *, examples: int) -> str:
         "Kanban reconcile compact notification",
         f"Mode: {triage.get('mode')} | wake_agent={str(bool(triage.get('wake_agent'))).lower()}",
         f"Actions: {int(triage.get('total_actions') or 0)} | Buckets: {_bucket_counts(triage)}",
+        _slo_line(result),
         "",
         rec.format_reconcile_text(result, max_examples=examples),
     ]
@@ -325,6 +368,7 @@ def _jensen_prompt_text(result: dict[str, Any], *, examples: int) -> str:
         "Constraints: keep actions deterministic, preserve DB integrity, avoid retry storms, and mutate only after explicit safe scope.",
         f"Mode: {triage.get('mode')} | wake_agent={str(bool(triage.get('wake_agent'))).lower()}",
         f"Actions: {int(triage.get('total_actions') or 0)} | Buckets: {_bucket_counts(triage)}",
+        _slo_line(result),
         f"Reason: {triage.get('reason')}",
         "",
         rec.format_reconcile_text(result, max_examples=examples),
@@ -432,6 +476,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum text output characters for Slack-safe delivery (default: 3500; <=0 disables)",
     )
     parser.add_argument(
+        "--duration-slo-ms",
+        type=int,
+        default=DEFAULT_RECONCILE_DURATION_SLO_MS,
+        help="Advisory reconcile script duration SLO in ms (default: 2000; 0 disables)",
+    )
+    parser.add_argument(
         "--mode",
         choices=["no-agent", "agent-gate"],
         default="no-agent",
@@ -481,9 +531,16 @@ def main(argv: list[str] | None = None) -> int:
         ))
         return 0
 
+    started = time.monotonic()
     result = rec.run_reconciler(
         board=args.board,
         ready_age_seconds=max(1, int(args.ready_age_seconds or 900)),
+    )
+    annotate_script_slo(
+        result,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        max_duration_ms=max(0, int(args.duration_slo_ms or 0)),
+        max_chars=max(0, int(args.max_chars or 0)),
     )
     if not args.json and not args.no_dedupe:
         emit, metadata = should_emit_with_dedupe(

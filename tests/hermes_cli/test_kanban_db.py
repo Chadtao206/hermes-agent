@@ -1463,6 +1463,70 @@ def test_implementation_closeout_packet_surfaces_pr_evidence(kanban_home):
     assert event_packet["pr_head_sha"] == packet["pr_head_sha"]
 
 
+def test_external_handoff_required_blocks_completion_without_evidence(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external handoff", assignee="default")
+        kb.claim_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        with pytest.raises(ValueError, match="external_handoff_required"):
+            kb.complete_task(
+                conn,
+                t,
+                summary="Ready for external follow-up.",
+                metadata={"external_handoff_required": True},
+                expected_run_id=run_id,
+            )
+        task_after = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert task_after is not None
+    assert task_after.status == "running"
+    gate_events = [e for e in events if e.kind == "completion_blocked_external_handoff_gate"]
+    assert len(gate_events) == 1
+    assert not [e for e in events if e.kind == "completed"]
+
+
+def test_external_handoff_evidence_is_carried_in_closeout_packet(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external handoff", assignee="default")
+        kb.claim_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        assert kb.complete_task(
+            conn,
+            t,
+            summary="Posted final handoff.",
+            metadata={
+                "external_handoff_required": True,
+                "external_handoff": {
+                    "jira_issue_key": "HERMES-123",
+                    "slack_thread": "C123:456.789",
+                },
+            },
+            expected_run_id=run_id,
+        )
+        run = kb.latest_run(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert run is not None
+    assert run.metadata is not None
+    packet = run.metadata["closeout_packet"]
+    assert packet["lane_type"] == "orchestration"
+    assert packet["external_handoff"] == {
+        "jira_issue_key": "HERMES-123",
+        "slack_thread": "C123:456.789",
+    }
+    completed_event = next(e for e in events if e.kind == "completed")
+    assert completed_event.payload["closeout_packet"]["external_handoff"] == packet["external_handoff"]
+
+
 def test_block_records_closeout_packet_and_is_idempotent_by_run_id(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="reviewer")

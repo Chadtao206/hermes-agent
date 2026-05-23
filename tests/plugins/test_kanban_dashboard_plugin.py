@@ -80,6 +80,37 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_reconcile_endpoint_exposes_decision_actions(client):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(conn, parent, summary="done")
+        child = kb.create_task(conn, title="parked review", assignee="reviewer", parents=[parent])
+        assert kb.schedule_task(conn, child, reason="park until operator reviews")
+        conn.execute("UPDATE tasks SET created_at = created_at - 10 WHERE id = ?", (child,))
+
+    r = client.get("/api/plugins/kanban/reconcile?ready_age_seconds=1&max_examples=2")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["wake_triage"]["mode"] == "jensen_decision_required"
+    assert any(
+        action["kind"] == "scheduled_with_completed_parents_decision"
+        and action["task_id"] == child
+        for action in data["actions"]
+    )
+    assert "scheduled_with_completed_parents_decision" in data["text_preview"]
+
+
+def test_doctor_endpoint_exposes_board_health(client):
+    r = client.get("/api/plugins/kanban/doctor")
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["issues"] == []
+    assert "Kanban board doctor: ok" in data["text_preview"]
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
@@ -1309,10 +1340,12 @@ def test_bulk_status_done_forwards_completion_summary(client):
         for tid in (a["id"], b["id"]):
             task = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
+            assert run is not None
             assert task.status == "done"
             assert task.result == "DECIDED: ship it"
             assert run.summary == "DECIDED: ship it"
-            assert run.metadata == {"source": "dashboard"}
+            assert run.metadata["source"] == "dashboard"
+            assert run.metadata["closeout_packet"]["metadata_keys"] == ["source"]
     finally:
         conn.close()
 
@@ -1539,7 +1572,8 @@ def test_task_detail_includes_runs(client):
     assert run["outcome"] == "completed"
     assert run["profile"] == "worker"
     assert run["summary"] == "tested on rate limiter"
-    assert run["metadata"] == {"changed_files": ["limiter.py"]}
+    assert run["metadata"]["changed_files"] == ["limiter.py"]
+    assert run["metadata"]["closeout_packet"]["metadata_keys"] == ["changed_files"]
     assert run["ended_at"] is not None
 
 
@@ -1578,9 +1612,12 @@ def test_patch_status_done_with_summary_and_metadata(client):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, tid)
+        assert run is not None
         assert run.outcome == "completed"
         assert run.summary == "shipped the thing"
-        assert run.metadata == {"changed_files": ["a.py", "b.py"], "tests_run": 7}
+        assert run.metadata["changed_files"] == ["a.py", "b.py"]
+        assert run.metadata["tests_run"] == 7
+        assert run.metadata["closeout_packet"]["metadata_keys"] == ["changed_files", "tests_run"]
     finally:
         conn.close()
 
@@ -1603,6 +1640,7 @@ def test_patch_status_done_without_summary_still_works(client):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, tid)
+        assert run is not None
         assert run.outcome == "completed"
         assert run.summary == "legacy shape"  # falls back to result
     finally:

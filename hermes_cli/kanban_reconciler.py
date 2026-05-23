@@ -895,17 +895,18 @@ def collect_reconcile_actions(
          ORDER BY r.started_at DESC, r.id DESC
         """
     ):
+        pid_alive = _pid_alive(row["worker_pid"])
         actions.append(_action(
             "stale_run_metadata",
             row["task_id"],
             "warning",
             "task_run is marked running but is not the task current active run",
-            safe_to_apply=False,
+            safe_to_apply=not pid_alive,
             details={
                 "run_id": row["run_id"],
                 "profile": row["profile"],
                 "worker_pid": row["worker_pid"],
-                "pid_alive": _pid_alive(row["worker_pid"]),
+                "pid_alive": pid_alive,
                 "task_status": row["task_status"],
                 "current_run_id": row["current_run_id"],
             },
@@ -1561,6 +1562,137 @@ def _apply_reclaim_running_claim(
     }
 
 
+def _apply_close_stale_run_metadata(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    action_signature: str,
+    action: dict[str, Any],
+    board: Optional[str],
+    path: Path,
+    author: str,
+    as_of: int,
+) -> dict[str, Any]:
+    option = "close_stale_run_metadata"
+    if not bool(action.get("safe_to_apply")):
+        return _apply_error(
+            "current stale_run_metadata action is advisory, not safe to apply",
+            board=board,
+            task_id=task_id,
+            option=option,
+            packet=action,
+        )
+    details = action.get("details") or {}
+    if not isinstance(details, dict) or details.get("run_id") is None:
+        return _apply_error(
+            "stale_run_metadata action is missing a valid run_id",
+            board=board,
+            task_id=task_id,
+            option=option,
+            packet=action,
+        )
+    try:
+        run_id_int = int(details["run_id"])
+    except (TypeError, ValueError):
+        return _apply_error(
+            "stale_run_metadata action is missing a valid run_id",
+            board=board,
+            task_id=task_id,
+            option=option,
+            packet=action,
+        )
+    comment = _reconcile_decision_applied_comment(
+        option=option,
+        packet_signature=action_signature,
+        category="stale_run_metadata",
+        mutation="close_stale_run_metadata",
+    )
+    with kb.write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT r.status, r.worker_pid, t.current_run_id
+              FROM task_runs r
+              JOIN tasks t ON t.id = r.task_id
+             WHERE r.id = ? AND r.task_id = ?
+            """,
+            (run_id_int, task_id),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return _apply_error(
+                "stale run metadata is no longer present",
+                board=board,
+                task_id=task_id,
+                option=option,
+                packet=action,
+            )
+        if row["current_run_id"] == run_id_int:
+            return _apply_error(
+                "run is current for task and cannot be closed as stale metadata",
+                board=board,
+                task_id=task_id,
+                option=option,
+                packet=action,
+            )
+        if _pid_alive(row["worker_pid"]):
+            return _apply_error(
+                "stale run worker PID is still alive; manual inspection required",
+                board=board,
+                task_id=task_id,
+                option=option,
+                packet=action,
+            )
+        now = int(time.time())
+        cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'reclaimed', outcome = 'reclaimed',
+                   summary = COALESCE(summary, 'stale run metadata closed by reconcile apply'),
+                   error = COALESCE(error, ?), ended_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+             WHERE id = ? AND task_id = ? AND status = 'running'
+            """,
+            (f"stale_run_metadata:{action_signature}", now, run_id_int, task_id),
+        )
+        if cur.rowcount != 1:
+            return _apply_error(
+                "stale run metadata could not be closed in its current state",
+                board=board,
+                task_id=task_id,
+                option=option,
+                packet=action,
+            )
+        comment_cur = conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, (author or "jensen").strip(), comment, now),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "reconcile_stale_run_metadata_closed",
+            {
+                "run_id": run_id_int,
+                "action_signature": action_signature,
+                "source": "kanban_reconcile_apply",
+            },
+            run_id=run_id_int,
+        )
+    return {
+        "ok": True,
+        "board": board or kb.get_current_board(),
+        "db_path": str(path),
+        "task_id": task_id,
+        "option": option,
+        "packet_signature": action_signature,
+        "packet": action,
+        "plan": None,
+        "comment_id": int(comment_cur.lastrowid or 0),
+        "comment": comment,
+        "mutation_applied": True,
+        "mutation": "close_stale_run_metadata",
+        "as_of": as_of,
+    }
+
+
 def apply_reconcile_decision(
     *,
     task_id: str,
@@ -1592,6 +1724,7 @@ def apply_reconcile_decision(
         "clear_orphan_claim_lock",
         "reclaim_dead_running",
         "reclaim_expired_claim",
+        "close_stale_run_metadata",
     }:
         return _apply_error(
             "unsupported reconcile apply option for gated apply",
@@ -1690,6 +1823,31 @@ def apply_reconcile_decision(
                 task_id=task_id,
                 option=option,
                 action_kind=action_kind,
+                action_signature=packet_signature,
+                action=action,
+                board=board,
+                path=path,
+                author=author,
+                as_of=as_of,
+            )
+
+        if option == "close_stale_run_metadata":
+            action = _find_reconcile_action(
+                action_dicts,
+                task_id=task_id,
+                kind="stale_run_metadata",
+                signature=packet_signature,
+            )
+            if action is None:
+                return _apply_error(
+                    "no current stale_run_metadata action matches task/signature",
+                    board=board,
+                    task_id=task_id,
+                    option=option,
+                )
+            return _apply_close_stale_run_metadata(
+                conn,
+                task_id=task_id,
                 action_signature=packet_signature,
                 action=action,
                 board=board,

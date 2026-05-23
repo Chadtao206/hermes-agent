@@ -232,7 +232,35 @@ def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 
                     action="check gateway dispatcher health and whether assignee profile exists",
                 ))
 
-    return {"ok": not issues, "board": board or kb.get_current_board(), "db_path": str(path), "issues": issues, "as_of": now}
+    reconcile_summary = _reconcile_summary(board=board, ready_age_seconds=ready_age_seconds)
+    return {"ok": not issues, "board": board or kb.get_current_board(), "db_path": str(path), "issues": issues, "reconcile_summary": reconcile_summary, "as_of": now}
+
+
+def _reconcile_summary(*, board: str | None, ready_age_seconds: int) -> dict[str, Any]:
+    """Embed a compact reconciler summary without changing doctor ok semantics."""
+    try:
+        from hermes_cli import kanban_reconciler as rec
+
+        result = rec.run_reconciler(
+            board=board,
+            ready_age_seconds=max(1, int(ready_age_seconds or 900)),
+        )
+        triage = result.get("wake_triage") or {}
+        actions = result.get("actions") or []
+        kinds: dict[str, int] = {}
+        for action in actions:
+            if isinstance(action, dict):
+                kind = str(action.get("kind") or "unknown")
+                kinds[kind] = kinds.get(kind, 0) + 1
+        return {
+            "ok": bool(result.get("ok")),
+            "action_count": len(actions),
+            "wake_mode": triage.get("mode"),
+            "wake_agent": bool(triage.get("wake_agent")),
+            "kinds": kinds,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def format_doctor_text(result: dict[str, Any]) -> str:

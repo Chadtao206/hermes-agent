@@ -79,7 +79,25 @@ def test_doctor_ignores_corrupt_notifier_sidecar_when_board_db_is_clean(kanban_h
 
     assert result["ok"] is True
     assert result["issues"] == []
+    assert result["reconcile_summary"]["action_count"] == 0
 
+
+
+def test_doctor_reconcile_summary_surfaces_decision_actions_without_failing_health(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(conn, parent, summary="done")
+        child = kb.create_task(conn, title="parked review", assignee="reviewer", parents=[parent])
+        assert kb.schedule_task(conn, child, reason="park until operator reviews")
+        conn.execute("UPDATE tasks SET created_at = created_at - 10 WHERE id = ?", (child,))
+
+    result = doctor.run_board_doctor(ready_age_seconds=1)
+
+    assert result["ok"] is True
+    assert result["issues"] == []
+    assert result["reconcile_summary"]["action_count"] >= 1
+    assert result["reconcile_summary"]["wake_mode"] == "jensen_decision_required"
+    assert result["reconcile_summary"]["kinds"]["scheduled_with_completed_parents_decision"] == 1
 
 
 def test_doctor_reports_orphan_links_and_stale_running_runs(kanban_home):
