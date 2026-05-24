@@ -123,6 +123,24 @@ def test_collect_metrics_reports_reliability_windows(kanban_home):
     assert by_label["since"]["total_runs"] == 3
 
 
+def test_collect_metrics_does_not_create_live_board_sidecars(kanban_home):
+    now = 1_700_000_000
+    _seed_runs(now)
+    db = kb.kanban_db_path()
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    sidecars = [db.with_name(db.name + suffix) for suffix in ("-wal", "-shm")]
+    for sidecar in sidecars:
+        sidecar.unlink(missing_ok=True)
+    before = db.stat().st_mtime_ns
+
+    result = km.collect_metrics(now=now, since_epoch=now - 180, ready_age_seconds=60)
+
+    assert result["current_state"]["max_consecutive_failures"] == 2
+    assert db.stat().st_mtime_ns == before
+    assert not any(sidecar.exists() for sidecar in sidecars)
+
+
 def test_metrics_snapshot_persists_to_sidecar_db(kanban_home):
     now = 1_700_000_000
     _seed_runs(now)

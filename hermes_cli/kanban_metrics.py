@@ -265,8 +265,10 @@ def collect_metrics(
     as_of = int(now if now is not None else time.time())
     path = kb.kanban_db_path(board=board)
     board_name = board or kb.get_current_board()
-    with kb.connect(path) as conn:
-        conn.row_factory = sqlite3.Row
+    # Metrics are observational. Read the hot board through the same
+    # filesystem snapshot pattern used by the reconciler so this command does
+    # not create/mutate the live board's WAL/SHM sidecars just to count rows.
+    with kb.snapshot_connect(path) as conn:
         current_state = _current_state_metrics(conn)
         windows = [
             _run_window_metrics(

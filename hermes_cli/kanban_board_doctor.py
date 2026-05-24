@@ -51,8 +51,7 @@ def _quick_check(path: Path) -> Issue | None:
                     first_16=header.hex(" "),
                     action="pause kanban-reading cron jobs, stop gateway/dashboard writers, recover DB, remove stale .db-wal/.db-shm sidecars after replacement, then resume after quick_check=ok",
                 )
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
+        with kb.snapshot_connect(path) as conn:
             rows: list[str] = []
             try:
                 cur = conn.execute("PRAGMA quick_check")
@@ -84,8 +83,6 @@ def _quick_check(path: Path) -> Issue | None:
                 f"PRAGMA quick_check returned {joined}",
                 action="stop gateway/dashboard/cron writers, recover with sqlite3 .recover or latest backup, replace the DB, remove stale .db-wal/.db-shm sidecars, then resume only after quick_check=ok",
             )
-        finally:
-            conn.close()
     except Exception as exc:
         return _issue(
             "critical",
@@ -106,7 +103,7 @@ def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 
         if db_issue.get("severity") == "critical":
             return {"ok": False, "board": board or kb.get_current_board(), "db_path": str(path), "issues": issues, "as_of": now}
 
-    with kb.connect(board=board, readonly=True) as conn:
+    with kb.snapshot_connect(board=board) as conn:
         # Orphan dependency/rollup links.
         for row in conn.execute(
             """

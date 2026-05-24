@@ -75,9 +75,11 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -1238,6 +1240,41 @@ def connect(
         conn.close()
         raise
     return conn
+
+
+@contextlib.contextmanager
+def snapshot_connect(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Open a temporary filesystem snapshot of a kanban board DB.
+
+    This is for observational commands (metrics, doctor/reconcile dry-runs,
+    dashboards) that must not mutate the hot board database or create live
+    ``-wal``/``-shm`` sidecars. The main DB and any existing sidecars are
+    copied into a temp dir; SQLite is then free to do any bookkeeping there.
+    """
+    if db_path is not None:
+        path = Path(db_path)
+    else:
+        path = kanban_db_path(board=board)
+    _validate_sqlite_header(path)
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-snapshot-") as tmp:
+        snap = Path(tmp) / path.name
+        shutil.copy2(path, snap)
+        for suffix in ("-wal", "-shm"):
+            src = path.with_name(path.name + suffix)
+            if src.exists():
+                shutil.copy2(src, snap.with_name(snap.name + suffix))
+        conn = sqlite3.connect(str(snap), isolation_level=None, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA foreign_keys=ON")
+            yield conn
+        finally:
+            conn.close()
 
 
 def init_db(
