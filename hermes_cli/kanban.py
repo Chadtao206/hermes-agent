@@ -29,6 +29,7 @@ from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_board_doctor as kdoc
 from hermes_cli import kanban_metrics as kmet
 from hermes_cli import kanban_reconciler as krec
+from hermes_cli import kanban_db_repair as krepair
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
 
@@ -579,6 +580,38 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--snapshot-db",
         default=None,
         help="Override sidecar snapshot DB path for --write-snapshot",
+    )
+
+    # --- repair-db (guarded live DB replacement runbook) ---
+    p_repair = sub.add_parser(
+        "repair-db",
+        help="Guarded runbook/preflight for quiesced kanban.db replacement",
+    )
+    p_repair.add_argument("--json", action="store_true", help="Emit structured JSON")
+    p_repair.add_argument(
+        "--candidate",
+        default=None,
+        help="Verified replacement candidate DB path; omit to print the guarded runbook only",
+    )
+    p_repair.add_argument(
+        "--install",
+        action="store_true",
+        help="Install candidate only after explicit quiescence/freshness gates pass",
+    )
+    p_repair.add_argument(
+        "--confirm-quiesced",
+        action="store_true",
+        help="Required with --install: all gateway/dashboard/cron writers are stopped",
+    )
+    p_repair.add_argument(
+        "--confirm-freshness-checked",
+        action="store_true",
+        help="Required with --install: candidate durable-table markers are accepted as fresh",
+    )
+    p_repair.add_argument(
+        "--evidence-dir",
+        default=None,
+        help="Evidence directory for install artifacts (default: ~/.hermes/forensics/kanban-live-repair-<ts>)",
     )
 
     # --- link / unlink ---
@@ -1249,7 +1282,8 @@ def kanban_command(args: argparse.Namespace) -> int:
     # HERMES_HOME. Previously only `init` and `daemon` triggered
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
-    if action != "reconcile":
+    observational_actions = {"doctor", "reconcile", "metrics", "repair-db"}
+    if action not in observational_actions:
         try:
             kb.init_db()
         except Exception as exc:
@@ -1272,6 +1306,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "doctor":   _cmd_doctor,
         "reconcile": _cmd_reconcile,
         "metrics":  _cmd_metrics,
+        "repair-db": _cmd_repair_db,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
         "claim":    _cmd_claim,
@@ -1381,6 +1416,22 @@ def _cmd_metrics(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     else:
         print(kmet.format_metrics_text(result))
+    return 0 if result.get("ok") else 2
+
+
+def _cmd_repair_db(args: argparse.Namespace) -> int:
+    result = krepair.run_repair_guard(
+        board=getattr(args, "board", None),
+        candidate=getattr(args, "candidate", None),
+        install=bool(getattr(args, "install", False)),
+        confirm_quiesced=bool(getattr(args, "confirm_quiesced", False)),
+        confirm_freshness_checked=bool(getattr(args, "confirm_freshness_checked", False)),
+        evidence_dir=getattr(args, "evidence_dir", None),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(krepair.format_repair_text(result))
     return 0 if result.get("ok") else 2
 
 

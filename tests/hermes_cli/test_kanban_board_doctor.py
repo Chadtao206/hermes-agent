@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import hashlib
+import sqlite3
+
 import pytest
 
 from hermes_cli import kanban as kc
@@ -165,4 +168,72 @@ def test_doctor_continues_for_noncritical_notifier_heartbeat_issue(kanban_home, 
     assert result["ok"] is False
     assert "notifier_heartbeat_integrity" in kinds
     assert "blocked_with_completed_parents" in kinds
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_observability_slash_commands_do_not_init_or_mutate_main_db(kanban_home, monkeypatch):
+    """Doctor/reconcile/metrics are observational; they must not call init_db."""
+    db = kanban_home / "kanban.db"
+    # Ensure any prior writable setup sidecars are gone before the observation smoke.
+    for suffix in ("-wal", "-shm"):
+        sidecar = db.with_name(db.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    before = _sha256(db)
+
+    def fail_init(*args, **kwargs):
+        raise AssertionError("observability command called init_db")
+
+    monkeypatch.setattr(kb, "init_db", fail_init)
+
+    for command in ("doctor --json", "reconcile --json", "metrics --json"):
+        out = kc.run_slash(command)
+        assert "observability command called init_db" not in out
+        assert _sha256(db) == before
+        assert not db.with_name(db.name + "-wal").exists()
+        assert not db.with_name(db.name + "-shm").exists()
+
+
+def test_repair_db_guard_requires_explicit_live_replacement_gates(kanban_home, tmp_path, monkeypatch):
+    db = kanban_home / "kanban.db"
+    candidate = tmp_path / "candidate.db"
+    with sqlite3.connect(db) as src, sqlite3.connect(candidate) as dst:
+        src.backup(dst)
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = db.with_name(db.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    before = _sha256(db)
+
+    def fail_init(*args, **kwargs):
+        raise AssertionError("repair-db guard called init_db")
+
+    monkeypatch.setattr(kb, "init_db", fail_init)
+
+    out = kc.run_slash(f"repair-db --candidate {candidate} --install --json")
+
+    assert "missing_confirmation" in out
+    assert "--confirm-quiesced" in out
+    assert "--confirm-freshness-checked" in out
+    assert "repair-db guard called init_db" not in out
+    assert _sha256(db) == before
+    assert not db.with_name(db.name + "-wal").exists()
+    assert not db.with_name(db.name + "-shm").exists()
+
+
+def test_repair_db_guard_runbook_only_is_safe_without_existing_db(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    out = kc.run_slash("repair-db --json")
+
+    assert "runbook_only" in out
+    assert "kanban.db" in out
+    assert not (home / "kanban.db").exists()
 
