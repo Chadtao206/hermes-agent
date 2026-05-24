@@ -10,6 +10,7 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_board_doctor as doctor
+from hermes_cli import kanban_db_repair as krepair
 
 
 @pytest.fixture
@@ -17,6 +18,14 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_SOURCE",
+        "_HERMES_GATEWAY",
+        "HERMES_GATEWAY_SESSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -229,6 +238,14 @@ def test_repair_db_guard_runbook_only_is_safe_without_existing_db(tmp_path, monk
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_SOURCE",
+        "_HERMES_GATEWAY",
+        "HERMES_GATEWAY_SESSION",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     out = kc.run_slash("repair-db --json")
@@ -236,4 +253,46 @@ def test_repair_db_guard_runbook_only_is_safe_without_existing_db(tmp_path, monk
     assert "runbook_only" in out
     assert "kanban.db" in out
     assert not (home / "kanban.db").exists()
+
+
+def test_repair_db_install_refuses_gateway_slack_context(kanban_home, tmp_path, monkeypatch):
+    db = kanban_home / "kanban.db"
+    candidate = tmp_path / "candidate.db"
+    with sqlite3.connect(db) as src, sqlite3.connect(candidate) as dst:
+        src.backup(dst)
+    before = _sha256(db)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "slack")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "C123")
+
+    out = kc.run_slash(
+        f"repair-db --candidate {candidate} --install "
+        "--confirm-quiesced --confirm-freshness-checked --json"
+    )
+
+    assert "active_gateway_context_refused" in out
+    assert "slack" in out
+    assert _sha256(db) == before
+
+
+def test_repair_db_install_blocks_writer_processes_even_after_confirmations(kanban_home, tmp_path, monkeypatch):
+    db = kanban_home / "kanban.db"
+    candidate = tmp_path / "candidate.db"
+    with sqlite3.connect(db) as src, sqlite3.connect(candidate) as dst:
+        src.backup(dst)
+    before = _sha256(db)
+
+    monkeypatch.setattr(krepair, "_writer_process_check", lambda: {
+        "ok": False,
+        "running_writers": [{"pid": 12345, "kind": "gateway", "command": "hermes gateway run"}],
+        "errors": [],
+    })
+
+    out = kc.run_slash(
+        f"repair-db --candidate {candidate} --install "
+        "--confirm-quiesced --confirm-freshness-checked --json"
+    )
+
+    assert "writer_processes_or_unverified" in out
+    assert "hermes gateway run" in out
+    assert _sha256(db) == before
 

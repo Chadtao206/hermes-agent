@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -152,6 +153,155 @@ def _open_handle_check(paths: list[Path]) -> dict[str, Any]:
     }
 
 
+def _session_context() -> dict[str, Any]:
+    """Return the current invocation context relevant to live DB repair.
+
+    Gateway sessions set task-local contextvars, while subprocesses spawned
+    from those sessions may only inherit legacy environment variables. Check
+    both so a Slack/gateway-originated install cannot bypass the guard merely
+    by shelling out to ``hermes kanban repair-db``.
+    """
+    platform = ""
+    chat_id = ""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        platform = os.getenv("HERMES_SESSION_PLATFORM", "") or ""
+        chat_id = os.getenv("HERMES_SESSION_CHAT_ID", "") or ""
+
+    source = os.getenv("HERMES_SESSION_SOURCE", "") or ""
+    gateway_markers = {
+        name: os.getenv(name, "")
+        for name in ("_HERMES_GATEWAY", "HERMES_GATEWAY_SESSION")
+        if os.getenv(name, "")
+    }
+    platform_l = platform.lower().strip()
+    source_l = source.lower().strip()
+    gateway_like_source = bool(platform_l and platform_l not in {"cli", "cron", "local"})
+    if source_l and source_l not in {"cli", "cron", "local", "tool"}:
+        gateway_like_source = True
+    active = bool(gateway_markers or gateway_like_source)
+    return {
+        "active_gateway_context": active,
+        "platform": platform,
+        "chat_id": chat_id,
+        "source": source,
+        "gateway_markers": gateway_markers,
+    }
+
+
+def _cmdline_for_pid(pid: int) -> str:
+    try:
+        if sys.platform.startswith("linux"):
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if raw:
+                return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return (proc.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _scan_processes_with_ps() -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        proc = subprocess.run(
+            ["ps", "axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return [], f"ps_unavailable: {type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        return [], f"ps_failed: {(proc.stderr or proc.stdout or '').strip()}"
+    rows: list[dict[str, Any]] = []
+    current_pid = os.getpid()
+    for line in (proc.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_s, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        command_l = command.lower()
+        kind = None
+        if "hermes" in command_l and "dashboard" in command_l:
+            kind = "dashboard"
+        elif "dashboard/server.py" in command_l or "tui_gateway/server.py" in command_l:
+            kind = "dashboard"
+        elif "cron.scheduler" in command_l or "cron/scheduler.py" in command_l:
+            kind = "cron"
+        elif "gateway/run.py" in command_l or ("hermes" in command_l and "gateway" in command_l):
+            kind = "gateway"
+        if kind:
+            rows.append({"pid": pid, "kind": kind, "command": command})
+    return rows, None
+
+
+def _writer_process_check() -> dict[str, Any]:
+    """Fail-closed writer-process gate beyond open-file checks.
+
+    SQLite open handles are necessary but not sufficient: a live gateway,
+    dashboard, or cron scheduler can reopen ``kanban.db`` immediately after
+    an ``lsof`` sample. This gate blocks install while known Hermes writer
+    services are running or while process verification is unavailable.
+    """
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    current_pid = os.getpid()
+
+    try:
+        from gateway.status import get_running_pid
+
+        gateway_pid = get_running_pid(cleanup_stale=False)
+        if gateway_pid and int(gateway_pid) != current_pid:
+            rows.append({
+                "pid": int(gateway_pid),
+                "kind": "gateway",
+                "source": "gateway.status",
+                "command": _cmdline_for_pid(int(gateway_pid)),
+            })
+    except Exception as exc:
+        errors.append(f"gateway_status_unavailable: {type(exc).__name__}: {exc}")
+
+    ps_rows, ps_error = _scan_processes_with_ps()
+    if ps_error:
+        errors.append(ps_error)
+    rows.extend(ps_rows)
+
+    seen: set[tuple[int, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for row in rows:
+        key = (int(row.get("pid") or 0), str(row.get("kind") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    blocking_errors = [err for err in errors if err.startswith("ps_")]
+    return {
+        "ok": not unique and not blocking_errors,
+        "running_writers": unique,
+        "errors": errors,
+    }
+
+
 def _default_evidence_dir() -> Path:
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     return kb.kanban_home() / "forensics" / f"kanban-live-repair-{stamp}"
@@ -185,8 +335,8 @@ def _write_text(path: Path, text: str) -> None:
 def _runbook(live_path: Path) -> list[str]:
     return [
         "Do not replace a live Kanban DB while gateway/dashboard/cron writers are active.",
-        "Use a non-gateway substrate or self-contained maintenance script with disk evidence.",
-        "Stop dashboard, cron/scheduler writers, then gateway; verify no PIDs or open lsof handles remain.",
+        "Use a non-gateway substrate or self-contained maintenance script with disk evidence; live replacement from Slack/gateway context is refused.",
+        "Stop dashboard, cron/scheduler writers, then gateway; verify no matching PIDs and no open lsof handles remain.",
         "Capture live kanban.db plus -wal/-shm sidecars into an evidence directory before mutation.",
         "Verify candidate PRAGMA quick_check and integrity_check are both ok.",
         "Compare durable-table freshness markers from live vs candidate; proceed only if candidate is equal/newer or explicit human loss acceptance is recorded.",
@@ -217,6 +367,7 @@ def run_repair_guard(
         "installed": False,
         "candidate": None,
         "evidence_dir": str(evidence),
+        "session_context": _session_context(),
         "issues": [],
         "runbook": _runbook(live_path),
     }
@@ -245,6 +396,17 @@ def run_repair_guard(
         result["issues"].append({"kind": "dry_run_only", "severity": "info"})
         return result
 
+    if result["session_context"].get("active_gateway_context"):
+        result["issues"].append(
+            {
+                "kind": "active_gateway_context_refused",
+                "severity": "error",
+                "message": "Refusing live DB replacement from a gateway/Slack-style session; launch an out-of-band maintenance shell/script after stopping services.",
+                "context": result["session_context"],
+            }
+        )
+        return result
+
     missing = []
     if not confirm_quiesced:
         missing.append("--confirm-quiesced")
@@ -263,6 +425,18 @@ def run_repair_guard(
 
     if not live_path.exists():
         result["issues"].append({"kind": "live_db_missing", "severity": "error"})
+        return result
+
+    writer_check = _writer_process_check()
+    result["writer_process_check"] = writer_check
+    if not writer_check.get("ok"):
+        result["issues"].append(
+            {
+                "kind": "writer_processes_or_unverified",
+                "severity": "error",
+                "message": "Refusing live replacement because gateway/dashboard/cron writer-process verification did not pass.",
+            }
+        )
         return result
 
     handle_check = _open_handle_check([live_path, *sidecars])
