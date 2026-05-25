@@ -254,8 +254,19 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        wrapper = (
+            "import subprocess, sys\n"
+            "script = sys.argv[1]\n"
+            "timeout_seconds = float(sys.argv[2])\n"
+            "try:\n"
+            "    subprocess.run(['bash', '-c', script], timeout=timeout_seconds)\n"
+            "except subprocess.TimeoutExpired:\n"
+            "    print('--- diagnostic timeout ---')\n"
+            "except Exception as exc:\n"
+            "    print(f'--- diagnostic failed: {exc} ---')\n"
+        )
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [sys.executable, "-c", wrapper, script, f"{timeout_seconds:.3f}"],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
