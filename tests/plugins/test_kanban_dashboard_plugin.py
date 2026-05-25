@@ -1128,6 +1128,133 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         assert ws is not None  # handshake succeeded
 
 
+def test_ws_task_log_stream_rejects_when_token_required(tmp_path, monkeypatch):
+    """Worker-log streaming uses the same dashboard token gate as /events."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="log-auth")
+    finally:
+        conn.close()
+
+    import hermes_cli
+    import types
+
+    stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    c = TestClient(app)
+
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with c.websocket_connect(f"/api/plugins/kanban/tasks/{tid}/log/stream"):
+            pass
+    assert exc.value.code == 1008
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with c.websocket_connect(f"/api/plugins/kanban/tasks/{tid}/log/stream?token=nope"):
+            pass
+    assert exc.value.code == 1008
+
+
+
+def test_ws_task_log_stream_sends_snapshot_and_appended_chunks(tmp_path, monkeypatch):
+    """The dashboard drawer can receive worker stdout/stderr without refresh."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="log-live")
+    finally:
+        conn.close()
+
+    log_path = kb.worker_log_path(tid)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("first\n", encoding="utf-8")
+
+    import hermes_cli
+    import types
+
+    stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    c = TestClient(app)
+
+    with c.websocket_connect(
+        f"/api/plugins/kanban/tasks/{tid}/log/stream?token=secret-xyz&offset=0"
+    ) as ws:
+        snapshot = ws.receive_json()
+        assert snapshot["type"] == "snapshot"
+        assert snapshot["task_id"] == tid
+        assert snapshot["content"] == "first\n"
+        assert snapshot["offset"] == log_path.stat().st_size
+
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("second\n")
+
+        appended = ws.receive_json()
+        assert appended["type"] == "append"
+        assert appended["task_id"] == tid
+        assert appended["chunk"] == "second\n"
+        assert appended["offset"] == log_path.stat().st_size
+
+
+
+def test_ws_task_log_stream_reports_rotation_when_offset_exceeds_size(tmp_path, monkeypatch):
+    """A rotated/truncated log is resynced instead of appending from a bad offset."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="log-rotated")
+    finally:
+        conn.close()
+
+    log_path = kb.worker_log_path(tid)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("after-rotation\n", encoding="utf-8")
+
+    import hermes_cli
+    import types
+
+    stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    c = TestClient(app)
+
+    with c.websocket_connect(
+        f"/api/plugins/kanban/tasks/{tid}/log/stream?token=secret-xyz&offset=9999"
+    ) as ws:
+        payload = ws.receive_json()
+
+    assert payload["type"] == "rotated"
+    assert payload["content"] == "after-rotation\n"
+    assert payload["offset"] == log_path.stat().st_size
+
+
+
 def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp_path, monkeypatch):
     """The event stream must honor ``board=default`` even when the global
     current-board pointer targets a different board.

@@ -2273,6 +2273,129 @@ def get_task_log(
     }
 
 
+def _read_worker_log_bytes(task_id: str, board: Optional[str], start: int, limit: int) -> tuple[str, int, int, str]:
+    """Read a bounded worker-log byte range for websocket streaming."""
+    log_path = kanban_db.worker_log_path(task_id, board=board)
+    stat = log_path.stat()
+    size = int(stat.st_size)
+    safe_start = max(0, min(int(start), size))
+    with open(log_path, "rb") as f:
+        f.seek(safe_start)
+        data = f.read(max(1, int(limit)))
+    return data.decode("utf-8", errors="replace"), safe_start + len(data), size, str(log_path)
+
+
+@router.websocket("/tasks/{task_id}/log/stream")
+async def stream_task_log(ws: WebSocket, task_id: str):
+    """Stream appended worker-log chunks for an open dashboard drawer.
+
+    The regular ``/events`` websocket is intentionally DB-event only. Worker
+    stdout/stderr is an append-only file stream, so this endpoint tails the log
+    file directly and emits small JSON frames without bloating ``task_events``.
+    """
+    token = ws.query_params.get("token")
+    if not _check_ws_token(token):
+        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+
+    raw_board = ws.query_params.get("board")
+    try:
+        board = kanban_db._normalize_board_slug(raw_board) if raw_board else None
+    except ValueError:
+        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        offset = max(0, int(ws.query_params.get("offset", "0") or "0"))
+    except ValueError:
+        offset = 0
+
+    conn = _conn(board=board, readonly=True)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+    if task is None:
+        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await ws.accept()
+    cursor = offset
+    sent_missing = False
+    try:
+        while True:
+            log_path = kanban_db.worker_log_path(task_id, board=board)
+            if not log_path.exists():
+                if not sent_missing:
+                    await ws.send_json({
+                        "type": "missing",
+                        "task_id": task_id,
+                        "offset": 0,
+                        "path": str(log_path),
+                    })
+                    sent_missing = True
+                cursor = 0
+                await asyncio.sleep(_LOG_STREAM_POLL_SECONDS)
+                continue
+
+            size = log_path.stat().st_size
+            if cursor <= 0:
+                content = kanban_db.read_worker_log(
+                    task_id, tail_bytes=_LOG_STREAM_TAIL_BYTES, board=board,
+                ) or ""
+                cursor = size
+                await ws.send_json({
+                    "type": "snapshot",
+                    "task_id": task_id,
+                    "offset": cursor,
+                    "size_bytes": size,
+                    "path": str(log_path),
+                    "content": content,
+                    "truncated": size > _LOG_STREAM_TAIL_BYTES,
+                })
+                sent_missing = False
+            elif size < cursor:
+                content = kanban_db.read_worker_log(
+                    task_id, tail_bytes=_LOG_STREAM_TAIL_BYTES, board=board,
+                ) or ""
+                cursor = size
+                await ws.send_json({
+                    "type": "rotated",
+                    "task_id": task_id,
+                    "offset": cursor,
+                    "size_bytes": size,
+                    "path": str(log_path),
+                    "content": content,
+                    "truncated": size > _LOG_STREAM_TAIL_BYTES,
+                })
+                sent_missing = False
+            elif size > cursor:
+                chunk, cursor, size, path = await asyncio.to_thread(
+                    _read_worker_log_bytes, task_id, board, cursor, _LOG_STREAM_MAX_CHUNK_BYTES,
+                )
+                await ws.send_json({
+                    "type": "append",
+                    "task_id": task_id,
+                    "offset": cursor,
+                    "size_bytes": size,
+                    "path": path,
+                    "chunk": chunk,
+                })
+                sent_missing = False
+
+            await asyncio.sleep(_LOG_STREAM_POLL_SECONDS)
+    except WebSocketDisconnect:
+        return
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        log.warning("Kanban worker log stream error for %s: %s", task_id, exc)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Dispatch nudge (optional quick-path so the UI doesn't wait 60 s)
 # ---------------------------------------------------------------------------
@@ -2424,6 +2547,9 @@ def switch_board(slug: str):
 # the simplest and most robust approach; it adds a fraction of a percent
 # of CPU and has no shared state to synchronize across workers.
 _EVENT_POLL_SECONDS = 0.3
+_LOG_STREAM_POLL_SECONDS = 0.3
+_LOG_STREAM_TAIL_BYTES = 100_000
+_LOG_STREAM_MAX_CHUNK_BYTES = 64_000
 
 
 # ---------------------------------------------------------------------------

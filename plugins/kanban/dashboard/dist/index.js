@@ -3526,20 +3526,124 @@
     );
   }
 
-  // Worker log: loads lazily (one GET on mount), refresh button, tail cap.
+  // Worker log: loads lazily, then tails appended chunks over a WebSocket.
   function WorkerLogSection(props) {
     const { t } = useI18n();
-    const [state, setState] = useState({ loading: false, data: null, err: null });
+    const [state, setState] = useState({ loading: false, data: null, err: null, streaming: false });
+    const [content, setContent] = useState("");
+    const wsRef = useRef(null);
+    const offsetRef = useRef(0);
+    const preRef = useRef(null);
+    const nearBottomRef = useRef(true);
+    const maxLogChars = 500000;
+
+    const trimContent = useCallback(function (text) {
+      const s = String(text || "");
+      return s.length > maxLogChars ? s.slice(s.length - maxLogChars) : s;
+    }, []);
+
     const load = useCallback(function () {
-      setState({ loading: true, data: null, err: null });
+      try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
+      wsRef.current = null;
+      setState({ loading: true, data: null, err: null, streaming: false });
+      setContent("");
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/log?tail=100000`, props.boardSlug))
-        .then(function (d) { setState({ loading: false, data: d, err: null }); })
-        .catch(function (e) { setState({ loading: false, data: null, err: String(e.message || e) }); });
-    }, [props.taskId, props.boardSlug]);
+        .then(function (d) {
+          offsetRef.current = Number(d && d.size_bytes ? d.size_bytes : 0);
+          setContent(trimContent(d && d.content ? d.content : ""));
+          setState({ loading: false, data: d, err: null, streaming: false });
+        })
+        .catch(function (e) {
+          setState({ loading: false, data: null, err: String(e.message || e), streaming: false });
+        });
+    }, [props.taskId, props.boardSlug, trimContent]);
 
     // Auto-load when the section mounts; the user opened the drawer so the
     // cost is one small HTTP round-trip.
     useEffect(function () { load(); }, [load]);
+
+    useEffect(function () {
+      const data = state.data;
+      if (!data || state.loading) return undefined;
+      const token = window.__HERMES_SESSION_TOKEN__ || "";
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const qsParams = {
+        token: token,
+        offset: String(offsetRef.current || 0),
+      };
+      if (props.boardSlug) qsParams.board = props.boardSlug;
+      const qs = new URLSearchParams(qsParams);
+      const url = `${proto}//${window.location.host}${API}/tasks/${encodeURIComponent(props.taskId)}/log/stream?${qs}`;
+      let ws;
+      try { ws = new WebSocket(url); } catch (_e) { return undefined; }
+      wsRef.current = ws;
+      ws.onopen = function () {
+        setState(function (prev) { return Object.assign({}, prev, { streaming: true }); });
+      };
+      ws.onmessage = function (ev) {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (!msg || !msg.type) return;
+          if (msg.type === "snapshot" || msg.type === "rotated") {
+            offsetRef.current = Number(msg.offset || 0);
+            setContent(trimContent(msg.content || ""));
+            setState(function (prev) {
+              const nextData = Object.assign({}, prev.data || {}, {
+                exists: true,
+                path: msg.path || (prev.data && prev.data.path) || "",
+                size_bytes: Number(msg.size_bytes || msg.offset || 0),
+                truncated: !!msg.truncated,
+              });
+              return Object.assign({}, prev, { data: nextData, err: null, streaming: true });
+            });
+          } else if (msg.type === "append") {
+            offsetRef.current = Number(msg.offset || offsetRef.current || 0);
+            setContent(function (prev) { return trimContent(String(prev || "") + String(msg.chunk || "")); });
+            setState(function (prev) {
+              const nextData = Object.assign({}, prev.data || {}, {
+                exists: true,
+                path: msg.path || (prev.data && prev.data.path) || "",
+                size_bytes: Number(msg.size_bytes || msg.offset || 0),
+              });
+              return Object.assign({}, prev, { data: nextData, err: null, streaming: true });
+            });
+          } else if (msg.type === "missing") {
+            offsetRef.current = 0;
+            setState(function (prev) {
+              const nextData = Object.assign({}, prev.data || {}, {
+                exists: false,
+                path: msg.path || (prev.data && prev.data.path) || "",
+                size_bytes: 0,
+              });
+              return Object.assign({}, prev, { data: nextData, streaming: true });
+            });
+          }
+        } catch (_e) { /* ignore malformed stream frames */ }
+      };
+      ws.onerror = function () {
+        setState(function (prev) { return Object.assign({}, prev, { streaming: false }); });
+      };
+      ws.onclose = function (ev) {
+        setState(function (prev) {
+          const next = Object.assign({}, prev, { streaming: false });
+          if (ev && ev.code === 1008) {
+            next.err = tx(t, "wsAuthFailed",
+              "WebSocket auth failed — reload the page to refresh the session token.");
+          }
+          return next;
+        });
+      };
+      return function () {
+        try { ws.close(); } catch (_e) { /* noop */ }
+        if (wsRef.current === ws) wsRef.current = null;
+      };
+    }, [state.data && state.data.task_id, state.loading, props.taskId, props.boardSlug, trimContent]);
+
+    useEffect(function () {
+      const el = preRef.current;
+      if (!el || !nearBottomRef.current) return;
+      try { el.scrollTop = el.scrollHeight; } catch (_e) { /* noop */ }
+    }, [content]);
 
     const data = state.data;
     let body;
@@ -3548,19 +3652,27 @@
         tx(t, "loadingLog", "Loading log…"));
     } else if (state.err) {
       body = h("div", { className: "text-xs text-destructive" }, state.err);
-    } else if (!data || !data.exists) {
+    } else if (!data || (!data.exists && !content)) {
       body = h("div", { className: "text-xs text-muted-foreground italic" },
         tx(t, "noWorkerLog",
           "— no worker log yet (task hasn't spawned or log was rotated away) —"));
     } else {
-      body = h("pre", { className: "hermes-kanban-pre hermes-kanban-log" },
-        data.content || "(empty)");
+      body = h("pre", {
+        ref: preRef,
+        className: "hermes-kanban-pre hermes-kanban-log",
+        onScroll: function (e) {
+          const el = e.currentTarget;
+          nearBottomRef.current = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 16);
+        },
+      }, content || "(empty)");
     }
 
+    const sizeLabel = data && data.size_bytes ? ` (${data.size_bytes} B)` : "";
+    const liveLabel = state.streaming ? " · live" : "";
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head-row" },
         h("span", { className: "hermes-kanban-section-head" },
-          tx(t, "workerLog", "Worker log") + (data && data.size_bytes ? ` (${data.size_bytes} B)` : "")),
+          tx(t, "workerLog", "Worker log") + sizeLabel + liveLabel),
         h("button", {
           type: "button",
           onClick: load,
@@ -3569,6 +3681,10 @@
         }, "refresh"),
       ),
       body,
+      content && content.length >= maxLogChars
+        ? h("div", { className: "text-xs text-muted-foreground" },
+            tx(t, "logClientTrimmed", "(showing latest in-browser log content — use refresh/full path for older output)"))
+        : null,
       data && data.truncated
         ? h("div", { className: "text-xs text-muted-foreground" },
             tx(t, "logTruncated", "(showing last 100 KB — full log at "),
