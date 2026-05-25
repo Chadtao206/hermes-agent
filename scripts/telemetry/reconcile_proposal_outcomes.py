@@ -128,6 +128,26 @@ def kanban_task_state(kanban_db: Path, task_id: str) -> sqlite3.Row | None:
         conn.close()
 
 
+def kanban_task_by_idempotency_key(kanban_db: Path, idempotency_key: str) -> sqlite3.Row | None:
+    if not kanban_db.exists() or not idempotency_key:
+        return None
+    conn = sqlite3.connect(f"file:{kanban_db}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            """
+            SELECT id, status, completed_at, consecutive_failures, result
+            FROM tasks
+            WHERE idempotency_key = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (idempotency_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
 def _status_equal(left: str | None, right: str | None) -> bool:
     return str(left or "").strip().lower() == str(right or "").strip().lower()
 
@@ -137,6 +157,7 @@ def derive_transition(
     proposal: sqlite3.Row,
     apply_link: sqlite3.Row | None,
     task: sqlite3.Row | None,
+    resolved_kanban_task_id: str | None = None,
 ) -> dict[str, Any]:
     proposal_id = str(proposal["proposal_id"])
     previous_status = str(proposal["status"] or "")
@@ -161,7 +182,11 @@ def derive_transition(
             "reason": "No proposal_apply_audit linkage found for proposal.",
         }
 
-    kanban_task_id = str(apply_link["kanban_task_id"] or "").strip()
+    kanban_task_id = (
+        str(resolved_kanban_task_id).strip()
+        if resolved_kanban_task_id
+        else str(apply_link["kanban_task_id"] or "").strip()
+    )
     if not kanban_task_id:
         return {
             "proposal_id": proposal_id,
@@ -383,8 +408,30 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
         for proposal in proposals:
             proposal_id = str(proposal["proposal_id"])
             link = latest_apply_link(conn, proposal_id)
-            task = kanban_task_state(kanban_db, str(link["kanban_task_id"]).strip()) if link and link["kanban_task_id"] else None
-            transition = derive_transition(proposal=proposal, apply_link=link, task=task)
+            link_task_id = str(link["kanban_task_id"] or "").strip() if link else ""
+            link_idempotency_key = str(link["idempotency_key"] or "").strip() if link else ""
+
+            task = kanban_task_state(kanban_db, link_task_id) if link_task_id else None
+            resolved_task_id: str | None = link_task_id or None
+            link_source: str | None = "apply_audit_id" if task is not None else None
+
+            if task is None and link_idempotency_key:
+                fallback_task = kanban_task_by_idempotency_key(kanban_db, link_idempotency_key)
+                if fallback_task is not None:
+                    task = fallback_task
+                    resolved_task_id = str(fallback_task["id"])
+                    link_source = (
+                        "idempotency_key_corroborated"
+                        if link_task_id
+                        else "idempotency_key_fallback"
+                    )
+
+            transition = derive_transition(
+                proposal=proposal,
+                apply_link=link,
+                task=task,
+                resolved_kanban_task_id=resolved_task_id,
+            )
             observation = {
                 "proposal_id": proposal_id,
                 "proposal": {
@@ -395,8 +442,8 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
                     "updated_at": proposal["updated_at"],
                 },
                 "apply_link": {
-                    "kanban_task_id": str(link["kanban_task_id"] or "").strip() if link else None,
-                    "idempotency_key": str(link["idempotency_key"] or "") if link else None,
+                    "kanban_task_id": link_task_id or None,
+                    "idempotency_key": link_idempotency_key or None,
                     "action": str(link["action"] or "") if link else None,
                     "applied_at": str(link["applied_at"] or "") if link else None,
                 }
@@ -406,6 +453,8 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
                     "status": str(task["status"] or "") if task else None,
                     "completed_at": task["completed_at"] if task else None,
                     "consecutive_failures": int(task["consecutive_failures"] or 0) if task else None,
+                    "resolved_task_id": resolved_task_id,
+                    "link_source": link_source,
                 }
                 if link
                 else None,

@@ -312,6 +312,98 @@ def case_execute_blocked_sets_needs_review() -> None:
         assert row == ("needs_review", "needs_review"), row
 
 
+def case_execute_failed_sets_failed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root = root / "telemetry"
+        kanban_db = root / "kanban.db"
+        proposal_id = "proposal:reconcile-failed"
+        task_id = "t_reconcile_failed"
+
+        _run_init(telemetry_root)
+        _init_kanban_db(kanban_db)
+        _seed_applied_row(telemetry_root / "experiments.db", proposal_id, task_id)
+        _insert_task(kanban_db, task_id, "failed", completed_at="2026-05-25T03:00:00+00:00", consecutive_failures=3)
+
+        payload = reconcile_mod.reconcile(
+            _args(
+                telemetry_root=telemetry_root,
+                kanban_db=kanban_db,
+                proposal_id=proposal_id,
+                execute=True,
+                operator="Chad Tao",
+                reason="Failed reconciliation",
+            )
+        )
+        assert payload["updated"] == 1, payload
+
+        row = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT status, outcome FROM proposals WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert row == ("failed", "failed"), row
+
+        audit = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT action, new_status, new_outcome FROM proposal_outcome_audit WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert audit == ("transitioned_failed", "failed", "failed"), audit
+
+
+def case_execute_idempotency_key_fallback_corroborates_link() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root = root / "telemetry"
+        kanban_db = root / "kanban.db"
+        proposal_id = "proposal:reconcile-idem-fallback"
+        task_id = "t_reconcile_idem_fallback"
+
+        _run_init(telemetry_root)
+        _init_kanban_db(kanban_db)
+        _seed_applied_row(telemetry_root / "experiments.db", proposal_id, None)
+
+        conn = sqlite3.connect(kanban_db)
+        try:
+            conn.execute(
+                "INSERT INTO tasks(id, idempotency_key, status, created_at, completed_at, consecutive_failures, result) VALUES (?, ?, ?, 1, ?, ?, ?)",
+                (task_id, f"proposal-apply:{proposal_id}", "done", "2026-05-25T03:00:00+00:00", 0, "done"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        payload = reconcile_mod.reconcile(
+            _args(
+                telemetry_root=telemetry_root,
+                kanban_db=kanban_db,
+                proposal_id=proposal_id,
+                execute=True,
+                operator="Chad Tao",
+                reason="Fallback via idempotency_key",
+            )
+        )
+        assert payload["updated"] == 1, payload
+        observation = payload["observations"][0]
+        assert observation["kanban"]["link_source"] == "idempotency_key_fallback", observation
+        assert observation["kanban"]["resolved_task_id"] == task_id, observation
+
+        row = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT status, outcome FROM proposals WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert row == ("verified", "success"), row
+
+        audit_task = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT kanban_task_id FROM proposal_outcome_audit WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert audit_task == (task_id,), audit_task
+
+
 def case_execute_non_terminal_is_noop() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -486,6 +578,8 @@ def main() -> int:
     case_dry_run_has_no_mutation()
     case_execute_done_sets_verified_success()
     case_execute_blocked_sets_needs_review()
+    case_execute_failed_sets_failed()
+    case_execute_idempotency_key_fallback_corroborates_link()
     case_execute_non_terminal_is_noop()
     case_execute_missing_task_sets_stale_attention()
     case_quick_check_failure_aborts_execute()
