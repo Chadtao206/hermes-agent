@@ -41,6 +41,17 @@ function statusClass(status: string): string {
   return "border-warning/30 bg-warning/10 text-warning";
 }
 
+function decisionLabel(decision: string | undefined): string {
+  if (!decision) return "unknown";
+  if (decision === "approve") return "approved";
+  if (decision === "deny") return "denied";
+  return decision;
+}
+
+function latestUpdatedAt(proposal: ControlCenterProposal): string {
+  return proposal.ledger_updated_at || proposal.updated_at || "unknown";
+}
+
 export default function ProposalQueuePage() {
   const [proposals, setProposals] = useState<ControlCenterProposal[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -104,6 +115,8 @@ export default function ProposalQueuePage() {
             <option value="proposed">proposed</option>
             <option value="approved">approved</option>
             <option value="denied">denied</option>
+            <option value="discussing">discussing</option>
+            <option value="needs_changes">needs_changes</option>
             <option value="applied">applied</option>
           </select>
         </label>
@@ -136,6 +149,10 @@ export default function ProposalQueuePage() {
                     <span>owner: {proposal.owner || "unknown"}</span>
                     <span>confidence: {confidenceText(proposal)}</span>
                   </div>
+                  <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
+                    <span>updated: {latestUpdatedAt(proposal)}</span>
+                    {proposal.decision ? <span>ledger: {decisionLabel(proposal.decision.decision)}</span> : null}
+                  </div>
                 </button>
               );
             })
@@ -156,9 +173,36 @@ export default function ProposalQueuePage() {
                 <div><span className="text-muted-foreground">status:</span> {selected.status}</div>
                 <div><span className="text-muted-foreground">decision requested:</span> {selected.decision_requested}</div>
                 <div><span className="text-muted-foreground">owner:</span> {selected.owner || "unknown"}</div>
-                <div><span className="text-muted-foreground">updated:</span> {selected.updated_at || "unknown"}</div>
+                <div><span className="text-muted-foreground">updated:</span> {latestUpdatedAt(selected)}</div>
                 <div><span className="text-muted-foreground">created:</span> {selected.created_at || "unknown"}</div>
+                <div><span className="text-muted-foreground">approver:</span> {selected.approver || selected.decision?.approver || "unknown"}</div>
               </div>
+
+              {selected.decision ? (
+                <Card className="p-3 text-sm">
+                  <div className="font-medium">Ledger decision</div>
+                  <div className="mt-1 text-card-foreground">
+                    {decisionLabel(selected.decision.decision)}
+                    {selected.decision.decided_at ? ` at ${selected.decision.decided_at}` : ""}
+                    {selected.decision.approver ? ` by ${selected.decision.approver}` : ""}
+                  </div>
+                  <div className="mt-2 grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+                    <div>source: {selected.decision.source || "unknown"}</div>
+                    <div>
+                      transition:{" "}
+                      {selected.decision.previous_status || "unknown"} →{" "}
+                      {selected.decision.new_status || selected.status}
+                    </div>
+                    {selected.approved_at ? <div>approved at: {selected.approved_at}</div> : null}
+                    {selected.denied_at ? <div>denied at: {selected.denied_at}</div> : null}
+                  </div>
+                  {selected.decision.reason || selected.denial_reason ? (
+                    <div className="mt-2 text-card-foreground">
+                      reason: {selected.decision.reason || selected.denial_reason}
+                    </div>
+                  ) : null}
+                </Card>
+              ) : null}
 
               <Card className="p-3">
                 <div className="text-sm font-medium">Evidence summary</div>

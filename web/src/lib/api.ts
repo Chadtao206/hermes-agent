@@ -1022,6 +1022,16 @@ export interface ControlCenterProposalEvidence {
   evidence_summary?: string;
 }
 
+export interface ControlCenterProposalDecision {
+  decision: string;
+  decided_at?: string | null;
+  approver?: string | null;
+  reason?: string | null;
+  previous_status?: string | null;
+  new_status?: string | null;
+  source?: string | null;
+}
+
 export interface ControlCenterProposal {
   proposal_id: string;
   title: string;
@@ -1044,6 +1054,12 @@ export interface ControlCenterProposal {
   approve_deny_discuss?: string;
   created_at?: string | null;
   updated_at?: string | null;
+  approved_at?: string | null;
+  denied_at?: string | null;
+  approver?: string | null;
+  denial_reason?: string | null;
+  ledger_updated_at?: string | null;
+  decision?: ControlCenterProposalDecision | null;
   provenance: {
     source_paths: string[];
     source_file: string;
