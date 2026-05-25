@@ -204,8 +204,10 @@ def case_dry_run_generates_artifact_without_mutation() -> None:
 
         apply_path = Path(payload["apply_artifact_path"])
         assert apply_path.exists(), payload
+        assert apply_path.name == f"{proposal_id}.apply.dry-run.json", payload
         apply_md = Path(payload["apply_markdown_path"])
         assert apply_md.exists(), payload
+        assert apply_md.name == f"{proposal_id}.apply.dry-run.md", payload
 
         db = telemetry_root / "experiments.db"
         row = _query_one(db, "SELECT status, applied_at FROM proposals WHERE proposal_id=?", (proposal_id,))
@@ -333,6 +335,20 @@ def case_execute_is_idempotent_and_records_audit_backup() -> None:
         original = apply_mod.create_kanban_task
         apply_mod.create_kanban_task = fake_create_kanban_task
         try:
+            dry_payload = apply_mod.apply(
+                _args(
+                    proposal_id=proposal_id,
+                    telemetry_root=telemetry_root,
+                    kanban_db=kanban_db,
+                    execute=False,
+                )
+            )
+            assert dry_payload["ok"] is True, dry_payload
+            assert dry_payload["action"] == "plan_generated", dry_payload
+            dry_artifact_path = Path(dry_payload["apply_artifact_path"])
+            assert dry_artifact_path.name.endswith(".apply.dry-run.json"), dry_payload
+            dry_artifact_before = dry_artifact_path.read_text(encoding="utf-8")
+
             first_payload = apply_mod.apply(
                 _args(
                     proposal_id=proposal_id,
@@ -349,6 +365,11 @@ def case_execute_is_idempotent_and_records_audit_backup() -> None:
             assert len(calls) == 1, calls
 
             idempotency_key = first_payload["idempotency_key"]
+            execute_artifact_path = Path(first_payload["apply_artifact_path"])
+            assert execute_artifact_path.name == f"{proposal_id}.apply.json", first_payload
+            assert execute_artifact_path != dry_artifact_path
+            execute_artifact_before = execute_artifact_path.read_text(encoding="utf-8")
+            assert dry_artifact_path.read_text(encoding="utf-8") == dry_artifact_before
             assert Path(first_payload["backup_path"]).exists(), first_payload
             assert Path(first_payload["kanban_backup_path"]).exists(), first_payload
             assert Path(first_payload["manifest_path"]).exists(), first_payload
@@ -394,7 +415,18 @@ def case_execute_is_idempotent_and_records_audit_backup() -> None:
             )
             assert second_payload["ok"] is True, second_payload
             assert second_payload["action"] == "noop_already_applied", second_payload
+            assert second_payload["apply_artifact_path"] == str(execute_artifact_path), second_payload
+            assert Path(second_payload["apply_markdown_path"]).name == f"{proposal_id}.apply.md", second_payload
+            assert execute_artifact_path.read_text(encoding="utf-8") == execute_artifact_before
+            assert dry_artifact_path.read_text(encoding="utf-8") == dry_artifact_before
             assert len(calls) == 1, calls
+
+            audit_count = _query_one(
+                db,
+                "SELECT COUNT(*) FROM proposal_apply_audit WHERE proposal_id=?",
+                (proposal_id,),
+            )[0]
+            assert audit_count == 1, audit_count
 
             count_after = _query_one(
                 kanban_db,

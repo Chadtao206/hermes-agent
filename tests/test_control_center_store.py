@@ -640,6 +640,9 @@ class TestReadProposals:
 
         _write_json(proposals_dir / f"{proposal_id}.json", packet)
         _write_json(proposals_dir / f"{proposal_id}.apply.json", apply_artifact)
+        _write_json(proposals_dir / f"{proposal_id}.apply.dry-run.json", {**apply_artifact, "mode": "dry_run"})
+        _write_json(proposals_dir / f"{proposal_id}.apply.execute.json", apply_artifact)
+        _write_json(proposals_dir / f"{proposal_id}.apply.noop-20260525.json", {**apply_artifact, "mode": "noop_already_applied"})
         _write_json(proposals_dir / f"{proposal_id}.manifest.json", {"proposal_id": proposal_id})
 
         rows = cc.read_proposals()

@@ -2078,6 +2078,8 @@ def _normalize_proposal_row(row: Dict[str, Any], source_path: Path) -> Dict[str,
 _PROPOSAL_PACKET_FALLBACK_EXCLUDE_SUFFIXES = (
     ".row.json",
     ".apply.json",
+    ".apply.dry-run.json",
+    ".apply.execute.json",
     ".manifest.json",
 )
 
@@ -2103,7 +2105,8 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
         candidates = [
             p
             for p in sorted(root.glob("*.json"))
-            if not any(p.name.endswith(suffix) for suffix in _PROPOSAL_PACKET_FALLBACK_EXCLUDE_SUFFIXES)
+            if ".apply." not in p.name
+            and not any(p.name.endswith(suffix) for suffix in _PROPOSAL_PACKET_FALLBACK_EXCLUDE_SUFFIXES)
         ]
 
     for candidate in candidates:

@@ -150,6 +150,23 @@ def latest_decision_audit(conn: sqlite3.Connection, proposal_id: str) -> sqlite3
     ).fetchone()
 
 
+def latest_apply_audit(conn: sqlite3.Connection, proposal_id: str) -> sqlite3.Row | None:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT applied_at, action, apply_artifact_path, kanban_task_id, manifest_path
+        FROM proposal_apply_audit
+        WHERE proposal_id = ?
+          AND action IN ('applied', 'noop_update_guard')
+          AND apply_artifact_path IS NOT NULL
+          AND apply_artifact_path != ''
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (proposal_id,),
+    ).fetchone()
+
+
 def build_task_payload(row: sqlite3.Row, packet: dict[str, Any], proposal_id: str, apply_artifact: Path) -> dict[str, str]:
     owner = str(row["owner_profile"] or packet.get("owner_profile") or packet.get("owner") or "engineer")
     title = f"proposal apply: {proposal_id} — {row['title'] or packet.get('title') or proposal_id}"
@@ -178,6 +195,18 @@ def build_task_payload(row: sqlite3.Row, packet: dict[str, Any], proposal_id: st
     return {"title": title, "body": body, "assignee": owner}
 
 
+def apply_artifact_paths(proposal_id: str, proposal_dir: Path, mode: str) -> tuple[Path, Path]:
+    if mode == "execute":
+        stem = f"{proposal_id}.apply"
+    elif mode == "dry_run":
+        stem = f"{proposal_id}.apply.dry-run"
+    elif mode == "noop_already_applied":
+        stem = f"{proposal_id}.apply.noop-{compact_timestamp()}"
+    else:
+        raise ValueError(f"Unsupported apply artifact mode: {mode!r}")
+    return proposal_dir / f"{stem}.json", proposal_dir / f"{stem}.md"
+
+
 def write_apply_artifacts(
     *,
     proposal_id: str,
@@ -190,8 +219,7 @@ def write_apply_artifacts(
     task_payload: dict[str, str],
 ) -> tuple[Path, Path]:
     proposal_dir.mkdir(parents=True, exist_ok=True)
-    apply_json_path = proposal_dir / f"{proposal_id}.apply.json"
-    apply_md_path = proposal_dir / f"{proposal_id}.apply.md"
+    apply_json_path, apply_md_path = apply_artifact_paths(proposal_id, proposal_dir, mode)
 
     payload = {
         "proposal_id": proposal_id,
@@ -389,36 +417,43 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
                 "Capture an explicit approval first via capture_proposal_decision.py."
             )
         decision = latest_decision_audit(conn, args.proposal_id)
+        apply_audit = latest_apply_audit(conn, args.proposal_id)
     finally:
         conn.close()
 
     idempotency_key = f"proposal-apply:{args.proposal_id}"
-    task_payload = build_task_payload(row, packet, args.proposal_id, proposal_dir / f"{args.proposal_id}.apply.json")
+    mode = "execute" if args.execute else "dry_run"
+
+    if row["status"] == "applied" and row["applied_at"]:
+        existing_task = existing_task_for_key(kanban_db, idempotency_key)
+        fallback_json_path, fallback_md_path = apply_artifact_paths(args.proposal_id, proposal_dir, "execute")
+        audit_artifact_path = apply_audit["apply_artifact_path"] if apply_audit else None
+        apply_json_path = Path(audit_artifact_path) if audit_artifact_path else fallback_json_path
+        apply_md_path = apply_json_path.with_suffix(".md") if audit_artifact_path else fallback_md_path
+        return {
+            "proposal_id": args.proposal_id,
+            "mode": mode,
+            "ok": True,
+            "action": "noop_already_applied",
+            "status": "applied",
+            "applied_at": row["applied_at"],
+            "kanban_task_id": existing_task or (apply_audit["kanban_task_id"] if apply_audit else None),
+            "apply_artifact_path": str(apply_json_path),
+            "apply_markdown_path": str(apply_md_path),
+            "idempotency_key": idempotency_key,
+        }
+
+    task_payload = build_task_payload(row, packet, args.proposal_id, apply_artifact_paths(args.proposal_id, proposal_dir, mode)[0])
     apply_json_path, apply_md_path = write_apply_artifacts(
         proposal_id=args.proposal_id,
         proposal_dir=proposal_dir,
         packet_path=packet_path,
         row=row,
         decision=decision,
-        mode="execute" if args.execute else "dry_run",
+        mode=mode,
         idempotency_key=idempotency_key,
         task_payload=task_payload,
     )
-
-    if row["status"] == "applied" and row["applied_at"]:
-        existing_task = existing_task_for_key(kanban_db, idempotency_key)
-        return {
-            "proposal_id": args.proposal_id,
-            "mode": "execute" if args.execute else "dry_run",
-            "ok": True,
-            "action": "noop_already_applied",
-            "status": "applied",
-            "applied_at": row["applied_at"],
-            "kanban_task_id": existing_task,
-            "apply_artifact_path": str(apply_json_path),
-            "apply_markdown_path": str(apply_md_path),
-            "idempotency_key": idempotency_key,
-        }
 
     if row["status"] != "approved" or not row["approved_at"]:
         raise ValueError(
