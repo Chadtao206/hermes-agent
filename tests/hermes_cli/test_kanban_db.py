@@ -1139,7 +1139,12 @@ def test_protocol_violation_event_carries_structured_failure_class(
     monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="needs closeout", assignee="a")
+        tid = kb.create_task(
+            conn,
+            title="needs closeout",
+            assignee="a",
+            max_retries=5,
+        )
         kb.claim_task(
             conn, tid,
             claimer=f"{_kb._claimer_id().split(':', 1)[0]}:worker",
@@ -1176,10 +1181,102 @@ def test_protocol_violation_event_carries_structured_failure_class(
             "AND kind='gave_up' ORDER BY id DESC LIMIT 1",
             (tid,),
         ).fetchone()["payload"])
+        assert gave_up_payload["effective_limit"] == 1
+        assert gave_up_payload["limit_source"] == "dispatcher"
         assert gave_up_payload["failure_class"] == (
             _kb.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
         )
         assert "kanban_complete" in gave_up_payload["guidance"]
+
+
+def test_classify_worker_exit_reaps_specific_pid_when_registry_misses(
+    kanban_home, monkeypatch,
+):
+    """If the periodic reap loop hasn't run yet, classification should
+    probe ``waitpid(pid, WNOHANG)`` so rc=0 exits are still recognized."""
+    import hermes_cli.kanban_db as _kb
+
+    if _kb.os.name == "nt":
+        pytest.skip("waitpid fallback is POSIX-only")
+
+    pid = 71234
+    monkeypatch.setattr(_kb, "_recent_worker_exits", {})
+
+    calls: list[tuple[int, int]] = []
+
+    def _waitpid(_pid, _flags):
+        calls.append((int(_pid), int(_flags)))
+        return (pid, 0)  # raw wait status for exit code 0
+
+    monkeypatch.setattr(_kb.os, "waitpid", _waitpid)
+
+    kind, code = _kb._classify_worker_exit(pid)
+    assert (kind, code) == ("clean_exit", 0)
+    assert calls and calls[0][0] == pid
+    assert pid in _kb._recent_worker_exits
+
+
+def test_dispatch_classifies_clean_exit_before_stale_reclaim(
+    kanban_home, monkeypatch,
+):
+    """A stale claim with dead pid should still become protocol_violation,
+    not get silently reclaimed first."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="closeout-miss", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, claim_expires=? WHERE id=?",
+            (70003, int(time.time()) - 3600, tid),
+        )
+        conn.commit()
+
+        res = kb.dispatch_once(conn, dry_run=True)
+
+        assert tid in res.crashed
+        assert res.reclaimed == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        violation = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='protocol_violation' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert violation is not None
+
+
+def test_recompute_ready_keeps_protocol_violation_gave_up_blocked(kanban_home):
+    """Protocol-violation gave_up should remain sticky-blocked until explicit
+    unblock, while ordinary gave_up keeps auto-recovery behavior."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        sticky = kb.create_task(conn, title="sticky", assignee="a")
+        auto = kb.create_task(conn, title="auto", assignee="a")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (sticky,))
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (auto,))
+        _kb._append_event(
+            conn,
+            sticky,
+            "gave_up",
+            {"failure_class": _kb.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT},
+        )
+        _kb._append_event(conn, auto, "gave_up", {"failure_class": "systemic_spawn_failure"})
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+
+        assert promoted == 1
+        sticky_task = kb.get_task(conn, sticky)
+        auto_task = kb.get_task(conn, auto)
+        assert sticky_task is not None and sticky_task.status == "blocked"
+        assert auto_task is not None and auto_task.status == "ready"
 
 
 def test_nonprotocol_crash_does_not_set_protocol_violation_failure_class(

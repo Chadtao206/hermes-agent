@@ -190,8 +190,8 @@ def test_reassign_resets_failure_counter_for_new_profile(kanban_home, all_assign
 
 
 def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assignees_spawnable):
-    """Per-task ``max_retries`` overrides both the caller-supplied
-    ``failure_limit`` (gateway config) and the hardcoded default.
+    """Per-task ``max_retries`` overrides the caller-supplied
+    ``failure_limit`` for ordinary failures.
 
     Three-tier resolution order:
       1. ``task.max_retries`` (set via ``create_task(max_retries=N)`` /
@@ -230,6 +230,45 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
         assert gave_up, f"expected gave_up event, got {[e.kind for e in events]}"
         assert gave_up[-1].payload.get("limit_source") == "task"
         assert gave_up[-1].payload.get("effective_limit") == 1
+    finally:
+        conn.close()
+
+
+def test_dispatcher_failure_limit_cap_can_force_task_max_retries(kanban_home, all_assignees_spawnable):
+    """Deterministic callers may explicitly cap task-level retries.
+
+    Deterministic failure classes (e.g. protocol_violation_clean_exit)
+    route through ``_record_task_failure(..., failure_limit=1,
+    failure_limit_is_cap=True)``. The cap ensures they block on first
+    occurrence even if ``task.max_retries`` is higher.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="deterministic", assignee="worker", max_retries=5,
+        )
+        kb.claim_task(conn, tid)
+        tripped = kb._record_task_failure(
+            conn, tid,
+            error="protocol violation",
+            outcome="crashed",
+            failure_limit=1,
+            failure_limit_is_cap=True,
+            release_claim=True,
+            end_run=False,
+        )
+        assert tripped is True
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+
+        events = kb.list_events(conn, tid)
+        gave_up = [e for e in events if e.kind == "gave_up"]
+        assert gave_up, f"expected gave_up event, got {[e.kind for e in events]}"
+        payload = gave_up[-1].payload or {}
+        assert payload.get("effective_limit") == 1
+        assert payload.get("limit_source") == "dispatcher"
     finally:
         conn.close()
 
@@ -1455,7 +1494,10 @@ def test_run_closed_on_complete_with_summary(kanban_home):
         assert r.status == "done"
         assert r.outcome == "completed"
         assert r.summary == "implemented rate limiter, tests pass"
-        assert r.metadata == {"changed_files": ["limiter.py"], "tests_run": 12}
+        assert isinstance(r.metadata, dict)
+        assert r.metadata["changed_files"] == ["limiter.py"]
+        assert r.metadata["tests_run"] == 12
+        assert "closeout_packet" in r.metadata
         assert r.ended_at is not None
     finally:
         conn.close()
@@ -1801,7 +1843,8 @@ def test_cli_runs_json(kanban_home):
     data = json.loads(out)
     assert len(data) == 1
     assert data[0]["outcome"] == "completed"
-    assert data[0]["metadata"] == {"files": 1}
+    assert data[0]["metadata"]["files"] == 1
+    assert "closeout_packet" in data[0]["metadata"]
 
 
 def test_cli_complete_with_summary_and_metadata(kanban_home):
@@ -1822,8 +1865,11 @@ def test_cli_complete_with_summary_and_metadata(kanban_home):
         r = kb.latest_run(conn, tid)
     finally:
         conn.close()
+    assert r is not None
     assert r.summary == "done it"
-    assert r.metadata == {"files": 3}
+    assert isinstance(r.metadata, dict)
+    assert r.metadata["files"] == 3
+    assert "closeout_packet" in r.metadata
 
 
 def test_cli_edit_backfills_result_on_done_task(kanban_home):
@@ -1926,6 +1972,7 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
     Importing _set_status_direct directly to simulate the PATCH handler
     without spinning up FastAPI.
     """
+    pytest.importorskip("fastapi")
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
     conn = kb.connect()
@@ -1951,6 +1998,7 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
 
 def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanban_home):
     """todo -> ready on an unclaimed task must not create any run rows."""
+    pytest.importorskip("fastapi")
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
     conn = kb.connect()
@@ -2065,7 +2113,9 @@ def test_complete_never_claimed_task_synthesizes_run(kanban_home):
         r = runs[0]
         assert r.outcome == "completed"
         assert r.summary == "did it manually"
-        assert r.metadata == {"reason": "human intervention"}
+        assert isinstance(r.metadata, dict)
+        assert r.metadata["reason"] == "human intervention"
+        assert "closeout_packet" in r.metadata
         # Zero-duration synthetic run.
         assert r.started_at == r.ended_at
         # Task pointer still NULL (we never claimed, never opened a run).

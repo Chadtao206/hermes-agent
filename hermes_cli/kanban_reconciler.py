@@ -710,6 +710,8 @@ def _pre_spawn_validation_errors_for_reconcile(task: kb.Task) -> list[str]:
 
     try:
         errors.extend(kb._workspace_pre_spawn_errors(task))
+        if (task.workspace_kind or "scratch") == "dir" and not task.workspace_path:
+            errors.append("workspace_kind=dir requires workspace_path")
     except Exception as exc:
         errors.append(f"workspace validation failed: {exc}")
 

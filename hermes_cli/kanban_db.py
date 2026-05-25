@@ -3007,53 +3007,74 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` should remain blocked until explicit
+    operator action.
 
-    A ``blocked`` status can come from two very different sources:
+    Sticky blockers come from two sources:
 
-    * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+    * explicit worker/operator ``kanban_block`` (``blocked`` event), which
+      remains sticky until a later ``unblocked`` event even if subsequent
+      failure/gave_up rows are appended.
+    * structured circuit-breaker ``gave_up`` events emitted by
+      ``_record_task_failure`` after the retry budget is exhausted,
+      including ``protocol_violation_clean_exit``. These stay sticky until
+      an explicit operator unblock so exhausted tasks do not retry churn.
 
-    * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
-
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation). Tasks created with ``initial_status='blocked'`` do
-    append a ``blocked`` event, so they are treated as sticky until an
-    explicit unblock.
+    Legacy/payloadless ``gave_up`` rows keep their historical auto-recovery
+    behavior unless an earlier explicit block remains uncleared.
     """
-    row = conn.execute(
-        "SELECT kind FROM task_events "
+    gate_row = conn.execute(
+        "SELECT id, kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    since_event_id = 0
+    if gate_row:
+        if gate_row["kind"] == "blocked":
+            return True
+        since_event_id = int(gate_row["id"])
+
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'gave_up' AND id > ? "
+        "ORDER BY id DESC",
+        (task_id, since_event_id),
+    ).fetchall()
+    for row in rows:
+        payload = None
+        if row["payload"]:
+            try:
+                payload = json.loads(row["payload"])
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get("failure_class")
+            == FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
+        ):
+            return True
+        if (
+            "failures" in payload
+            and "effective_limit" in payload
+            and "trigger_outcome" in payload
+        ):
+            return True
+    return False
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
     """Promote dispatchable tasks to ``ready`` once parents are done.
 
     ``todo`` tasks become ready when every parent is ``done`` or
-    ``archived``.  ``blocked`` tasks are more nuanced: explicit
+    ``archived``. ``blocked`` tasks are more nuanced: explicit
     worker/operator blocks (including ``initial_status='blocked'`` gates)
-    are sticky and require ``unblock_task``, while circuit-breaker /
-    direct-triage blocks (no latest ``blocked`` event) are allowed to
-    auto-recover.  ``scheduled`` remains an explicit parking state and is
+    stay sticky until ``unblock_task``; exhausted retry-budget auto-blocks
+    (structured ``gave_up`` payloads from ``_record_task_failure``, including
+    ``failure_class=protocol_violation_clean_exit``) are also sticky to stop
+    retry churn. Other direct-triage blocks with no sticky signal are allowed
+    to auto-recover. ``scheduled`` remains an explicit parking state and is
     never auto-promoted here.
     """
     promoted = 0
@@ -4854,14 +4875,30 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       and should be auto-blocked immediately — retrying will just loop.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
-    * ``"unknown"`` — pid was not in the reap registry (either reaped by
-      something else, or died between reap tick and liveness check). Fall
-      back to existing crashed-counter behavior.
+    * ``"unknown"`` — no exit status could be recovered. This means the
+      worker is dead but neither the in-memory reap registry nor a direct
+      ``waitpid(pid, WNOHANG)`` probe could provide the terminal status.
+      Fall back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``nonzero_exit``) or
     the signal number (for ``signaled``), or ``None`` for ``unknown``.
     """
-    entry = _recent_worker_exits.get(int(pid))
+    pid = int(pid)
+    entry = _recent_worker_exits.get(pid)
+    if entry is None and os.name != "nt":
+        # Deterministic fallback: if the periodic reap loop hasn't run yet,
+        # try harvesting this specific child directly. This closes the race
+        # where a worker exits rc=0 without terminal closeout and would
+        # otherwise be downgraded to "unknown" until the next tick.
+        try:
+            reaped_pid, raw_status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            reaped_pid, raw_status = (0, 0)
+        except Exception:
+            reaped_pid, raw_status = (0, 0)
+        if reaped_pid == pid:
+            _record_worker_exit(reaped_pid, raw_status)
+            entry = _recent_worker_exits.get(pid)
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
@@ -5315,7 +5352,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    skip_unknown: bool = False,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -5358,6 +5399,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            if kind == "unknown" and skip_unknown:
+                # The PID is no longer alive but we could not recover a
+                # terminal status. In dispatcher ticks, leave this lane for
+                # TTL/heartbeat-based stale handling instead of letting
+                # unknown status pre-empt stale classification.
+                continue
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -5470,6 +5517,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 error=error_text,
                 outcome="crashed",
                 failure_limit=1 if (protocol_violation or is_systemic) else None,
+                failure_limit_is_cap=bool(protocol_violation or is_systemic),
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
@@ -5491,6 +5539,7 @@ def _record_task_failure(
     *,
     outcome: str,
     failure_limit: int = None,
+    failure_limit_is_cap: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -5524,13 +5573,15 @@ def _record_task_failure(
     context (e.g. pid on crash, elapsed on timeout).
 
     Resolution order for the effective threshold:
-      1. per-task ``max_retries`` if set (nothing else overrides)
-      2. caller-supplied ``failure_limit`` (gateway passes the config
-         value from ``kanban.failure_limit``; tests pass fixed values)
+      1. per-task ``max_retries`` if set
+      2. caller-supplied ``failure_limit``
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    By default, per-task ``max_retries`` remains authoritative when set.
+    Callers handling deterministic/systemic failure classes may pass
+    ``failure_limit_is_cap=True`` to force an earlier trip while preserving
+    ordinary retry semantics elsewhere.
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
     with write_txn(conn):
         row = conn.execute(
@@ -5542,16 +5593,28 @@ def _record_task_failure(
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
 
-        # Per-task override wins over both caller-supplied and default
-        # thresholds. None (the common case) falls through.
+        # Per-task override remains authoritative for ordinary failures.
+        # Deterministic/systemic failure paths can opt into cap semantics
+        # with ``failure_limit_is_cap=True``.
         task_override = (
             row["max_retries"] if "max_retries" in row.keys() else None
         )
-        if task_override is not None:
+        if (
+            task_override is not None
+            and failure_limit is not None
+            and failure_limit_is_cap
+        ):
+            task_limit = int(task_override)
+            caller_limit = int(failure_limit)
+            effective_limit = min(task_limit, caller_limit)
+            limit_source = "task" if effective_limit == task_limit else "dispatcher"
+        elif task_override is not None:
             effective_limit = int(task_override)
             limit_source = "task"
         else:
-            effective_limit = int(failure_limit)
+            effective_limit = int(
+                failure_limit if failure_limit is not None else DEFAULT_FAILURE_LIMIT
+            )
             limit_source = "dispatcher"
 
         if failures >= effective_limit:
@@ -5789,8 +5852,6 @@ def _workspace_pre_spawn_errors(task: Task) -> list[str]:
     errors: list[str] = []
     if kind not in VALID_WORKSPACE_KINDS:
         return [f"unknown workspace_kind: {kind}"]
-    if kind == "dir" and not path:
-        errors.append("workspace_kind=dir requires workspace_path")
     if path and kind in {"scratch", "dir"}:
         if not Path(path).expanduser().is_absolute():
             errors.append("workspace_path must be absolute")
@@ -6122,11 +6183,14 @@ def dispatch_once(
             pass
 
     result = DispatchResult()
+    # Classify dead worker pids first. This prevents stale-claim reclaim
+    # from pre-empting clean-exit protocol-violation classification when
+    # a worker exits rc=0 without terminal kanban closeout.
+    result.crashed = detect_crashed_workers(conn, skip_unknown=True)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -6198,6 +6262,7 @@ def dispatch_once(
             conn, task_id, error,
             outcome="spawn_failed",
             failure_limit=1 if systemic else failure_limit,
+            failure_limit_is_cap=bool(systemic),
             release_claim=True,
             end_run=True,
             event_payload_extra=event_extra,
