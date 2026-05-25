@@ -1886,6 +1886,80 @@ def _proposal_packets_dir() -> Path:
     return _hermes_home() / "telemetry" / "proposals"
 
 
+def _proposal_ledger_db_path() -> Path:
+    return _hermes_home() / "telemetry" / "experiments.db"
+
+
+def _load_proposal_decisions() -> Dict[str, Dict[str, Any]]:
+    """Load proposal decision/status overlays from telemetry experiments.db.
+
+    Best-effort only: any read/schema issue returns an empty mapping so the
+    dashboard can still render file-only proposal rows.
+    """
+
+    db_path = _proposal_ledger_db_path()
+    if not db_path.exists():
+        return {}
+
+    overlays: Dict[str, Dict[str, Any]] = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            for row in conn.execute(
+                """
+                SELECT proposal_id, status, approved_at, denied_at, approver, denial_reason, updated_at
+                FROM proposals
+                """
+            ):
+                proposal_id = str(row["proposal_id"] or "")
+                if not proposal_id:
+                    continue
+                overlays[proposal_id] = {
+                    "status": row["status"],
+                    "approved_at": row["approved_at"],
+                    "denied_at": row["denied_at"],
+                    "approver": row["approver"],
+                    "denial_reason": row["denial_reason"],
+                    "ledger_updated_at": row["updated_at"],
+                }
+
+            latest_audit: Dict[str, sqlite3.Row] = {}
+            for row in conn.execute(
+                """
+                SELECT id, proposal_id, decided_at, decision, approver, reason,
+                       previous_status, new_status, source
+                FROM proposal_decision_audit
+                ORDER BY proposal_id ASC, decided_at DESC, id DESC
+                """
+            ):
+                proposal_id = str(row["proposal_id"] or "")
+                if not proposal_id or proposal_id in latest_audit:
+                    continue
+                latest_audit[proposal_id] = row
+
+            for proposal_id, audit in latest_audit.items():
+                overlay = overlays.setdefault(proposal_id, {})
+                if audit["new_status"]:
+                    overlay["status"] = audit["new_status"]
+                overlay["audit"] = {
+                    "decided_at": audit["decided_at"],
+                    "decision": audit["decision"],
+                    "approver": audit["approver"],
+                    "reason": audit["reason"],
+                    "previous_status": audit["previous_status"],
+                    "new_status": audit["new_status"],
+                    "source": audit["source"],
+                }
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("Failed to read proposal decision overlays from experiments.db", exc_info=True)
+        return {}
+
+    return overlays
+
+
 def _load_json_object(path: Path) -> Optional[Dict[str, Any]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1967,6 +2041,7 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
         return []
 
     rows: List[tuple[Dict[str, Any], Path]] = []
+    overlays = _load_proposal_decisions()
 
     candidates = sorted(root.glob("*.row.json"))
     if not candidates:
@@ -1977,6 +2052,25 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
         if not data:
             continue
         normalized = _normalize_proposal_row(data, candidate)
+        overlay = overlays.get(str(normalized.get("proposal_id") or ""))
+        if overlay:
+            normalized["status"] = overlay.get("status") or normalized.get("status")
+            normalized["approved_at"] = overlay.get("approved_at")
+            normalized["denied_at"] = overlay.get("denied_at")
+            normalized["approver"] = overlay.get("approver")
+            normalized["denial_reason"] = overlay.get("denial_reason")
+            normalized["ledger_updated_at"] = overlay.get("ledger_updated_at")
+            audit = overlay.get("audit") if isinstance(overlay.get("audit"), dict) else None
+            if audit:
+                normalized["decision"] = {
+                    "decision": audit.get("decision"),
+                    "decided_at": audit.get("decided_at"),
+                    "approver": audit.get("approver"),
+                    "reason": audit.get("reason"),
+                    "previous_status": audit.get("previous_status"),
+                    "new_status": audit.get("new_status"),
+                    "source": audit.get("source"),
+                }
         if status and str(normalized.get("status") or "").lower() != status.lower():
             continue
         rows.append((normalized, candidate))

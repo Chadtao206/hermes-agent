@@ -214,6 +214,117 @@ class TestControlCenterEndpoints:
         assert proposed.status_code == 200
         assert proposed.json()["proposals"] == []
 
+    def test_proposals_endpoint_overlays_ledger_decisions(self, _isolate_hermes_home):
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        proposals_dir = home / "telemetry" / "proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            proposals_dir / "proposal:test-ledger-overlay.row.json",
+            {
+                "proposal_id": "proposal:test-ledger-overlay",
+                "title": "Ledger overlay fixture",
+                "status": "proposed",
+                "decision_requested": "approve",
+                "owner_profile": "ops",
+                "tl_dr": "ledger overlay test",
+                "confidence_score": 0.4,
+                "confidence_label": "low",
+                "confidence_basis": {},
+                "risk_level": "medium",
+                "risk_notes": "",
+                "rollback_plan": "",
+                "verification_plan": "",
+                "evidence": [],
+                "created_at": "2026-05-25T02:00:00+00:00",
+                "updated_at": "2026-05-25T02:00:00+00:00",
+            },
+        )
+
+        db = home / "telemetry" / "experiments.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    status TEXT,
+                    approved_at TEXT,
+                    denied_at TEXT,
+                    approver TEXT,
+                    denial_reason TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proposal_decision_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposal_id TEXT NOT NULL,
+                    decided_at TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    approver TEXT NOT NULL,
+                    reason TEXT,
+                    previous_status TEXT,
+                    new_status TEXT NOT NULL,
+                    source TEXT,
+                    backup_path TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO proposals(proposal_id, status, approved_at, denied_at, approver, denial_reason, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "proposal:test-ledger-overlay",
+                    "approved",
+                    "2026-05-25T03:00:00+00:00",
+                    None,
+                    "Chad Tao",
+                    None,
+                    "2026-05-25T03:00:00+00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_decision_audit(
+                    proposal_id, decided_at, decision, approver, reason,
+                    previous_status, new_status, source, backup_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "proposal:test-ledger-overlay",
+                    "2026-05-25T03:00:00+00:00",
+                    "approve",
+                    "Chad Tao",
+                    None,
+                    "proposed",
+                    "approved",
+                    "slack:thread-22",
+                    "/tmp/backup",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        resp = self.client.get("/api/control-center/proposals?status=approved")
+        assert resp.status_code == 200
+        rows = resp.json()["proposals"]
+        assert len(rows) == 1
+        assert rows[0]["proposal_id"] == "proposal:test-ledger-overlay"
+        assert rows[0]["status"] == "approved"
+        assert rows[0]["approver"] == "Chad Tao"
+        assert rows[0]["decision"]["source"] == "slack:thread-22"
+
+        proposed = self.client.get("/api/control-center/proposals?status=proposed")
+        assert proposed.status_code == 200
+        assert proposed.json()["proposals"] == []
+
     def test_pending_respond_enqueues_phase2c_command(self, monkeypatch, _isolate_hermes_home):
         monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
         import control_center_store as cc

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -175,6 +176,139 @@ def _populated_proposals(_isolate_hermes_home):
     _write_json(base.with_suffix(".row.json"), row)
     _write_json(base.with_suffix(".json"), packet)
     base.with_suffix(".md").write_text("# synthetic proposal\n", encoding="utf-8")
+
+
+@pytest.fixture
+def _populated_proposals_with_ledger(_populated_proposals, _isolate_hermes_home):
+    """Add experiments.db decision rows that should overlay proposal row artifacts."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    proposals_dir = home / "telemetry" / "proposals"
+
+    denied_row = {
+        "proposal_id": "proposal:test-override-denied",
+        "title": "Denied overlay fixture",
+        "status": "proposed",
+        "decision_requested": "approve",
+        "owner_profile": "reviewer",
+        "tl_dr": "Synthetic denied fixture.",
+        "confidence_score": 0.61,
+        "confidence_label": "medium",
+        "confidence_basis": {"reasons": ["test evidence"]},
+        "risk_level": "medium",
+        "risk_notes": "bounded synthetic risk",
+        "rollback_plan": "delete synthetic fixture",
+        "verification_plan": "assert endpoint shape",
+        "evidence": [],
+        "created_at": "2026-05-25T00:00:00+00:00",
+        "updated_at": "2026-05-25T00:10:00+00:00",
+    }
+    _write_json(proposals_dir / f"{denied_row['proposal_id']}.row.json", denied_row)
+
+    db = home / "telemetry" / "experiments.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proposals (
+                proposal_id TEXT PRIMARY KEY,
+                status TEXT,
+                approved_at TEXT,
+                denied_at TEXT,
+                approver TEXT,
+                denial_reason TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proposal_decision_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT NOT NULL,
+                decided_at TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                approver TEXT NOT NULL,
+                reason TEXT,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                source TEXT,
+                backup_path TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO proposals(proposal_id, status, approved_at, denied_at, approver, denial_reason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "proposal:test-read-only-queue",
+                "approved",
+                "2026-05-25T01:00:00+00:00",
+                None,
+                "Chad Tao",
+                None,
+                "2026-05-25T01:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposals(proposal_id, status, approved_at, denied_at, approver, denial_reason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                denied_row["proposal_id"],
+                "denied",
+                None,
+                "2026-05-25T02:00:00+00:00",
+                "Boris",
+                "not enough evidence",
+                "2026-05-25T02:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposal_decision_audit(
+                proposal_id, decided_at, decision, approver, reason,
+                previous_status, new_status, source, backup_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "proposal:test-read-only-queue",
+                "2026-05-25T01:00:00+00:00",
+                "approve",
+                "Chad Tao",
+                None,
+                "proposed",
+                "approved",
+                "slack:thread-1",
+                "/tmp/backup-approved",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposal_decision_audit(
+                proposal_id, decided_at, decision, approver, reason,
+                previous_status, new_status, source, backup_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                denied_row["proposal_id"],
+                "2026-05-25T02:00:00+00:00",
+                "deny",
+                "Boris",
+                "not enough evidence",
+                "proposed",
+                "denied",
+                "manual",
+                "/tmp/backup-denied",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +490,44 @@ class TestReadProposals:
 
         assert len(proposed) == 1
         assert denied == []
+
+    def test_overlays_ledger_status_and_audit_metadata(self, _populated_proposals_with_ledger):
+        import control_center_store as cc
+
+        rows = cc.read_proposals()
+        by_id = {row["proposal_id"]: row for row in rows}
+
+        approved = by_id["proposal:test-read-only-queue"]
+        assert approved["status"] == "approved"
+        assert approved["approver"] == "Chad Tao"
+        assert approved["approved_at"] == "2026-05-25T01:00:00+00:00"
+        assert approved["decision"]["decision"] == "approve"
+        assert approved["decision"]["source"] == "slack:thread-1"
+
+        denied = by_id["proposal:test-override-denied"]
+        assert denied["status"] == "denied"
+        assert denied["denial_reason"] == "not enough evidence"
+        assert denied["decision"]["decision"] == "deny"
+        assert denied["decision"]["source"] == "manual"
+
+    def test_status_filter_uses_ledger_overlay(self, _populated_proposals_with_ledger):
+        import control_center_store as cc
+
+        approved = cc.read_proposals(status="approved")
+        proposed = cc.read_proposals(status="proposed")
+
+        assert [row["proposal_id"] for row in approved] == ["proposal:test-read-only-queue"]
+        assert proposed == []
+
+    def test_missing_or_unreadable_ledger_falls_back_to_file_rows(self, _populated_proposals, monkeypatch):
+        import control_center_store as cc
+
+        monkeypatch.setattr(cc, "_load_proposal_decisions", lambda: {})
+        rows = cc.read_proposals()
+
+        assert len(rows) == 1
+        assert rows[0]["proposal_id"] == "proposal:test-read-only-queue"
+        assert rows[0]["status"] == "proposed"
 
 
 # ---------------------------------------------------------------------------
