@@ -130,6 +130,53 @@ def _populated_spawn_trees(_isolate_hermes_home):
     index_path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
 
 
+@pytest.fixture
+def _populated_proposals(_isolate_hermes_home):
+    """Write read-only proposal artifacts under telemetry/proposals."""
+    from hermes_constants import get_hermes_home
+
+    proposals_dir = get_hermes_home() / "telemetry" / "proposals"
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+
+    row = {
+        "proposal_id": "proposal:test-read-only-queue",
+        "title": "Test read-only proposal",
+        "status": "proposed",
+        "decision_requested": "approve",
+        "owner_profile": "engineer",
+        "tl_dr": "Synthetic proposal row for dashboard queue tests.",
+        "confidence_score": 0.72,
+        "confidence_label": "medium",
+        "confidence_basis": {"reasons": ["test evidence"]},
+        "risk_level": "low",
+        "risk_notes": "bounded synthetic risk",
+        "rollback_plan": "delete synthetic fixture",
+        "verification_plan": "assert endpoint shape",
+        "evidence": [
+            {
+                "evidence_type": "unit_test",
+                "evidence_ref": "tests/test_control_center_store.py",
+                "evidence_summary": "proposal queue fixture",
+            }
+        ],
+        "created_at": "2026-05-25T00:00:00+00:00",
+        "updated_at": "2026-05-25T00:10:00+00:00",
+    }
+
+    packet = {
+        "proposal_id": row["proposal_id"],
+        "title": row["title"],
+        "decision_requested": "approve",
+        "tl_dr": row["tl_dr"],
+        "owner": "engineer",
+    }
+
+    base = proposals_dir / row["proposal_id"]
+    _write_json(base.with_suffix(".row.json"), row)
+    _write_json(base.with_suffix(".json"), packet)
+    base.with_suffix(".md").write_text("# synthetic proposal\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Tests: read_sessions
 # ---------------------------------------------------------------------------
@@ -263,6 +310,52 @@ class TestReadSessions:
             f"Adding a parent+child pair should increase active_sessions by 1 (parent only), "
             f"got delta={delta} (baseline={baseline}, after={count_after})"
         )
+
+
+class TestReadProposals:
+    def test_returns_empty_list_when_no_proposals(self, _isolate_hermes_home):
+        import control_center_store as cc
+
+        rows = cc.read_proposals()
+        assert rows == []
+
+    def test_reads_row_json_shape(self, _populated_proposals):
+        import control_center_store as cc
+
+        rows = cc.read_proposals()
+        assert len(rows) >= 1
+        proposal = rows[0]
+
+        for field in (
+            "proposal_id",
+            "title",
+            "status",
+            "decision_requested",
+            "owner",
+            "tl_dr",
+            "confidence",
+            "risk",
+            "rollback",
+            "verification",
+            "evidence",
+            "provenance",
+        ):
+            assert field in proposal, f"proposal row missing field: {field}"
+
+        assert proposal["proposal_id"] == "proposal:test-read-only-queue"
+        assert proposal["status"] == "proposed"
+        assert proposal["confidence"]["band"] == "medium"
+        assert isinstance(proposal["provenance"]["source_paths"], list)
+        assert any(path.endswith(".row.json") for path in proposal["provenance"]["source_paths"])
+
+    def test_status_filter(self, _populated_proposals):
+        import control_center_store as cc
+
+        proposed = cc.read_proposals(status="proposed")
+        denied = cc.read_proposals(status="denied")
+
+        assert len(proposed) == 1
+        assert denied == []
 
 
 # ---------------------------------------------------------------------------

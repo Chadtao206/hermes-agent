@@ -1790,6 +1790,113 @@ def count_profiles_online() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Proposals (read-only dashboard queue)
+# ---------------------------------------------------------------------------
+
+def _proposal_packets_dir() -> Path:
+    return _hermes_home() / "telemetry" / "proposals"
+
+
+def _load_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _proposal_sort_key(row: Dict[str, Any], source_path: Path) -> tuple[str, float]:
+    updated_at = row.get("updated_at") or row.get("created_at") or ""
+    try:
+        mtime = source_path.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+    return str(updated_at), float(mtime)
+
+
+def _normalize_proposal_row(row: Dict[str, Any], source_path: Path) -> Dict[str, Any]:
+    proposal_id = str(row.get("proposal_id") or source_path.stem.replace(".row", ""))
+    confidence_basis = row.get("confidence_basis")
+    if not isinstance(confidence_basis, dict):
+        confidence_basis = {}
+
+    evidence = row.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+
+    base_path = source_path
+    if base_path.name.endswith(".row.json"):
+        base_path = base_path.with_name(base_path.name[: -len(".row.json")])
+    elif base_path.name.endswith(".json"):
+        base_path = base_path.with_suffix("")
+    markdown_path = base_path.with_suffix(".md")
+
+    sources = [str(source_path)]
+    if markdown_path.exists():
+        sources.append(str(markdown_path))
+
+    return {
+        "proposal_id": proposal_id,
+        "title": row.get("title") or proposal_id,
+        "status": row.get("status") or "proposed",
+        "decision_requested": row.get("decision_requested") or "approve",
+        "owner": row.get("owner_profile") or row.get("owner") or None,
+        "tl_dr": row.get("tl_dr") or row.get("problem_statement") or "",
+        "confidence": {
+            "score": row.get("confidence_score"),
+            "band": row.get("confidence_label"),
+            "basis": confidence_basis,
+        },
+        "risk": {
+            "level": row.get("risk_level") or "unknown",
+            "notes": row.get("risk_notes") or "",
+        },
+        "rollback": row.get("rollback_plan") or row.get("rollback") or "",
+        "verification": row.get("verification_plan") or row.get("verification") or "",
+        "evidence": evidence,
+        "approve_deny_discuss": row.get("approve_deny_discuss") or "",
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "provenance": {
+            "source_paths": sources,
+            "source_file": str(source_path),
+        },
+    }
+
+
+def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return read-only self-improvement proposals for dashboard queue rendering.
+
+    Source of truth is telemetry proposal artifacts under
+    ``$HERMES_HOME/telemetry/proposals``. Prefer ``*.row.json`` files (contain
+    status/risk/confidence fields used by the queue). If none exist, fall back
+    to ``*.json`` packet files.
+    """
+
+    root = _proposal_packets_dir()
+    if not root.exists():
+        return []
+
+    rows: List[tuple[Dict[str, Any], Path]] = []
+
+    candidates = sorted(root.glob("*.row.json"))
+    if not candidates:
+        candidates = [p for p in sorted(root.glob("*.json")) if not p.name.endswith(".row.json")]
+
+    for candidate in candidates:
+        data = _load_json_object(candidate)
+        if not data:
+            continue
+        normalized = _normalize_proposal_row(data, candidate)
+        if status and str(normalized.get("status") or "").lower() != status.lower():
+            continue
+        rows.append((normalized, candidate))
+
+    rows.sort(key=lambda pair: _proposal_sort_key(pair[0], pair[1]), reverse=True)
+    return [row for row, _ in rows[: max(1, min(limit, 500))]]
+
+
+# ---------------------------------------------------------------------------
 # Alerts
 # ---------------------------------------------------------------------------
 

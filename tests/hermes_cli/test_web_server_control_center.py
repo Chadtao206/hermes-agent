@@ -140,6 +140,79 @@ class TestControlCenterEndpoints:
         data = self.client.get("/api/control-center/pending").json()
         assert data["requests"] == []
 
+    def test_proposals_status_and_keys(self, _isolate_hermes_home):
+        from hermes_constants import get_hermes_home
+
+        proposals_dir = get_hermes_home() / "telemetry" / "proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        row = {
+            "proposal_id": "proposal:test-web-endpoint",
+            "title": "Test endpoint proposal",
+            "status": "proposed",
+            "decision_requested": "approve",
+            "owner_profile": "ops",
+            "tl_dr": "Endpoint fixture",
+            "confidence_score": 0.55,
+            "confidence_label": "medium",
+            "confidence_basis": {"reasons": ["fixture"]},
+            "risk_level": "low",
+            "risk_notes": "test",
+            "rollback_plan": "none",
+            "verification_plan": "endpoint returns row",
+            "evidence": [],
+            "created_at": "2026-05-25T01:00:00+00:00",
+            "updated_at": "2026-05-25T01:00:00+00:00",
+        }
+        _write_json(proposals_dir / "proposal:test-web-endpoint.row.json", row)
+
+        resp = self.client.get("/api/control-center/proposals")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "proposals" in data
+        assert isinstance(data["proposals"], list)
+        assert len(data["proposals"]) == 1
+
+        proposal = data["proposals"][0]
+        assert proposal["proposal_id"] == "proposal:test-web-endpoint"
+        assert proposal["status"] == "proposed"
+        assert proposal["owner"] == "ops"
+        assert "source_paths" in proposal["provenance"]
+
+    def test_proposals_status_filter(self, _isolate_hermes_home):
+        from hermes_constants import get_hermes_home
+
+        proposals_dir = get_hermes_home() / "telemetry" / "proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            proposals_dir / "proposal:test-status-filter.row.json",
+            {
+                "proposal_id": "proposal:test-status-filter",
+                "title": "Status filter fixture",
+                "status": "approved",
+                "decision_requested": "approve",
+                "owner_profile": "reviewer",
+                "tl_dr": "Status filter test",
+                "confidence_score": 0.9,
+                "confidence_label": "high",
+                "confidence_basis": {},
+                "risk_level": "low",
+                "risk_notes": "",
+                "rollback_plan": "",
+                "verification_plan": "",
+                "evidence": [],
+                "created_at": "2026-05-25T02:00:00+00:00",
+                "updated_at": "2026-05-25T02:00:00+00:00",
+            },
+        )
+
+        approved = self.client.get("/api/control-center/proposals?status=approved")
+        proposed = self.client.get("/api/control-center/proposals?status=proposed")
+
+        assert approved.status_code == 200
+        assert len(approved.json()["proposals"]) == 1
+        assert proposed.status_code == 200
+        assert proposed.json()["proposals"] == []
+
     def test_pending_respond_enqueues_phase2c_command(self, monkeypatch, _isolate_hermes_home):
         monkeypatch.setenv("HERMES_CONTROL_CENTER_ACTIONS", "1")
         import control_center_store as cc

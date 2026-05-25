@@ -69,6 +69,7 @@ import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import ChatPage from "@/pages/ChatPage";
 import ControlCenterPage from "@/pages/ControlCenterPage";
+import ProposalQueuePage from "@/pages/ProposalQueuePage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -111,6 +112,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
   "/control-center": ControlCenterPage,
+  "/proposals": ProposalQueuePage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
@@ -143,6 +145,11 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "controlCenter",
     label: "Control Center",
     icon: LayoutDashboard,
+  },
+  {
+    path: "/proposals",
+    label: "Proposals",
+    icon: Database,
   },
   {
     path: "/analytics",

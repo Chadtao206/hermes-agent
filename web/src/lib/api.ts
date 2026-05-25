@@ -351,6 +351,14 @@ export const api = {
     fetchJSON<{ requests: ControlCenterPendingRequest[] }>("/api/control-center/pending"),
   getControlCenterCommands: () =>
     fetchJSON<{ commands: ControlCenterCommand[] }>("/api/control-center/commands"),
+  getControlCenterProposals: (limit = 100, status?: string) => {
+    const qs = new URLSearchParams();
+    qs.set("limit", String(limit));
+    if (status && status.trim()) qs.set("status", status.trim());
+    return fetchJSON<{ proposals: ControlCenterProposal[] }>(
+      `/api/control-center/proposals?${qs.toString()}`,
+    );
+  },
   interruptControlCenterSession: (sessionId: string) =>
     fetchJSON<{ ok: boolean; command: ControlCenterCommand }>(
       `/api/control-center/sessions/${encodeURIComponent(sessionId)}/interrupt`,
@@ -1004,6 +1012,40 @@ export interface ControlCenterCommand {
   completed_at?: number | null;
   payload?: Record<string, unknown> | null;
   result?: Record<string, unknown> | null;
+}
+
+export interface ControlCenterProposalEvidence {
+  evidence_type?: string;
+  evidence_ref?: string;
+  evidence_summary?: string;
+}
+
+export interface ControlCenterProposal {
+  proposal_id: string;
+  title: string;
+  status: string;
+  decision_requested: string;
+  owner?: string | null;
+  tl_dr: string;
+  confidence: {
+    score?: number | null;
+    band?: string | null;
+    basis?: Record<string, unknown>;
+  };
+  risk: {
+    level: string;
+    notes: string;
+  };
+  rollback: string;
+  verification: string;
+  evidence: ControlCenterProposalEvidence[];
+  approve_deny_discuss?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  provenance: {
+    source_paths: string[];
+    source_file: string;
+  };
 }
 
 export interface ControlCenterProcess {

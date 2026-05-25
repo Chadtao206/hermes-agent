@@ -4475,6 +4475,19 @@ async def get_control_center_commands(limit: int = 50):
         return {"commands": []}
 
 
+@app.get("/api/control-center/proposals")
+async def get_control_center_proposals(limit: int = 100, status: str | None = None):
+    try:
+        import control_center_store as _cc
+        return {
+            "proposals": _cc.read_proposals(
+                limit=max(1, min(limit, 500)),
+                status=(status.strip() if isinstance(status, str) and status.strip() else None),
+            )
+        }
+    except Exception:
+        return {"proposals": []}
+
 
 
 def _control_center_actions_enabled() -> bool:
