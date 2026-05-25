@@ -2075,6 +2075,13 @@ def _normalize_proposal_row(row: Dict[str, Any], source_path: Path) -> Dict[str,
     }
 
 
+_PROPOSAL_PACKET_FALLBACK_EXCLUDE_SUFFIXES = (
+    ".row.json",
+    ".apply.json",
+    ".manifest.json",
+)
+
+
 def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return read-only self-improvement proposals for dashboard queue rendering.
 
@@ -2093,7 +2100,11 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
 
     candidates = sorted(root.glob("*.row.json"))
     if not candidates:
-        candidates = [p for p in sorted(root.glob("*.json")) if not p.name.endswith(".row.json")]
+        candidates = [
+            p
+            for p in sorted(root.glob("*.json"))
+            if not any(p.name.endswith(suffix) for suffix in _PROPOSAL_PACKET_FALLBACK_EXCLUDE_SUFFIXES)
+        ]
 
     for candidate in candidates:
         data = _load_json_object(candidate)

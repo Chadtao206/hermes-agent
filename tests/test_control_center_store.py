@@ -616,6 +616,36 @@ class TestReadProposals:
         assert rows[0]["proposal_id"] == "proposal:test-read-only-queue"
         assert rows[0]["status"] == "proposed"
 
+    def test_fallback_ignores_apply_and_manifest_artifacts_when_row_json_missing(self, _isolate_hermes_home):
+        from hermes_constants import get_hermes_home
+        import control_center_store as cc
+
+        proposals_dir = get_hermes_home() / "telemetry" / "proposals"
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+
+        proposal_id = "proposal:test-fallback-byproducts"
+        packet = {
+            "proposal_id": proposal_id,
+            "title": "Fallback packet",
+            "decision_requested": "approve",
+            "owner_profile": "engineer",
+            "tl_dr": "fallback fixture",
+        }
+        apply_artifact = {
+            "proposal_id": proposal_id,
+            "mode": "execute",
+            "title": "Apply artifact - must not appear in queue",
+            "status": "applied",
+        }
+
+        _write_json(proposals_dir / f"{proposal_id}.json", packet)
+        _write_json(proposals_dir / f"{proposal_id}.apply.json", apply_artifact)
+        _write_json(proposals_dir / f"{proposal_id}.manifest.json", {"proposal_id": proposal_id})
+
+        rows = cc.read_proposals()
+        assert [row["proposal_id"] for row in rows] == [proposal_id]
+        assert rows[0]["title"] == "Fallback packet"
+
 
 # ---------------------------------------------------------------------------
 # Tests: read_gateway_status
