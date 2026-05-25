@@ -40,4 +40,21 @@ Examples:
 - Execute one proposal reconciliation:
   - `python3 scripts/telemetry/reconcile_proposal_outcomes.py --proposal-id proposal:example --execute --operator "Chad Tao" --source "slack:thread-123" --reason "Phase 4 outcome reconciliation" --json`
 
-Note: this card does not create or schedule watchdog cron jobs. Scheduling and cadence are intentionally deferred to later ops coordination.
+### Scheduled dry-run watchdog
+
+A live dry-run watchdog is scheduled through the root/default Hermes scheduler:
+
+- job id: `5f20f4434882`
+- name: `Phase 4 proposal outcome dry-run watchdog`
+- schedule: `every 120m`
+- script: `telemetry/proposal_outcome_watchdog.py`
+- mode: no-agent, dry-run only; the wrapper invokes `reconcile_proposal_outcomes.py --json` and never passes `--execute`
+- active scheduler proof: `hermes cron health` should show `5f20f4434882 [scheduler | healthy]`
+
+Rollback / removal:
+
+- pause active watchdog: `HOME=/Users/ctao HERMES_HOME=/Users/ctao/.hermes hermes cron pause 5f20f4434882`
+- remove active watchdog: `HOME=/Users/ctao HERMES_HOME=/Users/ctao/.hermes hermes cron remove 5f20f4434882`
+- optional full retirement cleanup after removing the job and confirming no other consumers: `rm /Users/ctao/.hermes/scripts/telemetry/proposal_outcome_watchdog.py`
+
+The obsolete ops-profile duplicate job `ecced3f3fe14` has been retired/removed. Do not use old rollback commands that target `ecced3f3fe14`; the authoritative recurring job is `5f20f4434882`.
