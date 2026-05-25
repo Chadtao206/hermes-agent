@@ -254,6 +254,11 @@ class TestControlCenterEndpoints:
                     denied_at TEXT,
                     approver TEXT,
                     denial_reason TEXT,
+                    applied_at TEXT,
+                    verified_at TEXT,
+                    scored_at TEXT,
+                    outcome TEXT,
+                    linked_experiment_id TEXT,
                     updated_at TEXT
                 )
                 """
