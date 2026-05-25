@@ -9,6 +9,7 @@ import {
   ChevronDown,
   Pencil,
   Plus,
+  Settings,
   Terminal,
   Trash2,
   Users,
@@ -17,7 +18,7 @@ import {
 import spinners from "unicode-animations";
 import { H2 } from "@/components/NouiTypography";
 import { api } from "@/lib/api";
-import type { ProfileInfo } from "@/lib/api";
+import type { ProfileInfo, SkillInfo } from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { useToast } from "@/hooks/useToast";
 import { useConfirmDelete } from "@/hooks/useConfirmDelete";
@@ -35,6 +36,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 // Mirrors hermes_cli/profiles.py::_PROFILE_ID_RE so we can reject obviously
 // invalid names (uppercase, spaces, …) before round-tripping a doomed POST.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+type ProfileTab = "soul" | "skills" | "config";
 
 /** Braille unicode spinner (`unicode-animations`); static first frame when reduced motion is preferred. */
 function ProfilesLoadingSpinner() {
@@ -94,6 +96,18 @@ export default function ProfilesPage() {
   // Tracks the latest SOUL request so out-of-order responses don't overwrite
   // newer state when the user switches profiles or closes the editor.
   const activeSoulRequest = useRef<string | null>(null);
+  const activeSkillsRequest = useRef<string | null>(null);
+  const activeConfigRequest = useRef<string | null>(null);
+  const [activeProfileTab, setActiveProfileTab] = useState<ProfileTab>("soul");
+  const [profileSkills, setProfileSkills] = useState<SkillInfo[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillFilter, setSkillFilter] = useState("");
+  const [configText, setConfigText] = useState("");
+  const [configOriginalText, setConfigOriginalText] = useState("");
+  const [configReviewConfirmed, setConfigReviewConfirmed] = useState(false);
+  const [configPath, setConfigPath] = useState("");
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configSaving, setConfigSaving] = useState(false);
 
   const load = useCallback(() => {
     api
@@ -161,11 +175,20 @@ export default function ProfilesPage() {
     async (name: string) => {
       if (editingSoulFor === name) {
         activeSoulRequest.current = null;
+        activeSkillsRequest.current = null;
+        activeConfigRequest.current = null;
         setEditingSoulFor(null);
         return;
       }
       setEditingSoulFor(name);
+      setActiveProfileTab("soul");
       setSoulText("");
+      setProfileSkills([]);
+      setSkillFilter("");
+      setConfigText("");
+      setConfigOriginalText("");
+      setConfigReviewConfirmed(false);
+      setConfigPath("");
       activeSoulRequest.current = name;
       try {
         const soul = await api.getProfileSoul(name);
@@ -190,6 +213,91 @@ export default function ProfilesPage() {
       showToast(`${t.status.error}: ${e}`, "error");
     } finally {
       setSoulSaving(false);
+    }
+  };
+
+  const loadProfileSkills = useCallback(
+    async (name: string) => {
+      setSkillsLoading(true);
+      activeSkillsRequest.current = name;
+      try {
+        const res = await api.getProfileSkills(name);
+        if (activeSkillsRequest.current === name) {
+          setProfileSkills(res.skills);
+        }
+      } catch (e) {
+        if (activeSkillsRequest.current === name) {
+          showToast(`${t.status.error}: ${e}`, "error");
+        }
+      } finally {
+        if (activeSkillsRequest.current === name) {
+          setSkillsLoading(false);
+        }
+      }
+    },
+    [showToast, t.status.error],
+  );
+
+  const loadProfileConfig = useCallback(
+    async (name: string) => {
+      setConfigLoading(true);
+      activeConfigRequest.current = name;
+      try {
+        const res = await api.getProfileConfig(name);
+        if (activeConfigRequest.current === name) {
+          setConfigText(res.content);
+          setConfigOriginalText(res.content);
+          setConfigReviewConfirmed(false);
+          setConfigPath(res.path);
+        }
+      } catch (e) {
+        if (activeConfigRequest.current === name) {
+          showToast(`${t.status.error}: ${e}`, "error");
+        }
+      } finally {
+        if (activeConfigRequest.current === name) {
+          setConfigLoading(false);
+        }
+      }
+    },
+    [showToast, t.status.error],
+  );
+
+  const handleProfileTab = (name: string, tab: ProfileTab) => {
+    setActiveProfileTab(tab);
+    if (tab === "skills") loadProfileSkills(name);
+    if (tab === "config") loadProfileConfig(name);
+  };
+
+  const handleToggleProfileSkill = async (profileName: string, skillName: string, enabled: boolean) => {
+    setProfileSkills((items) =>
+      items.map((skill) =>
+        skill.name === skillName ? { ...skill, enabled } : skill,
+      ),
+    );
+    try {
+      await api.toggleProfileSkill(profileName, skillName, enabled);
+      showToast(`${skillName} ${enabled ? "enabled" : "disabled"} for ${profileName}`, "success");
+      load();
+    } catch (e) {
+      showToast(`${t.status.error}: ${e}`, "error");
+      loadProfileSkills(profileName);
+    }
+  };
+
+  const handleSaveProfileConfig = async (name: string) => {
+    setConfigSaving(true);
+    try {
+      const res = await api.updateProfileConfig(name, configText);
+      setConfigPath(res.path);
+      setConfigOriginalText(configText);
+      setConfigReviewConfirmed(false);
+      showToast(`config.yaml saved for ${name}. Changes apply to new sessions/restarts.`, "success");
+      load();
+    } catch (e) {
+      showToast(`${t.status.error}: ${e}`, "error");
+    } finally {
+      setConfigSaving(false);
     }
   };
 
@@ -378,6 +486,16 @@ export default function ProfilesPage() {
         {profiles.map((p) => {
           const isRenaming = renamingFrom === p.name;
           const isEditingSoul = editingSoulFor === p.name;
+          const skillQuery = skillFilter.trim().toLowerCase();
+          const configDirty = configText !== configOriginalText;
+          const filteredProfileSkills = skillQuery
+            ? profileSkills.filter((skill) =>
+                [skill.name, skill.description, skill.category]
+                  .join(" ")
+                  .toLowerCase()
+                  .includes(skillQuery),
+              )
+            : profileSkills;
           return (
             <Card key={p.name}>
               <CardContent className="flex items-start gap-4 py-4">
@@ -441,7 +559,7 @@ export default function ProfilesPage() {
                       </span>
                     )}
                     <span>
-                      {t.profiles.skills}: {p.skill_count}
+                      {t.profiles.skills}: {p.active_skill_count ?? "?"}/{p.skill_count} active
                     </span>
                     <span className="font-mono truncate max-w-[28rem]">
                       {p.path}
@@ -468,16 +586,14 @@ export default function ProfilesPage() {
                       <Button
                         ghost
                         size="icon"
-                        title={t.profiles.editSoul}
-                        aria-label={t.profiles.editSoul}
+                        title="Configure profile"
+                        aria-label="Configure profile"
                         onClick={() => openSoulEditor(p.name)}
                       >
                         {isEditingSoul ? (
                           <ChevronDown className="h-4 w-4" />
                         ) : (
-                          <span aria-hidden className="text-xs font-bold">
-                            S
-                          </span>
+                          <Settings className="h-4 w-4" />
                         )}
                       </Button>
                       <Button
@@ -520,29 +636,165 @@ export default function ProfilesPage() {
               </CardContent>
 
               {isEditingSoul && (
-                <div className="border-t border-border px-4 pb-4 pt-3 flex flex-col gap-2">
-                  <Label
-                    htmlFor={`soul-editor-${p.name}`}
-                    className="flex items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground"
-                  >
-                    {t.profiles.soulSection}
-                  </Label>
-                  <textarea
-                    id={`soul-editor-${p.name}`}
-                    className="flex min-h-[180px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    placeholder={t.profiles.soulPlaceholder}
-                    value={soulText}
-                    onChange={(e) => setSoulText(e.target.value)}
-                  />
-                  <div>
-                    <Button
-                      size="sm"
-                      onClick={() => handleSaveSoul(p.name)}
-                      disabled={soulSaving}
-                    >
-                      {soulSaving ? t.common.saving : t.profiles.saveSoul}
-                    </Button>
+                <div className="border-t border-border px-4 pb-4 pt-3 flex flex-col gap-4">
+                  <div className="flex flex-wrap gap-2" role="tablist" aria-label={`${p.name} settings`}>
+                    {([
+                      ["soul", "SOUL.md"],
+                      ["skills", "Skills"],
+                      ["config", "Config YAML"],
+                    ] as const).map(([tab, label]) => (
+                      <Button
+                        key={tab}
+                        size="sm"
+                        ghost={activeProfileTab !== tab}
+                        onClick={() => handleProfileTab(p.name, tab)}
+                        aria-pressed={activeProfileTab === tab}
+                      >
+                        {label}
+                      </Button>
+                    ))}
                   </div>
+
+                  {activeProfileTab === "soul" && (
+                    <div className="flex flex-col gap-2">
+                      <Label
+                        htmlFor={`soul-editor-${p.name}`}
+                        className="flex items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground"
+                      >
+                        {t.profiles.soulSection}
+                      </Label>
+                      <textarea
+                        id={`soul-editor-${p.name}`}
+                        className="flex min-h-[180px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        placeholder={t.profiles.soulPlaceholder}
+                        value={soulText}
+                        onChange={(e) => setSoulText(e.target.value)}
+                      />
+                      <div>
+                        <Button
+                          size="sm"
+                          onClick={() => handleSaveSoul(p.name)}
+                          disabled={soulSaving}
+                        >
+                          {soulSaving ? t.common.saving : t.profiles.saveSoul}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeProfileTab === "skills" && (
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <Input
+                          value={skillFilter}
+                          onChange={(e) => setSkillFilter(e.target.value)}
+                          placeholder="Filter profile skills…"
+                          className="max-w-sm"
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          {profileSkills.filter((skill) => skill.enabled).length}/{profileSkills.length} enabled
+                        </span>
+                      </div>
+                      {skillsLoading ? (
+                        <p className="text-sm text-muted-foreground">Loading skills…</p>
+                      ) : filteredProfileSkills.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">No skills found for this profile.</p>
+                      ) : (
+                        <div className="grid gap-2 md:grid-cols-2">
+                          {filteredProfileSkills.map((skill) => (
+                            <label
+                              key={skill.name}
+                              className="flex items-start gap-3 border border-border px-3 py-2 text-sm"
+                            >
+                              <Checkbox
+                                checked={skill.enabled}
+                                onCheckedChange={(checked) =>
+                                  handleToggleProfileSkill(p.name, skill.name, checked === true)
+                                }
+                              />
+                              <span className="min-w-0">
+                                <span className="block font-medium">{skill.name}</span>
+                                <span className="block text-xs text-muted-foreground">
+                                  {skill.category || "uncategorized"}
+                                  {skill.description ? ` — ${skill.description}` : ""}
+                                </span>
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {activeProfileTab === "config" && (
+                    <div className="flex flex-col gap-2">
+                      <div className="border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-muted-foreground">
+                        Advanced: edits write this profile's config.yaml. Existing sessions may need a restart or new session before changes take effect.
+                      </div>
+                      {configPath && (
+                        <p className="font-mono text-xs text-muted-foreground truncate">
+                          {configPath}
+                        </p>
+                      )}
+                      <textarea
+                        id={`config-editor-${p.name}`}
+                        className="flex min-h-[260px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        placeholder="model:
+  default: ..."
+                        value={configText}
+                        onChange={(e) => {
+                          setConfigText(e.target.value);
+                          setConfigReviewConfirmed(false);
+                        }}
+                        disabled={configLoading}
+                      />
+                      {configDirty && (
+                        <details className="border border-border p-3 text-xs" open>
+                          <summary className="cursor-pointer text-muted-foreground">
+                            Review changes before saving
+                          </summary>
+                          <div className="mt-3 grid gap-3 md:grid-cols-2">
+                            <div>
+                              <p className="mb-1 text-muted-foreground">Current on disk</p>
+                              <pre className="max-h-48 overflow-auto whitespace-pre-wrap border border-border p-2 font-mono">
+                                {configOriginalText || "(empty)"}
+                              </pre>
+                            </div>
+                            <div>
+                              <p className="mb-1 text-muted-foreground">Pending save</p>
+                              <pre className="max-h-48 overflow-auto whitespace-pre-wrap border border-border p-2 font-mono">
+                                {configText || "(empty)"}
+                              </pre>
+                            </div>
+                          </div>
+                          <label className="mt-3 flex items-center gap-2 text-muted-foreground">
+                            <Checkbox
+                              checked={configReviewConfirmed}
+                              onCheckedChange={(checked) => setConfigReviewConfirmed(checked === true)}
+                            />
+                            I reviewed the pending config.yaml changes
+                          </label>
+                        </details>
+                      )}
+                      <div className="flex gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() => handleSaveProfileConfig(p.name)}
+                          disabled={configSaving || configLoading || (configDirty && !configReviewConfirmed)}
+                        >
+                          {configSaving ? t.common.saving : "Save config.yaml"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          ghost
+                          onClick={() => loadProfileConfig(p.name)}
+                          disabled={configLoading}
+                        >
+                          Reload
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </Card>

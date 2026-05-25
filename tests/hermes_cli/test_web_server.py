@@ -615,8 +615,14 @@ class TestNewEndpoints:
         named = hermes_home / "profiles" / "multi-agent"
         named.mkdir(parents=True)
         (named / ".env").write_text("EXAMPLE=1\n", encoding="utf-8")
+        (named / "config.yaml").write_text(
+            "skills:\n  disabled:\n    - disabled-demo\n",
+            encoding="utf-8",
+        )
         (named / "skills" / "demo").mkdir(parents=True)
         (named / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+        (named / "skills" / "disabled-demo").mkdir(parents=True)
+        (named / "skills" / "disabled-demo" / "SKILL.md").write_text("---\nname: disabled-demo\n---\n", encoding="utf-8")
 
         monkeypatch.setattr(
             profiles_mod,
@@ -631,7 +637,8 @@ class TestNewEndpoints:
         assert profiles["default"]["is_default"] is True
         assert profiles["default"]["provider"] == "openrouter"
         assert profiles["multi-agent"]["has_env"] is True
-        assert profiles["multi-agent"]["skill_count"] == 1
+        assert profiles["multi-agent"]["skill_count"] == 2
+        assert profiles["multi-agent"]["active_skill_count"] == 1
 
     def test_profiles_create_rename_delete_round_trip(self, monkeypatch):
         # Stub gateway service teardown so the test doesn't shell out to
@@ -738,6 +745,90 @@ class TestNewEndpoints:
         assert seeded_skill.exists()
         profiles = {p["name"]: p for p in self.client.get("/api/profiles").json()["profiles"]}
         assert profiles["fresh"]["skill_count"] == 1
+
+    def test_profile_config_raw_round_trip_is_profile_scoped(self):
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        default_config = home / "config.yaml"
+        default_config.write_text("model:\n  default: root-model\n", encoding="utf-8")
+        profile_dir = home / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model:\n  default: old-model\n", encoding="utf-8")
+
+        resp = self.client.get("/api/profiles/coder/config")
+        assert resp.status_code == 200
+        assert "old-model" in resp.json()["content"]
+
+        update = self.client.put(
+            "/api/profiles/coder/config",
+            json={"content": "model:\n  default: new-model\n"},
+        )
+        assert update.status_code == 200
+        assert "new-model" in (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        assert "root-model" in default_config.read_text(encoding="utf-8")
+
+    def test_profile_config_rejects_invalid_yaml(self):
+        from hermes_constants import get_hermes_home
+
+        profile_dir = get_hermes_home() / "profiles" / "coder"
+        profile_dir.mkdir(parents=True)
+
+        resp = self.client.put(
+            "/api/profiles/coder/config",
+            json={"content": "model: [unterminated"},
+        )
+
+        assert resp.status_code == 400
+        assert "Invalid YAML" in resp.text
+
+    def test_profile_skills_list_and_toggle_are_profile_scoped(self):
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        profile_dir = home / "profiles" / "coder"
+        skill_dir = profile_dir / "skills" / "custom" / "sample-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: sample-skill\ndescription: Sample profile skill\n---\nBody\n",
+            encoding="utf-8",
+        )
+        (profile_dir / "config.yaml").write_text(
+            "# keep this comment\nskills:\n  disabled:\n    - sample-skill\n    - other-skill  # keep other comment\n",
+            encoding="utf-8",
+        )
+        default_config = home / "config.yaml"
+        default_config.write_text("skills:\n  disabled: []\n", encoding="utf-8")
+
+        listed = self.client.get("/api/profiles/coder/skills")
+        assert listed.status_code == 200
+        skill = listed.json()["skills"][0]
+        assert skill["name"] == "sample-skill"
+        assert skill["category"] == "custom"
+        assert skill["enabled"] is False
+
+        toggled = self.client.put(
+            "/api/profiles/coder/skills/toggle",
+            json={"name": "sample-skill", "enabled": True},
+        )
+        assert toggled.status_code == 200
+        profile_config = (profile_dir / "config.yaml").read_text(encoding="utf-8")
+        assert "sample-skill" not in profile_config
+        assert "# keep this comment" in profile_config
+        assert "other-skill  # keep other comment" in profile_config
+        assert "disabled: []" in default_config.read_text(encoding="utf-8")
+
+    def test_default_profile_config_endpoint_uses_root_home(self):
+        from hermes_constants import get_hermes_home
+
+        config_path = get_hermes_home() / "config.yaml"
+        config_path.write_text("model:\n  default: root-model\n", encoding="utf-8")
+
+        resp = self.client.get("/api/profiles/default/config")
+
+        assert resp.status_code == 200
+        assert resp.json()["path"] == str(config_path)
+        assert "root-model" in resp.json()["content"]
 
     def test_profile_open_terminal_uses_macos_terminal(self, monkeypatch):
         from hermes_constants import get_hermes_home

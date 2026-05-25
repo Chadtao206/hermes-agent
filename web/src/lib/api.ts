@@ -195,6 +195,32 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
+  getProfileConfig: (name: string) =>
+    fetchJSON<ProfileConfigResponse>(
+      `/api/profiles/${encodeURIComponent(name)}/config`,
+    ),
+  updateProfileConfig: (name: string, content: string) =>
+    fetchJSON<{ ok: boolean; path: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/config`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      },
+    ),
+  getProfileSkills: (name: string) =>
+    fetchJSON<{ skills: SkillInfo[] }>(
+      `/api/profiles/${encodeURIComponent(name)}/skills`,
+    ),
+  toggleProfileSkill: (name: string, skillName: string, enabled: boolean) =>
+    fetchJSON<{ ok: boolean; name: string; enabled: boolean }>(
+      `/api/profiles/${encodeURIComponent(name)}/skills/toggle`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: skillName, enabled }),
+      },
+    ),
 
   // Skills & Toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),
@@ -598,6 +624,7 @@ export interface ProfileInfo {
   provider: string | null;
   has_env: boolean;
   skill_count: number;
+  active_skill_count: number | null;
 }
 
 export interface ModelsAnalyticsModelEntry {
@@ -664,6 +691,12 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+}
+
+export interface ProfileConfigResponse {
+  content: string;
+  exists: boolean;
+  path: string;
 }
 
 export interface ToolsetInfo {

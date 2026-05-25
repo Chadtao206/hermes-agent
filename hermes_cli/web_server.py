@@ -18,6 +18,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -2760,6 +2761,15 @@ class ProfileSoulUpdate(BaseModel):
     content: str
 
 
+class ProfileConfigUpdate(BaseModel):
+    content: str
+
+
+class ProfileSkillToggle(BaseModel):
+    name: str
+    enabled: bool
+
+
 def _profile_attr(info, name: str, default: Any = None) -> Any:
     try:
         return getattr(info, name)
@@ -2767,15 +2777,29 @@ def _profile_attr(info, name: str, default: Any = None) -> Any:
         return default
 
 
+def _profile_skill_summary(profile_dir: Path, fallback_total: int = 0) -> Tuple[int, Optional[int]]:
+    """Return (visible skill count, active skill count) for dashboard cards."""
+    try:
+        skills = _list_profile_skills(profile_dir)
+    except Exception as e:
+        _log.debug("Failed to summarize profile skills for %s: %s", profile_dir, e, exc_info=True)
+        return fallback_total, None
+    return len(skills), sum(1 for skill in skills if skill.get("enabled"))
+
+
 def _profile_to_dict(info) -> Dict[str, Any]:
+    fallback_skill_count = int(_profile_attr(info, "skill_count", 0) or 0)
+    profile_dir = Path(str(_profile_attr(info, "path", "") or ""))
+    skill_count, active_skill_count = _profile_skill_summary(profile_dir, fallback_skill_count)
     return {
         "name": _profile_attr(info, "name", ""),
-        "path": str(_profile_attr(info, "path", "")),
+        "path": str(profile_dir),
         "is_default": bool(_profile_attr(info, "is_default", False)),
         "model": _profile_attr(info, "model"),
         "provider": _profile_attr(info, "provider"),
         "has_env": bool(_profile_attr(info, "has_env", False)),
-        "skill_count": int(_profile_attr(info, "skill_count", 0) or 0),
+        "skill_count": skill_count,
+        "active_skill_count": active_skill_count,
     }
 
 
@@ -2790,6 +2814,10 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
     default_home = profiles_mod._get_default_hermes_home()
     if default_home.is_dir():
         model, provider = _safe(lambda: profiles_mod._read_config_model(default_home), (None, None))
+        skill_count, active_skill_count = _profile_skill_summary(
+            default_home,
+            _safe(lambda: profiles_mod._count_skills(default_home), 0),
+        )
         profiles.append({
             "name": "default",
             "path": str(default_home),
@@ -2797,7 +2825,8 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
             "model": model,
             "provider": provider,
             "has_env": (default_home / ".env").exists(),
-            "skill_count": _safe(lambda: profiles_mod._count_skills(default_home), 0),
+            "skill_count": skill_count,
+            "active_skill_count": active_skill_count,
         })
 
     profiles_root = profiles_mod._get_profiles_root()
@@ -2806,6 +2835,10 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
             if not entry.is_dir() or not profiles_mod._PROFILE_ID_RE.match(entry.name):
                 continue
             model, provider = _safe(lambda entry=entry: profiles_mod._read_config_model(entry), (None, None))
+            skill_count, active_skill_count = _profile_skill_summary(
+                entry,
+                _safe(lambda entry=entry: profiles_mod._count_skills(entry), 0),
+            )
             profiles.append({
                 "name": entry.name,
                 "path": str(entry),
@@ -2813,7 +2846,8 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
                 "model": model,
                 "provider": provider,
                 "has_env": (entry / ".env").exists(),
-                "skill_count": _safe(lambda entry=entry: profiles_mod._count_skills(entry), 0),
+                "skill_count": skill_count,
+                "active_skill_count": active_skill_count,
             })
 
     return profiles
@@ -2829,6 +2863,213 @@ def _resolve_profile_dir(name: str) -> Path:
     if not profiles_mod.profile_exists(name):
         raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
     return profiles_mod.get_profile_dir(name)
+
+
+def _profile_config_path(profile_dir: Path) -> Path:
+    return profile_dir / "config.yaml"
+
+
+def _read_profile_config(profile_dir: Path) -> Dict[str, Any]:
+    config_path = _profile_config_path(profile_dir)
+    if not config_path.exists():
+        return {}
+    try:
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid existing config.yaml: {e}")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read config.yaml: {e}")
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="config.yaml must be a mapping")
+    return parsed
+
+
+def _validate_profile_config_text(content: str) -> Dict[str, Any]:
+    try:
+        parsed = yaml.safe_load(content) if content.strip() else {}
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+    if parsed is None:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="YAML must be a mapping")
+    return parsed
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    from utils import atomic_replace
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        original_mode = path.stat().st_mode if path.exists() else None
+    except OSError:
+        original_mode = None
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            if content and not content.endswith("\n"):
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        if original_mode is not None:
+            try:
+                os.chmod(real_path, original_mode)
+            except OSError:
+                pass
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _mutate_profile_disabled_skill(profile_dir: Path, skill_name: str, enabled: bool) -> None:
+    """Toggle one skill in ``skills.disabled`` while preserving YAML trivia.
+
+    The Profiles page also exposes raw config.yaml editing, so a checkbox toggle
+    must not round-trip the whole file through ``yaml.dump`` and erase comments
+    or user formatting.  Mutate the existing ruamel sequence in place instead;
+    comments/flow style on surrounding keys and remaining disabled entries stay
+    attached.
+    """
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
+    from utils import atomic_replace
+
+    config_path = _profile_config_path(profile_dir)
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+    try:
+        if config_path.exists():
+            with config_path.open("r", encoding="utf-8") as f:
+                config = yaml_rt.load(f) or CommentedMap()
+        else:
+            config = CommentedMap()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read config.yaml: {e}")
+
+    if not isinstance(config, CommentedMap):
+        config = CommentedMap(config)
+
+    skills_cfg = config.get("skills")
+    if not isinstance(skills_cfg, CommentedMap):
+        skills_cfg = CommentedMap()
+        config["skills"] = skills_cfg
+
+    disabled_seq = skills_cfg.get("disabled")
+    if not isinstance(disabled_seq, CommentedSeq):
+        disabled_seq = CommentedSeq(
+            list(disabled_seq) if isinstance(disabled_seq, list) else []
+        )
+        skills_cfg["disabled"] = disabled_seq
+
+    if enabled:
+        for idx in range(len(disabled_seq) - 1, -1, -1):
+            if str(disabled_seq[idx]) == skill_name:
+                del disabled_seq[idx]
+    elif not any(str(item) == skill_name for item in disabled_seq):
+        disabled_seq.append(skill_name)
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        original_mode = config_path.stat().st_mode if config_path.exists() else None
+    except OSError:
+        original_mode = None
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(config_path.parent),
+        prefix=f".{config_path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(config, f)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, config_path)
+        if original_mode is not None:
+            try:
+                os.chmod(real_path, original_mode)
+            except OSError:
+                pass
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _profile_skill_category(skills_dir: Path, skill_md: Path) -> str:
+    try:
+        parts = skill_md.relative_to(skills_dir).parts
+    except ValueError:
+        return "uncategorized"
+    if len(parts) >= 3:
+        return parts[0] or "uncategorized"
+    return "uncategorized"
+
+
+def _list_profile_skills(profile_dir: Path) -> List[Dict[str, Any]]:
+    from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
+    from hermes_cli.skills_config import get_disabled_skills
+    from tools.skills_tool import (
+        MAX_DESCRIPTION_LENGTH,
+        _parse_frontmatter,
+        skill_matches_platform,
+    )
+
+    skills_dir = profile_dir / "skills"
+    disabled = get_disabled_skills(_read_profile_config(profile_dir))
+    skills: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    if not skills_dir.is_dir():
+        return skills
+
+    for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        skill_dir = skill_md.parent
+        try:
+            content = skill_md.read_text(encoding="utf-8")[:4000]
+            frontmatter, body = _parse_frontmatter(content)
+            if not skill_matches_platform(frontmatter):
+                continue
+            name = str(frontmatter.get("name", skill_dir.name))[:120]
+            if not name or name in seen_names:
+                continue
+            description = str(frontmatter.get("description", "") or "")
+            if not description:
+                for line in body.strip().split("\n"):
+                    candidate = line.strip()
+                    if candidate and not candidate.startswith("#"):
+                        description = candidate
+                        break
+            if len(description) > MAX_DESCRIPTION_LENGTH:
+                description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
+            seen_names.add(name)
+            skills.append({
+                "name": name,
+                "description": description,
+                "category": _profile_skill_category(skills_dir, skill_md),
+                "enabled": name not in disabled,
+            })
+        except Exception as e:
+            _log.debug("Skipping profile skill at %s: %s", skill_md, e, exc_info=True)
+            continue
+
+    return sorted(skills, key=lambda item: (item.get("category") or "", item.get("name") or ""))
 
 
 def _profile_setup_command(name: str) -> str:
@@ -2990,6 +3231,47 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True}
+
+
+@app.get("/api/profiles/{name}/config")
+async def get_profile_config(name: str):
+    config_path = _profile_config_path(_resolve_profile_dir(name))
+    if not config_path.exists():
+        return {"content": "", "exists": False, "path": str(config_path)}
+    try:
+        return {
+            "content": config_path.read_text(encoding="utf-8"),
+            "exists": True,
+            "path": str(config_path),
+        }
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not read config.yaml: {e}")
+
+
+@app.put("/api/profiles/{name}/config")
+async def update_profile_config(name: str, body: ProfileConfigUpdate):
+    profile_dir = _resolve_profile_dir(name)
+    _validate_profile_config_text(body.content)
+    config_path = _profile_config_path(profile_dir)
+    try:
+        _atomic_write_text(config_path, body.content)
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/config failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write config.yaml: {e}")
+    return {"ok": True, "path": str(config_path)}
+
+
+@app.get("/api/profiles/{name}/skills")
+async def get_profile_skills(name: str):
+    return {"skills": _list_profile_skills(_resolve_profile_dir(name))}
+
+
+@app.put("/api/profiles/{name}/skills/toggle")
+async def toggle_profile_skill(name: str, body: ProfileSkillToggle):
+    profile_dir = _resolve_profile_dir(name)
+    _read_profile_config(profile_dir)  # validate existing YAML before mutation
+    _mutate_profile_disabled_skill(profile_dir, body.name, body.enabled)
+    return {"ok": True, "name": body.name, "enabled": body.enabled}
 
 
 # ---------------------------------------------------------------------------
