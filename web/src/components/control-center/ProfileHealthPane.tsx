@@ -31,7 +31,7 @@ export function ProfileHealthPane({ profiles }: ProfileHealthPaneProps) {
                 <span className="truncate text-foreground font-medium">{p.name}</span>
                 <span
                   className={`shrink-0 h-2 w-2 rounded-full ${
-                    p.is_online ? "bg-green-500" : "bg-muted-foreground"
+                    p.is_online ? "bg-success" : "bg-muted-foreground"
                   }`}
                   aria-label={p.is_online ? "online" : "offline"}
                 />

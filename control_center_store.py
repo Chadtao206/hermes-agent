@@ -1521,6 +1521,95 @@ def read_delegation_subagents(limit: int = 20) -> List[Dict[str, Any]]:
     return result
 
 
+def read_specialist_lanes(limit: int = 20) -> Dict[str, Any]:
+    """Return durable specialist-lane activity derived from the kanban board.
+
+    This is intentionally separate from ``read_delegation_subagents``.  The
+    latter reflects synchronous ``delegate_task``/spawn-tree runs; kanban lanes
+    are durable profile workers spawned by the dispatcher via ``hermes -p``.
+    """
+    db_path = _hermes_home() / "kanban.db"
+    result: Dict[str, Any] = {
+        "status": "missing",
+        "available": False,
+        "db_path": str(db_path),
+        "lanes": [],
+        "recent_tasks": [],
+        "updated_at": None,
+        "error": None,
+    }
+    if not db_path.exists():
+        return result
+
+    terminal_statuses = {"done", "completed", "cancelled", "archived"}
+    placeholders = ",".join("?" for _ in terminal_statuses)
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            lane_rows = conn.execute(
+                f"""
+                SELECT assignee, status, COUNT(*) AS count
+                FROM tasks
+                WHERE COALESCE(status, '') NOT IN ({placeholders})
+                GROUP BY assignee, status
+                """,
+                tuple(terminal_statuses),
+            ).fetchall()
+            recent_rows = conn.execute(
+                """
+                SELECT id, title, assignee, status, created_at, started_at,
+                       completed_at, session_id
+                FROM tasks
+                ORDER BY COALESCE(completed_at, started_at, created_at, 0) DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        lanes_by_assignee: Dict[str, Dict[str, Any]] = {}
+        for row in lane_rows:
+            assignee = str(row["assignee"] or "unassigned")
+            status_name = str(row["status"] or "unknown")
+            count = int(row["count"] or 0)
+            lane = lanes_by_assignee.setdefault(
+                assignee,
+                {
+                    "assignee": assignee,
+                    "open_tasks": 0,
+                    "running_tasks": 0,
+                    "blocked_tasks": 0,
+                    "scheduled_tasks": 0,
+                    "todo_tasks": 0,
+                    "by_status": {},
+                },
+            )
+            lane["by_status"][status_name] = count
+            lane["open_tasks"] += count
+            if status_name in {"running", "in_progress"}:
+                lane["running_tasks"] += count
+            if status_name == "blocked":
+                lane["blocked_tasks"] += count
+            if status_name == "scheduled":
+                lane["scheduled_tasks"] += count
+            if status_name in {"todo", "ready"}:
+                lane["todo_tasks"] += count
+
+        lanes = sorted(
+            lanes_by_assignee.values(),
+            key=lambda lane: (-int(lane.get("open_tasks") or 0), str(lane.get("assignee") or "")),
+        )
+        recent_tasks = [dict(row) for row in recent_rows]
+        result.update({
+            "status": "ok",
+            "available": True,
+            "lanes": lanes,
+            "recent_tasks": recent_tasks,
+            "updated_at": db_path.stat().st_mtime,
+        })
+    except Exception as exc:
+        result.update({"status": "unavailable", "error": str(exc)})
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Control Center operator capabilities

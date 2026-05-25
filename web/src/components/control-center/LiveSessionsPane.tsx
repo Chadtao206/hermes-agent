@@ -41,9 +41,9 @@ function shortId(id: string): string {
 }
 
 function statusPillClass(kind: "running" | "awaiting" | "idle" | "pending"): string {
-  if (kind === "running") return "border-green-300 text-green-700 dark:border-green-900 dark:text-green-300";
-  if (kind === "awaiting") return "border-amber-300 text-amber-700 dark:border-amber-900 dark:text-amber-300";
-  if (kind === "pending") return "border-blue-300 text-blue-700 dark:border-blue-900 dark:text-blue-300";
+  if (kind === "running") return "border-success/30 bg-success/10 text-success";
+  if (kind === "awaiting") return "border-warning/30 bg-warning/10 text-warning";
+  if (kind === "pending") return "border-ring bg-muted/40 text-foreground";
   return "border-border text-muted-foreground";
 }
 

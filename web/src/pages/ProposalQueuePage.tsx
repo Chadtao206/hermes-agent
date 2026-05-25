@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type ControlCenterProposal } from "@/lib/api";
+import { Card } from "@/components/ui/card";
 
 const REFRESH_MS = 10_000;
 
@@ -32,12 +33,12 @@ function confidenceBasisRows(
 function statusClass(status: string): string {
   const normalized = status.toLowerCase();
   if (normalized === "approved" || normalized === "applied") {
-    return "border-green-300 bg-green-50 text-green-900 dark:border-green-900 dark:bg-green-950/30 dark:text-green-200";
+    return "border-success/30 bg-success/10 text-success";
   }
   if (normalized === "denied") {
-    return "border-red-300 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200";
+    return "border-destructive/30 bg-destructive/10 text-destructive";
   }
-  return "border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200";
+  return "border-warning/30 bg-warning/10 text-warning";
 }
 
 export default function ProposalQueuePage() {
@@ -78,19 +79,24 @@ export default function ProposalQueuePage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="rounded-lg border border-blue-300 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-200">
-        <div className="font-medium">Read-only proposal queue</div>
-        <div className="mt-1 text-xs opacity-80">
-          This phase surfaces proposal evidence only. Approval/deny actions remain in Slack.
+      <Card className="bg-card/80">
+        <div className="flex items-start gap-3 px-4 py-3 text-sm text-card-foreground">
+          <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-muted-foreground" />
+          <div className="min-w-0">
+            <div className="font-medium text-foreground">Read-only proposal queue</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              This phase surfaces proposal evidence only. Approval/deny actions remain in Slack.
+            </div>
+          </div>
         </div>
-      </div>
+      </Card>
 
       <div className="flex items-center justify-between gap-3">
-        <div className="text-sm opacity-80">{proposals.length} proposal(s)</div>
+        <div className="text-sm text-muted-foreground">{proposals.length} proposal(s)</div>
         <label className="flex items-center gap-2 text-sm">
-          <span className="opacity-80">Status</span>
+          <span className="text-muted-foreground">Status</span>
           <select
-            className="rounded border px-2 py-1 text-sm"
+            className="rounded border border-input bg-card px-2 py-1 text-sm text-card-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             value={statusFilter}
             onChange={(event) => setStatusFilter(event.target.value)}
           >
@@ -106,7 +112,7 @@ export default function ProposalQueuePage() {
       <div className="flex min-w-0 gap-6">
         <aside className="w-96 shrink-0 space-y-3">
           {proposals.length === 0 ? (
-            <div className="rounded-lg border p-4 text-sm opacity-70">No proposals found.</div>
+            <Card className="p-4 text-sm text-muted-foreground">No proposals found.</Card>
           ) : (
             proposals.map((proposal) => {
               const active = proposal.proposal_id === selectedId;
@@ -115,18 +121,18 @@ export default function ProposalQueuePage() {
                   key={proposal.proposal_id}
                   type="button"
                   className={`w-full rounded-lg border p-3 text-left transition ${
-                    active ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/20" : "hover:bg-foreground/5"
+                    active ? "border-ring bg-muted/40" : "border-border bg-card/80 hover:bg-muted/40"
                   }`}
                   onClick={() => setSelectedId(proposal.proposal_id)}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <div className="font-medium leading-tight">{proposal.title}</div>
+                    <div className="font-medium leading-tight text-foreground">{proposal.title}</div>
                     <span className={`rounded border px-2 py-0.5 text-xs ${statusClass(proposal.status)}`}>
                       {proposal.status}
                     </span>
                   </div>
-                  <div className="mt-2 text-xs opacity-80">{proposal.proposal_id}</div>
-                  <div className="mt-2 flex items-center justify-between text-xs opacity-80">
+                  <div className="mt-2 text-xs text-muted-foreground">{proposal.proposal_id}</div>
+                  <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
                     <span>owner: {proposal.owner || "unknown"}</span>
                     <span>confidence: {confidenceText(proposal)}</span>
                   </div>
@@ -136,27 +142,27 @@ export default function ProposalQueuePage() {
           )}
         </aside>
 
-        <section className="min-w-0 flex-1 rounded-lg border p-4">
+        <Card className="min-w-0 flex-1 p-4">
           {!selected ? (
-            <div className="text-sm opacity-70">Select a proposal to inspect details.</div>
+            <div className="text-sm text-muted-foreground">Select a proposal to inspect details.</div>
           ) : (
             <div className="space-y-4">
               <div>
-                <h2 className="text-lg font-semibold leading-tight">{selected.title}</h2>
-                <div className="mt-1 text-xs opacity-80">{selected.proposal_id}</div>
+                <h2 className="text-lg font-semibold leading-tight text-foreground">{selected.title}</h2>
+                <div className="mt-1 text-xs text-muted-foreground">{selected.proposal_id}</div>
               </div>
 
               <div className="grid gap-2 text-sm md:grid-cols-2">
-                <div><span className="opacity-70">status:</span> {selected.status}</div>
-                <div><span className="opacity-70">decision requested:</span> {selected.decision_requested}</div>
-                <div><span className="opacity-70">owner:</span> {selected.owner || "unknown"}</div>
-                <div><span className="opacity-70">updated:</span> {selected.updated_at || "unknown"}</div>
-                <div><span className="opacity-70">created:</span> {selected.created_at || "unknown"}</div>
+                <div><span className="text-muted-foreground">status:</span> {selected.status}</div>
+                <div><span className="text-muted-foreground">decision requested:</span> {selected.decision_requested}</div>
+                <div><span className="text-muted-foreground">owner:</span> {selected.owner || "unknown"}</div>
+                <div><span className="text-muted-foreground">updated:</span> {selected.updated_at || "unknown"}</div>
+                <div><span className="text-muted-foreground">created:</span> {selected.created_at || "unknown"}</div>
               </div>
 
-              <div className="rounded border p-3">
+              <Card className="p-3">
                 <div className="text-sm font-medium">Evidence summary</div>
-                <div className="mt-1 text-sm opacity-90">{selected.tl_dr || "No summary provided."}</div>
+                <div className="mt-1 text-sm text-card-foreground">{selected.tl_dr || "No summary provided."}</div>
                 {selected.evidence.length > 0 && (
                   <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">
                     {selected.evidence.map((item, index) => (
@@ -168,9 +174,9 @@ export default function ProposalQueuePage() {
                     ))}
                   </ul>
                 )}
-              </div>
+              </Card>
 
-              <div className="rounded border p-3 text-sm">
+              <Card className="p-3 text-sm">
                 <div className="font-medium">Confidence</div>
                 <div className="mt-1">
                   score:{" "}
@@ -182,60 +188,63 @@ export default function ProposalQueuePage() {
                 {(() => {
                   const basisRows = confidenceBasisRows(selected.confidence?.basis);
                   if (!basisRows.length) {
-                    return <div className="mt-1 opacity-70">No basis recorded.</div>;
+                    return <div className="mt-1 text-muted-foreground">No basis recorded.</div>;
                   }
                   return (
                     <dl className="mt-2 grid gap-1 text-xs sm:grid-cols-2">
                       {basisRows.map(([key, value]) => (
                         <div key={`${selected.proposal_id}-basis-${key}`} className="flex gap-2">
-                          <dt className="opacity-70">{key}:</dt>
+                          <dt className="text-muted-foreground">{key}:</dt>
                           <dd className="break-all font-mono">{value}</dd>
                         </div>
                       ))}
                     </dl>
                   );
                 })()}
-              </div>
+              </Card>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <div className="rounded border p-3 text-sm">
+                <Card className="p-3 text-sm">
                   <div className="font-medium">Risk</div>
                   <div className="mt-1">level: {selected.risk.level}</div>
-                  <div className="mt-1 opacity-90">{selected.risk.notes || "No additional risk notes."}</div>
-                </div>
-                <div className="rounded border p-3 text-sm">
+                  <div className="mt-1 text-card-foreground">{selected.risk.notes || "No additional risk notes."}</div>
+                </Card>
+                <Card className="p-3 text-sm">
                   <div className="font-medium">Verification</div>
-                  <div className="mt-1 opacity-90">{selected.verification || "No verification plan recorded."}</div>
-                </div>
+                  <div className="mt-1 text-card-foreground">{selected.verification || "No verification plan recorded."}</div>
+                </Card>
               </div>
 
-              <div className="rounded border p-3 text-sm">
+              <Card className="p-3 text-sm">
                 <div className="font-medium">Rollback</div>
-                <div className="mt-1 opacity-90">{selected.rollback || "No rollback plan recorded."}</div>
-              </div>
+                <div className="mt-1 text-card-foreground">{selected.rollback || "No rollback plan recorded."}</div>
+              </Card>
 
-              <div className="rounded border p-3 text-sm">
+              <Card className="p-3 text-sm">
                 <div className="font-medium">Provenance links/paths</div>
                 <ul className="mt-2 list-disc space-y-1 pl-5 font-mono text-xs">
                   {selected.provenance.source_paths.map((path) => (
                     <li key={`${selected.proposal_id}:${path}`}>{path}</li>
                   ))}
                 </ul>
-              </div>
+              </Card>
 
               {selected.approve_deny_discuss ? (
-                <div className="rounded border p-3 text-sm">
+                <Card className="p-3 text-sm">
                   <div className="font-medium">Approve / deny guidance</div>
-                  <div className="mt-1 opacity-90">{selected.approve_deny_discuss}</div>
-                </div>
+                  <div className="mt-1 text-card-foreground">{selected.approve_deny_discuss}</div>
+                </Card>
               ) : null}
 
-              <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                Action controls intentionally omitted in this read-only phase.
-              </div>
+              <Card className="bg-card/80">
+                <div className="flex items-start gap-2 px-3 py-2 text-xs text-muted-foreground">
+                  <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-warning" />
+                  <span>Action controls intentionally omitted in this read-only phase.</span>
+                </div>
+              </Card>
             </div>
           )}
-        </section>
+        </Card>
       </div>
     </div>
   );

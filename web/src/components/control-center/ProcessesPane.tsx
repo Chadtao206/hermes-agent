@@ -26,7 +26,7 @@ function formatAge(seconds?: number | null): string {
 }
 
 function statusClass(exited: boolean): string {
-  return !exited ? "text-green-600 dark:text-green-400" : "text-muted-foreground";
+  return !exited ? "text-success" : "text-muted-foreground";
 }
 
 function shortId(id: string): string {
@@ -117,7 +117,7 @@ export function ProcessesPane({
                       ) : null}
                       {!p.exited && controllable && onKill ? (
                         <button
-                          className="rounded border border-red-300 px-2 py-1 text-red-600 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40"
+                          className="rounded border border-destructive/30 px-2 py-1 text-destructive hover:bg-destructive/10"
                           onClick={() => onKill(p)}
                         >
                           Kill
@@ -180,7 +180,7 @@ export function ProcessesPane({
                   <div className="flex items-center justify-between gap-2">
                     <div className="min-w-0 flex items-center gap-2">
                       <span className="rounded border px-2 py-0.5 text-xs uppercase text-muted-foreground">{p.kind}</span>
-                      {p.managed ? <span className="rounded border px-2 py-0.5 text-xs text-green-600 dark:text-green-400">managed</span> : null}
+                      {p.managed ? <span className="rounded border border-success/30 bg-success/10 px-2 py-0.5 text-xs text-success">managed</span> : null}
                       <span className="truncate font-mono text-xs text-foreground">{p.command_preview || p.command}</span>
                     </div>
                     <span className="shrink-0 text-xs text-muted-foreground">pid {p.pid}</span>

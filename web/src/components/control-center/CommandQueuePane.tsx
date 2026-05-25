@@ -16,10 +16,10 @@ function ago(ts: number | null | undefined): string {
 }
 
 function statusClass(status: string): string {
-  if (status === "completed") return "border-green-300 text-green-700 dark:border-green-900 dark:text-green-300";
-  if (status === "failed") return "border-red-300 text-red-700 dark:border-red-900 dark:text-red-300";
-  if (status === "expired") return "border-amber-300 text-amber-700 dark:border-amber-900 dark:text-amber-300";
-  if (status === "claimed") return "border-blue-300 text-blue-700 dark:border-blue-900 dark:text-blue-300";
+  if (status === "completed") return "border-success/30 bg-success/10 text-success";
+  if (status === "failed") return "border-destructive/30 bg-destructive/10 text-destructive";
+  if (status === "expired") return "border-warning/30 bg-warning/10 text-warning";
+  if (status === "claimed") return "border-ring bg-muted/40 text-foreground";
   return "border-border text-muted-foreground";
 }
 

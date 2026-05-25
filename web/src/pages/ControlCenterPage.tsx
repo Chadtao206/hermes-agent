@@ -23,6 +23,7 @@ import { DelegationPane } from "@/components/control-center/DelegationPane";
 import { ProfileHealthPane } from "@/components/control-center/ProfileHealthPane";
 import { CommandQueuePane } from "@/components/control-center/CommandQueuePane";
 import { RuntimeHealthPane } from "@/components/control-center/RuntimeHealthPane";
+import { Card } from "@/components/ui/card";
 
 const OVERVIEW_MS = 5_000;
 const DETAIL_MS = 4_000;
@@ -309,25 +310,28 @@ export default function ControlCenterPage() {
 
       <OverviewCards data={overview} />
 
-      <div
-        className={`rounded-lg border px-4 py-3 text-sm ${
-          controlCenterActionsEnabled
-            ? "border-green-300 bg-green-50 text-green-900 dark:border-green-900 dark:bg-green-950/30 dark:text-green-200"
-            : "border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
-        }`}
-      >
-        <div className="font-medium">
-          {controlCenterMode?.label || (controlCenterActionsEnabled ? "Operator actions enabled" : "Read-only mode")}
+      <Card className="bg-card/80">
+        <div className="flex items-start gap-3 px-4 py-3 text-sm text-card-foreground">
+          <span
+            className={`mt-1 h-2.5 w-2.5 shrink-0 rounded-full ${
+              controlCenterActionsEnabled ? "bg-success" : "bg-warning"
+            }`}
+          />
+          <div className="min-w-0">
+            <div className="font-medium text-foreground">
+              {controlCenterMode?.label || (controlCenterActionsEnabled ? "Operator actions enabled" : "Read-only mode")}
+            </div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {controlCenterActionsEnabled
+                ? `Safe controls are available: session steer/submit, pending-request responses, and process poll/log/wait.${destructiveControlsEnabled ? " Destructive controls are enabled with confirmations." : " Destructive controls require a second explicit opt-in."}`
+                : controlCenterMode?.reason || "Operator actions are disabled; this dashboard is currently read-only."}
+              {controlCenterActionsEnabled && !destructiveControlsEnabled && controlCenterMode?.destructive_controls_reason
+                ? ` ${controlCenterMode.destructive_controls_reason}`
+                : ""}
+            </div>
+          </div>
         </div>
-        <div className="mt-1 text-xs opacity-80">
-          {controlCenterActionsEnabled
-            ? `Safe controls are available: session steer/submit, pending-request responses, and process poll/log/wait.${destructiveControlsEnabled ? " Destructive controls are enabled with confirmations." : " Destructive controls require a second explicit opt-in."}`
-            : controlCenterMode?.reason || "Operator actions are disabled; this dashboard is currently read-only."}
-          {controlCenterActionsEnabled && !destructiveControlsEnabled && controlCenterMode?.destructive_controls_reason
-            ? ` ${controlCenterMode.destructive_controls_reason}`
-            : ""}
-        </div>
-      </div>
+      </Card>
 
       <div className="flex min-w-0 gap-6">
         <div className="flex min-w-0 flex-1 flex-col gap-6">

@@ -12,10 +12,10 @@ const CARDS = [
   { label: "Profiles Online", key: "profiles_online" },
 ] as const;
 
-const ALERT_CLASSES: Record<string, string> = {
-  error: "border-red-500 bg-red-50 text-red-800 dark:bg-red-950 dark:text-red-200",
-  warning: "border-yellow-500 bg-yellow-50 text-yellow-800 dark:bg-yellow-950 dark:text-yellow-200",
-  info: "border-blue-500 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-200",
+const ALERT_TONE_CLASSES: Record<string, string> = {
+  error: "bg-destructive text-destructive",
+  warning: "bg-warning text-warning",
+  info: "bg-muted-foreground text-muted-foreground",
 };
 
 function statusLabel(status?: string | null): string {
@@ -32,7 +32,7 @@ export function OverviewCards({ data }: OverviewCardsProps) {
       <div className="flex items-center gap-2 text-sm">
         <span
           className={`h-2.5 w-2.5 rounded-full ${
-            gateway?.running ? "bg-green-500" : "bg-muted-foreground"
+            gateway?.running ? "bg-success" : "bg-muted-foreground"
           }`}
         />
         <span className="text-muted-foreground">
@@ -47,11 +47,15 @@ export function OverviewCards({ data }: OverviewCardsProps) {
       {alerts.length > 0 && (
         <div className="flex flex-col gap-2">
           {alerts.map((a, i) => {
-            const cls = ALERT_CLASSES[a.level] ?? ALERT_CLASSES.info;
+            const tone = ALERT_TONE_CLASSES[a.level] ?? ALERT_TONE_CLASSES.info;
+            const [dotClass, textClass] = tone.split(" ");
             return (
-              <div key={i} className={`rounded border px-3 py-2 text-sm ${cls}`}>
-                {a.message}
-              </div>
+              <Card key={i} className="bg-card/80">
+                <div className="flex items-start gap-2 px-3 py-2 text-sm text-card-foreground">
+                  <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${dotClass}`} />
+                  <span className={textClass}>{a.message}</span>
+                </div>
+              </Card>
             );
           })}
         </div>

@@ -1,6 +1,7 @@
 """Tests for Control Center REST endpoints in hermes_cli.web_server."""
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -428,6 +429,47 @@ class TestControlCenterEndpoints:
         for field in ("session_id", "subagent_id", "status"):
             assert field in d, f"delegation item missing field: {field}"
         assert "parent_subagent_id" in d
+
+    def test_specialist_lanes_from_kanban(self, _isolate_hermes_home):
+        """Specialist lanes must report durable kanban/profile-lane work separately."""
+        from hermes_constants import get_hermes_home
+
+        db_path = get_hermes_home() / "kanban.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    session_id TEXT
+                )
+                """
+            )
+            now = time.time()
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("t_impl", "implement lane", "engineer", "running", now - 120, now - 60, None, "s-eng"),
+                    ("t_review", "review lane", "reviewer", "todo", now - 90, None, None, None),
+                    ("t_old", "old lane", "ops", "archived", now - 240, now - 200, now - 100, None),
+                ],
+            )
+            conn.commit()
+
+        resp = self.client.get("/api/control-center/specialist-lanes")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is True
+        lanes = {lane["assignee"]: lane for lane in data["lanes"]}
+        assert lanes["engineer"]["running_tasks"] == 1
+        assert lanes["reviewer"]["todo_tasks"] == 1
+        assert "ops" not in lanes
+        assert data["recent_tasks"][0]["id"] in {"t_impl", "t_review", "t_old"}
 
     def test_profiles_status_and_keys(self):
         resp = self.client.get("/api/control-center/profiles")

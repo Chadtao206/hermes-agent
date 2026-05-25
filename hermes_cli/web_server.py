@@ -4735,6 +4735,15 @@ async def get_control_center_delegation():
         return {"subagents": []}
 
 
+@app.get("/api/control-center/specialist-lanes")
+async def get_control_center_specialist_lanes():
+    try:
+        import control_center_store as _cc
+        return _cc.read_specialist_lanes(limit=20)
+    except Exception as exc:
+        return {"status": "unavailable", "available": False, "lanes": [], "recent_tasks": [], "error": str(exc)}
+
+
 @app.get("/api/control-center/profiles")
 async def get_control_center_profiles():
     try:

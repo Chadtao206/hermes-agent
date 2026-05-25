@@ -24,8 +24,8 @@ function detailValue(value: unknown): string {
 }
 
 function statusClass(runtime: ControlCenterRuntimeCard): string {
-  if (runtime.warnings?.length) return "text-amber-600 dark:text-amber-400";
-  if (runtime.running || runtime.status === "active") return "text-green-600 dark:text-green-400";
+  if (runtime.warnings?.length) return "text-warning";
+  if (runtime.running || runtime.status === "active") return "text-success";
   return "text-muted-foreground";
 }
 
@@ -66,7 +66,7 @@ export function RuntimeHealthPane({ data, actionResult = null, onAction }: Runti
                   ))}
                 </div>
                 {runtime.warnings?.length ? (
-                  <div className="mt-3 flex flex-col gap-1 text-xs text-amber-700 dark:text-amber-300">
+                  <div className="mt-3 flex flex-col gap-1 text-xs text-warning">
                     {runtime.warnings.map((warning, idx) => (
                       <div key={idx} className="flex gap-1"><AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" /> <span>{warning}</span></div>
                     ))}
@@ -79,7 +79,7 @@ export function RuntimeHealthPane({ data, actionResult = null, onAction }: Runti
                         key={action.id}
                         title={action.reason || undefined}
                         disabled={!action.available}
-                        className={`rounded border px-2 py-1 text-xs ${action.available ? "hover:bg-accent" : "cursor-not-allowed opacity-50"} ${action.destructive && action.available ? "border-red-300 text-red-600 dark:border-red-900 dark:text-red-400" : ""}`}
+                        className={`rounded border px-2 py-1 text-xs ${action.available ? "hover:bg-accent" : "cursor-not-allowed opacity-50"} ${action.destructive && action.available ? "border-destructive/30 text-destructive hover:bg-destructive/10" : ""}`}
                         onClick={() => onAction?.(runtime, action)}
                       >
                         {action.label}
