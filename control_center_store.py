@@ -1999,6 +1999,45 @@ def _load_proposal_decisions() -> Dict[str, Dict[str, Any]]:
                     overlay["apply_artifact_path"] = apply_audit["apply_artifact_path"]
                 if apply_audit["idempotency_key"]:
                     overlay["apply_idempotency_key"] = apply_audit["idempotency_key"]
+
+            latest_outcome_audit: Dict[str, sqlite3.Row] = {}
+            try:
+                for row in conn.execute(
+                    """
+                    SELECT id, proposal_id, observed_at, action, operator, source,
+                           reason, kanban_task_id, kanban_task_status,
+                           kanban_completed_at, previous_status, new_status,
+                           previous_outcome, new_outcome, verified_at,
+                           manifest_path
+                    FROM proposal_outcome_audit
+                    ORDER BY proposal_id ASC, observed_at DESC, id DESC
+                    """
+                ):
+                    proposal_id = str(row["proposal_id"] or "")
+                    if not proposal_id or proposal_id in latest_outcome_audit:
+                        continue
+                    latest_outcome_audit[proposal_id] = row
+            except sqlite3.Error:
+                latest_outcome_audit = {}
+
+            for proposal_id, outcome_audit in latest_outcome_audit.items():
+                overlay = overlays.setdefault(proposal_id, {})
+                overlay["outcome_audit"] = {
+                    "observed_at": outcome_audit["observed_at"],
+                    "action": outcome_audit["action"],
+                    "operator": outcome_audit["operator"],
+                    "source": outcome_audit["source"],
+                    "reason": outcome_audit["reason"],
+                    "kanban_task_id": outcome_audit["kanban_task_id"],
+                    "kanban_task_status": outcome_audit["kanban_task_status"],
+                    "kanban_completed_at": outcome_audit["kanban_completed_at"],
+                    "previous_status": outcome_audit["previous_status"],
+                    "new_status": outcome_audit["new_status"],
+                    "previous_outcome": outcome_audit["previous_outcome"],
+                    "new_outcome": outcome_audit["new_outcome"],
+                    "verified_at": outcome_audit["verified_at"],
+                    "manifest_path": outcome_audit["manifest_path"],
+                }
         finally:
             conn.close()
     except Exception:
@@ -2158,6 +2197,24 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
                     "apply_artifact_path": apply_audit.get("apply_artifact_path"),
                     "kanban_task_id": apply_audit.get("kanban_task_id"),
                     "manifest_path": apply_audit.get("manifest_path"),
+                }
+            outcome_audit = overlay.get("outcome_audit") if isinstance(overlay.get("outcome_audit"), dict) else None
+            if outcome_audit:
+                normalized["outcome_audit"] = {
+                    "observed_at": outcome_audit.get("observed_at"),
+                    "action": outcome_audit.get("action"),
+                    "operator": outcome_audit.get("operator"),
+                    "source": outcome_audit.get("source"),
+                    "reason": outcome_audit.get("reason"),
+                    "kanban_task_id": outcome_audit.get("kanban_task_id"),
+                    "kanban_task_status": outcome_audit.get("kanban_task_status"),
+                    "kanban_completed_at": outcome_audit.get("kanban_completed_at"),
+                    "previous_status": outcome_audit.get("previous_status"),
+                    "new_status": outcome_audit.get("new_status"),
+                    "previous_outcome": outcome_audit.get("previous_outcome"),
+                    "new_outcome": outcome_audit.get("new_outcome"),
+                    "verified_at": outcome_audit.get("verified_at"),
+                    "manifest_path": outcome_audit.get("manifest_path"),
                 }
         if status and str(normalized.get("status") or "").lower() != status.lower():
             continue

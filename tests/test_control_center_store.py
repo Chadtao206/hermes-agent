@@ -269,6 +269,30 @@ def _populated_proposals_with_ledger(_populated_proposals, _isolate_hermes_home)
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS proposal_outcome_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                source TEXT,
+                reason TEXT,
+                kanban_task_id TEXT,
+                kanban_task_status TEXT,
+                kanban_completed_at TEXT,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                previous_outcome TEXT,
+                new_outcome TEXT,
+                verified_at TEXT,
+                backup_path TEXT,
+                kanban_backup_path TEXT,
+                manifest_path TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             INSERT INTO proposals(proposal_id, status, approved_at, denied_at, approver, denial_reason, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
@@ -363,6 +387,35 @@ def _populated_proposals_with_ledger(_populated_proposals, _isolate_hermes_home)
                 "/tmp/proposal:test-read-only-queue.apply.json",
                 "t_apply_123",
                 "/tmp/proposal:test-read-only-queue.manifest.json",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposal_outcome_audit(
+                proposal_id, observed_at, action, operator, source, reason,
+                kanban_task_id, kanban_task_status, kanban_completed_at,
+                previous_status, new_status, previous_outcome, new_outcome,
+                verified_at, backup_path, kanban_backup_path, manifest_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "proposal:test-read-only-queue",
+                "2026-05-25T04:00:00+00:00",
+                "transitioned_verified",
+                "Chad Tao",
+                "manual",
+                "phase-4 test fixture",
+                "t_apply_123",
+                "done",
+                "2026-05-25T03:30:00+00:00",
+                "applied",
+                "verified",
+                None,
+                "success",
+                "2026-05-25T03:30:00+00:00",
+                "/tmp/backup-outcome",
+                "/tmp/kanban-backup-outcome",
+                "/tmp/proposal:test-read-only-queue.outcome.manifest.json",
             ),
         )
         conn.commit()
@@ -569,6 +622,10 @@ class TestReadProposals:
         assert approved["apply"]["operator"] == "Chad Tao"
         assert approved["apply"]["source"] == "manual"
         assert approved["apply"]["kanban_task_id"] == "t_apply_123"
+        assert approved["outcome_audit"]["action"] == "transitioned_verified"
+        assert approved["outcome_audit"]["new_status"] == "verified"
+        assert approved["outcome_audit"]["new_outcome"] == "success"
+        assert approved["outcome_audit"]["kanban_task_status"] == "done"
 
         denied = by_id["proposal:test-override-denied"]
         assert denied["status"] == "denied"

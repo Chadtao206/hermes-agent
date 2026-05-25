@@ -10,7 +10,7 @@ EVENTS_DB_NAME = "events.db"
 EXPERIMENTS_DB_NAME = "experiments.db"
 
 EVENTS_SCHEMA_VERSION = 5
-EXPERIMENTS_SCHEMA_VERSION = 4
+EXPERIMENTS_SCHEMA_VERSION = 5
 
 EVENTS_SCHEMA = [
     """
@@ -527,6 +527,28 @@ EXPERIMENTS_SCHEMA = [
         manifest_path TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS proposal_outcome_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proposal_id TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        action TEXT NOT NULL,
+        operator TEXT NOT NULL,
+        source TEXT,
+        reason TEXT,
+        kanban_task_id TEXT,
+        kanban_task_status TEXT,
+        kanban_completed_at TEXT,
+        previous_status TEXT,
+        new_status TEXT NOT NULL,
+        previous_outcome TEXT,
+        new_outcome TEXT,
+        verified_at TEXT,
+        backup_path TEXT,
+        kanban_backup_path TEXT,
+        manifest_path TEXT
+    )
+    """,
 ]
 
 EXPERIMENTS_SCHEMA_MIGRATIONS = {
@@ -551,6 +573,7 @@ EXPERIMENTS_SCHEMA_MIGRATIONS = {
     ],
     3: [],
     4: [],
+    5: [],
 }
 
 EXPERIMENTS_INDEXES = [
@@ -564,6 +587,7 @@ EXPERIMENTS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_proposal_evidence_links_proposal_id ON proposal_evidence_links(proposal_id)",
     "CREATE INDEX IF NOT EXISTS idx_proposal_decision_audit_proposal_id ON proposal_decision_audit(proposal_id)",
     "CREATE INDEX IF NOT EXISTS idx_proposal_apply_audit_proposal_id ON proposal_apply_audit(proposal_id)",
+    "CREATE INDEX IF NOT EXISTS idx_proposal_outcome_audit_proposal_id ON proposal_outcome_audit(proposal_id)",
 ]
 
 

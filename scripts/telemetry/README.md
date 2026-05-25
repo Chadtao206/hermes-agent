@@ -23,3 +23,21 @@ When changing these scripts, update the tracked copy first, run the relevant scr
 ## Safety posture
 
 The production proposal digest remains dry-run/non-mutating. Mutable proposal decision/apply helpers are manual-command surfaces and must keep explicit human approval provenance, backup, idempotency, and targeted tests.
+
+## Proposal outcome-loop reconciliation (Phase 4)
+
+`reconcile_proposal_outcomes.py` links applied proposals to their `proposal_apply_audit.kanban_task_id` and reconciles `proposals.status/outcome/verified_at/scored_at` when linked Kanban tasks reach terminal states.
+
+- default mode: dry-run only (plan output, no DB mutation)
+- execute mode: requires explicit `--operator --source --reason`
+- execute mode safety: pre/post `PRAGMA quick_check`, execute backups for `experiments.db` and `kanban.db`, idempotent guarded updates, append-only `proposal_outcome_audit` transition evidence
+- stale detection: missing linked task marks proposal `stale/needs_attention`
+
+Examples:
+
+- Dry-run scan of applied proposals:
+  - `python3 scripts/telemetry/reconcile_proposal_outcomes.py --json`
+- Execute one proposal reconciliation:
+  - `python3 scripts/telemetry/reconcile_proposal_outcomes.py --proposal-id proposal:example --execute --operator "Chad Tao" --source "slack:thread-123" --reason "Phase 4 outcome reconciliation" --json`
+
+Note: this card does not create or schedule watchdog cron jobs. Scheduling and cadence are intentionally deferred to later ops coordination.

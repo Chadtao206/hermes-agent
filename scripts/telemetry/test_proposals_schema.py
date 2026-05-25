@@ -52,7 +52,8 @@ def main() -> int:
             assert "proposals" in tables, tables
             assert "proposal_evidence_links" in tables, tables
             assert "proposal_apply_audit" in tables, tables
-            assert _schema_version(conn) == "4", _schema_version(conn)
+            assert "proposal_outcome_audit" in tables, tables
+            assert _schema_version(conn) == "5", _schema_version(conn)
 
             proposal_columns = _table_columns(conn, "proposals")
             assert "proposal_id" in proposal_columns, proposal_columns
@@ -62,6 +63,16 @@ def main() -> int:
 
             evidence_columns = _table_columns(conn, "proposal_evidence_links")
             assert {"proposal_id", "evidence_type", "evidence_ref"}.issubset(evidence_columns), evidence_columns
+
+            outcome_columns = _table_columns(conn, "proposal_outcome_audit")
+            assert {
+                "proposal_id",
+                "action",
+                "new_status",
+                "new_outcome",
+                "verified_at",
+                "kanban_task_id",
+            }.issubset(outcome_columns), outcome_columns
         finally:
             conn.close()
 
@@ -69,7 +80,7 @@ def main() -> int:
         _run_init(telemetry_root)
         conn = sqlite3.connect(experiments_db)
         try:
-            assert _schema_version(conn) == "4", _schema_version(conn)
+            assert _schema_version(conn) == "5", _schema_version(conn)
         finally:
             conn.close()
 
