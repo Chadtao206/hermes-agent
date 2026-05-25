@@ -2527,6 +2527,51 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
     return message, deduped
 
 
+def _auto_block_unclosed_kanban_worker_turn(
+    response: str,
+    result: Optional[dict[str, Any]],
+) -> bool:
+    """Auto-block a one-shot kanban worker that returned prose without closeout.
+
+    This is a CLI-side guardrail for dispatched workers.  Normal successful
+    workers call ``kanban_complete``/``kanban_block`` during the turn, leaving
+    nothing for this helper to do.  If the model returns a final answer while
+    the task is still running, block it now with a protocol-violation event so
+    the dispatcher does not later classify the same run as a vague ``pid not
+    alive`` crash.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return False
+    if result and result.get("interrupted"):
+        return False
+
+    run_id_raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        expected_run_id = int(run_id_raw) if run_id_raw else None
+    except ValueError:
+        expected_run_id = None
+    expected_claim_lock = (
+        os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or ""
+    ).strip() or None
+
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+        import contextlib as _contextlib
+
+        with _contextlib.closing(_kanban_db.connect()) as conn:
+            return _kanban_db.auto_block_unclosed_worker_turn(
+                conn,
+                task_id,
+                final_response=response,
+                expected_run_id=expected_run_id,
+                expected_claim_lock=expected_claim_lock,
+            )
+    except Exception as exc:
+        logging.warning("kanban closeout guard failed for %s: %s", task_id, exc)
+        return False
+
+
 class ChatConsole:
     """Rich Console adapter for prompt_toolkit's patch_stdout context.
 
@@ -11797,6 +11842,12 @@ class HermesCLI:
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+
+            # Kanban worker closeout guard: if a dispatched one-shot worker
+            # returned final prose while its task is still running, durably
+            # block the task now as a protocol violation.  Normal workers that
+            # already called kanban_complete/kanban_block are no-ops here.
+            _auto_block_unclosed_kanban_worker_turn(response, result)
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):

@@ -4132,6 +4132,112 @@ def block_task(
         return True
 
 
+def auto_block_unclosed_worker_turn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    final_response: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Block a still-running worker that returned prose without closeout.
+
+    Kanban workers are required to end by calling ``kanban_complete`` or
+    ``kanban_block``.  Dispatcher-side crash detection catches many clean exits
+    after the fact, but it can miss the exact exit code when a worker process is
+    reaped outside the registry window.  The CLI calls this guard at the end of
+    one-shot kanban worker turns: if the task is *still* running for the same
+    run/claim, convert the final prose into a durable blocked closeout before
+    process exit.  That prevents a generic later ``pid not alive`` crash from
+    hiding the protocol violation.
+    """
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return False
+
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running":
+        return False
+
+    active_run_id = row["current_run_id"]
+    if expected_run_id is not None:
+        if active_run_id is None or int(active_run_id) != int(expected_run_id):
+            return False
+    if expected_claim_lock and row["claim_lock"] != expected_claim_lock:
+        return False
+
+    response_text = (final_response or "").strip()
+    response_tail = response_text[-4096:] if response_text else ""
+    reason = (
+        "Protocol violation: worker returned a final response without calling "
+        "kanban_complete or kanban_block; CLI closeout guard auto-blocked "
+        "the task before process exit."
+    )
+    if response_tail:
+        reason += "\n\nFinal response tail:\n" + response_tail
+
+    run_id_for_block = (
+        int(active_run_id)
+        if active_run_id is not None
+        else (int(expected_run_id) if expected_run_id is not None else None)
+    )
+    if not block_task(
+        conn,
+        task_id,
+        reason=reason,
+        expected_run_id=run_id_for_block,
+    ):
+        return False
+
+    payload: dict[str, Any] = {
+        "failure_class": FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+        "guidance": _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
+        "source": "cli_closeout_guard",
+    }
+    if expected_claim_lock:
+        payload["claimer"] = expected_claim_lock
+    if run_id_for_block is not None:
+        payload["run_id"] = run_id_for_block
+    if response_tail:
+        payload["final_response_tail"] = response_tail
+
+    with write_txn(conn):
+        if run_id_for_block is not None:
+            run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (run_id_for_block,),
+            ).fetchone()
+            if run is not None:
+                try:
+                    metadata = json.loads(run["metadata"] or "{}")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                except Exception:
+                    metadata = {}
+                metadata.update({
+                    "failure_class": FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+                    "guidance": _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
+                    "closeout_guard": "cli_final_response_auto_block",
+                })
+                if response_tail:
+                    metadata["final_response_tail"] = response_tail
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(metadata, ensure_ascii=False), run_id_for_block),
+                )
+        _append_event(
+            conn,
+            task_id,
+            "protocol_violation",
+            payload,
+            run_id=run_id_for_block,
+        )
+    return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
