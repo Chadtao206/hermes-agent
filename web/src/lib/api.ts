@@ -425,6 +425,8 @@ export const api = {
     ),
   getControlCenterDelegation: () =>
     fetchJSON<{ subagents: ControlCenterDelegationSummary[] }>("/api/control-center/delegation"),
+  getControlCenterSpecialistLanes: () =>
+    fetchJSON<ControlCenterSpecialistLaneResponse>("/api/control-center/specialist-lanes"),
   getControlCenterProfiles: () =>
     fetchJSON<{ profiles: ControlCenterProfileStatus[] }>("/api/control-center/profiles"),
 };
@@ -1146,6 +1148,37 @@ export interface ControlCenterDelegationSummary {
   started_at?: number | null;
   finished_at?: number | null;
   parent_subagent_id?: string | null;
+}
+
+export interface ControlCenterSpecialistLane {
+  assignee: string;
+  open_tasks: number;
+  running_tasks: number;
+  blocked_tasks: number;
+  scheduled_tasks: number;
+  todo_tasks: number;
+  by_status: Record<string, number>;
+}
+
+export interface ControlCenterSpecialistTask {
+  id: string;
+  title?: string | null;
+  assignee?: string | null;
+  status?: string | null;
+  created_at?: number | null;
+  started_at?: number | null;
+  completed_at?: number | null;
+  session_id?: string | null;
+}
+
+export interface ControlCenterSpecialistLaneResponse {
+  status: string;
+  available: boolean;
+  db_path?: string | null;
+  lanes: ControlCenterSpecialistLane[];
+  recent_tasks: ControlCenterSpecialistTask[];
+  updated_at?: number | null;
+  error?: string | null;
 }
 
 export interface ControlCenterProfileStatus {

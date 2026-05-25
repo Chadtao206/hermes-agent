@@ -8,6 +8,7 @@ import type {
   ControlCenterProcess,
   ControlCenterSystemProcess,
   ControlCenterDelegationSummary,
+  ControlCenterSpecialistLaneResponse,
   ControlCenterProfileStatus,
   ControlCenterCommand,
   ControlCenterProcessActionResponse,
@@ -20,6 +21,7 @@ import { LiveSessionsPane } from "@/components/control-center/LiveSessionsPane";
 import { PendingRequestsPane } from "@/components/control-center/PendingRequestsPane";
 import { ProcessesPane } from "@/components/control-center/ProcessesPane";
 import { DelegationPane } from "@/components/control-center/DelegationPane";
+import { SpecialistLanesPane } from "@/components/control-center/SpecialistLanesPane";
 import { ProfileHealthPane } from "@/components/control-center/ProfileHealthPane";
 import { CommandQueuePane } from "@/components/control-center/CommandQueuePane";
 import { RuntimeHealthPane } from "@/components/control-center/RuntimeHealthPane";
@@ -36,6 +38,7 @@ export default function ControlCenterPage() {
   const [processes, setProcesses] = useState<ControlCenterProcess[] | null>(null);
   const [systemProcesses, setSystemProcesses] = useState<ControlCenterSystemProcess[] | null>(null);
   const [subagents, setSubagents] = useState<ControlCenterDelegationSummary[] | null>(null);
+  const [specialistLanes, setSpecialistLanes] = useState<ControlCenterSpecialistLaneResponse | null>(null);
   const [profiles, setProfiles] = useState<ControlCenterProfileStatus[] | null>(null);
   const [runtimes, setRuntimes] = useState<ControlCenterRuntimeHealthResponse | null>(null);
   const [selectedProcessId, setSelectedProcessId] = useState<string | null>(null);
@@ -93,6 +96,12 @@ export default function ControlCenterPage() {
       .catch(() => {});
   };
 
+  const refreshSpecialistLanes = () => {
+    api.getControlCenterSpecialistLanes()
+      .then((d) => { if (mountedRef.current) setSpecialistLanes(d); })
+      .catch(() => {});
+  };
+
   const refreshProfiles = () => {
     api.getControlCenterProfiles()
       .then((d) => { if (mountedRef.current) setProfiles(d.profiles); })
@@ -112,6 +121,7 @@ export default function ControlCenterPage() {
     refreshCommands();
     refreshProcesses();
     refreshSystemProcesses();
+    refreshSpecialistLanes();
     refreshRuntimes();
   };
 
@@ -154,6 +164,12 @@ export default function ControlCenterPage() {
   useEffect(() => {
     refreshSubagents();
     const id = setInterval(refreshSubagents, DETAIL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    refreshSpecialistLanes();
+    const id = setInterval(refreshSpecialistLanes, DETAIL_MS);
     return () => clearInterval(id);
   }, []);
 
@@ -363,6 +379,7 @@ export default function ControlCenterPage() {
             onKill={destructiveControlsEnabled ? handleProcessKill : undefined}
           />
           <DelegationPane subagents={subagents} />
+          <SpecialistLanesPane data={specialistLanes} />
           <ProfileHealthPane profiles={profiles} />
         </div>
 

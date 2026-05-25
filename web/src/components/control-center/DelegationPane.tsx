@@ -12,7 +12,7 @@ export function DelegationPane({ subagents }: DelegationPaneProps) {
       <CardHeader className="py-3 px-4">
         <CardTitle className="text-sm flex items-center gap-2">
           <Users className="h-4 w-4" />
-          Delegation
+          Subagent Runs
         </CardTitle>
       </CardHeader>
       <CardContent className="px-4 pb-4">
@@ -21,9 +21,12 @@ export function DelegationPane({ subagents }: DelegationPaneProps) {
             Loading…
           </p>
         ) : subagents.length === 0 ? (
-          <p className="text-sm text-muted-foreground text-center py-6">
-            No delegation history.
-          </p>
+          <div className="py-6 text-center">
+            <p className="text-sm text-muted-foreground">No synchronous subagent runs.</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              This only tracks delegate_task/spawn-tree activity; durable profile work is shown in Specialist Lanes.
+            </p>
+          </div>
         ) : (
           <ul className="divide-y divide-border text-sm">
             {subagents.map((d) => (
