@@ -12,6 +12,23 @@ function confidenceText(proposal: ControlCenterProposal): string {
   return "unknown";
 }
 
+function confidenceBasisRows(
+  basis: Record<string, unknown> | undefined,
+): Array<[key: string, value: string]> {
+  if (!basis) return [];
+  return Object.entries(basis).map(([key, value]) => {
+    if (value === null || value === undefined) return [key, "—"];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      return [key, String(value)];
+    }
+    try {
+      return [key, JSON.stringify(value)];
+    } catch {
+      return [key, "[unserializable]"];
+    }
+  });
+}
+
 function statusClass(status: string): string {
   const normalized = status.toLowerCase();
   if (normalized === "approved" || normalized === "applied") {
@@ -133,7 +150,6 @@ export default function ProposalQueuePage() {
                 <div><span className="opacity-70">status:</span> {selected.status}</div>
                 <div><span className="opacity-70">decision requested:</span> {selected.decision_requested}</div>
                 <div><span className="opacity-70">owner:</span> {selected.owner || "unknown"}</div>
-                <div><span className="opacity-70">confidence:</span> {confidenceText(selected)}</div>
                 <div><span className="opacity-70">updated:</span> {selected.updated_at || "unknown"}</div>
                 <div><span className="opacity-70">created:</span> {selected.created_at || "unknown"}</div>
               </div>
@@ -152,6 +168,33 @@ export default function ProposalQueuePage() {
                     ))}
                   </ul>
                 )}
+              </div>
+
+              <div className="rounded border p-3 text-sm">
+                <div className="font-medium">Confidence</div>
+                <div className="mt-1">
+                  score:{" "}
+                  {typeof selected.confidence?.score === "number"
+                    ? selected.confidence.score.toFixed(2)
+                    : "unknown"}
+                  {selected.confidence?.band ? ` · band: ${selected.confidence.band}` : ""}
+                </div>
+                {(() => {
+                  const basisRows = confidenceBasisRows(selected.confidence?.basis);
+                  if (!basisRows.length) {
+                    return <div className="mt-1 opacity-70">No basis recorded.</div>;
+                  }
+                  return (
+                    <dl className="mt-2 grid gap-1 text-xs sm:grid-cols-2">
+                      {basisRows.map(([key, value]) => (
+                        <div key={`${selected.proposal_id}-basis-${key}`} className="flex gap-2">
+                          <dt className="opacity-70">{key}:</dt>
+                          <dd className="break-all font-mono">{value}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  );
+                })()}
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
