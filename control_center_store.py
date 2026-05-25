@@ -1908,7 +1908,9 @@ def _load_proposal_decisions() -> Dict[str, Dict[str, Any]]:
         try:
             for row in conn.execute(
                 """
-                SELECT proposal_id, status, approved_at, denied_at, approver, denial_reason, updated_at
+                SELECT proposal_id, status, approved_at, denied_at, approver, denial_reason,
+                       applied_at, verified_at, scored_at, outcome, linked_experiment_id,
+                       updated_at
                 FROM proposals
                 """
             ):
@@ -1921,6 +1923,11 @@ def _load_proposal_decisions() -> Dict[str, Dict[str, Any]]:
                     "denied_at": row["denied_at"],
                     "approver": row["approver"],
                     "denial_reason": row["denial_reason"],
+                    "applied_at": row["applied_at"],
+                    "verified_at": row["verified_at"],
+                    "scored_at": row["scored_at"],
+                    "outcome": row["outcome"],
+                    "linked_experiment_id": row["linked_experiment_id"],
                     "ledger_updated_at": row["updated_at"],
                 }
 
@@ -1951,6 +1958,47 @@ def _load_proposal_decisions() -> Dict[str, Dict[str, Any]]:
                     "new_status": audit["new_status"],
                     "source": audit["source"],
                 }
+
+            latest_apply_audit: Dict[str, sqlite3.Row] = {}
+            try:
+                for row in conn.execute(
+                    """
+                    SELECT id, proposal_id, applied_at, action, operator, approver,
+                           approval_decided_at, approval_source, source,
+                           idempotency_key, apply_artifact_path, kanban_task_id,
+                           manifest_path
+                    FROM proposal_apply_audit
+                    ORDER BY proposal_id ASC, applied_at DESC, id DESC
+                    """
+                ):
+                    proposal_id = str(row["proposal_id"] or "")
+                    if not proposal_id or proposal_id in latest_apply_audit:
+                        continue
+                    latest_apply_audit[proposal_id] = row
+            except sqlite3.Error:
+                latest_apply_audit = {}
+
+            for proposal_id, apply_audit in latest_apply_audit.items():
+                overlay = overlays.setdefault(proposal_id, {})
+                overlay["apply"] = {
+                    "applied_at": apply_audit["applied_at"],
+                    "action": apply_audit["action"],
+                    "operator": apply_audit["operator"],
+                    "approver": apply_audit["approver"],
+                    "approval_decided_at": apply_audit["approval_decided_at"],
+                    "approval_source": apply_audit["approval_source"],
+                    "source": apply_audit["source"],
+                    "idempotency_key": apply_audit["idempotency_key"],
+                    "apply_artifact_path": apply_audit["apply_artifact_path"],
+                    "kanban_task_id": apply_audit["kanban_task_id"],
+                    "manifest_path": apply_audit["manifest_path"],
+                }
+                if apply_audit["kanban_task_id"]:
+                    overlay["kanban_task_id"] = apply_audit["kanban_task_id"]
+                if apply_audit["apply_artifact_path"]:
+                    overlay["apply_artifact_path"] = apply_audit["apply_artifact_path"]
+                if apply_audit["idempotency_key"]:
+                    overlay["apply_idempotency_key"] = apply_audit["idempotency_key"]
         finally:
             conn.close()
     except Exception:
@@ -2057,9 +2105,20 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
             normalized["status"] = overlay.get("status") or normalized.get("status")
             normalized["approved_at"] = overlay.get("approved_at")
             normalized["denied_at"] = overlay.get("denied_at")
+            normalized["applied_at"] = overlay.get("applied_at")
+            normalized["verified_at"] = overlay.get("verified_at")
+            normalized["scored_at"] = overlay.get("scored_at")
+            normalized["outcome"] = overlay.get("outcome")
+            normalized["linked_experiment_id"] = overlay.get("linked_experiment_id")
             normalized["approver"] = overlay.get("approver")
             normalized["denial_reason"] = overlay.get("denial_reason")
             normalized["ledger_updated_at"] = overlay.get("ledger_updated_at")
+            if overlay.get("kanban_task_id"):
+                normalized["kanban_task_id"] = overlay.get("kanban_task_id")
+            if overlay.get("apply_artifact_path"):
+                normalized["apply_artifact_path"] = overlay.get("apply_artifact_path")
+            if overlay.get("apply_idempotency_key"):
+                normalized["apply_idempotency_key"] = overlay.get("apply_idempotency_key")
             audit = overlay.get("audit") if isinstance(overlay.get("audit"), dict) else None
             if audit:
                 normalized["decision"] = {
@@ -2070,6 +2129,21 @@ def read_proposals(limit: int = 200, status: Optional[str] = None) -> List[Dict[
                     "previous_status": audit.get("previous_status"),
                     "new_status": audit.get("new_status"),
                     "source": audit.get("source"),
+                }
+            apply_audit = overlay.get("apply") if isinstance(overlay.get("apply"), dict) else None
+            if apply_audit:
+                normalized["apply"] = {
+                    "applied_at": apply_audit.get("applied_at"),
+                    "action": apply_audit.get("action"),
+                    "operator": apply_audit.get("operator"),
+                    "approver": apply_audit.get("approver"),
+                    "approval_decided_at": apply_audit.get("approval_decided_at"),
+                    "approval_source": apply_audit.get("approval_source"),
+                    "source": apply_audit.get("source"),
+                    "idempotency_key": apply_audit.get("idempotency_key"),
+                    "apply_artifact_path": apply_audit.get("apply_artifact_path"),
+                    "kanban_task_id": apply_audit.get("kanban_task_id"),
+                    "manifest_path": apply_audit.get("manifest_path"),
                 }
         if status and str(normalized.get("status") or "").lower() != status.lower():
             continue

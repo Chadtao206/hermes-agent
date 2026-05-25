@@ -218,6 +218,11 @@ def _populated_proposals_with_ledger(_populated_proposals, _isolate_hermes_home)
                 denied_at TEXT,
                 approver TEXT,
                 denial_reason TEXT,
+                applied_at TEXT,
+                verified_at TEXT,
+                scored_at TEXT,
+                outcome TEXT,
+                linked_experiment_id TEXT,
                 updated_at TEXT
             )
             """
@@ -235,6 +240,30 @@ def _populated_proposals_with_ledger(_populated_proposals, _isolate_hermes_home)
                 new_status TEXT NOT NULL,
                 source TEXT,
                 backup_path TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proposal_apply_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                approver TEXT,
+                approval_decided_at TEXT,
+                approval_source TEXT,
+                reason TEXT,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                source TEXT,
+                idempotency_key TEXT NOT NULL,
+                backup_path TEXT NOT NULL,
+                kanban_backup_path TEXT,
+                apply_artifact_path TEXT,
+                kanban_task_id TEXT,
+                manifest_path TEXT
             )
             """
         )
@@ -304,6 +333,36 @@ def _populated_proposals_with_ledger(_populated_proposals, _isolate_hermes_home)
                 "denied",
                 "manual",
                 "/tmp/backup-denied",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposal_apply_audit(
+                proposal_id, applied_at, action, operator, approver,
+                approval_decided_at, approval_source, reason,
+                previous_status, new_status, source, idempotency_key,
+                backup_path, kanban_backup_path, apply_artifact_path,
+                kanban_task_id, manifest_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "proposal:test-read-only-queue",
+                "2026-05-25T03:00:00+00:00",
+                "applied",
+                "Chad Tao",
+                "Chad Tao",
+                "2026-05-25T01:00:00+00:00",
+                "slack:thread-1",
+                "launch pilot",
+                "approved",
+                "applied",
+                "manual",
+                "proposal-apply:proposal:test-read-only-queue",
+                "/tmp/backup-approved",
+                "/tmp/kanban-backup-approved",
+                "/tmp/proposal:test-read-only-queue.apply.json",
+                "t_apply_123",
+                "/tmp/proposal:test-read-only-queue.manifest.json",
             ),
         )
         conn.commit()
@@ -503,6 +562,13 @@ class TestReadProposals:
         assert approved["approved_at"] == "2026-05-25T01:00:00+00:00"
         assert approved["decision"]["decision"] == "approve"
         assert approved["decision"]["source"] == "slack:thread-1"
+        assert approved["kanban_task_id"] == "t_apply_123"
+        assert approved["apply_artifact_path"] == "/tmp/proposal:test-read-only-queue.apply.json"
+        assert approved["apply_idempotency_key"] == "proposal-apply:proposal:test-read-only-queue"
+        assert approved["apply"]["action"] == "applied"
+        assert approved["apply"]["operator"] == "Chad Tao"
+        assert approved["apply"]["source"] == "manual"
+        assert approved["apply"]["kanban_task_id"] == "t_apply_123"
 
         denied = by_id["proposal:test-override-denied"]
         assert denied["status"] == "denied"
@@ -518,6 +584,27 @@ class TestReadProposals:
 
         assert [row["proposal_id"] for row in approved] == ["proposal:test-read-only-queue"]
         assert proposed == []
+
+    def test_missing_apply_audit_table_falls_back_to_decision_overlay(self, _populated_proposals_with_ledger, _isolate_hermes_home):
+        from hermes_constants import get_hermes_home
+        import control_center_store as cc
+
+        db = get_hermes_home() / "telemetry" / "experiments.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("DROP TABLE IF EXISTS proposal_apply_audit")
+            conn.commit()
+        finally:
+            conn.close()
+
+        rows = cc.read_proposals(status="approved")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["proposal_id"] == "proposal:test-read-only-queue"
+        assert row["status"] == "approved"
+        assert row["decision"]["decision"] == "approve"
+        assert "apply" not in row
+        assert "kanban_task_id" not in row
 
     def test_missing_or_unreadable_ledger_falls_back_to_file_rows(self, _populated_proposals, monkeypatch):
         import control_center_store as cc

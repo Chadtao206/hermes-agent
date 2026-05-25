@@ -48,6 +48,20 @@ describe("ProposalQueuePage read-only ledger overlays", () => {
           ledger_updated_at: "2026-05-25T03:00:00Z",
           approver: "Chad Tao",
           approved_at: "2026-05-25T02:00:00Z",
+          applied_at: "2026-05-25T03:00:00Z",
+          outcome: "unknown",
+          kanban_task_id: "t_apply_123",
+          apply_artifact_path: "/tmp/proposal-approved.apply.json",
+          apply_idempotency_key: "proposal-apply:proposal:approved",
+          apply: {
+            action: "applied",
+            operator: "Chad Tao",
+            source: "manual",
+            applied_at: "2026-05-25T03:00:00Z",
+            kanban_task_id: "t_apply_123",
+            idempotency_key: "proposal-apply:proposal:approved",
+            apply_artifact_path: "/tmp/proposal-approved.apply.json",
+          },
           decision: {
             decision: "approve",
             decided_at: "2026-05-25T02:00:00Z",
@@ -127,6 +141,9 @@ describe("ProposalQueuePage read-only ledger overlays", () => {
 
     expect(screen.queryByText(/1999-01-01T00:00:00Z/)).toBeNull();
     expect(screen.getByText("source: slack:thread-1")).toBeTruthy();
+    expect(screen.getByText("kanban task: t_apply_123")).toBeTruthy();
+    expect(screen.getByText("idempotency: proposal-apply:proposal:approved")).toBeTruthy();
+    expect(screen.getByText("artifact: /tmp/proposal-approved.apply.json")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /Denied proposal/i }));
     expect(screen.getByText("source: manual")).toBeTruthy();

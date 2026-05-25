@@ -1032,6 +1032,20 @@ export interface ControlCenterProposalDecision {
   source?: string | null;
 }
 
+export interface ControlCenterProposalApply {
+  applied_at?: string | null;
+  action?: string | null;
+  operator?: string | null;
+  approver?: string | null;
+  approval_decided_at?: string | null;
+  approval_source?: string | null;
+  source?: string | null;
+  idempotency_key?: string | null;
+  apply_artifact_path?: string | null;
+  kanban_task_id?: string | null;
+  manifest_path?: string | null;
+}
+
 export interface ControlCenterProposal {
   proposal_id: string;
   title: string;
@@ -1056,10 +1070,19 @@ export interface ControlCenterProposal {
   updated_at?: string | null;
   approved_at?: string | null;
   denied_at?: string | null;
+  applied_at?: string | null;
+  verified_at?: string | null;
+  scored_at?: string | null;
+  outcome?: string | null;
+  linked_experiment_id?: string | null;
   approver?: string | null;
   denial_reason?: string | null;
   ledger_updated_at?: string | null;
+  kanban_task_id?: string | null;
+  apply_artifact_path?: string | null;
+  apply_idempotency_key?: string | null;
   decision?: ControlCenterProposalDecision | null;
+  apply?: ControlCenterProposalApply | null;
   provenance: {
     source_paths: string[];
     source_file: string;

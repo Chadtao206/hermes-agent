@@ -176,6 +176,8 @@ export default function ProposalQueuePage() {
                 <div><span className="text-muted-foreground">updated:</span> {latestUpdatedAt(selected)}</div>
                 <div><span className="text-muted-foreground">created:</span> {selected.created_at || "unknown"}</div>
                 <div><span className="text-muted-foreground">approver:</span> {selected.approver || selected.decision?.approver || "unknown"}</div>
+                {selected.applied_at ? <div><span className="text-muted-foreground">applied at:</span> {selected.applied_at}</div> : null}
+                {selected.outcome ? <div><span className="text-muted-foreground">outcome:</span> {selected.outcome}</div> : null}
               </div>
 
               {selected.decision ? (
@@ -200,6 +202,23 @@ export default function ProposalQueuePage() {
                     <div className="mt-2 text-card-foreground">
                       reason: {selected.decision.reason || selected.denial_reason}
                     </div>
+                  ) : null}
+                </Card>
+              ) : null}
+
+              {selected.apply ? (
+                <Card className="p-3 text-sm">
+                  <div className="font-medium">Apply metadata</div>
+                  <div className="mt-2 grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+                    <div>action: {selected.apply.action || "unknown"}</div>
+                    <div>operator: {selected.apply.operator || "unknown"}</div>
+                    <div>source: {selected.apply.source || "unknown"}</div>
+                    {selected.apply.applied_at ? <div>applied at: {selected.apply.applied_at}</div> : null}
+                    {selected.apply.kanban_task_id ? <div>kanban task: {selected.apply.kanban_task_id}</div> : null}
+                    {selected.apply.idempotency_key ? <div>idempotency: {selected.apply.idempotency_key}</div> : null}
+                  </div>
+                  {selected.apply.apply_artifact_path ? (
+                    <div className="mt-2 text-card-foreground">artifact: {selected.apply.apply_artifact_path}</div>
                   ) : null}
                 </Card>
               ) : null}
