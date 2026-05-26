@@ -11,6 +11,7 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -658,6 +659,110 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     finally:
         conn1.close()
         conn2.close()
+
+
+def test_notify_claim_idle_path_does_not_open_write_transaction(kanban_home, monkeypatch):
+    """Quiet notifier polls should not take a SQLite writer lock."""
+    conn = kb.connect()
+    calls = {"write_txn": 0}
+
+    @contextlib.contextmanager
+    def counted_write_txn(db):
+        calls["write_txn"] += 1
+        with original_write_txn(db) as tx:
+            yield tx
+
+    original_write_txn = kb.write_txn
+    monkeypatch.setattr(kb, "write_txn", counted_write_txn)
+    try:
+        tid = kb.create_task(conn, title="idle notify", assignee="w")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
+        calls["write_txn"] = 0
+
+        old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed", "blocked"],
+        )
+
+        assert events == []
+        assert new_cursor == old_cursor
+        assert calls["write_txn"] == 0
+    finally:
+        conn.close()
+
+
+def test_profile_event_claim_idle_path_does_not_open_write_transaction(
+    kanban_home, monkeypatch,
+):
+    """Quiet profile-event subscriptions should be read-only until events exist."""
+    conn = kb.connect()
+    calls = {"write_txn": 0}
+
+    @contextlib.contextmanager
+    def counted_write_txn(db):
+        calls["write_txn"] += 1
+        with original_write_txn(db) as tx:
+            yield tx
+
+    original_write_txn = kb.write_txn
+    monkeypatch.setattr(kb, "write_txn", counted_write_txn)
+    try:
+        tid = kb.create_task(conn, title="idle profile event", assignee="w")
+        kb.add_profile_event_sub(
+            conn, task_id=tid, profile="default", event_kinds=["completed"],
+        )
+        calls["write_txn"] = 0
+
+        old_cursor, new_cursor, events = kb.claim_unseen_events_for_profile_sub(
+            conn,
+            task_id=tid,
+            profile="default",
+        )
+
+        assert events == []
+        assert new_cursor == old_cursor
+        assert calls["write_txn"] == 0
+    finally:
+        conn.close()
+
+
+def test_profile_event_claim_still_uses_write_transaction_when_events_exist(
+    kanban_home, monkeypatch,
+):
+    """The optimization must not weaken single-owner claiming for real events."""
+    conn = kb.connect()
+    calls = {"write_txn": 0}
+
+    @contextlib.contextmanager
+    def counted_write_txn(db):
+        calls["write_txn"] += 1
+        with original_write_txn(db) as tx:
+            yield tx
+
+    original_write_txn = kb.write_txn
+    monkeypatch.setattr(kb, "write_txn", counted_write_txn)
+    try:
+        tid = kb.create_task(conn, title="active profile event", assignee="w")
+        kb.add_profile_event_sub(
+            conn, task_id=tid, profile="default", event_kinds=["completed"],
+        )
+        kb.complete_task(conn, tid, result="ok")
+        calls["write_txn"] = 0
+
+        old_cursor, new_cursor, events = kb.claim_unseen_events_for_profile_sub(
+            conn,
+            task_id=tid,
+            profile="default",
+        )
+
+        assert [ev.kind for ev in events] == ["completed"]
+        assert new_cursor > old_cursor
+        assert calls["write_txn"] == 1
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -8127,6 +8127,22 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
+    # Idle notifier polls are intentionally read-only: the gateway wakes every
+    # few seconds, and taking a BEGIN IMMEDIATE writer lock for every quiet
+    # subscription turns kanban.db into a high-frequency event bus. Probe first;
+    # only take the writer lock when there is a cursor to claim.
+    old_cursor, preview_events = unseen_events_for_sub(
+        conn,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        kinds=kinds,
+        include_children=include_children,
+    )
+    if not preview_events:
+        return old_cursor, old_cursor, []
+
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
@@ -8416,6 +8432,39 @@ def claim_unseen_events_for_profile_sub(
     On spawn (or any downstream) failure, callers should rewind via
     :func:`rewind_profile_event_cursor` with the CAS old/claimed pair.
     """
+    # Idle profile-wake polls are intentionally read-only for the same reason
+    # as chat notifications: every enabled profile subscription is checked on
+    # every gateway notifier tick, but most ticks have no new lifecycle events.
+    # Avoid a writer transaction unless there is an actual event batch to claim.
+    row = conn.execute(
+        """
+        SELECT last_event_id, event_kinds, include_children, enabled
+        FROM kanban_profile_event_subs
+        WHERE task_id = ? AND profile = ? AND name = ?
+        """,
+        (task_id, profile, name or ""),
+    ).fetchone()
+    if row is None:
+        return 0, 0, []
+    if not int(row["enabled"]):
+        cursor = int(row["last_event_id"])
+        return cursor, cursor, []
+    old_cursor = int(row["last_event_id"])
+    sub_kinds = _parse_event_kinds_column(row["event_kinds"])
+    effective_kinds = sub_kinds if sub_kinds else DEFAULT_NOTIFY_TERMINAL_KINDS
+    include_children = bool(row["include_children"])
+    _preview_cursor, preview_events = _unseen_events_for_profile_sub(
+        conn,
+        task_id=task_id,
+        profile=profile,
+        name=name or "",
+        cursor=old_cursor,
+        kinds=effective_kinds,
+        include_children=include_children,
+    )
+    if not preview_events:
+        return old_cursor, old_cursor, []
+
     with write_txn(conn):
         row = conn.execute(
             """
