@@ -29,9 +29,10 @@ The production proposal digest remains dry-run/non-mutating. Mutable proposal de
 `reconcile_proposal_outcomes.py` links applied proposals to their `proposal_apply_audit.kanban_task_id` and reconciles `proposals.status/outcome/verified_at/scored_at` when linked Kanban tasks reach terminal states.
 
 - default mode: dry-run only (plan output, no DB mutation)
-- execute mode: requires explicit `--operator --source --reason`
+- execute mode: manual-only; requires explicit `--operator --source --reason`
 - execute mode safety: pre/post `PRAGMA quick_check`, execute backups for `experiments.db` and `kanban.db`, idempotent guarded updates, append-only `proposal_outcome_audit` transition evidence
 - stale detection: missing linked task marks proposal `stale/needs_attention`
+- automatic execute-mode reconciliation remains out of scope; revisit only after several successful manual reconciliations and a separate safety proposal/review
 
 Examples:
 
