@@ -6251,7 +6251,15 @@ class GatewayRunner:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        disabled_corrupt_boards: dict[str, tuple[str, int | None, int | None]] = {}
+        # Boards disabled for this process lifetime. We intentionally do not
+        # auto-retry when the on-disk DB fingerprint changes mid-run because
+        # live file swaps are the main corruption vector: operators must recover
+        # through the guarded quiesced repair path, then restart the gateway.
+        disabled_boards: dict[str, dict[str, Any]] = {}
+        # Last known *live* fingerprint for each board. We only store entries
+        # after we observe a real file stat (device/inode), which prevents false
+        # positives on first-open transitions like (path,None,None)->(path,dev,ino).
+        last_seen_live_fingerprints: dict[str, tuple[str, int | None, int | None]] = {}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -6263,7 +6271,7 @@ class GatewayRunner:
                 stat = path.stat()
             except OSError:
                 return (resolved, None, None)
-            return (resolved, stat.st_mtime_ns, stat.st_size)
+            return (resolved, stat.st_dev, stat.st_ino)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             if not isinstance(exc, sqlite3.DatabaseError):
@@ -6285,15 +6293,38 @@ class GatewayRunner:
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
-            disabled_fingerprint = disabled_corrupt_boards.get(slug)
-            if disabled_fingerprint == fingerprint:
+            if slug in disabled_boards:
                 return None
-            if disabled_fingerprint is not None:
-                logger.info(
-                    "kanban dispatcher: board %s database changed; retrying dispatch",
+
+            previous_live_fingerprint = last_seen_live_fingerprints.get(slug)
+            if (
+                previous_live_fingerprint is not None
+                and fingerprint != previous_live_fingerprint
+            ):
+                disabled_boards[slug] = {
+                    "reason": "hot_replacement",
+                    "previous_fingerprint": previous_live_fingerprint,
+                    "current_fingerprint": fingerprint,
+                }
+                logger.critical(
+                    "kanban dispatcher: board %s database appears to have been hot-replaced "
+                    "while gateway is running; path=%s previous_fingerprint=(dev=%s,ino=%s) "
+                    "current_fingerprint=(dev=%s,ino=%s). Dispatch is disabled for this "
+                    "board until gateway restart. If intentional, stop the gateway first and "
+                    "recover via guarded repair (`hermes kanban doctor --json` then "
+                    "`hermes kanban repair-db ... --install`) before restarting.",
                     slug,
+                    fingerprint[0],
+                    previous_live_fingerprint[1],
+                    previous_live_fingerprint[2],
+                    fingerprint[1],
+                    fingerprint[2],
                 )
-                disabled_corrupt_boards.pop(slug, None)
+                return None
+
+            if fingerprint[1] is not None:
+                last_seen_live_fingerprints[slug] = fingerprint
+
             try:
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
@@ -6312,13 +6343,16 @@ class GatewayRunner:
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = fingerprint
+                    disabled_boards[slug] = {
+                        "reason": "corrupt_db",
+                        "current_fingerprint": fingerprint,
+                    }
                     logger.error(
                         "kanban dispatcher: board %s database %s is not a valid "
                         "SQLite database; disabling dispatch for this board "
-                        "until the file changes or the gateway restarts. Move "
-                        "or restore the file, then run `hermes kanban init` if "
-                        "you need a fresh board.",
+                        "until the gateway restarts. Restore or repair the board "
+                        "through a quiesced path (`hermes kanban doctor --json` then "
+                        "`hermes kanban repair-db ... --install`) before restart.",
                         slug,
                         fingerprint[0],
                     )
