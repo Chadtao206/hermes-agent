@@ -1656,6 +1656,85 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _kanban_worker_db_mutation_error(command: str) -> str:
+    """Return an error when a kanban worker tries to mutate the live board DB.
+
+    Dispatcher-spawned workers may inspect the board, but recovery/install
+    belongs to the quiesced repair path. This guard blocks the unsafe class that
+    caused a live `kanban.db` hot replacement: shell-level file operations
+    against the board DB while gateway/dashboard processes still hold handles.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return ""
+
+    lowered = command.lower()
+    db_tokens = {
+        "$hermes_kanban_db",
+        "${hermes_kanban_db}",
+        "kanban.db",
+    }
+    env_db = os.environ.get("HERMES_KANBAN_DB")
+    if env_db:
+        db_tokens.add(env_db.lower())
+        try:
+            db_tokens.add(str(Path(env_db).expanduser()).lower())
+            db_tokens.add(str(Path(env_db).expanduser().resolve()).lower())
+        except Exception:
+            pass
+    try:
+        default_db = Path.home() / ".hermes" / "kanban.db"
+        db_tokens.add(str(default_db).lower())
+        db_tokens.add(str(default_db.resolve()).lower())
+    except Exception:
+        pass
+
+    if not any(token and token in lowered for token in db_tokens):
+        return ""
+
+    # `hermes kanban repair-db --install` is safe only when run by an operator
+    # after quiescing gateway/dashboard/workers, never from inside a worker.
+    if re.search(r"\bhermes\s+kanban\s+repair-db\b", lowered) and "--install" in lowered:
+        return _KANBAN_WORKER_DB_MUTATION_MESSAGE
+
+    # File-level mutations involving the board DB are categorically unsafe in a
+    # worker. This intentionally blocks both "copy DB to backup" and "copy over
+    # DB"; workers should block/escalate instead of manipulating live state.
+    mutating_shell_ops = (
+        r"\bcp\b",
+        r"\bmv\b",
+        r"\brm\b",
+        r"\brsync\b",
+        r"\binstall\b",
+        r"\bdd\b",
+        r"\btruncate\b",
+        r"\btouch\b",
+        r"\btee\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in mutating_shell_ops):
+        return _KANBAN_WORKER_DB_MUTATION_MESSAGE
+
+    # Allow read-only SQLite probes such as PRAGMA quick_check/integrity_check,
+    # but block SQLite commands that can mutate or rewrite the board file.
+    if re.search(r"\bsqlite3\b", lowered) and re.search(
+        r"\b(vacuum|reindex|restore|backup|insert|update|delete|drop|create|alter|replace)\b|"
+        r"pragma\s+journal_mode|\.recover|\.restore|\.backup",
+        lowered,
+    ):
+        return _KANBAN_WORKER_DB_MUTATION_MESSAGE
+
+    if re.search(r">\s*(?:\$hermes_kanban_db|\$\{hermes_kanban_db\}|[^\s;]*kanban\.db)", lowered):
+        return _KANBAN_WORKER_DB_MUTATION_MESSAGE
+
+    return ""
+
+
+_KANBAN_WORKER_DB_MUTATION_MESSAGE = (
+    "Kanban worker commands may not mutate or replace the live kanban DB. "
+    "Block/escalate to Grace/Jensen and use the quiesced repair path instead "
+    "of shelling out against ~/.hermes/kanban.db."
+)
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1708,6 +1787,19 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        kanban_guard_error = _kanban_worker_db_mutation_error(command)
+        if kanban_guard_error:
+            logger.warning(
+                "Rejected kanban worker terminal command touching live board DB: %s",
+                kanban_guard_error,
+            )
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": kanban_guard_error,
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Get configuration
