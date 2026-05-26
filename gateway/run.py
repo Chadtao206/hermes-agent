@@ -6257,8 +6257,8 @@ class GatewayRunner:
         # through the guarded quiesced repair path, then restart the gateway.
         disabled_boards: dict[str, dict[str, Any]] = {}
         # Last known *live* fingerprint for each board. We only store entries
-        # after we observe a real file stat (mtime/size), which prevents false
-        # positives on first-open transitions like (path,None,None)->(path,mtime,size).
+        # after we observe a real file stat (device/inode), which prevents false
+        # positives on first-open transitions like (path,None,None)->(path,dev,ino).
         last_seen_live_fingerprints: dict[str, tuple[str, int | None, int | None]] = {}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
@@ -6271,7 +6271,7 @@ class GatewayRunner:
                 stat = path.stat()
             except OSError:
                 return (resolved, None, None)
-            return (resolved, stat.st_mtime_ns, stat.st_size)
+            return (resolved, stat.st_dev, stat.st_ino)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             if not isinstance(exc, sqlite3.DatabaseError):
@@ -6308,8 +6308,8 @@ class GatewayRunner:
                 }
                 logger.critical(
                     "kanban dispatcher: board %s database appears to have been hot-replaced "
-                    "while gateway is running; path=%s previous_fingerprint=(mtime_ns=%s,size=%s) "
-                    "current_fingerprint=(mtime_ns=%s,size=%s). Dispatch is disabled for this "
+                    "while gateway is running; path=%s previous_fingerprint=(dev=%s,ino=%s) "
+                    "current_fingerprint=(dev=%s,ino=%s). Dispatch is disabled for this "
                     "board until gateway restart. If intentional, stop the gateway first and "
                     "recover via guarded repair (`hermes kanban doctor --json` then "
                     "`hermes kanban repair-db ... --install`) before restarting.",

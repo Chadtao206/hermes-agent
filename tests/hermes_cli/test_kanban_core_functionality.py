@@ -3806,7 +3806,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 def test_gateway_dispatcher_disables_hot_replaced_board_until_restart(
     monkeypatch, tmp_path, caplog
 ):
-    """A live DB fingerprint change mid-run triggers a one-time hard disable."""
+    """An atomic board DB replacement mid-run triggers a one-time hard disable."""
     import asyncio
     import logging
     import os
@@ -3855,11 +3855,9 @@ def test_gateway_dispatcher_disables_hot_replaced_board_until_restart(
         if name == "_tick_once":
             calls["tick"] += 1
             if calls["tick"] == 1:
-                board_db.write_bytes(b"hot-swap-1")
-                os.utime(board_db, None)
-            elif calls["tick"] == 2:
-                board_db.write_bytes(b"hot-swap-2")
-                os.utime(board_db, None)
+                swapped_db = tmp_path / "kanban-swapped.db"
+                _kb.init_db(db_path=swapped_db)
+                os.replace(swapped_db, board_db)
             elif calls["tick"] >= 3:
                 runner._running = False
         return result
@@ -3884,6 +3882,8 @@ def test_gateway_dispatcher_disables_hot_replaced_board_until_restart(
     assert len(hot_swap_logs) == 1
     assert "until gateway restart" in hot_swap_logs[0]
     assert "repair-db" in hot_swap_logs[0]
+    assert "previous_fingerprint=(dev=" in hot_swap_logs[0]
+    assert "current_fingerprint=(dev=" in hot_swap_logs[0]
     assert calls["dispatch"] == 1
     assert calls["tick"] >= 3
 
@@ -3959,6 +3959,89 @@ def test_gateway_dispatcher_first_open_transition_is_not_flagged_hot_replacement
     assert not any("hot-replaced" in msg for msg in messages)
     assert not any("database changed; retrying dispatch" in msg for msg in messages)
     assert calls["dispatch"] == 2
+
+
+def test_gateway_dispatcher_does_not_disable_on_normal_sqlite_write_between_ticks(
+    monkeypatch, tmp_path, caplog
+):
+    """Ordinary between-tick SQLite writes must not trigger hot-replacement disable."""
+    import asyncio
+    import logging
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    class _DispatchResult:
+        def summary(self):
+            return {}
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+
+    calls = {"tick": 0, "dispatch": 0}
+
+    def _dispatch_once(conn, *args, **kwargs):
+        calls["dispatch"] += 1
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS gateway_tick_touch ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO gateway_tick_touch(note) VALUES (?)",
+            (f"tick-{calls['dispatch']}",),
+        )
+        conn.commit()
+        return _DispatchResult()
+
+    async def _to_thread(fn, *args, **kwargs):
+        name = getattr(fn, "__name__", "")
+        result = fn(*args, **kwargs)
+        if name == "_tick_once":
+            calls["tick"] += 1
+            if calls["tick"] >= 3:
+                runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("hot-replaced" in msg for msg in messages)
+    assert calls["dispatch"] == 3
+    assert calls["tick"] >= 3
 
 
 # ---------------------------------------------------------------------------
