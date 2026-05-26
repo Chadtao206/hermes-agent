@@ -1304,6 +1304,35 @@ def test_heartbeat_refused_when_not_running(kanban_home):
         conn.close()
 
 
+def test_heartbeat_events_are_throttled_but_liveness_updates(kanban_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        monkeypatch.setattr(kb.time, "time", lambda: 1_000)
+        assert kb.heartbeat_worker(conn, tid, note="first") is True
+        first_task = kb.get_task(conn, tid)
+        assert first_task is not None
+        assert first_task.last_heartbeat_at == 1_000
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_010)
+        assert kb.heartbeat_worker(conn, tid, note="chatty") is True
+        second_task = kb.get_task(conn, tid)
+        assert second_task is not None
+        assert second_task.last_heartbeat_at == 1_010
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "heartbeat"]
+        assert len(events) == 1
+        assert events[0].payload == {"note": "first"}
+
+        monkeypatch.setattr(kb.time, "time", lambda: 1_061)
+        assert kb.heartbeat_worker(conn, tid, note="later") is True
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "heartbeat"]
+        assert len(events) == 2
+        assert events[-1].payload == {"note": "later"}
+    finally:
+        conn.close()
+
+
 def test_cli_heartbeat_verb(kanban_home):
     conn = kb.connect()
     try:
@@ -1314,14 +1343,17 @@ def test_cli_heartbeat_verb(kanban_home):
     out = run_slash(f"heartbeat {tid}")
     assert "Heartbeat recorded" in out
 
-    # With --note.
+    # With --note. The second call may be event-throttled, but the command must
+    # still update authoritative liveness state and report success.
     out = run_slash(f"heartbeat {tid} --note 'step 42'")
     assert "Heartbeat recorded" in out
     conn = kb.connect()
     try:
-        events = kb.list_events(conn, tid)
-        notes = [e.payload.get("note") for e in events if e.kind == "heartbeat" and e.payload]
-        assert "step 42" in notes
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.last_heartbeat_at is not None
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "heartbeat"]
+        assert len(events) >= 1
     finally:
         conn.close()
 

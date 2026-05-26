@@ -730,6 +730,64 @@ def test_profile_event_wake_includes_child_event(tmp_path, monkeypatch):
     assert ev_tasks[child_id].title == "child"
 
 
+def test_profile_event_wake_dedupes_overlapping_child_roots(tmp_path, monkeypatch):
+    """The same descendant event should wake one profile/name only once."""
+    db_path = tmp_path / "profile-subtree-dedupe.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root_a = kb.create_task(conn, title="root a", assignee="lead")
+        root_b = kb.create_task(conn, title="root b", assignee="lead")
+        child_id = kb.create_task(conn, title="shared child", assignee="worker")
+        kb.link_tasks(conn, root_a, child_id)
+        kb.link_tasks(conn, root_b, child_id)
+        for root_id in (root_a, root_b):
+            kb.add_profile_event_sub(
+                conn,
+                task_id=root_id,
+                profile="default",
+                name="jensen-orchestrator",
+                event_kinds=["completed"],
+                include_children=True,
+            )
+        kb._append_event(
+            conn, child_id, kind="completed", payload={"summary": "shared done"},
+        )
+    finally:
+        conn.close()
+
+    wake_calls: list[tuple[str, list[str]]] = []
+
+    def fake_wake(self, sub, events, task, event_tasks, board):
+        wake_calls.append((sub["task_id"], [e.task_id for e in events]))
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_kanban_profile_wake", fake_wake)
+
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(wake_calls) == 1
+    assert wake_calls[0][1] == [child_id]
+
+    conn = kb.connect()
+    try:
+        claims = conn.execute(
+            "SELECT event_id, profile, name, root_task_id "
+            "FROM kanban_profile_event_claims"
+        ).fetchall()
+        assert len(claims) == 1
+        assert claims[0]["profile"] == "default"
+        assert claims[0]["name"] == "jensen-orchestrator"
+        subs = kb.list_profile_event_subs(conn, profile="default")
+        assert len(subs) == 2
+        assert all(int(sub["last_event_id"] or 0) > 0 for sub in subs)
+    finally:
+        conn.close()
+
+
 def test_profile_event_wake_failure_rewinds_cursor(tmp_path, monkeypatch):
     """Spawn failure must rewind the cursor so the next tick retries."""
     db_path = tmp_path / "profile-rewind.db"
@@ -763,11 +821,29 @@ def test_profile_event_wake_failure_rewinds_cursor(tmp_path, monkeypatch):
     try:
         subs = kb.list_profile_event_subs(conn, task_id=tid)
         assert len(subs) == 1
-        # Cursor rewound to 0; last_wake_at untouched.
+        # Cursor rewound to 0; last_wake_at untouched, and the transient
+        # event claim was released so a later notifier tick can retry.
         assert int(subs[0]["last_event_id"]) == 0
         assert subs[0]["last_wake_at"] in (None, 0)
+        claims = conn.execute(
+            "SELECT COUNT(*) FROM kanban_profile_event_claims"
+        ).fetchone()[0]
+        assert claims == 0
     finally:
         conn.close()
+
+    wake_calls: list[int] = []
+
+    def fake_wake_success(self, sub, events, task, event_tasks, board):
+        wake_calls.append(len(events))
+        return True
+
+    monkeypatch.setattr(
+        GatewayRunner, "_kanban_profile_wake", fake_wake_success,
+    )
+    runner = _make_runner_no_adapters()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert wake_calls == [1]
 
 
 def test_profile_event_wake_command_and_env_via_popen(tmp_path, monkeypatch):
@@ -920,8 +996,8 @@ def test_chat_subscription_unaffected_when_profile_sub_present(tmp_path, monkeyp
 # These tests pin the gateway → kanban_db wiring for ``record_profile_wake_*``:
 # success clears the error state and appends a ``status='success'`` wake-event
 # row, failure increments ``wake_failure_count``, stamps the sanitized error,
-# preserves the existing cursor-rewind behavior, and appends a
-# ``status='failed'`` row.
+# preserves the existing cursor-rewind behavior, and appends/coalesces
+# ``status='failed'`` wake-event rows.
 
 
 def test_profile_wake_success_records_health_and_wake_event(tmp_path, monkeypatch):
@@ -1017,6 +1093,56 @@ def test_profile_wake_failure_records_health_and_preserves_rewind(tmp_path, monk
         assert rows[0]["status"] == "failed"
         assert rows[0]["error"] and "BoomError" in rows[0]["error"]
         assert int(rows[0]["claimed_event_cursor"]) > 0
+    finally:
+        conn.close()
+
+
+def test_profile_wake_failure_rows_are_throttled_but_health_updates(tmp_path, monkeypatch):
+    db_path = tmp_path / "profile-health-failure-throttle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="health failure throttle", assignee="worker")
+        kb.add_profile_event_sub(conn, task_id=tid, profile="jensen")
+        first_id = kb.record_profile_wake_failure(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            claimed_cursor=10,
+            old_cursor=0,
+            error=RuntimeError("first"),
+            at=1_000,
+        )
+        second_id = kb.record_profile_wake_failure(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            claimed_cursor=11,
+            old_cursor=0,
+            error=RuntimeError("second"),
+            at=1_010,
+        )
+        assert second_id == first_id
+        sub = kb.list_profile_event_subs(conn, task_id=tid)[0]
+        assert int(sub["wake_failure_count"] or 0) == 2
+        assert "second" in sub["last_wake_error"]
+        rows = kb.list_profile_wake_events(conn, task_id=tid)
+        assert len(rows) == 1
+
+        third_id = kb.record_profile_wake_failure(
+            conn,
+            task_id=tid,
+            profile="jensen",
+            claimed_cursor=12,
+            old_cursor=0,
+            error=RuntimeError("third"),
+            at=1_061,
+        )
+        assert third_id != first_id
+        rows = kb.list_profile_wake_events(conn, task_id=tid)
+        assert len(rows) == 2
     finally:
         conn.close()
 

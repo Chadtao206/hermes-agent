@@ -144,6 +144,13 @@ NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS = _notifier_sidecar.NOTIFIER_HEARTBEAT_
 NOTIFIER_HEARTBEAT_RETENTION_SECONDS = _notifier_sidecar.NOTIFIER_HEARTBEAT_RETENTION_SECONDS
 NOTIFIER_HEARTBEAT_LIST_LIMIT = _notifier_sidecar.NOTIFIER_HEARTBEAT_LIST_LIMIT
 
+# Keep liveness authoritative on tasks/task_runs, but avoid using task_events
+# and profile wake_events as high-frequency event buses. These defaults reduce
+# SQLite append churn during long-running workers and broken profile-wake loops
+# while preserving periodic audit breadcrumbs for dashboard/notifier consumers.
+DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS = 60
+DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS = 60
+
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -1070,6 +1077,20 @@ CREATE TABLE IF NOT EXISTS kanban_profile_wake_events (
     created_at            INTEGER NOT NULL
 );
 
+-- Global per-event wake claims. Profile subscriptions have independent
+-- cursors so overlapping include_children roots can all see the same
+-- descendant terminal event. This table gives the notifier a durable
+-- cross-subscription claim so one profile/name wakes at most once for a
+-- task_event id, preventing duplicate orchestrator closeout/handoff work.
+CREATE TABLE IF NOT EXISTS kanban_profile_event_claims (
+    event_id     INTEGER NOT NULL,
+    profile      TEXT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    root_task_id TEXT NOT NULL,
+    claimed_at   INTEGER NOT NULL,
+    PRIMARY KEY (event_id, profile, name)
+);
+
 -- Per-gateway notifier heartbeats. One row per (notifier process, board
 -- slug, resolved DB path) the watcher scans. The dashboard tells "no
 -- active notifier" apart from "overlapping notifiers racing" by counting
@@ -1101,6 +1122,8 @@ CREATE INDEX IF NOT EXISTS idx_profile_event_subs_task ON kanban_profile_event_s
 CREATE INDEX IF NOT EXISTS idx_profile_event_subs_profile ON kanban_profile_event_subs(profile);
 CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task
     ON kanban_profile_wake_events(task_id, profile, name);
+CREATE INDEX IF NOT EXISTS idx_profile_event_claims_root
+    ON kanban_profile_event_claims(root_task_id, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_board
     ON kanban_notifier_heartbeats(board_slug, db_path);
 CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen
@@ -1715,6 +1738,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_profile_wake_events_task "
         "ON kanban_profile_wake_events(task_id, profile, name)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_profile_event_claims (
+            event_id     INTEGER NOT NULL,
+            profile      TEXT NOT NULL,
+            name         TEXT NOT NULL DEFAULT '',
+            root_task_id TEXT NOT NULL,
+            claimed_at   INTEGER NOT NULL,
+            PRIMARY KEY (event_id, profile, name)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_profile_event_claims_root "
+        "ON kanban_profile_event_claims(root_task_id, claimed_at)"
     )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -5532,18 +5571,25 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    min_event_interval_seconds: int = DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Touch ``last_heartbeat_at`` and periodically append heartbeat events.
 
     Called by long-running workers as a liveness signal orthogonal to
     the PID check. A worker that forks a long-lived child (train loop,
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
 
+    The authoritative liveness state is ``tasks.last_heartbeat_at`` and
+    ``task_runs.last_heartbeat_at``; those rows are updated on every accepted
+    heartbeat. The append-only ``task_events`` heartbeat row is throttled by
+    default so a chatty worker cannot turn the board DB into an event bus.
+
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
+    min_event_interval_seconds = max(0, int(min_event_interval_seconds or 0))
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -5569,11 +5615,34 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
-        _append_event(
-            conn, task_id, "heartbeat",
-            {"note": note} if note else None,
-            run_id=run_id,
-        )
+
+        should_append_event = True
+        if min_event_interval_seconds:
+            if run_id is None:
+                last_event = conn.execute(
+                    "SELECT created_at FROM task_events "
+                    "WHERE task_id = ? AND kind = 'heartbeat' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            else:
+                last_event = conn.execute(
+                    "SELECT created_at FROM task_events "
+                    "WHERE task_id = ? AND kind = 'heartbeat' AND run_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, run_id),
+                ).fetchone()
+            if last_event is not None:
+                should_append_event = (
+                    now - int(last_event["created_at"])
+                    >= min_event_interval_seconds
+                )
+        if should_append_event:
+            _append_event(
+                conn, task_id, "heartbeat",
+                {"note": note} if note else None,
+                run_id=run_id,
+            )
     return True
 
 
@@ -8493,16 +8562,36 @@ def claim_unseen_events_for_profile_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
+
+        # Cross-subscription dedupe: overlapping include_children roots can all
+        # observe the same descendant event. Claim each task_event id globally
+        # for this profile/name and only return rows this subscription won.
+        # The cursor still advances over duplicate-seen events so a losing root
+        # does not retry and fan out another orchestrator wake on every tick.
+        claimed_events: list[Event] = []
+        claimed_at = int(time.time())
+        sub_name = name or ""
+        for ev in events:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO kanban_profile_event_claims (
+                    event_id, profile, name, root_task_id, claimed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(ev.id), profile, sub_name, task_id, claimed_at),
+            )
+            if cur.rowcount:
+                claimed_events.append(ev)
         conn.execute(
             "UPDATE kanban_profile_event_subs SET last_event_id = ? "
             "WHERE task_id = ? AND profile = ? AND name = ? "
             "AND last_event_id = ?",
             (
-                int(new_cursor), task_id, profile, name or "",
+                int(new_cursor), task_id, profile, sub_name,
                 int(old_cursor),
             ),
         )
-        return old_cursor, new_cursor, events
+        return old_cursor, new_cursor, claimed_events
 
 
 def advance_profile_event_cursor(
@@ -8557,6 +8646,15 @@ def rewind_profile_event_cursor(
             (
                 int(old_cursor), task_id, profile, name or "",
                 int(claimed_cursor),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM kanban_profile_event_claims "
+            "WHERE root_task_id = ? AND profile = ? AND name = ? "
+            "AND event_id > ? AND event_id <= ?",
+            (
+                task_id, profile, name or "",
+                int(old_cursor), int(claimed_cursor),
             ),
         )
     return cur.rowcount > 0
@@ -8636,17 +8734,20 @@ def record_profile_wake_failure(
     old_cursor: int,
     error: Any = None,
     at: Optional[int] = None,
+    min_event_interval_seconds: int = DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS,
 ) -> int:
     """Atomically rewind a failed profile-wake claim and record the failure.
 
     Cursor rewind is CAS-guarded on ``claimed_cursor`` (matches
     :func:`rewind_profile_event_cursor`) so a racing claim that already
-    advanced further is preserved. Health columns and the wake-event row
-    are written regardless so the failure is always observable in the
-    dashboard, even when the rewind is a no-op.
-    Returns the inserted wake-event id.
+    advanced further is preserved. Health columns are updated on every
+    failure, but append-only ``kanban_profile_wake_events`` failure rows are
+    throttled by default so a broken profile wake cannot turn the board DB into
+    a 5-second event stream. Returns the inserted wake-event id, or the most
+    recent coalesced failure row id when throttled.
     """
     when = int(at if at is not None else time.time())
+    min_event_interval_seconds = max(0, int(min_event_interval_seconds or 0))
     sanitized = _sanitize_wake_error(error)
     with write_txn(conn):
         conn.execute(
@@ -8659,6 +8760,15 @@ def record_profile_wake_failure(
             ),
         )
         conn.execute(
+            "DELETE FROM kanban_profile_event_claims "
+            "WHERE root_task_id = ? AND profile = ? AND name = ? "
+            "AND event_id > ? AND event_id <= ?",
+            (
+                task_id, profile, name or "",
+                int(old_cursor), int(claimed_cursor),
+            ),
+        )
+        conn.execute(
             "UPDATE kanban_profile_event_subs SET "
             "    last_wake_error_at = ?, "
             "    last_wake_error    = ?, "
@@ -8666,6 +8776,19 @@ def record_profile_wake_failure(
             "WHERE task_id = ? AND profile = ? AND name = ?",
             (when, sanitized, task_id, profile, name or ""),
         )
+        if min_event_interval_seconds:
+            existing = conn.execute(
+                "SELECT id FROM kanban_profile_wake_events "
+                "WHERE task_id = ? AND profile = ? AND name = ? "
+                "  AND status = 'failed' AND created_at >= ? "
+                "ORDER BY id DESC LIMIT 1",
+                (
+                    task_id, profile, name or "",
+                    when - min_event_interval_seconds,
+                ),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO kanban_profile_wake_events "
             "(task_id, profile, name, status, error, "
