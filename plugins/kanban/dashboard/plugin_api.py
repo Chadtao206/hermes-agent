@@ -107,6 +107,38 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
+def _is_corrupt_db_error(exc: BaseException) -> bool:
+    """Return True for SQLite corruption/invalid-image failures."""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+        or "quick_check failed" in msg
+        or "integrity_check failed" in msg
+    )
+
+
+def _raise_kanban_db_unavailable(exc: BaseException, board: Optional[str]) -> None:
+    """Convert known DB-corruption failures into a controlled API response."""
+    path = kanban_db.kanban_db_path(board=board)
+    log.error(
+        "kanban dashboard: board %s database %s is unavailable/corrupt; "
+        "serve 503 and require quiesced repair",
+        board or kanban_db.DEFAULT_BOARD,
+        path,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Kanban database is unavailable or corrupt. Dispatch/repair must "
+            "fail closed; use the guarded quiesced repair path before retrying."
+        ),
+    ) from exc
+
+
 def _conn(board: Optional[str] = None, *, readonly: bool = False):
     """Open a kanban_db connection, creating the schema on first use.
 
@@ -119,19 +151,32 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
-    if readonly:
-        try:
-            path = kanban_db.kanban_db_path(board=board)
-            if not path.exists():
-                kanban_db.init_db(board=board)
-        except Exception as exc:
-            log.warning("kanban readonly init preflight failed: %s", exc)
-        return kanban_db.connect(board=board, readonly=True)
     try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
-    return kanban_db.connect(board=board)
+        if readonly:
+            try:
+                path = kanban_db.kanban_db_path(board=board)
+                if not path.exists():
+                    kanban_db.init_db(board=board)
+            except sqlite3.DatabaseError as exc:
+                if _is_corrupt_db_error(exc):
+                    _raise_kanban_db_unavailable(exc, board)
+                log.warning("kanban readonly init preflight failed: %s", exc)
+            except Exception as exc:
+                log.warning("kanban readonly init preflight failed: %s", exc)
+            return kanban_db.connect(board=board, readonly=True)
+        try:
+            kanban_db.init_db(board=board)
+        except sqlite3.DatabaseError as exc:
+            if _is_corrupt_db_error(exc):
+                _raise_kanban_db_unavailable(exc, board)
+            log.warning("kanban init_db failed: %s", exc)
+        except Exception as exc:
+            log.warning("kanban init_db failed: %s", exc)
+        return kanban_db.connect(board=board)
+    except sqlite3.DatabaseError as exc:
+        if _is_corrupt_db_error(exc):
+            _raise_kanban_db_unavailable(exc, board)
+        raise
 
 
 # ---------------------------------------------------------------------------
