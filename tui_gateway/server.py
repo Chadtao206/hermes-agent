@@ -118,6 +118,7 @@ from tui_gateway.render import make_stream_renderer, render_diff, render_message
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
+_pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
 _db = None
 _db_error: str | None = None
@@ -803,18 +804,21 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
         _cc_create_pending_request(rid, session_key, kind, prompt_preview=prompt_preview)
         _cc_publish_session(session_key, owner_kind="tui", owner_id=str(os.getpid()), running=True, awaiting_input=True)
 
-    _emit(event, sid, payload)
-    ev.wait(timeout=timeout)
-    _pending.pop(rid, None)
-
-    if kind and session_key:
-        _cc_resolve_pending_request(rid)
-        # Only re-publish as running if the session is still open; session.close
-        # pops _sessions[sid] before calling _finalize_session, so a missing or
-        # finalized entry means we must not resurrect the row as running=True.
-        session_obj = _sessions.get(sid)
-        if session_obj is not None and not session_obj.get("_finalized"):
-            _cc_publish_session(session_key, owner_kind="tui", owner_id=str(os.getpid()), running=True, awaiting_input=False)
+    _pending_prompt_payloads[rid] = (event, dict(payload))
+    try:
+        _emit(event, sid, payload)
+        ev.wait(timeout=timeout)
+    finally:
+        _pending.pop(rid, None)
+        _pending_prompt_payloads.pop(rid, None)
+        if kind and session_key:
+            _cc_resolve_pending_request(rid)
+            # Only re-publish as running if the session is still open; session.close
+            # pops _sessions[sid] before calling _finalize_session, so a missing or
+            # finalized entry means we must not resurrect the row as running=True.
+            session_obj = _sessions.get(sid)
+            if session_obj is not None and not session_obj.get("_finalized"):
+                _cc_publish_session(session_key, owner_kind="tui", owner_id=str(os.getpid()), running=True, awaiting_input=False)
 
     return _answers.pop(rid, "")
 
@@ -2287,12 +2291,16 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
 
 
 def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
+    now = time.time()
     _sessions[sid] = {
         "agent": agent,
         "session_key": key,
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
+        "inflight_turn": None,
+        "created_at": now,
+        "last_active": now,
         "running": False,
         "attached_images": [],
         "image_counter": 0,
@@ -2465,6 +2473,54 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     return messages
 
 
+def _inflight_text(value: Any) -> str:
+    return _content_display_text(value).strip()
+
+
+def _start_inflight_turn(session: dict, text: Any) -> None:
+    now = time.time()
+    session["inflight_turn"] = {
+        "assistant": "",
+        "started_at": now,
+        "streaming": True,
+        "updated_at": now,
+        "user": _inflight_text(text),
+    }
+
+
+def _append_inflight_delta(session: dict, delta: Any) -> None:
+    text = "" if delta is None else str(delta)
+    if not text:
+        return
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        turn = {"assistant": "", "streaming": True, "user": ""}
+    turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
+    turn["streaming"] = True
+    turn["updated_at"] = time.time()
+    session["inflight_turn"] = turn
+
+
+def _clear_inflight_turn(session: dict) -> None:
+    session["inflight_turn"] = None
+
+
+def _inflight_snapshot(session: dict) -> dict | None:
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return None
+    user = str(turn.get("user") or "").strip()
+    assistant = str(turn.get("assistant") or "")
+    streaming = bool(turn.get("streaming"))
+    if not user and not assistant and not streaming:
+        return None
+    return {
+        "assistant": assistant,
+        "streaming": streaming,
+        "user": user,
+    }
+
+
 # ── Methods: session ─────────────────────────────────────────────────
 
 
@@ -2476,6 +2532,7 @@ def _(rid, params: dict) -> dict:
     _enable_gateway_prompts()
 
     ready = threading.Event()
+    now = time.time()
 
     _sessions[sid] = {
         "agent": None,
@@ -2483,11 +2540,14 @@ def _(rid, params: dict) -> dict:
         "agent_ready": ready,
         "attached_images": [],
         "cols": cols,
+        "created_at": now,
         "edit_snapshots": {},
         "history": [],
         "history_lock": threading.Lock(),
         "history_version": 0,
         "image_counter": 0,
+        "inflight_turn": None,
+        "last_active": now,
         "pending_title": None,
         "running": False,
         "session_key": key,
@@ -2661,6 +2721,140 @@ def _(rid, params: dict) -> dict:
             "messages": messages,
             "info": _session_info(agent),
         },
+    )
+
+
+def _session_pending_kind(sid: str) -> str:
+    for rid, (owner_sid, _ev) in list(_pending.items()):
+        if owner_sid != sid:
+            continue
+        event, _payload = _pending_prompt_payloads.get(rid, ("input.request", {}))
+        return str(event).removesuffix(".request")
+    return ""
+
+
+def _session_live_status(sid: str, session: dict) -> str:
+    if _session_pending_kind(sid):
+        return "waiting"
+    ready = session.get("agent_ready")
+    if ready is not None and not ready.is_set():
+        return "starting"
+    if session.get("running"):
+        return "working"
+    return "idle"
+
+
+def _message_preview(history: list) -> str:
+    for msg in reversed(history or []):
+        text = _content_display_text(msg.get("content", msg.get("text", ""))).strip()
+        if text:
+            return " ".join(text.split())[:160]
+    return ""
+
+
+def _session_live_title(session: dict, key: str) -> str:
+    title = str(session.get("pending_title") or "").strip()
+    db = _get_db()
+    if db is not None:
+        try:
+            title = str(db.get_session_title(key) or title or "").strip()
+        except Exception:
+            pass
+    return title
+
+
+def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
+    key = str(session.get("session_key") or sid)
+    agent = session.get("agent")
+    history = list(session.get("history") or [])
+    status = _session_live_status(sid, session)
+    inflight = _inflight_snapshot(session)
+    preview = _message_preview(history)
+    if inflight:
+        preview = inflight.get("assistant") or inflight.get("user") or preview
+        preview = " ".join(str(preview).split())[:160]
+    now = time.time()
+    return {
+        "current": sid == current_sid,
+        "id": sid,
+        "last_active": float(session.get("last_active") or session.get("created_at") or now),
+        "message_count": len(history),
+        "model": str(getattr(agent, "model", "") or _resolve_model()),
+        "preview": preview,
+        "session_key": key,
+        "started_at": float(session.get("created_at") or now),
+        "status": status,
+        "title": _session_live_title(session, key),
+    }
+
+
+def _fallback_session_info(session: dict) -> dict:
+    agent = session.get("agent")
+    if agent is not None:
+        return _session_info(agent)
+    return {
+        "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
+        "lazy": True,
+        "model": _resolve_model(),
+        "skills": {},
+        "tools": {},
+    }
+
+
+@method("session.active_list")
+def _(rid, params: dict) -> dict:
+    """Return live TUI sessions in this gateway process.
+
+    Unlike ``session.list`` this is not a historical DB browser: it reports only
+    sessions with in-memory agents/workers that the current TUI can switch to
+    without closing siblings.
+    """
+    current = str(params.get("current_session_id") or "")
+    try:
+        snapshot = list(_sessions.items())
+    except Exception as e:
+        return _err(rid, 5036, f"could not enumerate active sessions: {e}")
+
+    # Keep the natural creation/insertion order from ``_sessions``.  The
+    # frontend marks the focused session with ``current``; it should not jump to
+    # the top just because the user switched to it.
+    rows = [_session_live_item(sid, session, current) for sid, session in snapshot]
+    return _ok(rid, {"sessions": rows})
+
+
+@method("session.activate")
+def _(rid, params: dict) -> dict:
+    """Attach the frontend to an already-live TUI session.
+
+    This intentionally does not close the previously focused session; it merely
+    returns enough state for Ink to redraw around another live session id.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+
+    with session["history_lock"]:
+        session["last_active"] = time.time()
+        history = list(session.get("display_history") or session.get("history") or [])
+        inflight = _inflight_snapshot(session)
+        running = bool(session.get("running"))
+    status = _session_live_status(sid, session)
+    payload = {
+        "info": _fallback_session_info(session),
+        "message_count": len(history),
+        "messages": _history_to_messages(history),
+        "running": running,
+        "session_id": sid,
+        "session_key": session.get("session_key") or sid,
+        "started_at": float(session.get("created_at") or time.time()),
+        "status": status,
+    }
+    if inflight:
+        payload["inflight"] = inflight
+    return _ok(
+        rid,
+        payload,
     )
 
 
@@ -3404,6 +3598,8 @@ def _(rid, params: dict) -> dict:
         if session.get("running"):
             return _err(rid, 4009, "session busy")
         session["running"] = True
+        session["last_active"] = time.time()
+        _start_inflight_turn(session, text)
 
     _start_agent_build(sid, session)
 
@@ -3421,6 +3617,7 @@ def _(rid, params: dict) -> dict:
             )
             with session["history_lock"]:
                 session["running"] = False
+                _clear_inflight_turn(session)
             return
         _run_prompt_submit(rid, sid, session, text)
 
@@ -3533,6 +3730,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
+        if not isinstance(session.get("inflight_turn"), dict):
+            _start_inflight_turn(session, text)
     agent = session["agent"]
     _emit("message.start", sid)
 
@@ -3642,6 +3841,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_message = _enrich_with_attached_images(prompt, images)
 
             def _stream(delta):
+                with session["history_lock"]:
+                    _append_inflight_delta(session, delta)
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
@@ -3725,6 +3926,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            with session["history_lock"]:
+                _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -3862,6 +4065,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
             _cc_publish_session(session.get("session_key", ""), running=False)
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -4187,6 +4392,14 @@ def _(rid, params: dict) -> dict:
                         4009,
                         "session busy — /interrupt the current turn before switching models",
                     )
+                if session.get("agent") is None:
+                    session_id = params.get("session_id", "")
+                    _start_agent_build(session_id, session)
+                    init_err = _wait_agent(session, rid)
+                    if init_err:
+                        return init_err
+                    if session.get("agent") is None:
+                        return _err(rid, 5032, "agent initialization failed")
                 result = _apply_model_switch(
                     params.get("session_id", ""), session, value
                 )
@@ -4800,6 +5013,7 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
         "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
         "TUI",
     ),
+    ("/sessions", "Switch between live TUI sessions", "TUI"),
 ]
 
 # Commands that queue messages onto _pending_input in the CLI.
