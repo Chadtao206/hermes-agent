@@ -14,7 +14,19 @@ KANBAN_DB = Path.home() / ".hermes" / "kanban.db"
 
 STATUS_TO_OUTCOME = {
     "done": "success",
+    "archived": "success",
 }
+
+
+def is_completed_kanban_task(task_row: sqlite3.Row) -> bool:
+    """Return true when kanban has a durable terminal success timestamp.
+
+    Kanban tasks are often archived after completion. The live board keeps the
+    original `completed_at` timestamp, but the mutable `status` becomes
+    `archived`. Treating archived+completed rows as open makes closed telemetry
+    look incomplete and prevents routing correctness finalization.
+    """
+    return task_row["status"] == "done" or (task_row["status"] == "archived" and task_row["completed_at"] is not None)
 
 RUN_STATE_MAP = {
     "promoted": "promoted",
@@ -91,7 +103,7 @@ def select_run_id_for_event(run_rows: list[sqlite3.Row], event_row: sqlite3.Row)
 
 def task_status_projection(task_row: sqlite3.Row) -> tuple[str, str | None, int]:
     kanban_status = task_row["status"]
-    if kanban_status == "done":
+    if is_completed_kanban_task(task_row):
         telemetry_status = "completed"
         outcome = "success"
     elif kanban_status == "blocked" and task_row["consecutive_failures"]:
@@ -743,12 +755,13 @@ def task_telemetry_completeness(
 ) -> tuple[int, str]:
     gaps: list[str] = []
     notes = parse_payload(telemetry_task_row["notes_json"] if telemetry_task_row is not None else None)
-    if task_row["status"] == "done":
+    completed_task = is_completed_kanban_task(task_row)
+    if completed_task:
         notes.setdefault("correction_state", "unknown")
         notes.setdefault("learning_artifact_state", "unknown")
     provenance = telemetry_task_row["provenance"] if telemetry_task_row is not None else None
     substantiality = telemetry_task_row["substantiality"] if telemetry_task_row is not None else None
-    if task_row["status"] == "done":
+    if completed_task:
         provenance = provenance or "real"
         substantiality = substantiality or "substantial"
     created_by_profile = None
@@ -765,13 +778,16 @@ def task_telemetry_completeness(
         gaps.append("created_by_profile")
     if not event_rows:
         gaps.append("activity_events")
+    # Historical archived root/wrapper rows can be completed without a worker run.
+    # Keep the original strict run/completed_at requirement for live `done` rows
+    # but do not reintroduce gaps when syncing archived+completed history.
     if task_row["status"] == "done" and not run_rows:
         gaps.append("execution_runs")
     if task_row["status"] == "done" and task_row["completed_at"] is None:
         gaps.append("completed_at")
-    if task_row["status"] == "done" and notes.get("correction_state") is None:
+    if completed_task and notes.get("correction_state") is None:
         gaps.append("correction_state")
-    if task_row["status"] == "done" and notes.get("learning_artifact_state") is None:
+    if completed_task and notes.get("learning_artifact_state") is None:
         gaps.append("learning_artifact_state")
     return (1 if not gaps else 0, json_dumps(gaps))
 
@@ -795,7 +811,7 @@ def update_task_hardening_fields(
     finally:
         telemetry_conn.row_factory = None
     existing_notes = parse_payload(telemetry_task_row["notes_json"] if telemetry_task_row is not None else None)
-    if task_row["status"] == "done":
+    if is_completed_kanban_task(task_row):
         existing_notes.setdefault("correction_state", "unknown")
         existing_notes.setdefault("learning_artifact_state", "unknown")
         existing_notes.setdefault("closeout_declaration_source", "kanban_sync_default")
@@ -822,8 +838,8 @@ def update_task_hardening_fields(
         """
         UPDATE tasks
         SET created_by_profile = COALESCE(?, created_by_profile),
-            provenance = CASE WHEN ? = 'done' THEN COALESCE(provenance, 'real') ELSE provenance END,
-            substantiality = CASE WHEN ? = 'done' THEN COALESCE(substantiality, 'substantial') ELSE substantiality END,
+            provenance = CASE WHEN ? THEN COALESCE(provenance, 'real') ELSE provenance END,
+            substantiality = CASE WHEN ? THEN COALESCE(substantiality, 'substantial') ELSE substantiality END,
             notes_json = ?,
             first_action_at = COALESCE(first_action_at, ?),
             last_activity_at = CASE
@@ -840,8 +856,8 @@ def update_task_hardening_fields(
         """,
         (
             created_by_profile or None,
-            task_row["status"],
-            task_row["status"],
+            int(is_completed_kanban_task(task_row)),
+            int(is_completed_kanban_task(task_row)),
             json_dumps(existing_notes),
             iso_from_epoch(first_action_epoch),
             iso_from_epoch(last_activity_epoch),

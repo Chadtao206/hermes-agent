@@ -260,23 +260,37 @@ def _coerce_str_list(value) -> list[str]:
     return []
 
 
-def write_routing_from_closeout(conn, payload: dict, notes: dict) -> None:
+def infer_routing_context(payload: dict, notes: dict) -> tuple[str, str]:
     initial_owner = notes.get("initial_owner") or notes.get("routed_from") or payload["owner_profile"]
     current_owner = notes.get("current_owner") or notes.get("routed_to") or payload["owner_profile"]
+    return initial_owner, current_owner
+
+
+def infer_routing_correctness(payload: dict, notes: dict) -> tuple:
+    """Return the normalized initial-owner correctness flag and evidence source.
+
+    Matching initial/current owner is not enough evidence by itself. Routed
+    work needs an explicit closeout declaration (`correct_owner` or
+    `user_corrected`) unless a reroute gives deterministic evidence that the
+    initial owner was not correct.
+    """
+    initial_owner, current_owner = infer_routing_context(payload, notes)
     correct = notes.get("correct_owner")
     user_corrected = notes.get("user_corrected")
     if isinstance(correct, bool):
-        flag = 1 if correct else 0
-    elif user_corrected is True:
-        flag = 0
-    elif user_corrected is False:
-        flag = 1
-    elif initial_owner != current_owner:
-        # Explicit reroute evidence: initial owner was not correct.
-        flag = 0
-    else:
-        # No explicit routing evidence; keep unknown instead of assuming correct.
-        flag = None
+        return (1 if correct else 0), "explicit"
+    if user_corrected is True:
+        return 0, "user_corrected"
+    if user_corrected is False:
+        return 1, "user_corrected"
+    if initial_owner != current_owner:
+        return 0, "reroute"
+    return None, None
+
+
+def write_routing_from_closeout(conn, payload: dict, notes: dict) -> None:
+    initial_owner, current_owner = infer_routing_context(payload, notes)
+    flag, _evidence_source = infer_routing_correctness(payload, notes)
     final_owner = current_owner if payload["outcome"] == "success" else None
     existing = conn.execute(
         "SELECT id FROM routing_events WHERE task_id = ? AND reroute_reason = ?",
@@ -525,25 +539,8 @@ def upsert_normalized_closeout(conn, payload: dict, notes: dict) -> None:
     )
 
     if table_exists(conn, "routing_decisions"):
-        initial_owner = notes.get("initial_owner") or payload["owner_profile"]
-        current_owner = notes.get("current_owner") or payload["owner_profile"]
-        correct = notes.get("correct_owner")
-        user_corrected = notes.get("user_corrected")
-        if isinstance(correct, bool):
-            correctness = 1 if correct else 0
-            evidence_source = "explicit"
-        elif user_corrected is True:
-            correctness = 0
-            evidence_source = "user_corrected"
-        elif user_corrected is False:
-            correctness = 1
-            evidence_source = "user_corrected"
-        elif initial_owner != current_owner:
-            correctness = 0
-            evidence_source = "reroute"
-        else:
-            correctness = None
-            evidence_source = None
+        initial_owner, current_owner = infer_routing_context(payload, notes)
+        correctness, evidence_source = infer_routing_correctness(payload, notes)
         existing = conn.execute(
             "SELECT sequence_index FROM routing_decisions WHERE task_id = ? AND source = 'closeout' ORDER BY sequence_index DESC LIMIT 1",
             (task_id,),
@@ -636,6 +633,8 @@ def upsert_normalized_closeout(conn, payload: dict, notes: dict) -> None:
             gaps.append("learning_artifact_state")
         if not notes.get("initial_owner") or not notes.get("current_owner"):
             gaps.append("routing_context")
+        if infer_routing_correctness(payload, notes)[0] is None:
+            gaps.append("routing_correctness")
         # Provenance / substantiality count as a gap when missing OR when the
         # caller explicitly recorded "unknown" — those tasks can't enter the
         # workflow-metrics eligible set (which requires real + substantial),

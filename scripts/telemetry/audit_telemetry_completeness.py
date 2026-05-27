@@ -52,7 +52,23 @@ def load_rows(db_path: Path, scope: str, limit: int) -> tuple[dict[str, Any], li
                 OR NOT EXISTS (SELECT 1 FROM task_events te WHERE te.task_id = tasks.task_id AND te.event_type = 'handoff_sent')
             )
         """
-        where = [f"(COALESCE(telemetry_complete, 0) != 1 OR ({required_handoff_sql}))", *base_where]
+        required_routing_correctness_sql = """
+            (
+                EXISTS (SELECT 1 FROM routing_decisions rd WHERE rd.task_id = tasks.task_id)
+                OR EXISTS (SELECT 1 FROM routing_events re WHERE re.task_id = tasks.task_id)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM routing_decisions rd
+                WHERE rd.task_id = tasks.task_id
+                  AND rd.was_initial_owner_correct IS NOT NULL
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM routing_events re
+                WHERE re.task_id = tasks.task_id
+                  AND re.was_initial_owner_correct IS NOT NULL
+            )
+        """
+        where = [f"(COALESCE(telemetry_complete, 0) != 1 OR ({required_handoff_sql}) OR ({required_routing_correctness_sql}))", *base_where]
 
         query = f"""
             SELECT
@@ -74,7 +90,21 @@ def load_rows(db_path: Path, scope: str, limit: int) -> tuple[dict[str, Any], li
                 EXISTS (SELECT 1 FROM task_events te WHERE te.task_id = tasks.task_id AND te.event_type = 'handoff_started') AS has_handoff_started,
                 EXISTS (SELECT 1 FROM task_events te WHERE te.task_id = tasks.task_id AND te.event_type = 'handoff_accepted') AS has_handoff_accepted,
                 EXISTS (SELECT 1 FROM task_events te WHERE te.task_id = tasks.task_id AND te.event_type = 'handoff_resolved') AS has_handoff_resolved,
-                EXISTS (SELECT 1 FROM task_events te WHERE te.task_id = tasks.task_id AND te.event_type = 'handoff_sent') AS has_handoff_sent
+                EXISTS (SELECT 1 FROM task_events te WHERE te.task_id = tasks.task_id AND te.event_type = 'handoff_sent') AS has_handoff_sent,
+                (
+                    (EXISTS (SELECT 1 FROM routing_decisions rd WHERE rd.task_id = tasks.task_id)
+                     OR EXISTS (SELECT 1 FROM routing_events re WHERE re.task_id = tasks.task_id))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM routing_decisions rd
+                        WHERE rd.task_id = tasks.task_id
+                          AND rd.was_initial_owner_correct IS NOT NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM routing_events re
+                        WHERE re.task_id = tasks.task_id
+                          AND re.was_initial_owner_correct IS NOT NULL
+                    )
+                ) AS missing_routing_correctness
             FROM tasks
             WHERE {' AND '.join(where)}
             ORDER BY closed_at DESC NULLS LAST, opened_at DESC NULLS LAST, task_id
@@ -90,7 +120,7 @@ def load_rows(db_path: Path, scope: str, limit: int) -> tuple[dict[str, Any], li
             base_where.append("lower(coalesce(substantiality, '')) = 'substantial'")
         base_filter = f"WHERE {' AND '.join(base_where)}" if base_where else ""
         complete_filter = f"WHERE {' AND '.join([*base_where, 'COALESCE(telemetry_complete, 0) = 1'])}"
-        issue_filter = f"WHERE {' AND '.join([f'(COALESCE(telemetry_complete, 0) != 1 OR ({required_handoff_sql}))', *base_where])}"
+        issue_filter = f"WHERE {' AND '.join([f'(COALESCE(telemetry_complete, 0) != 1 OR ({required_handoff_sql}) OR ({required_routing_correctness_sql}))', *base_where])}"
         summary_row = conn.execute(
             f"""
             SELECT
@@ -124,6 +154,8 @@ def load_rows(db_path: Path, scope: str, limit: int) -> tuple[dict[str, Any], li
             ):
                 if column in row and not row.get(column):
                     row["telemetry_gaps"].append(f"missing_{event_name}")
+        if row.get("missing_routing_correctness"):
+            row["telemetry_gaps"].append("routing_correctness")
         row["closeout_ready"] = bool(row.get("closed_at"))
         row.pop("telemetry_gaps_json", None)
     return summary, rows

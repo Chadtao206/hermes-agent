@@ -157,6 +157,30 @@ def insert_review_block_corrections(conn: sqlite3.Connection, task_id: str, even
         )
 
 
+def review_block_resolution(
+    blocked_event: dict[str, str],
+    remediations: list[dict[str, str]],
+    closed_at: str,
+    acceptance_artifact_url: str,
+) -> dict[str, str]:
+    for remediation in sorted(remediations, key=lambda item: item["at"]):
+        if remediation["at"] >= blocked_event["at"]:
+            return {
+                "at": remediation["at"],
+                "url": remediation["url"],
+                "summary": remediation["summary"],
+                "resolution_event_type": "remediation_pushed",
+                "profile": "owner",
+            }
+    return {
+        "at": closed_at,
+        "url": acceptance_artifact_url,
+        "summary": "review accepted after blocked review",
+        "resolution_event_type": "review_accepted",
+        "profile": "reviewer",
+    }
+
+
 def main() -> int:
     args = parse_args()
     telemetry_root = resolve_telemetry_root(args.telemetry_root)
@@ -223,7 +247,12 @@ def main() -> int:
         "task_type": "jira_ticket",
         "workdir": args.workdir or None,
         "repo_hint": args.repo_hint or args.repo.split("/")[-1],
-        "reopened": bool(blocked_reviews),
+        # A Boris review block/remediation cycle is an expected review iteration,
+        # not a task reopen after closure. Keep review-block evidence in
+        # task_events/review_events and notes; reserve `reopened` for true
+        # post-closeout or retry/reclaim churn so guardrail metrics do not
+        # penalize healthy review gates.
+        "reopened": False,
         "final_confidence": 0.95 if args.outcome == "success" else None,
         "assisting_profiles": split_csv(args.assisting_profiles),
         "notes": notes,
@@ -286,6 +315,33 @@ def main() -> int:
                 "blocked_stage": "boris_final_review",
             })
             insert_review_event(conn, task_id, event["at"], "blocked", event["url"], {"ticket_key": ticket_key}, [event["summary"]])
+            resolution = review_block_resolution(event, remediations, closed_at, args.acceptance_artifact_url)
+            resolution_profile = owner_profile if resolution["profile"] == "owner" else "reviewer"
+            resolution_payload = {
+                "ticket_key": ticket_key,
+                "reason": "review_blocked_resolved",
+                "blocked_at": event["at"],
+                "blocked_url": event["url"],
+                "resolution_event_type": resolution["resolution_event_type"],
+                "url": resolution["url"],
+                "summary": resolution["summary"],
+            }
+            insert_task_event(
+                conn,
+                task_id,
+                resolution["at"],
+                "unblocked",
+                resolution_profile,
+                resolution_payload,
+            )
+            insert_task_event(
+                conn,
+                task_id,
+                resolution["at"],
+                "review_unblocked",
+                resolution_profile,
+                resolution_payload,
+            )
         for event in remediations:
             insert_task_event(conn, task_id, event["at"], "remediation_pushed", owner_profile, {
                 "ticket_key": ticket_key,

@@ -105,14 +105,18 @@ def is_review_required_blocked(event: sqlite3.Row) -> bool:
     return "review-required" in reason
 
 
+def is_review_block_event(event: sqlite3.Row) -> bool:
+    return event["event_type"] == "review_blocked" or is_review_required_blocked(event)
+
+
 def count_review_blocked_unblocked_cycles(events: list[sqlite3.Row]) -> int:
     pending_review_blocks = 0
     cycles = 0
     sorted_events = sorted(events, key=lambda event: (event["occurred_at"], event["id"]))
     for event in sorted_events:
-        if is_review_required_blocked(event):
+        if is_review_block_event(event):
             pending_review_blocks += 1
-        elif event["event_type"] == "unblocked" and pending_review_blocks:
+        elif event["event_type"] in {"unblocked", "review_unblocked"} and pending_review_blocks:
             cycles += 1
             pending_review_blocks -= 1
     return cycles
@@ -556,7 +560,7 @@ def compute_for_day(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
     required_review_task_ids.update(
         row["task_id"]
         for row in task_events
-        if row["task_id"] in eligible_task_ids and is_review_required_blocked(row)
+        if row["task_id"] in eligible_task_ids and is_review_block_event(row)
     )
     participant_review_task_ids = {
         row["task_id"]
@@ -598,7 +602,12 @@ def compute_for_day(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
     ]
     bench["high_severity_finding_rate"] = safe_div(len(high_severity_findings), len(review_findings))
 
-    telemetry_complete_count = sum(1 for row in eligible_tasks if int(row["telemetry_complete"] or 0) == 1)
+    telemetry_complete_count = sum(
+        1
+        for row in eligible_tasks
+        if int(row["telemetry_complete"] or 0) == 1
+        and (row["task_id"] not in eligible_routed_tasks or row["task_id"] in {item["task_id"] for item in canonical_routing_rows})
+    )
     bench["telemetry_completeness_rate"] = safe_div(telemetry_complete_count, len(eligible_tasks))
 
     profiles = set(DEFAULT_PROFILES)
@@ -678,10 +687,18 @@ def compute_for_day(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
         workflow_decisions = [row for row in eligible_decisions if row["task_id"] in workflow_task_ids]
         workflow_review_required = required_review_task_ids & workflow_task_ids
         workflow_review_engaged = engaged_review_task_ids & workflow_task_ids
-        workflow_telemetry_complete = sum(1 for row in workflow_tasks if int(row["telemetry_complete"] or 0) == 1)
 
         workflow_routed = {row["task_id"] for row in workflow_decisions}
         workflow_rerouted = {row["task_id"] for row in workflow_decisions if (row["sequence_index"] or 0) > 0}
+        if not workflow_routed:
+            workflow_routed = {row["task_id"] for row in canonical_routing_rows if row["task_id"] in workflow_task_ids}
+        workflow_known_routing = {row["task_id"] for row in canonical_routing_rows if row["task_id"] in workflow_task_ids}
+        workflow_telemetry_complete = sum(
+            1
+            for row in workflow_tasks
+            if int(row["telemetry_complete"] or 0) == 1
+            and (row["task_id"] not in workflow_routed or row["task_id"] in workflow_known_routing)
+        )
 
         by_workflow[workflow] = {
             "date": day,
