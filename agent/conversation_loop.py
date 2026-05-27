@@ -2392,6 +2392,13 @@ def run_conversation(
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
                 _error_summary = agent._summarize_api_error(api_error)
+                # Surface a full traceback only for "internal bug" exception
+                # shapes (TypeError/AttributeError/KeyError/IndexError/ValueError).
+                # HTTPError/APIError/timeout/connection errors stay one-line —
+                # those already carry status_code + body in the summary.
+                _unexpected_bug = isinstance(
+                    api_error, (TypeError, AttributeError, KeyError, IndexError, ValueError)
+                )
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                     retry_count,
@@ -2399,6 +2406,7 @@ def run_conversation(
                     error_type,
                     agent._client_log_context(),
                     _error_summary,
+                    exc_info=_unexpected_bug,
                 )
 
                 _provider = getattr(agent, "provider", "unknown")
