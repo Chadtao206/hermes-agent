@@ -95,6 +95,28 @@ def test_doctor_ignores_corrupt_notifier_sidecar_when_board_db_is_clean(kanban_h
 
 
 
+def test_snapshot_connect_tolerates_vanishing_wal_sidecars(kanban_home, monkeypatch):
+    """WAL/SHM can disappear during snapshot copy after a live checkpoint."""
+    db = kanban_home / "kanban.db"
+    wal = db.with_name(db.name + "-wal")
+    wal.write_bytes(b"transient wal marker")
+    real_copy2 = kb.shutil.copy2
+
+    def race_copy2(src, dst, *args, **kwargs):
+        if Path(src) == wal:
+            wal.unlink()
+            raise FileNotFoundError(wal)
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(kb.shutil, "copy2", race_copy2)
+
+    with kb.snapshot_connect(db) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+    assert not wal.exists()
+
+
+
 def test_doctor_reconcile_summary_surfaces_decision_actions_without_failing_health(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="implementation", assignee="engineer")

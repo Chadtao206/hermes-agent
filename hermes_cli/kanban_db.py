@@ -1420,8 +1420,16 @@ def snapshot_connect(
         shutil.copy2(path, snap)
         for suffix in ("-wal", "-shm"):
             src = path.with_name(path.name + suffix)
-            if src.exists():
-                shutil.copy2(src, snap.with_name(snap.name + suffix))
+            dst = snap.with_name(snap.name + suffix)
+            # WAL/SHM files are transient: a writer can checkpoint and remove
+            # them between our exists() check and shutil.copy2()'s follow-up
+            # stat/copystat calls. Snapshot readers should tolerate that race
+            # instead of misclassifying a healthy board as unreadable.
+            try:
+                if src.exists():
+                    shutil.copy2(src, dst)
+            except FileNotFoundError:
+                dst.unlink(missing_ok=True)
         conn = sqlite3.connect(str(snap), isolation_level=None, timeout=30)
         conn.row_factory = sqlite3.Row
         try:

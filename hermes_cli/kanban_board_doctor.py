@@ -230,6 +230,23 @@ def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 
                 ))
 
     reconcile_summary = _reconcile_summary(board=board, ready_age_seconds=ready_age_seconds)
+    suppressed_blocked_tasks = {
+        str(packet.get("task_id"))
+        for packet in reconcile_summary.get("suppressed_decision_packets") or []
+        if "blocked_with_completed_parents_decision" in (packet.get("kinds") or [])
+    }
+    if suppressed_blocked_tasks:
+        before = len(issues)
+        issues = [
+            issue for issue in issues
+            if not (
+                issue.get("kind") == "blocked_with_completed_parents"
+                and str(issue.get("task_id")) in suppressed_blocked_tasks
+            )
+        ]
+        suppressed_count = before - len(issues)
+        if suppressed_count:
+            reconcile_summary["suppressed_doctor_issue_count"] = suppressed_count
     return {"ok": not issues, "board": board or kb.get_current_board(), "db_path": str(path), "issues": issues, "reconcile_summary": reconcile_summary, "as_of": now}
 
 
@@ -254,6 +271,8 @@ def _reconcile_summary(*, board: str | None, ready_age_seconds: int) -> dict[str
             "action_count": len(actions),
             "wake_mode": triage.get("mode"),
             "wake_agent": bool(triage.get("wake_agent")),
+            "suppressed_decision_packet_count": int(triage.get("suppressed_decision_packet_count") or 0),
+            "suppressed_decision_packets": list(triage.get("suppressed_decision_packets") or []),
             "kinds": kinds,
         }
     except Exception as exc:
