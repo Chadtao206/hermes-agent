@@ -1621,6 +1621,11 @@ def snapshot_connect(
         try:
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA foreign_keys=ON")
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            if not row or (row[0] or "").lower() != "ok":
+                raise sqlite3.DatabaseError(
+                    f"quick_check failed on kanban snapshot: {row[0] if row else '<no row>'}"
+                )
             yield conn
         finally:
             conn.close()

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import sqlite3
 from types import SimpleNamespace
 
@@ -77,6 +78,37 @@ def test_get_task_uses_readonly_conn(monkeypatch):
     assert calls == [True]
 
 
+def test_readonly_conn_uses_snapshot_not_live_mode_ro(monkeypatch, tmp_path):
+    db_path = tmp_path / "kanban.db"
+    db_path.write_text("placeholder", encoding="utf-8")
+    closed = []
+
+    class _FakeConn:
+        def close(self):
+            closed.append(True)
+
+    @contextlib.contextmanager
+    def _snapshot_connect(*, board=None):
+        assert board == "default"
+        conn = _FakeConn()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _connect(*args, **kwargs):
+        raise AssertionError("dashboard readonly paths must not use live mode=ro connect")
+
+    monkeypatch.setattr(plugin_api.kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(plugin_api.kanban_db, "snapshot_connect", _snapshot_connect)
+    monkeypatch.setattr(plugin_api.kanban_db, "connect", _connect)
+
+    conn = plugin_api._conn(board="default", readonly=True)
+    assert isinstance(conn, plugin_api._SnapshotConn)
+    conn.close()
+    assert closed == [True]
+
+
 def test_create_task_uses_writable_conn(monkeypatch):
     calls: list[bool] = []
 
@@ -93,13 +125,13 @@ def test_create_task_uses_writable_conn(monkeypatch):
     assert calls == [False]
 
 
-def test_board_counts_uses_readonly_connect(monkeypatch, tmp_path):
+def test_board_counts_uses_snapshot_reader(monkeypatch, tmp_path):
     db_path = tmp_path / "kanban.db"
     db_path.write_text("placeholder", encoding="utf-8")
 
     monkeypatch.setattr(plugin_api.kanban_db, "kanban_db_path", lambda board=None: db_path)
 
-    calls: list[bool] = []
+    calls: list[str | None] = []
 
     class _FakeConn:
         def execute(self, query):
@@ -108,28 +140,28 @@ def test_board_counts_uses_readonly_connect(monkeypatch, tmp_path):
         def close(self):
             return None
 
-    def _connect(*args, **kwargs):
-        calls.append(bool(kwargs.get("readonly", False)))
+    def _snapshot_conn(*, board=None):
+        calls.append(board)
         return _FakeConn()
 
-    monkeypatch.setattr(plugin_api.kanban_db, "connect", _connect)
+    monkeypatch.setattr(plugin_api, "_readonly_snapshot_conn", _snapshot_conn)
 
     counts = plugin_api._board_counts("default")
 
     assert counts == {"ready": 2}
-    assert calls == [True]
+    assert calls == ["default"]
 
 
-def test_stream_events_uses_readonly_connect(monkeypatch):
+def test_stream_events_uses_snapshot_reader(monkeypatch):
     monkeypatch.setattr(plugin_api, "_check_ws_token", lambda _token: True)
 
-    calls: list[dict] = []
+    calls: list[str | None] = []
 
-    def _recording_connect(*args, **kwargs):
-        calls.append(dict(kwargs))
+    def _recording_snapshot_conn(*, board=None):
+        calls.append(board)
         raise RuntimeError("stop after first poll")
 
-    monkeypatch.setattr(plugin_api.kanban_db, "connect", _recording_connect)
+    monkeypatch.setattr(plugin_api, "_readonly_snapshot_conn", _recording_snapshot_conn)
 
     class _FakeWS:
         def __init__(self):
@@ -151,9 +183,7 @@ def test_stream_events_uses_readonly_connect(monkeypatch):
 
     assert ws.accepted is True
     assert ws.closed is True
-    assert calls, "stream_events did not call kanban_db.connect"
-    assert calls[0].get("readonly") is True
-    assert calls[0].get("board") is None
+    assert calls == [None]
 
 
 def test_stream_events_corrupt_db_fail_stops_without_generic_warning(monkeypatch, tmp_path):
@@ -161,12 +191,12 @@ def test_stream_events_corrupt_db_fail_stops_without_generic_warning(monkeypatch
     db_path = tmp_path / "kanban.db"
     db_path.write_text("not sqlite", encoding="utf-8")
 
-    def _corrupt_connect(*args, **kwargs):
+    def _corrupt_snapshot_conn(*, board=None):
         raise plugin_api.kanban_db.KanbanDbCorruptError(
             db_path, tmp_path / "kanban.db.corrupt.once.bak", "sqlite refused to open file"
         )
 
-    monkeypatch.setattr(plugin_api.kanban_db, "connect", _corrupt_connect)
+    monkeypatch.setattr(plugin_api, "_readonly_snapshot_conn", _corrupt_snapshot_conn)
 
     class _FakeWS:
         def __init__(self):

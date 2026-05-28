@@ -141,6 +141,43 @@ def _raise_kanban_db_unavailable(exc: BaseException, board: Optional[str]) -> No
     ) from exc
 
 
+class _SnapshotConn:
+    """Connection-like wrapper that keeps a snapshot tempdir alive until close()."""
+
+    def __init__(self, cm):
+        self._cm = cm
+        self._conn = cm.__enter__()
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            return self._cm.__exit__(None, None, None)
+        return None
+
+
+def _readonly_snapshot_conn(board: Optional[str] = None):
+    """Open a non-mutating snapshot reader for dashboard observational paths.
+
+    SQLite read-only opens against a WAL-mode DB can fail when the live
+    ``-wal``/``-shm`` files have just been checkpointed away because a
+    mode=ro connection cannot create replacement sidecars. Snapshot reads copy
+    the main DB and any sidecars into a temp directory, then let SQLite do
+    bookkeeping there instead of touching the hot board.
+    """
+    return _SnapshotConn(kanban_db.snapshot_connect(board=board))
+
+
 def _conn(board: Optional[str] = None, *, readonly: bool = False):
     """Open a kanban_db connection, creating the schema on first use.
 
@@ -165,7 +202,7 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
                 log.warning("kanban readonly init preflight failed: %s", exc)
             except Exception as exc:
                 log.warning("kanban readonly init preflight failed: %s", exc)
-            return kanban_db.connect(board=board, readonly=True)
+            return _readonly_snapshot_conn(board=board)
         try:
             kanban_db.init_db(board=board)
         except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
@@ -2494,7 +2531,7 @@ def _board_counts(slug: str) -> dict[str, int]:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        conn = kanban_db.connect(board=slug, readonly=True)
+        conn = _readonly_snapshot_conn(board=slug)
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
@@ -2912,7 +2949,7 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         def _fetch_new(cursor_val: int, wake_cursor_val: int) -> tuple[int, list[dict], int, list[dict]]:
-            conn = kanban_db.connect(board=ws_board, readonly=True)
+            conn = _readonly_snapshot_conn(board=ws_board)
             try:
                 rows = conn.execute(
                     "SELECT id, task_id, run_id, kind, payload, created_at "
