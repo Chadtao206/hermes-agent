@@ -4892,6 +4892,29 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
     assert [t.title for t in tasks] == ["keeps"]
 
 
+def test_kanban_db_forensics_trace_records_write_boundaries(tmp_path, monkeypatch):
+    db_path = tmp_path / "trace.db"
+    trace_dir = tmp_path / "trace"
+    monkeypatch.setenv("HERMES_KANBAN_DB_FORENSICS", "1")
+    monkeypatch.setenv("HERMES_KANBAN_DB_FORENSICS_DIR", str(trace_dir))
+    kb._FORENSICS_CONFIG_CACHE = None
+
+    kb.init_db(db_path=db_path)
+    with kb.connect(db_path=db_path) as conn:
+        task_id = kb.create_task(conn, title="trace me", assignee="ops")
+        kb.unblock_task(conn, task_id)
+        claimed = kb.claim_task(conn, task_id)
+
+    assert claimed is not None
+    paths = list(trace_dir.glob("trace-*.jsonl"))
+    assert len(paths) == 1
+    records = [json.loads(line) for line in paths[0].read_text().splitlines()]
+    claim_records = [r for r in records if r.get("operation") == "claim_task" and r.get("task_id") == task_id]
+    assert [r["phase"] for r in claim_records] == ["before_begin", "after_commit"]
+    assert all(r.get("quick_check", {}).get("ok") is True for r in claim_records)
+    assert all(r.get("db_path") == str(db_path.resolve()) for r in claim_records)
+
+
 # ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------

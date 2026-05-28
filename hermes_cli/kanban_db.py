@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import os
 import re
@@ -107,6 +108,173 @@ def _rate_limited_notifier_sidecar_warning(key: str, message: str, *args: Any) -
     else:
         _log.debug(message, *args)
 
+
+
+# ---------------------------------------------------------------------------
+# Incident forensics (opt-in)
+# ---------------------------------------------------------------------------
+
+_FORENSICS_CONFIG_CACHE: Optional[dict[str, Any]] = None
+_FORENSICS_CONFIG_LOCK = threading.Lock()
+_FORENSIC_STACK_LOCAL = threading.local()
+
+
+def _parse_bool_env(value: Optional[str], *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _kanban_forensics_config() -> dict[str, Any]:
+    """Return opt-in DB forensic settings.
+
+    This is deliberately config/env gated because it can run PRAGMA quick_check
+    around every write transaction. During an incident that overhead is useful:
+    the JSONL trace gives us the exact process/function/transaction whose
+    commit was the last known-good or first suspicious DB state.
+    """
+    global _FORENSICS_CONFIG_CACHE
+    with _FORENSICS_CONFIG_LOCK:
+        if _FORENSICS_CONFIG_CACHE is not None:
+            return _FORENSICS_CONFIG_CACHE
+        enabled = _parse_bool_env(os.environ.get("HERMES_KANBAN_DB_FORENSICS"), default=False)
+        quick_check = _parse_bool_env(os.environ.get("HERMES_KANBAN_DB_FORENSICS_QUICK_CHECK"), default=enabled)
+        trace_dir: Optional[str] = os.environ.get("HERMES_KANBAN_DB_FORENSICS_DIR") or None
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            kan = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+            if "db_forensics_enabled" in kan:
+                enabled = bool(kan.get("db_forensics_enabled"))
+            if "db_forensics_quick_check" in kan:
+                quick_check = bool(kan.get("db_forensics_quick_check"))
+            if kan.get("db_forensics_dir"):
+                trace_dir = str(kan.get("db_forensics_dir"))
+        except Exception:
+            pass
+        _FORENSICS_CONFIG_CACHE = {
+            "enabled": enabled,
+            "quick_check": quick_check,
+            "trace_dir": trace_dir,
+        }
+        return _FORENSICS_CONFIG_CACHE
+
+
+def _forensic_trace_dir() -> Path:
+    cfg = _kanban_forensics_config()
+    if cfg.get("trace_dir"):
+        return Path(str(cfg["trace_dir"])).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return Path(home) / "forensics" / "kanban-db-trace"
+
+
+def _db_file_stats(path: Path) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for suffix, p in (("db", path), ("wal", Path(str(path) + "-wal")), ("shm", Path(str(path) + "-shm"))):
+        try:
+            st = p.stat()
+            out[suffix] = {"exists": True, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        except FileNotFoundError:
+            out[suffix] = {"exists": False}
+        except Exception as exc:
+            out[suffix] = {"exists": None, "error": f"{type(exc).__name__}: {exc}"}
+    return out
+
+
+def _conn_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None:
+            return None
+        # sqlite3.Row and tuple both support positional indexing.
+        value = row[2]
+        return Path(value).resolve() if value else None
+    except Exception:
+        return None
+
+
+def _infer_write_context() -> dict[str, Any]:
+    for frame_info in inspect.stack(context=0)[2:18]:
+        frame = frame_info.frame
+        func = frame_info.function
+        module = frame.f_globals.get("__name__")
+        if module != __name__:
+            continue
+        if func in {"write_txn", "_infer_write_context", "_record_kanban_db_trace"}:
+            continue
+        locals_ = frame.f_locals
+        return {
+            "operation": func,
+            "task_id": locals_.get("task_id"),
+            "run_id": locals_.get("run_id") or locals_.get("expected_run_id"),
+        }
+    return {"operation": "unknown", "task_id": None, "run_id": None}
+
+
+def _quick_check_for_trace(conn: sqlite3.Connection) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        rows = [str(row[0]) for row in conn.execute("PRAGMA quick_check").fetchall()]
+        return {
+            "ok": rows == ["ok"],
+            "rows": rows[:10],
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+
+
+def _record_kanban_db_trace(
+    conn: sqlite3.Connection,
+    *,
+    phase: str,
+    tx_id: str,
+    error: Optional[BaseException] = None,
+) -> None:
+    cfg = _kanban_forensics_config()
+    if not cfg.get("enabled"):
+        return
+    ctx = _infer_write_context()
+    db_path = _conn_main_db_path(conn)
+    rec: dict[str, Any] = {
+        "ts": time.time(),
+        "ts_ns": time.time_ns(),
+        "phase": phase,
+        "tx_id": tx_id,
+        "operation": ctx.get("operation"),
+        "task_id": ctx.get("task_id"),
+        "run_id": ctx.get("run_id"),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "argv": sys.argv[:6],
+        "profile": os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE"),
+        "worker_task": os.environ.get("HERMES_KANBAN_TASK"),
+        "worker_run_id": os.environ.get("HERMES_KANBAN_RUN_ID"),
+        "board": os.environ.get("HERMES_KANBAN_BOARD"),
+        "db_path": str(db_path) if db_path else None,
+    }
+    if db_path is not None:
+        rec["files"] = _db_file_stats(db_path)
+    if error is not None:
+        rec["error"] = f"{type(error).__name__}: {error}"
+    if cfg.get("quick_check"):
+        rec["quick_check"] = _quick_check_for_trace(conn)
+    try:
+        trace_dir = _forensic_trace_dir()
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        path = trace_dir / (datetime.now().strftime("trace-%Y%m%d.jsonl"))
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        _log.debug("kanban DB forensic trace write failed: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1867,10 +2035,12 @@ def write_txn(conn: sqlite3.Connection):
     secondary failure must not mask the primary database error; operators need
     the first SQLite exception to diagnose corruption, I/O, or lock failures.
     """
+    tx_id = f"{os.getpid()}-{time.time_ns()}"
+    _record_kanban_db_trace(conn, phase="before_begin", tx_id=tx_id)
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
-    except Exception:
+    except Exception as exc:
         try:
             conn.execute("ROLLBACK")
         except Exception as rollback_exc:
@@ -1879,9 +2049,11 @@ def write_txn(conn: sqlite3.Connection):
                 "preserving the original exception: %s",
                 rollback_exc,
             )
+        _record_kanban_db_trace(conn, phase="after_rollback", tx_id=tx_id, error=exc)
         raise
     else:
         conn.execute("COMMIT")
+        _record_kanban_db_trace(conn, phase="after_commit", tx_id=tx_id)
 
 
 # ---------------------------------------------------------------------------
