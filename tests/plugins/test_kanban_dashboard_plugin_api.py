@@ -154,3 +154,40 @@ def test_stream_events_uses_readonly_connect(monkeypatch):
     assert calls, "stream_events did not call kanban_db.connect"
     assert calls[0].get("readonly") is True
     assert calls[0].get("board") is None
+
+
+def test_stream_events_corrupt_db_fail_stops_without_generic_warning(monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin_api, "_check_ws_token", lambda _token: True)
+    db_path = tmp_path / "kanban.db"
+    db_path.write_text("not sqlite", encoding="utf-8")
+
+    def _corrupt_connect(*args, **kwargs):
+        raise plugin_api.kanban_db.KanbanDbCorruptError(
+            db_path, tmp_path / "kanban.db.corrupt.once.bak", "sqlite refused to open file"
+        )
+
+    monkeypatch.setattr(plugin_api.kanban_db, "connect", _corrupt_connect)
+
+    class _FakeWS:
+        def __init__(self):
+            self.query_params = {"token": "token", "since": "0"}
+            self.accepted = False
+            self.closed = False
+            self.close_code = None
+
+        async def accept(self):
+            self.accepted = True
+
+        async def send_json(self, data):
+            return None
+
+        async def close(self, code=None):
+            self.closed = True
+            self.close_code = code
+
+    ws = _FakeWS()
+    asyncio.run(plugin_api.stream_events(ws))  # type: ignore[arg-type]
+
+    assert ws.accepted is True
+    assert ws.closed is True
+    assert ws.close_code == plugin_api.http_status.WS_1011_INTERNAL_ERROR

@@ -4792,6 +4792,60 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
+def test_connect_corrupt_existing_file_backs_up_once_per_process(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    kb._CORRUPT_PATHS.pop(resolved, None)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as first_exc:
+        kb.connect(db_path=db_path)
+    first_backup = first_exc.value.backup_path
+    assert first_backup is not None
+    assert first_backup.exists()
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 1
+
+    with pytest.raises(kb.KanbanDbCorruptError) as second_exc:
+        kb.connect(db_path=db_path, readonly=True)
+    assert second_exc.value.backup_path == first_backup
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 1
+
+
+def test_repair_guard_malformed_live_markers_fail_closed_without_crash(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db_repair as repair
+
+    live_path = tmp_path / "kanban.db"
+    _write_corrupt_db(live_path)
+    candidate = tmp_path / "candidate.db"
+    kb.init_db(db_path=candidate)
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_path))
+    result = repair.run_repair_guard(candidate=candidate, install=False)
+
+    assert result["ok"] is False
+    issue = result["issues"][0]
+    assert issue["kind"] == "live_marker_read_failed"
+    assert issue["severity"] == "error"
+    assert issue["errors"]
+
+
+def test_repair_guard_allows_explicit_loss_override_for_unreadable_live_markers(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db_repair as repair
+
+    live_path = tmp_path / "kanban.db"
+    _write_corrupt_db(live_path)
+    candidate = tmp_path / "candidate.db"
+    kb.init_db(db_path=candidate)
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live_path))
+    result = repair.run_repair_guard(candidate=candidate, install=False, allow_data_loss=True)
+
+    assert result["ok"] is True
+    assert any(issue["kind"] == "live_marker_read_failed" and issue["severity"] == "warning" for issue in result["issues"])
+    assert result["freshness_comparison"]["unknown"] is True
+
+
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     """A transient lock during the probe must not produce a .corrupt backup
     and must not be reported as :class:`KanbanDbCorruptError`. Raw sqlite

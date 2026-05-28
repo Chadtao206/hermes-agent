@@ -109,6 +109,8 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
 
 def _is_corrupt_db_error(exc: BaseException) -> bool:
     """Return True for SQLite corruption/invalid-image failures."""
+    if isinstance(exc, kanban_db.KanbanDbCorruptError):
+        return True
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     msg = str(exc).lower()
@@ -157,7 +159,7 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
                 path = kanban_db.kanban_db_path(board=board)
                 if not path.exists():
                     kanban_db.init_db(board=board)
-            except sqlite3.DatabaseError as exc:
+            except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
                 if _is_corrupt_db_error(exc):
                     _raise_kanban_db_unavailable(exc, board)
                 log.warning("kanban readonly init preflight failed: %s", exc)
@@ -166,14 +168,14 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
             return kanban_db.connect(board=board, readonly=True)
         try:
             kanban_db.init_db(board=board)
-        except sqlite3.DatabaseError as exc:
+        except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
             if _is_corrupt_db_error(exc):
                 _raise_kanban_db_unavailable(exc, board)
             log.warning("kanban init_db failed: %s", exc)
         except Exception as exc:
             log.warning("kanban init_db failed: %s", exc)
         return kanban_db.connect(board=board)
-    except sqlite3.DatabaseError as exc:
+    except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
         if _is_corrupt_db_error(exc):
             _raise_kanban_db_unavailable(exc, board)
         raise
@@ -2976,6 +2978,18 @@ async def stream_events(ws: WebSocket):
         # surfaces the cancellation as an application traceback. Quiet it.
         return
     except Exception as exc:  # defensive: never crash the dashboard worker
+        if _is_corrupt_db_error(exc):
+            log.error(
+                "Kanban event stream fail-stopped: board %s database unavailable/corrupt; "
+                "closing websocket until quiesced repair",
+                ws.query_params.get("board") or kanban_db.DEFAULT_BOARD,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            try:
+                await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
+            except Exception:
+                pass
+            return
         log.warning("Kanban event stream error: %s", exc)
         try:
             await ws.close()

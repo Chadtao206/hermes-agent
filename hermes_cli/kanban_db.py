@@ -1136,6 +1136,11 @@ CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+# Cache corrupt-path verdicts per process so high-frequency read paths (dashboard
+# websocket/API polling, watchdogs) fail closed without creating a new
+# .corrupt.<timestamp>.bak copy on every attempted open. A later successful
+# quiesced repair swaps in a new DB via a fresh process/restart path.
+_CORRUPT_PATHS: dict[str, tuple[Optional[Path], str]] = {}
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
@@ -1294,7 +1299,12 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    resolved_key = str(resolved)
+    cached_corrupt = _CORRUPT_PATHS.get(resolved_key)
+    if cached_corrupt is not None:
+        backup_path, cached_reason = cached_corrupt
+        raise KanbanDbCorruptError(resolved, backup_path, cached_reason)
+    if resolved_key in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
     try:
@@ -1313,6 +1323,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if reason is None:
         return
     backup = _backup_corrupt_db(resolved)
+    _CORRUPT_PATHS[resolved_key] = (backup, reason)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -1354,6 +1365,12 @@ def connect(
     # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
     # and other invalid-header cases without opening a sqlite connection.
     _validate_sqlite_header(path)
+    if readonly:
+        path_key = str(path.resolve())
+        cached_corrupt = _CORRUPT_PATHS.get(path_key)
+        if cached_corrupt is not None:
+            backup_path, cached_reason = cached_corrupt
+            raise KanbanDbCorruptError(path.resolve(), backup_path, cached_reason)
     # Full integrity probe — catches corruption past the header (malformed
     # pages, broken internal metadata). Cached per-path after first success
     # via _INITIALIZED_PATHS so it only runs once per process per path.
@@ -1391,6 +1408,7 @@ def connect(
                 conn.executescript(SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)
+                _CORRUPT_PATHS.pop(resolved, None)
     except Exception:
         conn.close()
         raise
@@ -1465,6 +1483,7 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
+        _CORRUPT_PATHS.pop(resolved, None)
     with contextlib.closing(connect(path)):
         pass
     return path

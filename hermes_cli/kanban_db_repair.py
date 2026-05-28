@@ -72,24 +72,28 @@ def _max_expr(columns: set[str]) -> str:
 def _durable_markers(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     markers: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
-    with kb.snapshot_connect(db_path=path) as conn:
-        for table in DURABLE_TABLES:
-            if not _table_exists(conn, table):
-                markers[table] = {"exists": False, "count": None}
-                continue
-            try:
-                columns = _table_columns(conn, table)
-                count = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                item: dict[str, Any] = {"exists": True, "count": count}
-                expr = _max_expr(columns)
-                if expr:
-                    row = conn.execute(f"SELECT {expr} FROM {table}").fetchone()
-                    if row is not None:
-                        item.update({key: row[key] for key in row.keys()})
-                markers[table] = item
-            except Exception as exc:  # pragma: no cover - defensive evidence path
-                errors.append({"table": table, "error": f"{type(exc).__name__}: {exc}"})
-                markers[table] = {"exists": True, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        conn_ctx = kb.snapshot_connect(db_path=path)
+        with conn_ctx as conn:
+            for table in DURABLE_TABLES:
+                try:
+                    if not _table_exists(conn, table):
+                        markers[table] = {"exists": False, "count": None}
+                        continue
+                    columns = _table_columns(conn, table)
+                    count = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    item: dict[str, Any] = {"exists": True, "count": count}
+                    expr = _max_expr(columns)
+                    if expr:
+                        row = conn.execute(f"SELECT {expr} FROM {table}").fetchone()
+                        if row is not None:
+                            item.update({key: row[key] for key in row.keys()})
+                    markers[table] = item
+                except Exception as exc:  # pragma: no cover - defensive evidence path
+                    errors.append({"table": table, "error": f"{type(exc).__name__}: {exc}"})
+                    markers[table] = {"exists": True, "error": f"{type(exc).__name__}: {exc}"}
+    except Exception as exc:
+        errors.append({"table": "__database__", "error": f"{type(exc).__name__}: {exc}"})
     return markers, errors
 
 
@@ -327,6 +331,17 @@ def _scan_processes_with_ps() -> tuple[list[dict[str, Any]], str | None]:
         if pid == current_pid:
             continue
         command_l = command.lower()
+        # Ignore shell/status wrappers that merely contain writer command text in
+        # their argv (for example an operator one-liner that ran
+        # ``hermes dashboard --status`` before invoking repair-db).  The actual
+        # gateway/dashboard/cron writer, if alive, appears as its own process and
+        # will still be caught below.
+        if (
+            command_l.startswith(("/bin/bash -c", "bash -c", "/bin/sh -c", "sh -c", "zsh -c", "/bin/zsh -c"))
+            or "hermes dashboard --status" in command_l
+            or "hermes dashboard --stop" in command_l
+        ):
+            continue
         kind = None
         if "hermes" in command_l and "dashboard" in command_l:
             kind = "dashboard"
@@ -484,26 +499,38 @@ def run_repair_guard(
         live_markers, live_marker_errors = _durable_markers(live_path)
         result["live_durable_markers"] = live_markers
         if live_marker_errors:
-            result["issues"].append(
-                {
-                    "kind": "live_marker_read_failed",
-                    "severity": "error",
-                    "errors": live_marker_errors,
-                }
-            )
-            return result
-        freshness = compare_freshness(live_markers, candidate_result.get("durable_markers") or {})
-        result["freshness_comparison"] = freshness
-        if not freshness.get("ok") and not allow_data_loss:
-            result["issues"].append(
-                {
-                    "kind": "freshness_regression",
-                    "severity": "error",
-                    "message": "Candidate durable markers regress versus live DB; refusing install without explicit --allow-data-loss.",
-                    "regressions": freshness.get("regressions") or [],
-                }
-            )
-            return result
+            issue = {
+                "kind": "live_marker_read_failed",
+                "severity": "warning" if allow_data_loss else "error",
+                "message": (
+                    "Live durable markers could not be read. This is treated as a freshness/loss risk; "
+                    "install requires explicit --allow-data-loss plus normal quiescence confirmations."
+                ),
+                "errors": live_marker_errors,
+            }
+            result["issues"].append(issue)
+            result["freshness_comparison"] = {
+                "ok": False,
+                "regressions": [],
+                "table_deltas": [],
+                "unknown": True,
+                "live_marker_errors": live_marker_errors,
+            }
+            if not allow_data_loss:
+                return result
+        else:
+            freshness = compare_freshness(live_markers, candidate_result.get("durable_markers") or {})
+            result["freshness_comparison"] = freshness
+            if not freshness.get("ok") and not allow_data_loss:
+                result["issues"].append(
+                    {
+                        "kind": "freshness_regression",
+                        "severity": "error",
+                        "message": "Candidate durable markers regress versus live DB; refusing install without explicit --allow-data-loss.",
+                        "regressions": freshness.get("regressions") or [],
+                    }
+                )
+                return result
 
     if not install:
         result["ok"] = True
