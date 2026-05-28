@@ -232,6 +232,49 @@ def _quick_check_for_trace(conn: sqlite3.Connection) -> dict[str, Any]:
         }
 
 
+def _record_kanban_db_probe_trace(
+    path: Path,
+    *,
+    phase: str,
+    error: Optional[BaseException] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    cfg = _kanban_forensics_config()
+    if not cfg.get("enabled"):
+        return
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    rec: dict[str, Any] = {
+        "ts": time.time(),
+        "ts_ns": time.time_ns(),
+        "phase": phase,
+        "operation": "db_open_guard",
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "argv": sys.argv[:6],
+        "profile": os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE"),
+        "worker_task": os.environ.get("HERMES_KANBAN_TASK"),
+        "worker_run_id": os.environ.get("HERMES_KANBAN_RUN_ID"),
+        "board": os.environ.get("HERMES_KANBAN_BOARD"),
+        "db_path": str(resolved),
+        "files": _db_file_stats(resolved),
+    }
+    if error is not None:
+        rec["error"] = f"{type(error).__name__}: {error}"
+    if extra:
+        rec.update(extra)
+    try:
+        trace_dir = _forensic_trace_dir()
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = trace_dir / (datetime.now().strftime("trace-%Y%m%d.jsonl"))
+        with trace_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        _log.debug("kanban DB probe forensic trace write failed: %s", exc)
+
+
 def _record_kanban_db_trace(
     conn: sqlite3.Connection,
     *,
@@ -1475,19 +1518,48 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if resolved_key in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
-    try:
-        probe = sqlite3.connect(str(resolved), timeout=5, isolation_level=None)
+    last_database_error: Optional[sqlite3.DatabaseError] = None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
-    except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
-        raise
-    except sqlite3.DatabaseError as exc:
-        reason = f"sqlite refused to open file: {exc}"
+            probe = sqlite3.connect(str(resolved), timeout=5, isolation_level=None)
+            try:
+                row = probe.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                probe.close()
+            if not row or (row[0] or "").lower() != "ok":
+                reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+                last_database_error = None
+            else:
+                if attempt > 1:
+                    _record_kanban_db_probe_trace(
+                        resolved,
+                        phase="guard_retry_recovered",
+                        error=last_database_error,
+                        extra={"attempt": attempt, "max_attempts": max_attempts},
+                    )
+                return
+        except sqlite3.OperationalError:
+            # Lock contention, busy, transient IO — not corruption. Let it propagate.
+            raise
+        except sqlite3.DatabaseError as exc:
+            last_database_error = exc
+            reason = f"sqlite refused to open file: {exc}"
+        if attempt < max_attempts:
+            _record_kanban_db_probe_trace(
+                resolved,
+                phase="guard_retry_after_database_error",
+                error=last_database_error,
+                extra={"attempt": attempt, "max_attempts": max_attempts, "reason": reason},
+            )
+            time.sleep(0.05)
+            continue
+        _record_kanban_db_probe_trace(
+            resolved,
+            phase="guard_confirmed_corrupt",
+            error=last_database_error,
+            extra={"attempt": attempt, "max_attempts": max_attempts, "reason": reason},
+        )
     if reason is None:
         return
     backup = _backup_corrupt_db(resolved)

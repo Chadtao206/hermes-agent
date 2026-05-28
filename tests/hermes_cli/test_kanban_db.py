@@ -4877,6 +4877,39 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     assert "still here" in titles
 
 
+def test_transient_malformed_probe_retries_before_corrupt_backup(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    kb._CORRUPT_PATHS.pop(resolved, None)
+
+    real_connect = sqlite3.connect
+    calls = {"n": 0}
+
+    class FlakyProbe:
+        def execute(self, _sql):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        def close(self):
+            return None
+
+    def flaky_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FlakyProbe()
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(kb.sqlite3, "connect", flaky_once)
+
+    with kb.connect(db_path=db_path) as conn:
+        kb.create_task(conn, title="recovered")
+        titles = [t.title for t in kb.list_tasks(conn)]
+
+    assert "recovered" in titles
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak")) == []
+
+
 def test_init_db_allows_missing_then_healthy(tmp_path):
     db_path = tmp_path / "fresh.db"
     assert not db_path.exists()
