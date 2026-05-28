@@ -117,16 +117,18 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert tid in adapter.sent[0]["text"]
 
 
-def test_kanban_notifier_corrupt_db_disable_is_keyed_by_resolved_path(tmp_path, monkeypatch):
-    """Once one alias sees DB corruption, same-DB aliases stop retrying.
-
-    The gateway can enumerate multiple board slugs that resolve to the same
-    SQLite file. Corruption fail-stop must key by resolved DB path, not slug,
-    so a later tick with a different alias first does not keep hammering the
-    same unhealthy file.
-    """
+def test_kanban_notifier_corrupt_db_disable_is_keyed_by_resolved_path(tmp_path, monkeypatch, caplog):
+    """Once one DB path is repeatedly confirmed corrupt, aliases stop retrying."""
     shared_db = tmp_path / "shared-corrupt.db"
     orders = [
+        [
+            {"slug": "alias-a", "db_path": str(shared_db)},
+            {"slug": "alias-b", "db_path": str(shared_db)},
+        ],
+        [
+            {"slug": "alias-b", "db_path": str(shared_db)},
+            {"slug": "alias-a", "db_path": str(shared_db)},
+        ],
         [
             {"slug": "alias-a", "db_path": str(shared_db)},
             {"slug": "alias-b", "db_path": str(shared_db)},
@@ -159,14 +161,21 @@ def test_kanban_notifier_corrupt_db_disable_is_keyed_by_resolved_path(tmp_path, 
     )
 
     runner = _make_runner(RecordingAdapter())
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    runner._running = True
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    for _ in range(4):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
 
-    assert connect_calls == ["alias-a"]
+    # Hard-disable only after confirmation streak reaches threshold.
+    assert connect_calls == ["alias-a", "alias-b", "alias-a"]
     disabled = runner._kanban_notifier_disabled_db_paths
     assert str(shared_db.resolve()) in disabled
     assert disabled[str(shared_db.resolve())]["reason"] == "corrupt_db"
+    assert (
+        disabled[str(shared_db.resolve())]["streak"]
+        == gateway_run._KANBAN_DB_CORRUPTION_CONFIRM_STREAK
+    )
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
 
 
 
@@ -203,6 +212,593 @@ def test_kanban_notifier_transient_malformed_is_not_db_path_disabled(tmp_path, m
     assert connect_calls == ["alias-a", "alias-a"]
     assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
     assert "treating as transient" in caplog.text
+
+
+def test_confirm_board_db_corruption_retries_transient_database_error(monkeypatch, tmp_path):
+    """A single malformed probe must not confirm corruption if retry is healthy."""
+
+    class _Cursor:
+        def __init__(self, value):
+            self._value = value
+
+        def fetchone(self):
+            return self._value
+
+    class _Conn:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        def execute(self, sql):
+            if "quick_check" in sql and self._attempt == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            if "quick_check" in sql:
+                return _Cursor(("ok",))
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    attempts = {"count": 0}
+    sleep_calls = []
+
+    def fake_connect(*args, **kwargs):
+        attempts["count"] += 1
+        return _Conn(attempts["count"])
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(tmp_path / "board.db")
+
+    assert confirmed is False
+    assert "ok on attempt 2" in reason
+    assert attempts["count"] == 2
+    assert sleep_calls == [gateway_run._KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC]
+
+
+def test_confirm_board_db_corruption_confirms_after_repeated_database_errors(monkeypatch, tmp_path):
+    """Only repeated malformed probe failures should confirm durable corruption."""
+
+    class _Conn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    sleep_calls = []
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", lambda *a, **kw: _Conn())
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(tmp_path / "board.db")
+
+    assert confirmed is True
+    assert f"failed {gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x" in reason
+    assert len(sleep_calls) == gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS - 1
+
+
+def test_confirm_board_db_corruption_operational_error_is_transient(monkeypatch, tmp_path):
+    """Operational open/lock failures remain transient and should not retry."""
+    sleep_calls = []
+
+    def fail_connect(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fail_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(tmp_path / "board.db")
+
+    assert confirmed is False
+    assert "transient/open failure on attempt 1" in reason
+    assert sleep_calls == []
+
+
+def test_confirm_board_db_corruption_non_corruption_database_error_is_transient(
+    monkeypatch, tmp_path
+):
+    """Non-corruption DatabaseError should short-circuit as transient."""
+
+    def fail_connect(*args, **kwargs):
+        err = sqlite3.DatabaseError("no such table: tasks")
+        err.sqlite_errorcode = sqlite3.SQLITE_ERROR
+        err.sqlite_errorname = "SQLITE_ERROR"
+        raise err
+
+    sleep_calls = []
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fail_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(tmp_path / "board.db")
+
+    assert confirmed is False
+    assert "non-corruption DatabaseError" in reason
+    assert sleep_calls == []
+
+
+def test_confirm_board_db_corruption_header_mismatch_confirms_without_probe(monkeypatch, tmp_path):
+    """Non-SQLite file header is durable corruption and should fail-close immediately."""
+    db_path = tmp_path / "board.db"
+    db_path.write_bytes(b"not-a-real-sqlite-db")
+
+    connect_called = {"value": False}
+
+    def fail_connect(*args, **kwargs):
+        connect_called["value"] = True
+        raise AssertionError("connect should not be called when header mismatches")
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fail_connect)
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(db_path)
+
+    assert confirmed is True
+    assert "header mismatch" in reason
+    assert connect_called["value"] is False
+
+
+def test_confirm_board_db_corruption_uses_read_only_uri_and_only_quick_check(
+    monkeypatch, tmp_path
+):
+    """Probe should use readonly URI and avoid integrity_check in hot path."""
+    db_path = tmp_path / "board.db"
+    db_path.write_bytes(gateway_run._SQLITE_HEADER_MAGIC + (b"\x00" * 64))
+
+    seen_sql = []
+    captured = {}
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _Conn:
+        def execute(self, sql):
+            seen_sql.append(sql)
+            return _Cursor()
+
+        def close(self):
+            return None
+
+    def fake_connect(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _Conn()
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_connect)
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(db_path)
+
+    target = captured["args"][0]
+    assert confirmed is False
+    assert "quick_check ok on attempt 1" in reason
+    assert "mode=ro" in target
+    assert captured["kwargs"]["uri"] is True
+    assert any("quick_check" in sql for sql in seen_sql)
+    assert not any("integrity_check" in sql for sql in seen_sql)
+
+
+def test_confirm_board_db_corruption_outlasts_transient_malformed_window(
+    monkeypatch, tmp_path
+):
+    """A short malformed burst that later recovers should not confirm corruption."""
+    db_path = tmp_path / "board.db"
+    db_path.write_bytes(gateway_run._SQLITE_HEADER_MAGIC + (b"\x00" * 64))
+
+    fake_clock = {"seconds": 0.0}
+    attempts = {"count": 0}
+    sleep_calls = []
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _Conn:
+        def execute(self, sql):
+            if "quick_check" not in sql:
+                raise AssertionError(f"unexpected SQL: {sql}")
+            if fake_clock["seconds"] < 1.0:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return _Cursor()
+
+        def close(self):
+            return None
+
+    def fake_connect(*args, **kwargs):
+        attempts["count"] += 1
+        return _Conn()
+
+    def fake_sleep(sec):
+        sleep_calls.append(sec)
+        fake_clock["seconds"] += sec
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", fake_sleep)
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(db_path)
+
+    assert confirmed is False
+    assert "quick_check ok on attempt 4" in reason
+    assert attempts["count"] == 4
+    assert sleep_calls == [
+        gateway_run._KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC,
+        gateway_run._KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC,
+        gateway_run._KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC,
+    ]
+
+
+def test_kanban_notifier_transient_malformed_retrying_probe_preserves_db(tmp_path, monkeypatch, caplog):
+    """Notifier should treat malformed reads as transient when probe retry turns healthy."""
+    shared_db = tmp_path / "shared-healthy-retry.db"
+    orders = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+    connect_calls = []
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    class _Cursor:
+        def __init__(self, value):
+            self._value = value
+
+        def fetchone(self):
+            return self._value
+
+    class _ProbeConn:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        def execute(self, sql):
+            if "quick_check" in sql and self._attempt % 2 == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            if "quick_check" in sql:
+                return _Cursor(("ok",))
+            if "integrity_check" in sql:
+                return _Cursor(("ok",))
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    probe_attempts = {"count": 0}
+
+    def fake_probe_connect(*args, **kwargs):
+        probe_attempts["count"] += 1
+        return _ProbeConn(probe_attempts["count"])
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_probe_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert connect_calls == ["alias-a", "alias-a"]
+    assert probe_attempts["count"] == 4
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert getattr(runner, "_kanban_notifier_corruption_streaks", {}) == {}
+    assert "treating as transient" in caplog.text
+
+
+def test_kanban_notifier_confirmation_streak_resets_when_probe_turns_healthy(
+    tmp_path, monkeypatch, caplog
+):
+    """Confirmed failures must be consecutive; a healthy probe resets the streak."""
+    shared_db = tmp_path / "shared-flap.db"
+    orders = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+    connect_calls = []
+    confirmations = iter(
+        [
+            (True, "test confirmed corruption #1"),
+            (True, "test confirmed corruption #2"),
+            (False, "confirmation probe quick_check/integrity_check ok"),
+            (True, "test confirmed corruption #3"),
+        ]
+    )
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: next(confirmations),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(4):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    resolved = str(shared_db.resolve())
+    assert connect_calls == ["alias-a", "alias-a", "alias-a", "alias-a"]
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert runner._kanban_notifier_corruption_streaks[resolved] == 1
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    assert "treating as transient" in caplog.text
+
+
+def test_kanban_notifier_post_connect_read_corruption_progresses_to_hard_disable(
+    tmp_path, monkeypatch, caplog
+):
+    """Corruption after successful connect must still advance 1/3 -> 2/3 -> 3/3."""
+    shared_db = tmp_path / "post-connect-read-corrupt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db()
+
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}] for _ in range(4)]
+    connect_calls = []
+    real_connect = kb.connect
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        return real_connect(board=board, **kwargs)
+
+    def fake_list_notify_subs(*args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "list_notify_subs", fake_list_notify_subs)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(4):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    resolved = str(shared_db.resolve())
+    assert connect_calls == ["alias-a", "alias-a", "alias-a"]
+    disabled = runner._kanban_notifier_disabled_db_paths
+    assert resolved in disabled
+    assert disabled[resolved]["reason"] == "corrupt_db"
+    assert disabled[resolved]["streak"] == gateway_run._KANBAN_DB_CORRUPTION_CONFIRM_STREAK
+    assert resolved not in runner._kanban_notifier_corruption_streaks
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    assert "is corrupt/unhealthy during read" in caplog.text
+
+
+def test_kanban_notifier_post_connect_profile_event_corruption_progresses_streak(
+    tmp_path, monkeypatch, caplog
+):
+    """Profile-event claim corruption after connect should preserve streak across ticks."""
+    shared_db = tmp_path / "post-connect-profile-event-corrupt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db()
+
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}] for _ in range(3)]
+    connect_calls = []
+    real_connect = kb.connect
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        return real_connect(board=board, **kwargs)
+
+    def fake_list_profile_event_subs(conn, enabled_only=True):
+        return [{"task_id": "t_profile", "profile": "default", "name": ""}]
+
+    def fake_claim_profile_sub(*args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "list_notify_subs", lambda *a, **kw: [])
+    monkeypatch.setattr(kb, "list_profile_event_subs", fake_list_profile_event_subs)
+    monkeypatch.setattr(kb, "claim_unseen_events_for_profile_sub", fake_claim_profile_sub)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(3):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    assert connect_calls == ["alias-a", "alias-a", "alias-a"]
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    assert "profile-event claim detected corrupt/unhealthy DB" in caplog.text
+
+
+def test_kanban_notifier_multi_profile_sub_corruption_increments_once_per_tick(
+    tmp_path, monkeypatch, caplog
+):
+    """Multiple failing profile subs on one DB should only consume one confirmation per tick."""
+    shared_db = tmp_path / "profile-event-multi-sub-corrupt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db()
+
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}]]
+    connect_calls = []
+    claim_calls = {"count": 0}
+    real_connect = kb.connect
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        return real_connect(board=board, **kwargs)
+
+    def fake_list_profile_event_subs(conn, enabled_only=True):
+        return [
+            {"task_id": "t_profile_a", "profile": "default", "name": "sub-a"},
+            {"task_id": "t_profile_b", "profile": "default", "name": "sub-b"},
+            {"task_id": "t_profile_c", "profile": "default", "name": "sub-c"},
+        ]
+
+    def fake_claim_profile_sub(*args, **kwargs):
+        claim_calls["count"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "list_notify_subs", lambda *a, **kw: [])
+    monkeypatch.setattr(kb, "list_profile_event_subs", fake_list_profile_event_subs)
+    monkeypatch.setattr(kb, "claim_unseen_events_for_profile_sub", fake_claim_profile_sub)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    resolved = str(shared_db.resolve())
+    assert connect_calls == ["alias-a"]
+    assert claim_calls["count"] == 3
+    assert runner._kanban_notifier_corruption_streaks[resolved] == 1
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert caplog.text.count("confirmation 1/3 signaled corruption") == 1
+    assert "confirmation 2/3 signaled corruption" not in caplog.text
+
+
+def test_kanban_notifier_multi_profile_sub_corruption_still_progresses_across_ticks(
+    tmp_path, monkeypatch, caplog
+):
+    """Persistent profile-event corruption should still hard-disable after consecutive ticks."""
+    shared_db = tmp_path / "profile-event-multi-sub-progress.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db()
+
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}] for _ in range(3)]
+    connect_calls = []
+    real_connect = kb.connect
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        return real_connect(board=board, **kwargs)
+
+    def fake_list_profile_event_subs(conn, enabled_only=True):
+        return [
+            {"task_id": "t_profile_a", "profile": "default", "name": "sub-a"},
+            {"task_id": "t_profile_b", "profile": "default", "name": "sub-b"},
+            {"task_id": "t_profile_c", "profile": "default", "name": "sub-c"},
+        ]
+
+    def fake_claim_profile_sub(*args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "list_notify_subs", lambda *a, **kw: [])
+    monkeypatch.setattr(kb, "list_profile_event_subs", fake_list_profile_event_subs)
+    monkeypatch.setattr(kb, "claim_unseen_events_for_profile_sub", fake_claim_profile_sub)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(3):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    resolved = str(shared_db.resolve())
+    assert connect_calls == ["alias-a", "alias-a", "alias-a"]
+    disabled = runner._kanban_notifier_disabled_db_paths
+    assert resolved in disabled
+    assert disabled[resolved]["reason"] == "profile_event_corruption"
+    assert disabled[resolved]["streak"] == gateway_run._KANBAN_DB_CORRUPTION_CONFIRM_STREAK
+    assert caplog.text.count("confirmation 1/3 signaled corruption") == 1
+    assert caplog.text.count("confirmation 2/3 signaled corruption") == 1
+    assert caplog.text.count("profile-event claim detected corrupt/unhealthy DB") == 1
+
+
+def test_kanban_notifier_post_connect_streak_clears_after_healthy_read_cycle(
+    tmp_path, monkeypatch, caplog
+):
+    """A healthy read cycle after confirmed corruption should reset streak."""
+    shared_db = tmp_path / "post-connect-read-flap.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db()
+
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}] for _ in range(4)]
+    connect_calls = []
+    list_calls = {"count": 0}
+    real_connect = kb.connect
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        return real_connect(board=board, **kwargs)
+
+    def fake_list_notify_subs(*args, **kwargs):
+        list_calls["count"] += 1
+        if list_calls["count"] in (1, 2, 4):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return []
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "list_notify_subs", fake_list_notify_subs)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(4):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    resolved = str(shared_db.resolve())
+    assert connect_calls == ["alias-a", "alias-a", "alias-a", "alias-a"]
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert runner._kanban_notifier_corruption_streaks[resolved] == 1
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    assert caplog.text.count("confirmation 1/3 signaled corruption") == 2
 
 
 def test_kanban_notifier_disk_io_disable_is_keyed_by_resolved_path(tmp_path, monkeypatch, caplog):

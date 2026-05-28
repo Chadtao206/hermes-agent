@@ -1777,6 +1777,22 @@ _DISK_IO_BOARD_DB_GUIDANCE = (
     "once the underlying volume is healthy."
 )
 
+# Require consecutive corruption confirmations before process-lifetime disable.
+# One-off connection-local malformed/open errors can surface during WAL/SHM churn.
+_KANBAN_DB_CORRUPTION_CONFIRM_STREAK = 3
+# Within a single confirmation attempt, wait long enough to outlast brief WAL/SHM
+# and sidecar churn before treating malformed DatabaseError as durable corruption.
+_KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS = 5
+_KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC = 0.4
+_SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+_DURABLE_CORRUPTION_ERRCODES = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_CORRUPT", 11),
+        getattr(sqlite3, "SQLITE_NOTADB", 26),
+        getattr(sqlite3, "SQLITE_FORMAT", 24),
+    }
+)
+
 
 def _is_disk_io_board_db_error(exc: Exception) -> bool:
     return (
@@ -1785,36 +1801,91 @@ def _is_disk_io_board_db_error(exc: Exception) -> bool:
     )
 
 
+def _is_durable_corruption_database_error(exc: sqlite3.DatabaseError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code in _DURABLE_CORRUPTION_ERRCODES
+
+    message = str(exc).lower()
+    return (
+        "database disk image is malformed" in message
+        or "file is not a database" in message
+        or "file is encrypted or is not a database" in message
+    )
+
+
+def _board_db_header_looks_like_sqlite(path: Path) -> bool | None:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(len(_SQLITE_HEADER_MAGIC)) == _SQLITE_HEADER_MAGIC
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
 def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
     """Return whether an isolated probe confirms durable DB corruption.
 
     A single gateway connection can report ``database disk image is malformed``
     while the live file is immediately healthy from a fresh connection during
     WAL/SHM churn. Treat those one-off connection-local failures as transient
-    unless a fresh probe also sees a structural SQLite failure.
+    unless repeated fresh probes also see a structural SQLite failure.
     """
     try:
         path = Path(db_path).expanduser().resolve()
     except Exception as exc:
         return False, f"path resolution failed: {exc}"
-    try:
-        conn = sqlite3.connect(str(path), timeout=5, isolation_level=None)
+
+    header_ok = _board_db_header_looks_like_sqlite(path)
+    if header_ok is False:
+        return True, "confirmation probe failed: SQLite header mismatch"
+
+    db_uri = f"{path.as_uri()}?mode=ro"
+    last_failure = "no probe attempts"
+    for attempt in range(1, _KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS + 1):
         try:
-            quick_row = conn.execute("PRAGMA quick_check").fetchone()
-            integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            conn.close()
-    except sqlite3.OperationalError as exc:
-        return False, f"confirmation probe transient/open failure: {exc}"
-    except sqlite3.DatabaseError as exc:
-        return True, f"confirmation probe failed: {exc}"
-    except Exception as exc:
-        return False, f"confirmation probe unexpected failure: {exc}"
-    quick = quick_row[0] if quick_row else "<no row>"
-    integrity = integrity_row[0] if integrity_row else "<no row>"
-    if str(quick).lower() == "ok" and str(integrity).lower() == "ok":
-        return False, "confirmation probe quick_check/integrity_check ok"
-    return True, f"confirmation probe returned quick_check={quick!r} integrity_check={integrity!r}"
+            conn = sqlite3.connect(
+                db_uri,
+                timeout=5,
+                isolation_level=None,
+                uri=True,
+            )
+            try:
+                quick_row = conn.execute("PRAGMA quick_check").fetchone()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            # Lock/open failures are transient and do not confirm durable corruption.
+            return False, f"confirmation probe transient/open failure on attempt {attempt}: {exc}"
+        except sqlite3.DatabaseError as exc:
+            if not _is_durable_corruption_database_error(exc):
+                errname = getattr(exc, "sqlite_errorname", None)
+                return (
+                    False,
+                    "confirmation probe non-corruption DatabaseError "
+                    f"on attempt {attempt}: {exc} (errname={errname})",
+                )
+            last_failure = f"attempt {attempt} raised {exc}"
+        except Exception as exc:
+            return False, f"confirmation probe unexpected failure on attempt {attempt}: {exc}"
+        else:
+            quick = quick_row[0] if quick_row else "<no row>"
+            if str(quick).lower() == "ok":
+                return (
+                    False,
+                    f"confirmation probe quick_check ok on attempt {attempt}",
+                )
+            last_failure = f"attempt {attempt} quick_check={quick!r}"
+
+        if attempt < _KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+            time.sleep(_KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC)
+
+    return (
+        True,
+        "confirmation probe failed "
+        f"{_KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x; last: {last_failure}",
+    )
 
 
 class GatewayRunner:
@@ -5152,6 +5223,10 @@ class GatewayRunner:
             self, "_kanban_notifier_disabled_db_paths", {}
         )
         self._kanban_notifier_disabled_db_paths = notifier_disabled_db_paths
+        notifier_corruption_streaks: dict[str, int] = getattr(
+            self, "_kanban_notifier_corruption_streaks", {}
+        )
+        self._kanban_notifier_corruption_streaks = notifier_corruption_streaks
 
         def _notifier_db_error_is_corrupt(exc: Exception) -> bool:
             corrupt_error = getattr(_kb, "KanbanDbCorruptError", None)
@@ -5168,6 +5243,46 @@ class GatewayRunner:
                     or "profile-event table invariant failed" in msg
                 )
             )
+
+        def _record_notifier_corruption_confirmation(
+            *,
+            resolved_db_path: str,
+            slug: str,
+            exc: Exception,
+            confirmation: str,
+            reason: str,
+            tick_recorded_db_paths: set[str],
+            extra: dict[str, Any] | None = None,
+        ) -> bool:
+            if resolved_db_path in tick_recorded_db_paths:
+                return False
+            streak = notifier_corruption_streaks.get(resolved_db_path, 0) + 1
+            notifier_corruption_streaks[resolved_db_path] = streak
+            tick_recorded_db_paths.add(resolved_db_path)
+            if streak < _KANBAN_DB_CORRUPTION_CONFIRM_STREAK:
+                logger.warning(
+                    "kanban notifier: board %s database %s confirmation %d/%d signaled "
+                    "corruption (%s); deferring hard-disable this tick: %s",
+                    slug,
+                    resolved_db_path,
+                    streak,
+                    _KANBAN_DB_CORRUPTION_CONFIRM_STREAK,
+                    confirmation,
+                    exc,
+                )
+                return False
+            payload: dict[str, Any] = {
+                "reason": reason,
+                "board": slug,
+                "error": str(exc),
+                "confirmation": confirmation,
+                "streak": streak,
+            }
+            if extra:
+                payload.update(extra)
+            notifier_disabled_db_paths[resolved_db_path] = payload
+            notifier_corruption_streaks.pop(resolved_db_path, None)
+            return True
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -5202,6 +5317,7 @@ class GatewayRunner:
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
                     seen_db_paths: set[str] = set()
+                    tick_recorded_db_paths: set[str] = set()
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
@@ -5241,6 +5357,7 @@ class GatewayRunner:
                                 "kanban notifier: heartbeat record failed for board %s: %s",
                                 slug, exc,
                             )
+                        confirmed_corruption_this_tick = False
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
@@ -5259,22 +5376,25 @@ class GatewayRunner:
                             elif _notifier_db_error_is_corrupt(exc):
                                 confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
                                 if confirmed:
-                                    notifier_disabled_db_paths[resolved_db_path] = {
-                                        "reason": "corrupt_db",
-                                        "board": slug,
-                                        "error": str(exc),
-                                        "confirmation": confirmation,
-                                    }
-                                    logger.error(
-                                        "kanban notifier: board %s database %s is corrupt/unhealthy; "
-                                        "disabling notifier reads/writes for this DB until gateway restart "
-                                        "after quiesced repair: %s (confirmation: %s)",
-                                        slug,
-                                        resolved_db_path,
-                                        exc,
-                                        confirmation,
-                                    )
+                                    if _record_notifier_corruption_confirmation(
+                                        resolved_db_path=resolved_db_path,
+                                        slug=slug,
+                                        exc=exc,
+                                        confirmation=confirmation,
+                                        reason="corrupt_db",
+                                        tick_recorded_db_paths=tick_recorded_db_paths,
+                                    ):
+                                        logger.error(
+                                            "kanban notifier: board %s database %s is corrupt/unhealthy; "
+                                            "disabling notifier reads/writes for this DB until gateway restart "
+                                            "after quiesced repair: %s (confirmation: %s)",
+                                            slug,
+                                            resolved_db_path,
+                                            exc,
+                                            confirmation,
+                                        )
                                 else:
+                                    notifier_corruption_streaks.pop(resolved_db_path, None)
                                     logger.warning(
                                         "kanban notifier: board %s database %s reported corruption/open failure "
                                         "but confirmation did not find durable corruption (%s); treating as transient: %s",
@@ -5419,24 +5539,31 @@ class GatewayRunner:
                                         if _notifier_db_error_is_corrupt(exc):
                                             confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
                                             if confirmed:
-                                                notifier_disabled_db_paths[resolved_db_path] = {
-                                                    "reason": "profile_event_corruption",
-                                                    "board": slug,
-                                                    "task_id": psub.get("task_id"),
-                                                    "profile": psub.get("profile"),
-                                                    "error": str(exc),
-                                                    "confirmation": confirmation,
-                                                }
-                                                logger.error(
-                                                    "kanban notifier: profile-event claim detected corrupt/unhealthy DB "
-                                                    "for board %s path %s; disabling notifier for this DB until "
-                                                    "gateway restart after quiesced repair: %s (confirmation: %s)",
-                                                    slug,
-                                                    resolved_db_path,
-                                                    exc,
-                                                    confirmation,
-                                                )
-                                                break
+                                                confirmed_corruption_this_tick = True
+                                                if _record_notifier_corruption_confirmation(
+                                                    resolved_db_path=resolved_db_path,
+                                                    slug=slug,
+                                                    exc=exc,
+                                                    confirmation=confirmation,
+                                                    reason="profile_event_corruption",
+                                                    tick_recorded_db_paths=tick_recorded_db_paths,
+                                                    extra={
+                                                        "task_id": psub.get("task_id"),
+                                                        "profile": psub.get("profile"),
+                                                    },
+                                                ):
+                                                    logger.error(
+                                                        "kanban notifier: profile-event claim detected corrupt/unhealthy DB "
+                                                        "for board %s path %s; disabling notifier for this DB until "
+                                                        "gateway restart after quiesced repair: %s (confirmation: %s)",
+                                                        slug,
+                                                        resolved_db_path,
+                                                        exc,
+                                                        confirmation,
+                                                    )
+                                                    break
+                                                continue
+                                            notifier_corruption_streaks.pop(resolved_db_path, None)
                                             logger.warning(
                                                 "kanban notifier: profile-event claim for board %s path %s "
                                                 "reported corruption/open failure but confirmation did not find "
@@ -5485,6 +5612,8 @@ class GatewayRunner:
                                         "event_tasks": p_event_tasks,
                                         "board": slug,
                                     })
+                            if not confirmed_corruption_this_tick:
+                                notifier_corruption_streaks.pop(resolved_db_path, None)
                         except Exception as exc:
                             if _is_disk_io_board_db_error(exc):
                                 notifier_disabled_db_paths[resolved_db_path] = {
@@ -5501,22 +5630,25 @@ class GatewayRunner:
                             elif _notifier_db_error_is_corrupt(exc):
                                 confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
                                 if confirmed:
-                                    notifier_disabled_db_paths[resolved_db_path] = {
-                                        "reason": "corrupt_db",
-                                        "board": slug,
-                                        "error": str(exc),
-                                        "confirmation": confirmation,
-                                    }
-                                    logger.error(
-                                        "kanban notifier: board %s database %s is corrupt/unhealthy during read; "
-                                        "disabling notifier reads/writes for this DB until gateway restart "
-                                        "after quiesced repair: %s (confirmation: %s)",
-                                        slug,
-                                        resolved_db_path,
-                                        exc,
-                                        confirmation,
-                                    )
+                                    if _record_notifier_corruption_confirmation(
+                                        resolved_db_path=resolved_db_path,
+                                        slug=slug,
+                                        exc=exc,
+                                        confirmation=confirmation,
+                                        reason="corrupt_db",
+                                        tick_recorded_db_paths=tick_recorded_db_paths,
+                                    ):
+                                        logger.error(
+                                            "kanban notifier: board %s database %s is corrupt/unhealthy during read; "
+                                            "disabling notifier reads/writes for this DB until gateway restart "
+                                            "after quiesced repair: %s (confirmation: %s)",
+                                            slug,
+                                            resolved_db_path,
+                                            exc,
+                                            confirmation,
+                                        )
                                 else:
+                                    notifier_corruption_streaks.pop(resolved_db_path, None)
                                     logger.warning(
                                         "kanban notifier: board %s database %s read reported corruption/open failure "
                                         "but confirmation did not find durable corruption (%s); treating as transient: %s",
@@ -6489,6 +6621,9 @@ class GatewayRunner:
         # resolved DB path so aliases pointing at the same SQLite file are
         # quarantined together for this process lifetime.
         disabled_db_paths: dict[str, dict[str, Any]] = {}
+        # Corruption confirmation streaks keyed by resolved DB path. Require a
+        # stable run of confirmation failures before hard-disabling.
+        corruption_confirm_streaks: dict[str, int] = {}
         # Last known *live* fingerprint for each board. We only store entries
         # after we observe a real file stat (device/inode), which prevents false
         # positives on first-open transitions like (path,None,None)->(path,dev,ino).
@@ -6524,7 +6659,11 @@ class GatewayRunner:
                 )
             )
 
-        def _tick_once_for_board(slug: str, db_path: str | None = None) -> "Optional[object]":
+        def _tick_once_for_board(
+            slug: str,
+            db_path: str | None = None,
+            tick_recorded_db_paths: "set[str] | None" = None,
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -6533,6 +6672,8 @@ class GatewayRunner:
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
             """
+            if tick_recorded_db_paths is None:
+                tick_recorded_db_paths = set()
             conn = None
             fingerprint = _board_db_fingerprint(slug, db_path=db_path)
             if slug in disabled_boards:
@@ -6577,7 +6718,7 @@ class GatewayRunner:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -6585,6 +6726,8 @@ class GatewayRunner:
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
                 )
+                corruption_confirm_streaks.pop(fingerprint[0], None)
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_disk_io_board_db_error(exc):
                     disabled_db_paths[fingerprint[0]] = {
@@ -6603,12 +6746,33 @@ class GatewayRunner:
                 if _is_corrupt_board_db_error(exc):
                     confirmed, confirmation = _confirm_board_db_corruption(fingerprint[0])
                     if confirmed:
+                        if fingerprint[0] in tick_recorded_db_paths:
+                            # Multiple board aliases can resolve to one DB path;
+                            # only advance the confirmation streak once per tick.
+                            return None
+                        streak = corruption_confirm_streaks.get(fingerprint[0], 0) + 1
+                        corruption_confirm_streaks[fingerprint[0]] = streak
+                        tick_recorded_db_paths.add(fingerprint[0])
+                        if streak < _KANBAN_DB_CORRUPTION_CONFIRM_STREAK:
+                            logger.warning(
+                                "kanban dispatcher: board %s database %s confirmation %d/%d "
+                                "signaled corruption (%s); deferring hard-disable this tick: %s",
+                                slug,
+                                fingerprint[0],
+                                streak,
+                                _KANBAN_DB_CORRUPTION_CONFIRM_STREAK,
+                                confirmation,
+                                exc,
+                            )
+                            return None
                         disabled_db_paths[fingerprint[0]] = {
                             "reason": "corrupt_db",
                             "slug": slug,
                             "current_fingerprint": fingerprint,
                             "confirmation": confirmation,
+                            "streak": streak,
                         }
+                        corruption_confirm_streaks.pop(fingerprint[0], None)
                         logger.error(
                             "kanban dispatcher: board %s database %s is not a valid "
                             "SQLite database; disabling dispatch for this board "
@@ -6621,6 +6785,7 @@ class GatewayRunner:
                             confirmation,
                         )
                         return None
+                    corruption_confirm_streaks.pop(fingerprint[0], None)
                     logger.warning(
                         "kanban dispatcher: board %s database %s reported corruption/open failure "
                         "but confirmation did not find durable corruption (%s); treating as transient: %s",
@@ -6654,10 +6819,20 @@ class GatewayRunner:
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
+            tick_recorded_db_paths: set[str] = set()
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 db_path = b.get("db_path")
-                out.append((slug, _tick_once_for_board(slug, db_path=db_path)))
+                out.append(
+                    (
+                        slug,
+                        _tick_once_for_board(
+                            slug,
+                            db_path=db_path,
+                            tick_recorded_db_paths=tick_recorded_db_paths,
+                        ),
+                    )
+                )
             return out
 
         def _ready_nonempty() -> bool:

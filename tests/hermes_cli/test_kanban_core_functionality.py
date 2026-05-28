@@ -3905,7 +3905,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 4:
+        if calls["to_thread"] >= 8:
             runner._running = False
         return result
 
@@ -3916,7 +3916,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
-    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
         asyncio.run(
             asyncio.wait_for(
                 runner._kanban_dispatcher_watcher(),
@@ -3931,10 +3931,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert not any("database changed; retrying dispatch" in msg for msg in messages)
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + ready/review probes. Once the corruption
-    # confirmation probe validates the file is actually invalid, the dispatcher
-    # disables the DB path and avoids further dispatch retries in-process.
-    assert calls["connect"] == 3
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    # Repeated retries occur before hard-disable; once the confirmation streak
+    # hits threshold, in-process retries stop for that DB path.
+    assert calls["connect"] >= 7
 
 
 
@@ -4015,6 +4016,280 @@ def test_gateway_dispatcher_transient_malformed_is_not_disabled(
     assert any("treating as transient" in msg for msg in messages)
     assert not any("not a valid SQLite database" in msg for msg in messages)
     assert calls["connect"] >= 4
+
+
+def test_gateway_dispatcher_confirmation_streak_resets_when_probe_turns_healthy(
+    monkeypatch, tmp_path, caplog
+):
+    """Confirmed corruption must be consecutive; healthy confirmation resets streak."""
+    import asyncio
+    import logging
+    import sqlite3
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: {"slug": slug},
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+    confirmations = iter(
+        [
+            (True, "test confirmed corruption #1"),
+            (False, "confirmation probe quick_check/integrity_check ok"),
+            (True, "test confirmed corruption #2"),
+            (True, "test confirmed corruption #3"),
+        ]
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: next(
+            confirmations,
+            (False, "confirmation probe quick_check/integrity_check ok"),
+        ),
+    )
+
+    calls = {"connect": 0, "to_thread": 0}
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 10:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("not a valid SQLite database" in msg for msg in messages)
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    assert any("treating as transient" in msg for msg in messages)
+    assert calls["connect"] >= 8
+
+
+def test_gateway_dispatcher_post_connect_dispatch_corruption_progresses_to_hard_disable(
+    monkeypatch, tmp_path, caplog
+):
+    """Corruption from dispatch_once after connect should accumulate confirmation streak."""
+    import asyncio
+    import logging
+    import sqlite3
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: {"slug": slug},
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    calls = {"dispatch": 0, "to_thread": 0}
+
+    def _dispatch_once(*args, **kwargs):
+        calls["dispatch"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 8:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "confirmation 1/3 signaled corruption" in caplog.text
+    assert "confirmation 2/3 signaled corruption" in caplog.text
+    assert any("not a valid SQLite database" in msg for msg in messages)
+    assert calls["dispatch"] >= 3
+
+
+def test_gateway_dispatcher_same_tick_alias_corruption_dedupes_confirmation_streak(
+    monkeypatch, tmp_path, caplog
+):
+    """Aliases pointing at one DB advance the confirmation streak once per tick."""
+    import asyncio
+    import logging
+    import sqlite3
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    aliases = [
+        {"slug": "alpha", "db_path": str(board_db)},
+        {"slug": "beta", "db_path": str(board_db)},
+        {"slug": "gamma", "db_path": str(board_db)},
+    ]
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [dict(a) for a in aliases],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: next(dict(a) for a in aliases if a["slug"] == slug),
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
+
+    calls = {"connect": 0, "to_thread": 0}
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 8:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    # Three aliases per tick, but the streak advances exactly once per tick.
+    assert caplog.text.count("confirmation 1/3 signaled corruption") == 1
+    assert caplog.text.count("confirmation 2/3 signaled corruption") == 1
+    idx_1 = next(
+        i for i, m in enumerate(messages)
+        if "confirmation 1/3 signaled corruption" in m
+    )
+    idx_2 = next(
+        i for i, m in enumerate(messages)
+        if "confirmation 2/3 signaled corruption" in m
+    )
+    # No hard-disable on the first two ticks — only after the 3/3 threshold.
+    assert not any(
+        "not a valid SQLite database" in m for m in messages[: idx_2 + 1]
+    )
+    idx_disable = next(
+        i for i, m in enumerate(messages) if "not a valid SQLite database" in m
+    )
+    assert idx_1 < idx_2 < idx_disable
+    assert any("until the gateway restarts" in m for m in messages)
 
 
 def test_gateway_dispatcher_disables_hot_replaced_board_until_restart(
