@@ -17,13 +17,33 @@ import hermes_cli.kanban_notifier_sidecar as heartbeat_sidecar
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HERMES_HOME with an empty kanban DB.
+
+    Defense in depth: clear dispatcher/worker kanban env pins so these tests
+    never write to a live board when run inside a kanban worker shell.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    for env_name in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_LOGS_ROOT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    assert kb.kanban_db_path().resolve() == (home / "kanban.db").resolve()
     return home
+
+
+def test_kanban_home_fixture_isolation_ignores_live_board_pin(kanban_home):
+    """Regression guard: this module must never resolve the operator live board."""
+    resolved = kb.kanban_db_path().resolve()
+    assert resolved == (kanban_home / "kanban.db").resolve()
+    assert resolved != Path("/Users/ctao/.hermes/kanban.db").resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -4187,6 +4207,97 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=3)
 
     assert len(spawns) == 2, f"expected 2 spawns (cap 3 - 1 running), got {len(spawns)}"
+
+
+def test_dispatch_max_spawn_and_max_in_progress_share_concurrency_cap(
+    kanban_home, all_assignees_spawnable
+):
+    """One running + two ready at 2/2 caps should spawn exactly one ready task."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        ready_a = kb.create_task(conn, title="ready-a", assignee="bob")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="bob")
+        kb.claim_task(conn, running)
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=2,
+            max_in_progress=2,
+        )
+
+        assert len(res.spawned) == 1
+        assert len(spawns) == 1
+        ready_a_task = kb.get_task(conn, ready_a)
+        ready_b_task = kb.get_task(conn, ready_b)
+        assert ready_a_task is not None and ready_a_task.status == "running"
+        assert ready_b_task is not None and ready_b_task.status == "ready"
+        assert res.max_in_progress_blocked is False
+
+
+def test_dispatch_max_in_progress_blocks_review_only_when_at_effective_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review-only ticks must honor max_in_progress saturation."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        review = kb.create_task(conn, title="review", assignee="bob")
+        kb.claim_task(conn, running)
+        _set_task_status(conn, review, "review")
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=3,
+            max_in_progress=1,
+        )
+
+        assert res.max_in_progress_blocked is True
+        assert res.spawned == []
+        assert spawns == []
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None and review_task.status == "review"
+
+
+def test_dispatch_max_spawn_and_max_in_progress_zero_running_preserves_parallelism(
+    kanban_home, all_assignees_spawnable,
+):
+    """With zero running tasks, shared caps still allow full remaining capacity."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        ready_a = kb.create_task(conn, title="ready-a", assignee="alice")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="bob")
+        review = kb.create_task(conn, title="review", assignee="carol")
+        _set_task_status(conn, review, "review")
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=2,
+            max_in_progress=2,
+        )
+
+        assert res.max_in_progress_blocked is False
+        assert len(res.spawned) == 2
+        assert spawns == [ready_a, ready_b]
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None and review_task.status == "review"
 
 
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):

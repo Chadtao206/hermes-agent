@@ -27,6 +27,14 @@ DURABLE_TABLES = (
     "kanban_profile_event_subs",
     "kanban_profile_wake_events",
 )
+FRESHNESS_FIELDS = (
+    "count",
+    "max_id",
+    "max_updated_at",
+    "max_completed_at",
+    "max_finished_at",
+    "max_created_at",
+)
 
 
 def _readonly_connect(path: Path) -> sqlite3.Connection:
@@ -64,7 +72,7 @@ def _max_expr(columns: set[str]) -> str:
 def _durable_markers(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     markers: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
-    with _readonly_connect(path) as conn:
+    with kb.snapshot_connect(db_path=path) as conn:
         for table in DURABLE_TABLES:
             if not _table_exists(conn, table):
                 markers[table] = {"exists": False, "count": None}
@@ -83,6 +91,84 @@ def _durable_markers(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 errors.append({"table": table, "error": f"{type(exc).__name__}: {exc}"})
                 markers[table] = {"exists": True, "error": f"{type(exc).__name__}: {exc}"}
     return markers, errors
+
+
+def _marker_value(value: Any) -> int | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except Exception:
+        return text
+
+
+def _value_regressed(*, candidate: Any, live: Any) -> bool:
+    live_v = _marker_value(live)
+    if live_v is None:
+        return False
+    candidate_v = _marker_value(candidate)
+    if candidate_v is None:
+        return True
+    if isinstance(live_v, int) and isinstance(candidate_v, int):
+        return candidate_v < live_v
+    return str(candidate_v) < str(live_v)
+
+
+def compare_freshness(
+    live_markers: dict[str, Any],
+    candidate_markers: dict[str, Any],
+) -> dict[str, Any]:
+    regressions: list[dict[str, Any]] = []
+    table_deltas: list[dict[str, Any]] = []
+
+    for table in DURABLE_TABLES:
+        live = live_markers.get(table) or {}
+        candidate = candidate_markers.get(table) or {}
+        table_deltas.append({"table": table, "live": live, "candidate": candidate})
+
+        live_exists = bool(live.get("exists"))
+        live_count = _marker_value(live.get("count"))
+        if not live_exists or not isinstance(live_count, int) or live_count <= 0:
+            continue
+
+        if not candidate.get("exists"):
+            regressions.append(
+                {
+                    "table": table,
+                    "field": "exists",
+                    "kind": "missing_table",
+                    "live": True,
+                    "candidate": False,
+                }
+            )
+            continue
+
+        for field in FRESHNESS_FIELDS:
+            live_value = live.get(field)
+            if _marker_value(live_value) is None:
+                continue
+            candidate_value = candidate.get(field)
+            if _value_regressed(candidate=candidate_value, live=live_value):
+                regressions.append(
+                    {
+                        "table": table,
+                        "field": field,
+                        "kind": "staler_count" if field == "count" else f"staler_{field}",
+                        "live": live_value,
+                        "candidate": candidate_value,
+                    }
+                )
+
+    return {"ok": not regressions, "regressions": regressions, "table_deltas": table_deltas}
 
 
 def verify_candidate(candidate: Path) -> dict[str, Any]:
@@ -339,7 +425,7 @@ def _runbook(live_path: Path) -> list[str]:
         "Stop dashboard, cron/scheduler writers, then gateway; verify no matching PIDs and no open lsof handles remain.",
         "Capture live kanban.db plus -wal/-shm sidecars into an evidence directory before mutation.",
         "Verify candidate PRAGMA quick_check and integrity_check are both ok.",
-        "Compare durable-table freshness markers from live vs candidate; proceed only if candidate is equal/newer or explicit human loss acceptance is recorded.",
+        "Compare durable-table freshness markers from live vs candidate; proceed only if candidate is equal/newer or explicit --allow-data-loss human loss acceptance is recorded.",
         f"Install candidate to {live_path} only after the quiesced/open-handle gate passes.",
         "Remove stale live -wal/-shm sidecars, then re-run quick_check/integrity_check before restarting services.",
         "Restart gateway/dashboard/cron only after installed DB verification passes; run `hermes kanban doctor --json` after restart.",
@@ -353,6 +439,7 @@ def run_repair_guard(
     install: bool = False,
     confirm_quiesced: bool = False,
     confirm_freshness_checked: bool = False,
+    allow_data_loss: bool = False,
     evidence_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     live_path = kb.kanban_db_path(board=board)
@@ -364,6 +451,7 @@ def run_repair_guard(
         "board": board or kb.get_current_board(),
         "db_path": str(live_path),
         "install_requested": install,
+        "allow_data_loss": bool(allow_data_loss),
         "installed": False,
         "candidate": None,
         "evidence_dir": str(evidence),
@@ -390,6 +478,32 @@ def run_repair_guard(
     if not candidate_result.get("ok"):
         result["issues"].append({"kind": "candidate_verification_failed", "severity": "error"})
         return result
+
+    live_markers: dict[str, Any] = {}
+    if live_path.exists():
+        live_markers, live_marker_errors = _durable_markers(live_path)
+        result["live_durable_markers"] = live_markers
+        if live_marker_errors:
+            result["issues"].append(
+                {
+                    "kind": "live_marker_read_failed",
+                    "severity": "error",
+                    "errors": live_marker_errors,
+                }
+            )
+            return result
+        freshness = compare_freshness(live_markers, candidate_result.get("durable_markers") or {})
+        result["freshness_comparison"] = freshness
+        if not freshness.get("ok") and not allow_data_loss:
+            result["issues"].append(
+                {
+                    "kind": "freshness_regression",
+                    "severity": "error",
+                    "message": "Candidate durable markers regress versus live DB; refusing install without explicit --allow-data-loss.",
+                    "regressions": freshness.get("regressions") or [],
+                }
+            )
+            return result
 
     if not install:
         result["ok"] = True
@@ -422,6 +536,17 @@ def run_repair_guard(
             }
         )
         return result
+
+    freshness = result.get("freshness_comparison") or {}
+    if allow_data_loss and not freshness.get("ok", True):
+        result["issues"].append(
+            {
+                "kind": "allow_data_loss_override",
+                "severity": "warning",
+                "message": "Proceeding with --allow-data-loss despite freshness regressions.",
+                "regressions": freshness.get("regressions") or [],
+            }
+        )
 
     if not live_path.exists():
         result["issues"].append({"kind": "live_db_missing", "severity": "error"})

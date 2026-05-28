@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_health
 
 Issue = dict[str, Any]
 
@@ -39,6 +39,12 @@ def _issue(severity: str, kind: str, message: str, **extra: Any) -> Issue:
 
 
 def _quick_check(path: Path) -> Issue | None:
+    repair_action = (
+        "quiesced repair only: stop gateway/dashboard/cron writers, then run "
+        "`hermes kanban repair-db --candidate <verified.db> --install --confirm-quiesced --confirm-freshness-checked` "
+        "(add --allow-data-loss only when a human has accepted regression). "
+        "Never cp/mv over kanban.db while services hold handles."
+    )
     try:
         if path.exists() and path.stat().st_size > 0:
             with path.open("rb") as handle:
@@ -49,46 +55,75 @@ def _quick_check(path: Path) -> Issue | None:
                     "db_invalid_header",
                     "Kanban DB does not have a valid SQLite header",
                     first_16=header.hex(" "),
-                    action="pause kanban-reading cron jobs, stop gateway/dashboard writers, recover DB, remove stale .db-wal/.db-shm sidecars after replacement, then resume after quick_check=ok",
+                    action=repair_action,
                 )
-        with kb.snapshot_connect(path) as conn:
-            rows: list[str] = []
-            try:
-                cur = conn.execute("PRAGMA quick_check")
-                while True:
-                    row = cur.fetchone()
-                    if row is None:
-                        break
-                    rows.append(str(row[0]))
-                    if len(rows) >= 50:
-                        break
-            except sqlite3.DatabaseError as exc:
-                rows.append(f"{type(exc).__name__}: {exc}")
 
-            if rows == ["ok"]:
-                return None
-            first = rows[0] if rows else "no row"
-            joined = " | ".join(rows[:8])
-            if any("kanban_notifier_heartbeats" in row for row in rows):
+        bundle = kanban_health.run_readonly_health_bundle(path)
+        phase_map = {
+            str(entry.get("phase")): entry
+            for entry in bundle.get("phases", [])
+            if entry.get("phase")
+        }
+        python_connect_ok = phase_map.get(kanban_health.PHASE_PYTHON_RO_CONNECT, {}).get("status") == "ok"
+        python_select_ok = phase_map.get(kanban_health.PHASE_PYTHON_RO_SELECT_1, {}).get("status") == "ok"
+        python_quick_ok = (
+            phase_map.get(kanban_health.PHASE_PYTHON_RO_PRAGMA_QUICK_CHECK, {}).get("status") == "ok"
+        )
+
+        # Preserve prior doctor semantics: if Python read-only quick_check path is healthy,
+        # do not fail the board based solely on sqlite3 CLI shape/environment noise.
+        if python_connect_ok and python_select_ok and python_quick_ok:
+            return None
+
+        failed = [phase for phase in bundle.get("phases", []) if phase.get("status") == "failed"]
+        if not failed:
+            return None
+
+        first_failure = failed[0]
+        failed_phase = str(first_failure.get("phase") or "unknown")
+
+        if failed_phase == kanban_health.PHASE_PYTHON_RO_PRAGMA_QUICK_CHECK:
+            quick_rows = [str(row) for row in (first_failure.get("quick_check_rows") or [])]
+            first = quick_rows[0] if quick_rows else "no row"
+            joined = " | ".join(quick_rows[:8])
+            if any("kanban_notifier_heartbeats" in row for row in quick_rows):
                 return _issue(
                     "warning",
                     "notifier_heartbeat_integrity",
                     f"Non-critical notifier heartbeat telemetry failed quick_check: {first}",
-                    quick_check_rows=rows[:8],
+                    failed_phase=failed_phase,
+                    quick_check_rows=quick_rows[:8],
+                    health_phases=bundle.get("phases"),
                     action="reset ephemeral notifier telemetry only: DELETE FROM kanban_notifier_heartbeats; drop/recreate idx_notifier_heartbeats_*; do not recover or replace the main board DB unless other tables also fail",
                 )
-            return _issue(
-                "critical",
-                "db_quick_check_failed",
-                f"PRAGMA quick_check returned {joined}",
-                action="stop gateway/dashboard/cron writers, recover with sqlite3 .recover or latest backup, replace the DB, remove stale .db-wal/.db-shm sidecars, then resume only after quick_check=ok",
-            )
+            if quick_rows:
+                return _issue(
+                    "critical",
+                    "db_quick_check_failed",
+                    f"PRAGMA quick_check returned {joined}",
+                    failed_phase=failed_phase,
+                    quick_check_rows=quick_rows[:8],
+                    health_phases=bundle.get("phases"),
+                    action=repair_action,
+                )
+
+        exc_class = first_failure.get("exception_class")
+        exc_msg = first_failure.get("exception_message")
+        detail = f"{exc_class}: {exc_msg}" if exc_class else str(first_failure.get("message") or "unknown failure")
+        return _issue(
+            "critical",
+            "db_unreadable",
+            f"Kanban DB is unreadable at phase {failed_phase}: {detail}",
+            failed_phase=failed_phase,
+            health_phases=bundle.get("phases"),
+            action=repair_action,
+        )
     except Exception as exc:
         return _issue(
             "critical",
             "db_unreadable",
             f"Kanban DB is unreadable: {type(exc).__name__}: {exc}",
-            action="pause kanban-reading cron jobs, stop gateway/dashboard writers, recover DB, remove stale .db-wal/.db-shm sidecars after replacement, then resume after quick_check=ok",
+            action=repair_action,
         )
     return None
 

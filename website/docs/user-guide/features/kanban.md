@@ -539,6 +539,24 @@ The dashboard plugin exposes the same read-only control-plane data through:
 
 Both accept `?board=<slug>` so dashboard, CLI, and cron surfaces stay aligned.
 
+### Repairing or replacing the board DB
+
+Never `cp`, `mv`, `rsync`, or otherwise hot-swap `~/.hermes/kanban.db` while
+gateway/dashboard/cron services may still hold open file handles. SQLite WAL
+sidecars and dispatcher claims can desynchronize against inode swaps, and ad hoc
+replacement is the fastest path to silent durable-row loss.
+
+Use only the guarded `hermes kanban repair-db` workflow:
+
+1. Stop dashboard, cron/scheduler writers, then gateway.
+2. Verify candidate without install: `hermes kanban repair-db --candidate <path.db>`.
+3. Install only after gates pass: `hermes kanban repair-db --candidate <path.db> --install --confirm-quiesced --confirm-freshness-checked`.
+4. If candidate durable markers are older than live, the guard fails closed; pass `--allow-data-loss` only when a human explicitly accepts the regression.
+
+If `hermes kanban doctor` reports `db_invalid_header`, `db_quick_check_failed`,
+or `db_unreadable`, follow this quiesced repair flow instead of live DB
+replacement.
+
 ## Dashboard (GUI)
 
 The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard).

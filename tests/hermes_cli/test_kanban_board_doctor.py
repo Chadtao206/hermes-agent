@@ -57,7 +57,7 @@ def test_doctor_reports_unreadable_db_without_deleting_sidecars(tmp_path, monkey
 
     assert result["ok"] is False
     assert result["issues"][0]["kind"] == "db_invalid_header"
-    assert "recover DB" in result["issues"][0]["action"]
+    assert "repair-db" in result["issues"][0]["action"]
     assert wal.read_bytes() == b"stale wal marker"
     assert shm.read_bytes() == b"stale shm marker"
 
@@ -317,4 +317,68 @@ def test_repair_db_install_blocks_writer_processes_even_after_confirmations(kanb
     assert "writer_processes_or_unverified" in out
     assert "hermes gateway run" in out
     assert _sha256(db) == before
+
+
+def test_repair_db_install_blocks_freshness_regression_without_override(kanban_home, tmp_path, monkeypatch):
+    db = kanban_home / "kanban.db"
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="freshness baseline", assignee="engineer")
+    finally:
+        conn.close()
+
+    candidate = tmp_path / "candidate-stale.db"
+    with sqlite3.connect(db) as src, sqlite3.connect(candidate) as dst:
+        src.backup(dst)
+    with sqlite3.connect(candidate) as stale:
+        stale.execute("DELETE FROM tasks")
+        stale.commit()
+
+    before = _sha256(db)
+    monkeypatch.setattr(krepair, "_writer_process_check", lambda: {"ok": True, "running_writers": [], "errors": []})
+    monkeypatch.setattr(
+        krepair,
+        "_open_handle_check",
+        lambda paths: {"ok": True, "tool": "lsof", "checked_paths": [str(p) for p in paths], "open_handles": ""},
+    )
+
+    out = kc.run_slash(
+        f"repair-db --candidate {candidate} --install "
+        "--confirm-quiesced --confirm-freshness-checked --json"
+    )
+
+    assert "freshness_regression" in out
+    assert "staler_count" in out
+    assert _sha256(db) == before
+
+
+def test_repair_db_install_allows_freshness_regression_with_override(kanban_home, tmp_path, monkeypatch):
+    db = kanban_home / "kanban.db"
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="freshness baseline", assignee="engineer")
+    finally:
+        conn.close()
+
+    candidate = tmp_path / "candidate-stale.db"
+    with sqlite3.connect(db) as src, sqlite3.connect(candidate) as dst:
+        src.backup(dst)
+    with sqlite3.connect(candidate) as stale:
+        stale.execute("DELETE FROM tasks")
+        stale.commit()
+
+    monkeypatch.setattr(krepair, "_writer_process_check", lambda: {"ok": True, "running_writers": [], "errors": []})
+    monkeypatch.setattr(
+        krepair,
+        "_open_handle_check",
+        lambda paths: {"ok": True, "tool": "lsof", "checked_paths": [str(p) for p in paths], "open_handles": ""},
+    )
+
+    out = kc.run_slash(
+        f"repair-db --candidate {candidate} --install "
+        "--confirm-quiesced --confirm-freshness-checked --allow-data-loss --json"
+    )
+
+    assert '"installed": true' in out
+    assert "allow_data_loss_override" in out
 

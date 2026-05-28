@@ -609,6 +609,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Required with --install: candidate durable-table markers are accepted as fresh",
     )
     p_repair.add_argument(
+        "--allow-data-loss",
+        action="store_true",
+        help="Permit install when candidate durable markers regress versus live DB (explicit human override).",
+    )
+    p_repair.add_argument(
         "--evidence-dir",
         default=None,
         help="Evidence directory for install artifacts (default: ~/.hermes/forensics/kanban-live-repair-<ts>)",
@@ -1460,6 +1465,7 @@ def _cmd_repair_db(args: argparse.Namespace) -> int:
         install=bool(getattr(args, "install", False)),
         confirm_quiesced=bool(getattr(args, "confirm_quiesced", False)),
         confirm_freshness_checked=bool(getattr(args, "confirm_freshness_checked", False)),
+        allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
         evidence_dir=getattr(args, "evidence_dir", None),
     )
     if getattr(args, "json", False):

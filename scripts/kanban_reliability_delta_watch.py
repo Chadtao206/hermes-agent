@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from hermes_cli import kanban_db
+
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or "/Users/ctao/.hermes")
 KANBAN_DB = HERMES_HOME / "kanban.db"
 STATE_PATH = HERMES_HOME / "kanban_reliability_delta_watch_state.json"
@@ -51,12 +53,6 @@ def save_state(payload: dict[str, Any]) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
     tmp.replace(STATE_PATH)
-
-
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(KANBAN_DB))
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def is_synthetic(row: sqlite3.Row) -> bool:
@@ -147,7 +143,7 @@ def main() -> int:
 
     now = int(time.time())
     cutoff_24h = now - 24 * 60 * 60
-    with connect() as conn:
+    with kanban_db.snapshot_connect(db_path=KANBAN_DB) as conn:
         rows_24h = fetch_events(conn, cutoff_24h)
         summary_24h = summarize(rows_24h)
 

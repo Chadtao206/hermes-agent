@@ -6798,7 +6798,7 @@ def dispatch_once(
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
-    if max_spawn is not None:
+    if max_spawn is not None or max_in_progress is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -6810,22 +6810,24 @@ def dispatch_once(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    review_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'review' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
     result.ready_count = len(ready_rows)
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
+    result.review_count = len(review_rows)
+    # Honour kanban.max_in_progress as a live-concurrency cap across BOTH
+    # ready and review queues. Review-only ticks (ready empty, review non-empty)
+    # must still respect the same cap.
+    if max_in_progress is not None:
+        # max_spawn and max_in_progress are both total live-concurrency caps,
+        # so the effective cap is the stricter one.
+        if max_spawn is None or max_spawn > max_in_progress:
+            max_spawn = max_in_progress
+        if (ready_rows or review_rows) and max_spawn is not None and running_count >= max_spawn:
             result.max_in_progress_blocked = True
             return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
     spawned = 0
     spawn_failure_groups: dict[str, list[str]] = {}
 
@@ -7022,12 +7024,6 @@ def dispatch_once(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
-    result.review_count = len(review_rows)
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
