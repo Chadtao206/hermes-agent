@@ -5944,109 +5944,129 @@ def detect_crashed_workers(
     returning 0 without a terminal transition just loops forever.
     """
     crashed: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case so we can trip the breaker
-    # immediately instead of incrementing by 1.
+    # Per-crash details collected inside the reclaim write txn, used after it
+    # closes to run ``_record_task_failure`` (which needs its own write_txn so
+    # cannot nest). ``protocol_violation`` flags the clean-exit-but-still-
+    # running case so we can trip the breaker immediately instead of
+    # incrementing by 1.
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-        for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            if _pid_alive(row["worker_pid"]):
-                continue
 
-            pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
-            if kind == "unknown" and skip_unknown:
-                # The PID is no longer alive but we could not recover a
-                # terminal status. In dispatcher ticks, leave this lane for
-                # TTL/heartbeat-based stale handling instead of letting
-                # unknown status pre-empt stale classification.
-                continue
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help. Before blocking, harvest the worker log tail into
-                # the run/event so Jensen can recover artifacts without
-                # respawning or manually spelunking the log file.
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
-                )
-                log_tail = read_worker_log(row["id"], tail_bytes=4096) or ""
-                event_kind = "protocol_violation"
-                # ``failure_class`` / ``guidance`` give downstream tooling a
-                # stable enum + one-line nudge to filter on rather than
-                # regexing the free-text error. Same fields flow into the
-                # subsequent ``gave_up`` event via ``event_payload_extra``
-                # below so dashboards see the classification on the
-                # auto-block too, not only on the underlying violation.
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    "failure_class": FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
-                    "guidance": _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
-                }
-                if log_tail:
-                    event_payload["log_tail"] = log_tail[-4096:]
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+    # Read-only scan first: avoid paying BEGIN IMMEDIATE on healthy ticks.
+    rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    reclaim_candidates: list[tuple[str, int, str, bool, str, str, dict]] = []
+    # (task_id, pid, claim_lock, protocol_violation, error_text, event_kind,
+    #  event_payload)
+    for row in rows:
+        # Only check liveness for claims owned by this host.
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        if _pid_alive(row["worker_pid"]):
+            continue
 
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (row["id"],),
+        task_id = str(row["id"])
+        pid = int(row["worker_pid"])
+        kind, code = _classify_worker_exit(pid)
+        if kind == "unknown" and skip_unknown:
+            # The PID is no longer alive but we could not recover a
+            # terminal status. In dispatcher ticks, leave this lane for
+            # TTL/heartbeat-based stale handling instead of letting
+            # unknown status pre-empt stale classification.
+            continue
+        if kind == "clean_exit":
+            # Worker subprocess returned 0 but its task is still
+            # ``running`` in the DB — it exited without calling
+            # ``kanban_complete`` / ``kanban_block``. Retrying won't
+            # help. Before blocking, harvest the worker log tail into
+            # the run/event so Jensen can recover artifacts without
+            # respawning or manually spelunking the log file.
+            protocol_violation = True
+            error_text = (
+                "worker exited cleanly (rc=0) without calling "
+                "kanban_complete or kanban_block — protocol violation"
             )
-            if cur.rowcount == 1:
-                summary = None
-                if protocol_violation and event_payload.get("log_tail"):
-                    summary = (
-                        "Protocol violation: worker exited cleanly without terminal "
-                        "kanban closeout. Harvested worker log tail for recovery.\n\n"
-                        + str(event_payload["log_tail"])[-4096:]
+            log_tail = read_worker_log(task_id, tail_bytes=4096) or ""
+            event_kind = "protocol_violation"
+            # ``failure_class`` / ``guidance`` give downstream tooling a
+            # stable enum + one-line nudge to filter on rather than
+            # regexing the free-text error. Same fields flow into the
+            # subsequent ``gave_up`` event via ``event_payload_extra``
+            # below so dashboards see the classification on the
+            # auto-block too, not only on the underlying violation.
+            event_payload = {
+                "pid": pid,
+                "claimer": lock,
+                "exit_code": code,
+                "failure_class": FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+                "guidance": _PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
+            }
+            if log_tail:
+                event_payload["log_tail"] = log_tail[-4096:]
+        else:
+            protocol_violation = False
+            if kind == "nonzero_exit":
+                error_text = f"pid {pid} exited with code {code}"
+            elif kind == "signaled":
+                error_text = f"pid {pid} killed by signal {code}"
+            else:
+                error_text = f"pid {pid} not alive"
+            event_kind = "crashed"
+            event_payload = {"pid": pid, "claimer": lock}
+            if code is not None and kind != "unknown":
+                event_payload["exit_kind"] = kind
+                event_payload["exit_code"] = code
+
+        reclaim_candidates.append(
+            (task_id, pid, lock, protocol_violation, error_text, event_kind, event_payload)
+        )
+
+    if reclaim_candidates:
+        with write_txn(conn):
+            for (
+                task_id,
+                pid,
+                lock,
+                protocol_violation,
+                error_text,
+                event_kind,
+                event_payload,
+            ) in reclaim_candidates:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' AND worker_pid = ? "
+                    "AND COALESCE(claim_lock, '') = ?",
+                    (task_id, pid, lock),
+                )
+                if cur.rowcount == 1:
+                    summary = None
+                    if protocol_violation and event_payload.get("log_tail"):
+                        summary = (
+                            "Protocol violation: worker exited cleanly without terminal "
+                            "kanban closeout. Harvested worker log tail for recovery.\n\n"
+                            + str(event_payload["log_tail"])[-4096:]
+                        )
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="crashed", status="crashed",
+                        summary=summary,
+                        error=error_text,
+                        metadata=dict(event_payload),
                     )
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome="crashed", status="crashed",
-                    summary=summary,
-                    error=error_text,
-                    metadata=dict(event_payload),
-                )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
-                )
-                crashed.append(row["id"])
-                crash_details.append(
-                    (row["id"], pid, row["claim_lock"],
-                     protocol_violation, error_text)
-                )
+                    _append_event(
+                        conn, task_id, event_kind,
+                        event_payload,
+                        run_id=run_id,
+                    )
+                    crashed.append(task_id)
+                    crash_details.append(
+                        (task_id, pid, lock, protocol_violation, error_text)
+                    )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
@@ -8312,6 +8332,52 @@ def rewind_notify_cursor(
 # detect and refuse recursive setup).
 _PROFILE_EVENT_UNSET = object()
 
+
+def validate_profile_event_tables(conn: sqlite3.Connection) -> None:
+    """Fail fast if profile-wake bookkeeping tables contain impossible rows.
+
+    The profile-event tables are ephemeral notifier/wake bookkeeping, but they
+    sit in the hot kanban DB. If a low-level page/WAL inconsistency makes rows
+    from another table appear under these schemas, SQLite may still allow normal
+    SELECTs while ``PRAGMA quick_check`` later reports NOT NULL / type errors.
+    This lightweight canary checks the invariants that normal helper INSERTs
+    always satisfy and raises ``sqlite3.DatabaseError`` immediately so callers
+    can fail-stop the notifier instead of continuing to write a damaged board.
+    """
+    bad_claim = conn.execute(
+        """
+        SELECT COUNT(*)
+          FROM kanban_profile_event_claims
+         WHERE typeof(event_id) != 'integer'
+            OR typeof(profile) != 'text'
+            OR profile = ''
+            OR typeof(name) != 'text'
+            OR typeof(root_task_id) != 'text'
+            OR root_task_id = ''
+            OR typeof(claimed_at) != 'integer'
+        """
+    ).fetchone()[0]
+    bad_sub = conn.execute(
+        """
+        SELECT COUNT(*)
+          FROM kanban_profile_event_subs
+         WHERE typeof(task_id) != 'text'
+            OR task_id = ''
+            OR typeof(profile) != 'text'
+            OR profile = ''
+            OR typeof(name) != 'text'
+            OR typeof(created_at) != 'integer'
+            OR typeof(last_event_id) != 'integer'
+            OR typeof(enabled) != 'integer'
+        """
+    ).fetchone()[0]
+    if bad_claim or bad_sub:
+        raise sqlite3.DatabaseError(
+            "kanban profile-event table invariant failed: "
+            f"bad_claim_rows={int(bad_claim)} bad_sub_rows={int(bad_sub)}"
+        )
+
+
 def add_profile_event_sub(
     conn: sqlite3.Connection,
     *,
@@ -8599,6 +8665,7 @@ def claim_unseen_events_for_profile_sub(
                 int(old_cursor),
             ),
         )
+        validate_profile_event_tables(conn)
         return old_cursor, new_cursor, claimed_events
 
 

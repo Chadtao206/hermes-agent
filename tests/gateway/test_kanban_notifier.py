@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,32 @@ async def _run_one_notifier_tick(monkeypatch, runner):
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     await runner._kanban_notifier_watcher(interval=1)
+
+
+def test_profile_event_table_canary_rejects_impossible_claim_shape(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile wake canary", assignee="worker")
+        kb.add_profile_event_sub(
+            conn,
+            task_id=tid,
+            profile="default",
+            event_kinds=["completed"],
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_profile_event_claims (
+                event_id, profile, name, root_task_id, claimed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("t_not_an_event_id", 1779917918, "", tid, 1779917918),
+        )
+        with pytest.raises(sqlite3.DatabaseError, match="profile-event table invariant"):
+            kb.validate_profile_event_tables(conn)
+    finally:
+        conn.close()
 
 
 def _make_runner(adapter):
@@ -87,6 +114,144 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert len(adapter.sent) == 1
     assert "Kanban" in adapter.sent[0]["text"]
     assert tid in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_corrupt_db_disable_is_keyed_by_resolved_path(tmp_path, monkeypatch):
+    """Once one alias sees DB corruption, same-DB aliases stop retrying.
+
+    The gateway can enumerate multiple board slugs that resolve to the same
+    SQLite file. Corruption fail-stop must key by resolved DB path, not slug,
+    so a later tick with a different alias first does not keep hammering the
+    same unhealthy file.
+    """
+    shared_db = tmp_path / "shared-corrupt.db"
+    orders = [
+        [
+            {"slug": "alias-a", "db_path": str(shared_db)},
+            {"slug": "alias-b", "db_path": str(shared_db)},
+        ],
+        [
+            {"slug": "alias-b", "db_path": str(shared_db)},
+            {"slug": "alias-a", "db_path": str(shared_db)},
+        ],
+    ]
+    connect_calls = []
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise kb.KanbanDbCorruptError(
+            shared_db,
+            None,
+            "integrity_check returned 'wrong # of entries in index idx_profile_event_claims_root'",
+        )
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert connect_calls == ["alias-a"]
+    disabled = runner._kanban_notifier_disabled_db_paths
+    assert str(shared_db.resolve()) in disabled
+    assert disabled[str(shared_db.resolve())]["reason"] == "corrupt_db"
+
+
+def test_kanban_notifier_disk_io_disable_is_keyed_by_resolved_path(tmp_path, monkeypatch, caplog):
+    """Disk I/O fail-stop should disable the DB path once per process.
+
+    If one alias hits `sqlite3.OperationalError("disk I/O error")`, later
+    aliases resolving to the same DB must be skipped for the process lifetime.
+    """
+    shared_db = tmp_path / "shared-disk-io.db"
+    orders = [
+        [
+            {"slug": "alias-a", "db_path": str(shared_db)},
+            {"slug": "alias-b", "db_path": str(shared_db)},
+        ],
+        [
+            {"slug": "alias-b", "db_path": str(shared_db)},
+            {"slug": "alias-a", "db_path": str(shared_db)},
+        ],
+    ]
+    connect_calls = []
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert connect_calls == ["alias-a"]
+    disabled = runner._kanban_notifier_disabled_db_paths
+    assert str(shared_db.resolve()) in disabled
+    assert disabled[str(shared_db.resolve())]["reason"] == "disk_io_error"
+    assert "filesystem-level fault" in caplog.text
+
+
+def test_kanban_notifier_inner_disk_io_disables_board_path(tmp_path, monkeypatch):
+    """Disk I/O during in-conn board reads should quarantine that DB path."""
+    shared_db = tmp_path / "inner-disk-io.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="notify", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    orders = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+    connect_calls = []
+    list_calls = []
+    real_connect = kb.connect
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        return real_connect(board=board, **kwargs)
+
+    def fake_list_notify_subs(*args, **kwargs):
+        list_calls.append(1)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "list_notify_subs", fake_list_notify_subs)
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(list_calls) == 1
+    assert connect_calls == ["alias-a"]
+    disabled = runner._kanban_notifier_disabled_db_paths
+    assert str(shared_db.resolve()) in disabled
+    assert disabled[str(shared_db.resolve())]["reason"] == "disk_io_error"
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

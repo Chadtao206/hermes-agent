@@ -1769,6 +1769,22 @@ def _collect_kanban_dispatch_warning_details(
     return dict(reason_counts.most_common(5)), examples
 
 
+_DISK_IO_BOARD_DB_GUIDANCE = (
+    "SQLite reported a disk I/O error on board %s (path=%s): %s. "
+    "Dispatch/notifier access is disabled for this board DB until gateway restart. "
+    "This is a filesystem-level fault (not DB corruption): check disk free space, "
+    "mount/filesystem health, and HERMES_HOME permissions; then restart the gateway "
+    "once the underlying volume is healthy."
+)
+
+
+def _is_disk_io_board_db_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and "disk i/o error" in str(exc).lower()
+    )
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -5100,6 +5116,26 @@ class GatewayRunner:
         if not notifier_id:
             notifier_id = f"{notifier_host}:{notifier_pid}:{notifier_started_at}"
             self._kanban_notifier_id = notifier_id
+        notifier_disabled_db_paths: dict[str, dict[str, Any]] = getattr(
+            self, "_kanban_notifier_disabled_db_paths", {}
+        )
+        self._kanban_notifier_disabled_db_paths = notifier_disabled_db_paths
+
+        def _notifier_db_error_is_corrupt(exc: Exception) -> bool:
+            corrupt_error = getattr(_kb, "KanbanDbCorruptError", None)
+            if corrupt_error is not None and isinstance(exc, corrupt_error):
+                return True
+            msg = str(exc).lower()
+            return (
+                isinstance(exc, sqlite3.DatabaseError)
+                and (
+                    "file is not a database" in msg
+                    or "database disk image is malformed" in msg
+                    or "quick_check" in msg
+                    or "integrity_check" in msg
+                    or "profile-event table invariant failed" in msg
+                )
+            )
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -5148,6 +5184,14 @@ class GatewayRunner:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        if resolved_db_path in notifier_disabled_db_paths:
+                            logger.debug(
+                                "kanban notifier: board %s DB %s disabled for this process: %s",
+                                slug,
+                                resolved_db_path,
+                                notifier_disabled_db_paths[resolved_db_path],
+                            )
+                            continue
                         try:
                             _kb.record_notifier_heartbeat(
                                 None,
@@ -5168,7 +5212,34 @@ class GatewayRunner:
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
-                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            if _is_disk_io_board_db_error(exc):
+                                notifier_disabled_db_paths[resolved_db_path] = {
+                                    "reason": "disk_io_error",
+                                    "board": slug,
+                                    "error": str(exc),
+                                }
+                                logger.error(
+                                    _DISK_IO_BOARD_DB_GUIDANCE,
+                                    slug,
+                                    resolved_db_path,
+                                    exc,
+                                )
+                            elif _notifier_db_error_is_corrupt(exc):
+                                notifier_disabled_db_paths[resolved_db_path] = {
+                                    "reason": "corrupt_db",
+                                    "board": slug,
+                                    "error": str(exc),
+                                }
+                                logger.error(
+                                    "kanban notifier: board %s database %s is corrupt/unhealthy; "
+                                    "disabling notifier reads/writes for this DB until gateway restart "
+                                    "after quiesced repair: %s",
+                                    slug,
+                                    resolved_db_path,
+                                    exc,
+                                )
+                            else:
+                                logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
                             # `connect()` runs the schema + idempotent migration
@@ -5285,6 +5356,38 @@ class GatewayRunner:
                                             name=psub.get("name") or "",
                                         )
                                     except Exception as exc:
+                                        if _is_disk_io_board_db_error(exc):
+                                            notifier_disabled_db_paths[resolved_db_path] = {
+                                                "reason": "disk_io_error",
+                                                "board": slug,
+                                                "task_id": psub.get("task_id"),
+                                                "profile": psub.get("profile"),
+                                                "error": str(exc),
+                                            }
+                                            logger.error(
+                                                _DISK_IO_BOARD_DB_GUIDANCE,
+                                                slug,
+                                                resolved_db_path,
+                                                exc,
+                                            )
+                                            break
+                                        if _notifier_db_error_is_corrupt(exc):
+                                            notifier_disabled_db_paths[resolved_db_path] = {
+                                                "reason": "profile_event_corruption",
+                                                "board": slug,
+                                                "task_id": psub.get("task_id"),
+                                                "profile": psub.get("profile"),
+                                                "error": str(exc),
+                                            }
+                                            logger.error(
+                                                "kanban notifier: profile-event claim detected corrupt/unhealthy DB "
+                                                "for board %s path %s; disabling notifier for this DB until "
+                                                "gateway restart after quiesced repair: %s",
+                                                slug,
+                                                resolved_db_path,
+                                                exc,
+                                            )
+                                            break
                                         logger.warning(
                                             "kanban notifier: profile-event claim "
                                             "failed for %s/%s on board %s: %s",
@@ -5323,6 +5426,39 @@ class GatewayRunner:
                                         "event_tasks": p_event_tasks,
                                         "board": slug,
                                     })
+                        except Exception as exc:
+                            if _is_disk_io_board_db_error(exc):
+                                notifier_disabled_db_paths[resolved_db_path] = {
+                                    "reason": "disk_io_error",
+                                    "board": slug,
+                                    "error": str(exc),
+                                }
+                                logger.error(
+                                    _DISK_IO_BOARD_DB_GUIDANCE,
+                                    slug,
+                                    resolved_db_path,
+                                    exc,
+                                )
+                            elif _notifier_db_error_is_corrupt(exc):
+                                notifier_disabled_db_paths[resolved_db_path] = {
+                                    "reason": "corrupt_db",
+                                    "board": slug,
+                                    "error": str(exc),
+                                }
+                                logger.error(
+                                    "kanban notifier: board %s database %s is corrupt/unhealthy during read; "
+                                    "disabling notifier reads/writes for this DB until gateway restart "
+                                    "after quiesced repair: %s",
+                                    slug,
+                                    resolved_db_path,
+                                    exc,
+                                )
+                            else:
+                                logger.warning(
+                                    "kanban notifier: board %s tick failed: %s",
+                                    slug,
+                                    exc,
+                                )
                         finally:
                             conn.close()
                     return chat_deliveries, profile_deliveries
@@ -6277,15 +6413,22 @@ class GatewayRunner:
         # live file swaps are the main corruption vector: operators must recover
         # through the guarded quiesced repair path, then restart the gateway.
         disabled_boards: dict[str, dict[str, Any]] = {}
+        # Filesystem-level faults (disk I/O, malformed/corrupt DB) are keyed by
+        # resolved DB path so aliases pointing at the same SQLite file are
+        # quarantined together for this process lifetime.
+        disabled_db_paths: dict[str, dict[str, Any]] = {}
         # Last known *live* fingerprint for each board. We only store entries
         # after we observe a real file stat (device/inode), which prevents false
         # positives on first-open transitions like (path,None,None)->(path,dev,ino).
         last_seen_live_fingerprints: dict[str, tuple[str, int | None, int | None]] = {}
 
-        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
-            path = _kb.kanban_db_path(slug)
+        def _board_db_fingerprint(
+            slug: str,
+            db_path: str | None = None,
+        ) -> tuple[str, int | None, int | None]:
+            path = Path(db_path).expanduser() if db_path else _kb.kanban_db_path(slug)
             try:
-                resolved = str(path.expanduser().resolve())
+                resolved = str(path.resolve())
             except Exception:
                 resolved = str(path)
             try:
@@ -6295,15 +6438,21 @@ class GatewayRunner:
             return (resolved, stat.st_dev, stat.st_ino)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
+            corrupt_error = getattr(_kb, "KanbanDbCorruptError", None)
+            if corrupt_error is not None and isinstance(exc, corrupt_error):
+                return True
             msg = str(exc).lower()
             return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
+                isinstance(exc, sqlite3.DatabaseError)
+                and (
+                    "file is not a database" in msg
+                    or "database disk image is malformed" in msg
+                    or "quick_check" in msg
+                    or "integrity_check" in msg
+                )
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, db_path: str | None = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -6313,8 +6462,10 @@ class GatewayRunner:
             connection handle or accidentally claim across each other.
             """
             conn = None
-            fingerprint = _board_db_fingerprint(slug)
+            fingerprint = _board_db_fingerprint(slug, db_path=db_path)
             if slug in disabled_boards:
+                return None
+            if fingerprint[0] in disabled_db_paths:
                 return None
 
             previous_live_fingerprint = last_seen_live_fingerprints.get(slug)
@@ -6363,9 +6514,24 @@ class GatewayRunner:
                     stale_timeout_seconds=stale_timeout_seconds,
                 )
             except sqlite3.DatabaseError as exc:
+                if _is_disk_io_board_db_error(exc):
+                    disabled_db_paths[fingerprint[0]] = {
+                        "reason": "disk_io_error",
+                        "slug": slug,
+                        "current_fingerprint": fingerprint,
+                        "error": str(exc),
+                    }
+                    logger.error(
+                        _DISK_IO_BOARD_DB_GUIDANCE,
+                        slug,
+                        fingerprint[0],
+                        exc,
+                    )
+                    return None
                 if _is_corrupt_board_db_error(exc):
-                    disabled_boards[slug] = {
+                    disabled_db_paths[fingerprint[0]] = {
                         "reason": "corrupt_db",
+                        "slug": slug,
                         "current_fingerprint": fingerprint,
                     }
                     logger.error(
@@ -6404,7 +6570,8 @@ class GatewayRunner:
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+                db_path = b.get("db_path")
+                out.append((slug, _tick_once_for_board(slug, db_path=db_path)))
             return out
 
         def _ready_nonempty() -> bool:
@@ -6425,9 +6592,15 @@ class GatewayRunner:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                db_path = b.get("db_path")
+                if slug in disabled_boards:
+                    continue
+                fingerprint = _board_db_fingerprint(slug, db_path=db_path)
+                if fingerprint[0] in disabled_db_paths:
+                    continue
                 conn = None
                 try:
-                    conn = _kb.connect(board=slug)
+                    conn = _kb.connect(board=slug, readonly=True)
                     if _kb.has_spawnable_ready(conn):
                         return True
                     if _kb.has_spawnable_review(conn):

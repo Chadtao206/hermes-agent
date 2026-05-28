@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import pytest
 
 from pathlib import Path
@@ -325,6 +326,192 @@ def test_dispatcher_tick_does_not_call_init_db(kanban_home, monkeypatch):
         "_kanban_notifier_watcher must not call _kb.init_db(board=slug) — "
         "see issue #21378."
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_quarantines_board_on_disk_io_error(
+    kanban_home, monkeypatch, caplog,
+):
+    """A disk-I/O OperationalError should disable that board for this process."""
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as cli_config
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    shared_db = kb.kanban_db_path().resolve()
+    board_rows = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+
+    real_connect = kb.connect
+    write_connect_calls: list[str] = []
+
+    def fake_list_boards(include_archived=False):
+        return board_rows.pop(0) if board_rows else []
+
+    def fake_connect(*, board=None, readonly=False, **kwargs):
+        if readonly:
+            return real_connect(board=board, readonly=True)
+        write_connect_calls.append(board or "")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(
+        cli_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+
+    real_sleep = asyncio.sleep
+    sleep_calls = {"count": 0}
+
+    async def fake_sleep(delay):
+        await real_sleep(0)
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 3:
+            runner._running = False
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fake_sleep):
+        await asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=10.0)
+
+    # First tick attempts one writable open and quarantines the board.
+    # Second tick should skip `_tick_once_for_board` for that slug.
+    assert write_connect_calls == ["alias-a"]
+    assert "filesystem-level fault" in caplog.text
+    assert "disabled for this board DB until gateway restart" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_quarantines_shared_db_across_aliases(
+    kanban_home, monkeypatch, caplog,
+):
+    """A disk-I/O fault on alias-a should quarantine alias-b for the same DB path."""
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as cli_config
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    shared_db = kb.kanban_db_path().resolve()
+    boards = [
+        {"slug": "alias-a", "db_path": str(shared_db)},
+        {"slug": "alias-b", "db_path": str(shared_db)},
+    ]
+    board_rows = [list(boards), list(boards), list(boards)]
+
+    real_connect = kb.connect
+    write_connect_calls: list[str] = []
+    readonly_connect_calls: list[str] = []
+
+    def fake_list_boards(include_archived=False):
+        return board_rows.pop(0) if board_rows else []
+
+    def fake_connect(*, board=None, readonly=False, **kwargs):
+        if readonly:
+            readonly_connect_calls.append(board or "")
+            return real_connect(board=board, readonly=True)
+        write_connect_calls.append(board or "")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(
+        cli_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+
+    real_sleep = asyncio.sleep
+    sleep_calls = {"count": 0}
+
+    async def fake_sleep(delay):
+        await real_sleep(0)
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 3:
+            runner._running = False
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fake_sleep):
+        await asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=10.0)
+
+    # alias-b must not attempt to reopen the same unhealthy DB.
+    assert write_connect_calls == ["alias-a"]
+    # `_ready_nonempty` runs after `_tick_once` in the same loop; once alias-a
+    # quarantines this resolved DB path, readonly probes must skip both aliases.
+    assert readonly_connect_calls == []
+    assert "filesystem-level fault" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_ready_probe_uses_readonly_connect(kanban_home, monkeypatch):
+    """`_ready_nonempty` should use readonly DB opens for spawnability probes."""
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as cli_config
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    shared_db = kb.kanban_db_path().resolve()
+    board_rows = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+
+    real_connect = kb.connect
+    connect_calls: list[tuple[str, bool]] = []
+
+    def fake_list_boards(include_archived=False):
+        return board_rows.pop(0) if board_rows else []
+
+    def fake_connect(*, board=None, readonly=False, **kwargs):
+        connect_calls.append((board or "", bool(readonly)))
+        return real_connect(board=board, readonly=readonly)
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kb, "dispatch_once", lambda *args, **kwargs: SimpleNamespace(summary=lambda: {}))
+    monkeypatch.setattr(kb, "has_spawnable_ready", lambda _conn: False)
+    monkeypatch.setattr(kb, "has_spawnable_review", lambda _conn: False)
+    monkeypatch.setattr(
+        cli_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+
+    real_sleep = asyncio.sleep
+    sleep_calls = {"count": 0}
+
+    async def fake_sleep(delay):
+        await real_sleep(0)
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            runner._running = False
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fake_sleep):
+        await asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=10.0)
+
+    # There should be at least one readonly open from `_ready_nonempty`.
+    assert ("alias-a", True) in connect_calls
 
 
 @pytest.mark.asyncio

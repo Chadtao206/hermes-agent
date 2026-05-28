@@ -1025,6 +1025,123 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
+def test_detect_crashed_workers_no_candidates_skips_write_txn(
+    kanban_home, monkeypatch,
+):
+    """Healthy scans should not enter BEGIN IMMEDIATE just to read running rows."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="alive", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
+            (91001, f"{host}:alive", tid),
+        )
+        conn.commit()
+
+        traced_sql: list[str] = []
+        conn.set_trace_callback(traced_sql.append)
+        try:
+            crashed = kb.detect_crashed_workers(conn)
+        finally:
+            conn.set_trace_callback(None)
+
+        assert crashed == []
+        assert not any("BEGIN IMMEDIATE" in stmt.upper() for stmt in traced_sql)
+
+
+def test_detect_crashed_workers_opens_write_txn_only_when_reclaiming(
+    kanban_home, monkeypatch,
+):
+    """A dead PID should trigger exactly one reclaim write transaction."""
+    import hermes_cli.kanban_db as _kb
+
+    dead_pid = 92002
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid) != dead_pid)
+    monkeypatch.setattr(
+        _kb,
+        "_classify_worker_exit",
+        lambda _pid: ("nonzero_exit", 137),
+    )
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        alive_tid = kb.create_task(conn, title="alive", assignee="a")
+        dead_tid = kb.create_task(conn, title="dead", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
+            (92001, f"{host}:alive", alive_tid),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
+            (dead_pid, f"{host}:dead", dead_tid),
+        )
+        conn.commit()
+
+        traced_sql: list[str] = []
+        conn.set_trace_callback(traced_sql.append)
+        try:
+            crashed = kb.detect_crashed_workers(conn)
+        finally:
+            conn.set_trace_callback(None)
+
+        assert crashed == [dead_tid]
+        # One BEGIN/COMMIT pair for reclaim mutation + one for the unified
+        # failure-counter write (`_record_task_failure`).
+        assert sum("BEGIN IMMEDIATE" in stmt.upper() for stmt in traced_sql) == 2
+        assert sum("COMMIT" in stmt.upper() for stmt in traced_sql) == 2
+
+
+def test_detect_crashed_workers_recheck_cas_avoids_race_on_status_change(
+    kanban_home, monkeypatch,
+):
+    """If task state changes between scan and reclaim txn, skip reclaim safely."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="racy", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
+            (93001, f"{host}:race", tid),
+        )
+        conn.commit()
+
+        tripped = {"done": False}
+
+        def _pid_alive(_pid):
+            if not tripped["done"]:
+                tripped["done"] = True
+                conn.execute(
+                    "UPDATE tasks SET status='completed', worker_pid=NULL, claim_lock=NULL WHERE id=?",
+                    (tid,),
+                )
+                conn.commit()
+            return False
+
+        monkeypatch.setattr(_kb, "_pid_alive", _pid_alive)
+        monkeypatch.setattr(
+            _kb,
+            "_classify_worker_exit",
+            lambda _pid: ("nonzero_exit", 1),
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == []
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "completed"
+        crash_event = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='crashed'",
+            (tid,),
+        ).fetchone()
+        assert crash_event is None
+
+
 def test_detect_crashed_workers_systemic_failure_fast_block(
     kanban_home, monkeypatch,
 ):
