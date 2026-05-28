@@ -7638,6 +7638,19 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # Propagate incident-forensics flags from the dispatcher/root config into
+    # profile-scoped workers. Named worker profiles load their own config.yaml,
+    # so without explicit env propagation the root-level kanban.db_forensics_*
+    # setting traces gateway/dashboard writes but misses the worker closeout
+    # writes we most need for corruption RCA.
+    forensic_cfg = _kanban_forensics_config()
+    if forensic_cfg.get("enabled"):
+        env["HERMES_KANBAN_DB_FORENSICS"] = "1"
+        env["HERMES_KANBAN_DB_FORENSICS_QUICK_CHECK"] = (
+            "1" if forensic_cfg.get("quick_check") else "0"
+        )
+        if forensic_cfg.get("trace_dir"):
+            env["HERMES_KANBAN_DB_FORENSICS_DIR"] = str(forensic_cfg["trace_dir"])
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
