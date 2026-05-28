@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from gateway.config import Platform
+import gateway.run as gateway_run
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -151,6 +152,11 @@ def test_kanban_notifier_corrupt_db_disable_is_keyed_by_resolved_path(tmp_path, 
     monkeypatch.setattr(kb, "list_boards", fake_list_boards)
     monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
     monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (True, "test confirmed corruption"),
+    )
 
     runner = _make_runner(RecordingAdapter())
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
@@ -161,6 +167,42 @@ def test_kanban_notifier_corrupt_db_disable_is_keyed_by_resolved_path(tmp_path, 
     disabled = runner._kanban_notifier_disabled_db_paths
     assert str(shared_db.resolve()) in disabled
     assert disabled[str(shared_db.resolve())]["reason"] == "corrupt_db"
+
+
+
+def test_kanban_notifier_transient_malformed_is_not_db_path_disabled(tmp_path, monkeypatch, caplog):
+    """A connection-local malformed read should not process-disable a healthy DB."""
+    shared_db = tmp_path / "shared-healthy.db"
+    orders = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+    connect_calls = []
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (False, "confirmation probe quick_check/integrity_check ok"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert connect_calls == ["alias-a", "alias-a"]
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert "treating as transient" in caplog.text
 
 
 def test_kanban_notifier_disk_io_disable_is_keyed_by_resolved_path(tmp_path, monkeypatch, caplog):

@@ -3931,13 +3931,90 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert not any("database changed; retrying dispatch" in msg for msg in messages)
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # First tick connect (dispatch) + ready/review probes. Once the corruption
+    # confirmation probe validates the file is actually invalid, the dispatcher
+    # disables the DB path and avoids further dispatch retries in-process.
+    assert calls["connect"] == 3
+
+
+
+def test_gateway_dispatcher_transient_malformed_is_not_disabled(
+    monkeypatch, tmp_path, caplog
+):
+    """A connection-local malformed error is retried if confirmation is healthy."""
+    import asyncio
+    import logging
+    import sqlite3
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: {"slug": slug},
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+    monkeypatch.setattr(
+        gateway_run,
+        "_confirm_board_db_corruption",
+        lambda db_path: (False, "confirmation probe quick_check/integrity_check ok"),
+    )
+
+    calls = {"connect": 0, "to_thread": 0}
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 4:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("treating as transient" in msg for msg in messages)
+    assert not any("not a valid SQLite database" in msg for msg in messages)
+    assert calls["connect"] >= 4
 
 
 def test_gateway_dispatcher_disables_hot_replaced_board_until_restart(

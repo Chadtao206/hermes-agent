@@ -1785,6 +1785,38 @@ def _is_disk_io_board_db_error(exc: Exception) -> bool:
     )
 
 
+def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
+    """Return whether an isolated probe confirms durable DB corruption.
+
+    A single gateway connection can report ``database disk image is malformed``
+    while the live file is immediately healthy from a fresh connection during
+    WAL/SHM churn. Treat those one-off connection-local failures as transient
+    unless a fresh probe also sees a structural SQLite failure.
+    """
+    try:
+        path = Path(db_path).expanduser().resolve()
+    except Exception as exc:
+        return False, f"path resolution failed: {exc}"
+    try:
+        conn = sqlite3.connect(str(path), timeout=5, isolation_level=None)
+        try:
+            quick_row = conn.execute("PRAGMA quick_check").fetchone()
+            integrity_row = conn.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        return False, f"confirmation probe transient/open failure: {exc}"
+    except sqlite3.DatabaseError as exc:
+        return True, f"confirmation probe failed: {exc}"
+    except Exception as exc:
+        return False, f"confirmation probe unexpected failure: {exc}"
+    quick = quick_row[0] if quick_row else "<no row>"
+    integrity = integrity_row[0] if integrity_row else "<no row>"
+    if str(quick).lower() == "ok" and str(integrity).lower() == "ok":
+        return False, "confirmation probe quick_check/integrity_check ok"
+    return True, f"confirmation probe returned quick_check={quick!r} integrity_check={integrity!r}"
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -5225,19 +5257,32 @@ class GatewayRunner:
                                     exc,
                                 )
                             elif _notifier_db_error_is_corrupt(exc):
-                                notifier_disabled_db_paths[resolved_db_path] = {
-                                    "reason": "corrupt_db",
-                                    "board": slug,
-                                    "error": str(exc),
-                                }
-                                logger.error(
-                                    "kanban notifier: board %s database %s is corrupt/unhealthy; "
-                                    "disabling notifier reads/writes for this DB until gateway restart "
-                                    "after quiesced repair: %s",
-                                    slug,
-                                    resolved_db_path,
-                                    exc,
-                                )
+                                confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
+                                if confirmed:
+                                    notifier_disabled_db_paths[resolved_db_path] = {
+                                        "reason": "corrupt_db",
+                                        "board": slug,
+                                        "error": str(exc),
+                                        "confirmation": confirmation,
+                                    }
+                                    logger.error(
+                                        "kanban notifier: board %s database %s is corrupt/unhealthy; "
+                                        "disabling notifier reads/writes for this DB until gateway restart "
+                                        "after quiesced repair: %s (confirmation: %s)",
+                                        slug,
+                                        resolved_db_path,
+                                        exc,
+                                        confirmation,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "kanban notifier: board %s database %s reported corruption/open failure "
+                                        "but confirmation did not find durable corruption (%s); treating as transient: %s",
+                                        slug,
+                                        resolved_db_path,
+                                        confirmation,
+                                        exc,
+                                    )
                             else:
                                 logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
@@ -5372,22 +5417,36 @@ class GatewayRunner:
                                             )
                                             break
                                         if _notifier_db_error_is_corrupt(exc):
-                                            notifier_disabled_db_paths[resolved_db_path] = {
-                                                "reason": "profile_event_corruption",
-                                                "board": slug,
-                                                "task_id": psub.get("task_id"),
-                                                "profile": psub.get("profile"),
-                                                "error": str(exc),
-                                            }
-                                            logger.error(
-                                                "kanban notifier: profile-event claim detected corrupt/unhealthy DB "
-                                                "for board %s path %s; disabling notifier for this DB until "
-                                                "gateway restart after quiesced repair: %s",
+                                            confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
+                                            if confirmed:
+                                                notifier_disabled_db_paths[resolved_db_path] = {
+                                                    "reason": "profile_event_corruption",
+                                                    "board": slug,
+                                                    "task_id": psub.get("task_id"),
+                                                    "profile": psub.get("profile"),
+                                                    "error": str(exc),
+                                                    "confirmation": confirmation,
+                                                }
+                                                logger.error(
+                                                    "kanban notifier: profile-event claim detected corrupt/unhealthy DB "
+                                                    "for board %s path %s; disabling notifier for this DB until "
+                                                    "gateway restart after quiesced repair: %s (confirmation: %s)",
+                                                    slug,
+                                                    resolved_db_path,
+                                                    exc,
+                                                    confirmation,
+                                                )
+                                                break
+                                            logger.warning(
+                                                "kanban notifier: profile-event claim for board %s path %s "
+                                                "reported corruption/open failure but confirmation did not find "
+                                                "durable corruption (%s); treating as transient: %s",
                                                 slug,
                                                 resolved_db_path,
+                                                confirmation,
                                                 exc,
                                             )
-                                            break
+                                            continue
                                         logger.warning(
                                             "kanban notifier: profile-event claim "
                                             "failed for %s/%s on board %s: %s",
@@ -5440,19 +5499,32 @@ class GatewayRunner:
                                     exc,
                                 )
                             elif _notifier_db_error_is_corrupt(exc):
-                                notifier_disabled_db_paths[resolved_db_path] = {
-                                    "reason": "corrupt_db",
-                                    "board": slug,
-                                    "error": str(exc),
-                                }
-                                logger.error(
-                                    "kanban notifier: board %s database %s is corrupt/unhealthy during read; "
-                                    "disabling notifier reads/writes for this DB until gateway restart "
-                                    "after quiesced repair: %s",
-                                    slug,
-                                    resolved_db_path,
-                                    exc,
-                                )
+                                confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
+                                if confirmed:
+                                    notifier_disabled_db_paths[resolved_db_path] = {
+                                        "reason": "corrupt_db",
+                                        "board": slug,
+                                        "error": str(exc),
+                                        "confirmation": confirmation,
+                                    }
+                                    logger.error(
+                                        "kanban notifier: board %s database %s is corrupt/unhealthy during read; "
+                                        "disabling notifier reads/writes for this DB until gateway restart "
+                                        "after quiesced repair: %s (confirmation: %s)",
+                                        slug,
+                                        resolved_db_path,
+                                        exc,
+                                        confirmation,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "kanban notifier: board %s database %s read reported corruption/open failure "
+                                        "but confirmation did not find durable corruption (%s); treating as transient: %s",
+                                        slug,
+                                        resolved_db_path,
+                                        confirmation,
+                                        exc,
+                                    )
                             else:
                                 logger.warning(
                                     "kanban notifier: board %s tick failed: %s",
@@ -6529,19 +6601,33 @@ class GatewayRunner:
                     )
                     return None
                 if _is_corrupt_board_db_error(exc):
-                    disabled_db_paths[fingerprint[0]] = {
-                        "reason": "corrupt_db",
-                        "slug": slug,
-                        "current_fingerprint": fingerprint,
-                    }
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; disabling dispatch for this board "
-                        "until the gateway restarts. Restore or repair the board "
-                        "through a quiesced path (`hermes kanban doctor --json` then "
-                        "`hermes kanban repair-db ... --install`) before restart.",
+                    confirmed, confirmation = _confirm_board_db_corruption(fingerprint[0])
+                    if confirmed:
+                        disabled_db_paths[fingerprint[0]] = {
+                            "reason": "corrupt_db",
+                            "slug": slug,
+                            "current_fingerprint": fingerprint,
+                            "confirmation": confirmation,
+                        }
+                        logger.error(
+                            "kanban dispatcher: board %s database %s is not a valid "
+                            "SQLite database; disabling dispatch for this board "
+                            "until the gateway restarts. Restore or repair the board "
+                            "through a quiesced path (`hermes kanban doctor --json` then "
+                            "`hermes kanban repair-db ... --install`) before restart. "
+                            "Confirmation: %s",
+                            slug,
+                            fingerprint[0],
+                            confirmation,
+                        )
+                        return None
+                    logger.warning(
+                        "kanban dispatcher: board %s database %s reported corruption/open failure "
+                        "but confirmation did not find durable corruption (%s); treating as transient: %s",
                         slug,
                         fingerprint[0],
+                        confirmation,
+                        exc,
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
