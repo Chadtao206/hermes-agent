@@ -305,6 +305,36 @@ def test_mentioned_message_always_processed():
     assert _would_process(adapter, mentioned=True, text="what's up") is True
 
 
+def test_receipt_reaction_added_for_free_response_message(monkeypatch):
+    monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_channels=[CHANNEL_ID],
+    )
+    event = {"channel": CHANNEL_ID, "user": "U_USER", "ts": "123.456"}
+
+    # Once routing accepts a free-response-channel message for processing, it
+    # should get the visible 👀 receipt just like DMs and @mentions.
+    assert _would_process(adapter, channel_id=CHANNEL_ID, text="hello") is True
+    assert adapter._should_add_receipt_reaction(event) is True
+
+
+def test_receipt_reaction_respects_slack_reactions_toggle(monkeypatch):
+    monkeypatch.setenv("SLACK_REACTIONS", "false")
+    adapter = _make_adapter(require_mention=False)
+    event = {"channel": CHANNEL_ID, "user": "U_USER", "ts": "123.456"}
+
+    assert adapter._should_add_receipt_reaction(event) is False
+
+
+def test_receipt_reaction_skips_bot_messages(monkeypatch):
+    monkeypatch.delenv("SLACK_REACTIONS", raising=False)
+    adapter = _make_adapter(require_mention=False)
+
+    assert adapter._should_add_receipt_reaction({"bot_id": "B123", "ts": "123"}) is False
+    assert adapter._should_add_receipt_reaction({"subtype": "bot_message", "ts": "124"}) is False
+
+
 def test_thread_reply_with_active_session_processed():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
