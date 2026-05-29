@@ -128,6 +128,7 @@ export const uk: Translations = {
 
   sessions: {
     title: "Сесії",
+    history: "Історія",
     overview: "Огляд",
     searchPlaceholder: "Пошук у вмісті повідомлень...",
     noSessions: "Поки немає сесій",
@@ -423,7 +424,7 @@ export const uk: Translations = {
   },
 
   language: {
-    switchTo: "Перемкнути на англійську",
+    switchTo: "Змінити мову",
   },
 
   theme: {

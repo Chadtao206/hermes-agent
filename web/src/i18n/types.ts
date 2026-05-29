@@ -146,6 +146,7 @@ export interface Translations {
   // ── Sessions page ──
   sessions: {
     title: string;
+    history: string;
     overview: string;
     searchPlaceholder: string;
     noSessions: string;
