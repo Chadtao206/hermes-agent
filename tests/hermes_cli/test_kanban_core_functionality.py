@@ -4018,6 +4018,263 @@ def test_gateway_dispatcher_transient_malformed_is_not_disabled(
     assert calls["connect"] >= 4
 
 
+def test_gateway_dispatcher_live_readonly_malformed_snapshot_ok_never_hard_disables(
+    monkeypatch, tmp_path, caplog
+):
+    """Dispatcher should not disable when immutable snapshot contradicts live churn."""
+    import asyncio
+    import logging
+    import sqlite3
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: {"slug": slug},
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _LiveProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    class _BackupSourceConn:
+        def backup(self, dst):
+            return None
+
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    class _SnapshotProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                return _Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    calls = {"connect": 0, "to_thread": 0}
+    probe_connects = []
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    def _probe_connect(database, *args, **kwargs):
+        probe_connects.append(str(database))
+        if "immutable=1" in str(database):
+            return _SnapshotProbeConn()
+        live_ro_calls = [
+            uri for uri in probe_connects
+            if "mode=ro" in uri and "immutable=1" not in uri
+        ]
+        if "mode=ro" in str(database) and len(live_ro_calls) % (gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS + 1) != 0:
+            return _LiveProbeConn()
+        if "mode=ro" in str(database):
+            return _BackupSourceConn()
+        return _BackupDestConn()
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 4:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", _probe_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("sqlite backup snapshot quick_check ok" in msg for msg in messages)
+    assert any("treating as transient" in msg for msg in messages)
+    assert not any("not a valid SQLite database" in msg for msg in messages)
+    assert calls["connect"] >= 4
+
+
+def test_gateway_dispatcher_live_readonly_malformed_snapshot_backup_transient_then_ok(
+    monkeypatch, tmp_path, caplog
+):
+    """Dispatcher should not disable when snapshot backup transiently fails then recovers."""
+    import asyncio
+    import logging
+    import sqlite3
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    board_db = tmp_path / "kanban.db"
+    _kb.init_db(db_path=board_db)
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "read_board_metadata",
+        lambda slug: {"slug": slug},
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _LiveProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    class _BackupSourceConn:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        def backup(self, dst):
+            if self._attempt == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return None
+
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    class _SnapshotProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                return _Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    calls = {"connect": 0, "to_thread": 0}
+    probe_state = {"ro_in_cycle": 0}
+
+    def _connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    def _probe_connect(database, *args, **kwargs):
+        uri = str(database)
+        if "immutable=1" in uri:
+            probe_state["ro_in_cycle"] = 0
+            return _SnapshotProbeConn()
+        if "mode=ro" in uri:
+            probe_state["ro_in_cycle"] += 1
+            if probe_state["ro_in_cycle"] <= gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+                return _LiveProbeConn()
+            snapshot_attempt = (
+                probe_state["ro_in_cycle"]
+                - gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS
+            )
+            return _BackupSourceConn(snapshot_attempt)
+        return _BackupDestConn()
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 4:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", _probe_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(
+                runner._kanban_dispatcher_watcher(),
+                timeout=3.0,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("sqlite backup snapshot quick_check ok on attempt 2" in msg for msg in messages)
+    assert any("treating as transient" in msg for msg in messages)
+    assert not any("not a valid SQLite database" in msg for msg in messages)
+    assert calls["connect"] >= 4
+
+
 def test_gateway_dispatcher_confirmation_streak_resets_when_probe_turns_healthy(
     monkeypatch, tmp_path, caplog
 ):

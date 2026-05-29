@@ -257,9 +257,11 @@ def test_confirm_board_db_corruption_retries_transient_database_error(monkeypatc
 
 
 def test_confirm_board_db_corruption_confirms_after_repeated_database_errors(monkeypatch, tmp_path):
-    """Only repeated malformed probe failures should confirm durable corruption."""
+    """Repeated malformed live + sqlite-backup snapshot failures confirm corruption."""
+    db_path = tmp_path / "board.db"
+    db_path.write_bytes(gateway_run._SQLITE_HEADER_MAGIC + (b"\x00" * 64))
 
-    class _Conn:
+    class _LiveConn:
         def execute(self, sql):
             if "quick_check" in sql:
                 raise sqlite3.DatabaseError("database disk image is malformed")
@@ -268,16 +270,187 @@ def test_confirm_board_db_corruption_confirms_after_repeated_database_errors(mon
         def close(self):
             return None
 
-    sleep_calls = []
+    class _BackupSourceConn:
+        def backup(self, dst):
+            raise sqlite3.DatabaseError("database disk image is malformed")
 
-    monkeypatch.setattr(gateway_run.sqlite3, "connect", lambda *a, **kw: _Conn())
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    sleep_calls = []
+    connect_calls = []
+
+    def fake_connect(database, *args, **kwargs):
+        connect_calls.append(str(database))
+        live_ro_calls = [
+            uri for uri in connect_calls
+            if "mode=ro" in uri and "immutable=1" not in uri
+        ]
+        if "mode=ro" in str(database) and len(live_ro_calls) <= gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+            return _LiveConn()
+        if "mode=ro" in str(database):
+            return _BackupSourceConn()
+        return _BackupDestConn()
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_connect)
     monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
 
-    confirmed, reason = gateway_run._confirm_board_db_corruption(tmp_path / "board.db")
+    confirmed, reason = gateway_run._confirm_board_db_corruption(db_path)
 
     assert confirmed is True
     assert f"failed {gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x" in reason
+    assert "independent snapshot probe backup raised" in reason
+    expected_live_sleeps = gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS - 1
+    expected_snapshot_sleeps = gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS - 1
+    assert len(sleep_calls) == expected_live_sleeps + expected_snapshot_sleeps
+
+
+def test_confirm_board_db_corruption_snapshot_ok_overrides_live_readonly_malformed(
+    monkeypatch, tmp_path
+):
+    """Live readonly malformed bursts are transient if an immutable snapshot is ok."""
+    db_path = tmp_path / "board.db"
+    db_path.write_bytes(gateway_run._SQLITE_HEADER_MAGIC + (b"\x00" * 64))
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _LiveConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    class _BackupSourceConn:
+        def backup(self, dst):
+            return None
+
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    class _SnapshotConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                return _Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    seen_uris = []
+    sleep_calls = []
+
+    def fake_connect(database, *args, **kwargs):
+        seen_uris.append(str(database))
+        if "immutable=1" in str(database):
+            return _SnapshotConn()
+        live_ro_calls = [
+            uri for uri in seen_uris
+            if "mode=ro" in uri and "immutable=1" not in uri
+        ]
+        if "mode=ro" in str(database) and len(live_ro_calls) <= gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+            return _LiveConn()
+        if "mode=ro" in str(database):
+            return _BackupSourceConn()
+        return _BackupDestConn()
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(db_path)
+
+    assert confirmed is False
+    assert f"failed {gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x" in reason
+    assert "sqlite backup snapshot quick_check ok" in reason
+    assert sum("mode=ro" in uri and "immutable=1" not in uri for uri in seen_uris) == gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS + 1
+    assert sum("immutable=1" in uri for uri in seen_uris) == 1
     assert len(sleep_calls) == gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS - 1
+
+
+def test_confirm_board_db_corruption_snapshot_backup_transient_malformed_then_ok(
+    monkeypatch, tmp_path
+):
+    """A one-shot malformed backup probe must not confirm corruption."""
+    db_path = tmp_path / "board.db"
+    db_path.write_bytes(gateway_run._SQLITE_HEADER_MAGIC + (b"\x00" * 64))
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _LiveProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    class _BackupSourceConn:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        def backup(self, dst):
+            if self._attempt == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return None
+
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    class _SnapshotProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                return _Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    live_calls = {"count": 0}
+    snapshot_backup_attempt = {"count": 0}
+    sleep_calls = []
+
+    def fake_connect(database, *args, **kwargs):
+        uri = str(database)
+        if "immutable=1" in uri:
+            return _SnapshotProbeConn()
+        if "mode=ro" in uri:
+            if live_calls["count"] < gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+                live_calls["count"] += 1
+                return _LiveProbeConn()
+            snapshot_backup_attempt["count"] += 1
+            return _BackupSourceConn(snapshot_backup_attempt["count"])
+        return _BackupDestConn()
+
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda sec: sleep_calls.append(sec))
+
+    confirmed, reason = gateway_run._confirm_board_db_corruption(db_path)
+
+    assert confirmed is False
+    assert f"failed {gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x" in reason
+    assert "sqlite backup snapshot quick_check ok on attempt 2" in reason
+    assert snapshot_backup_attempt["count"] == 2
+    expected_sleeps = gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS
+    assert len(sleep_calls) == expected_sleeps
 
 
 def test_confirm_board_db_corruption_operational_error_is_transient(monkeypatch, tmp_path):
@@ -489,6 +662,179 @@ def test_kanban_notifier_transient_malformed_retrying_probe_preserves_db(tmp_pat
     assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
     assert getattr(runner, "_kanban_notifier_corruption_streaks", {}) == {}
     assert "treating as transient" in caplog.text
+
+
+def test_kanban_notifier_live_readonly_malformed_snapshot_ok_never_hard_disables(
+    tmp_path, monkeypatch, caplog
+):
+    """Repeated live readonly malformed probes need snapshot confirmation to disable."""
+    shared_db = tmp_path / "shared-sidecar-churn.db"
+    kb.init_db(db_path=shared_db)
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}] for _ in range(3)]
+    connect_calls = []
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _LiveProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    class _BackupSourceConn:
+        def backup(self, dst):
+            return None
+
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    class _SnapshotProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                return _Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    probe_connects = []
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    def fake_probe_connect(database, *args, **kwargs):
+        probe_connects.append(str(database))
+        if "immutable=1" in str(database):
+            return _SnapshotProbeConn()
+        live_ro_calls = [
+            uri for uri in probe_connects
+            if "mode=ro" in uri and "immutable=1" not in uri
+        ]
+        if "mode=ro" in str(database) and len(live_ro_calls) % (gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS + 1) != 0:
+            return _LiveProbeConn()
+        if "mode=ro" in str(database):
+            return _BackupSourceConn()
+        return _BackupDestConn()
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_probe_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(3):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    assert connect_calls == ["alias-a", "alias-a", "alias-a"]
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert getattr(runner, "_kanban_notifier_corruption_streaks", {}) == {}
+    assert "sqlite backup snapshot quick_check ok" in caplog.text
+    assert "is corrupt/unhealthy" not in caplog.text
+
+
+def test_kanban_notifier_live_readonly_malformed_snapshot_backup_transient_then_ok(
+    tmp_path, monkeypatch, caplog
+):
+    """Transient snapshot backup malformed should not disable notifier DB access."""
+    shared_db = tmp_path / "shared-sidecar-churn-backup-transient.db"
+    kb.init_db(db_path=shared_db)
+    orders = [[{"slug": "alias-a", "db_path": str(shared_db)}] for _ in range(3)]
+    connect_calls = []
+
+    class _Cursor:
+        def fetchone(self):
+            return ("ok",)
+
+    class _LiveProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    class _BackupSourceConn:
+        def __init__(self, attempt):
+            self._attempt = attempt
+
+        def backup(self, dst):
+            if self._attempt == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return None
+
+        def close(self):
+            return None
+
+    class _BackupDestConn:
+        def close(self):
+            return None
+
+    class _SnapshotProbeConn:
+        def execute(self, sql):
+            if "quick_check" in sql:
+                return _Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    probe_state = {"ro_in_cycle": 0}
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    def fake_probe_connect(database, *args, **kwargs):
+        uri = str(database)
+        if "immutable=1" in uri:
+            probe_state["ro_in_cycle"] = 0
+            return _SnapshotProbeConn()
+        if "mode=ro" in uri:
+            probe_state["ro_in_cycle"] += 1
+            if probe_state["ro_in_cycle"] <= gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+                return _LiveProbeConn()
+            snapshot_attempt = (
+                probe_state["ro_in_cycle"]
+                - gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS
+            )
+            return _BackupSourceConn(snapshot_attempt)
+        return _BackupDestConn()
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(gateway_run.sqlite3, "connect", fake_probe_connect)
+    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
+
+    runner = _make_runner(RecordingAdapter())
+    for _ in range(3):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+
+    assert connect_calls == ["alias-a", "alias-a", "alias-a"]
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert getattr(runner, "_kanban_notifier_corruption_streaks", {}) == {}
+    assert "sqlite backup snapshot quick_check ok on attempt 2" in caplog.text
+    assert "is corrupt/unhealthy" not in caplog.text
 
 
 def test_kanban_notifier_confirmation_streak_resets_when_probe_turns_healthy(

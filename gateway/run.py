@@ -1830,7 +1830,8 @@ def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
     A single gateway connection can report ``database disk image is malformed``
     while the live file is immediately healthy from a fresh connection during
     WAL/SHM churn. Treat those one-off connection-local failures as transient
-    unless repeated fresh probes also see a structural SQLite failure.
+    unless repeated fresh probes plus an independent at-rest snapshot probe also
+    see a structural SQLite failure.
     """
     try:
         path = Path(db_path).expanduser().resolve()
@@ -1840,6 +1841,115 @@ def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
     header_ok = _board_db_header_looks_like_sqlite(path)
     if header_ok is False:
         return True, "confirmation probe failed: SQLite header mismatch"
+
+    def _confirm_snapshot_corruption() -> tuple[bool | None, str]:
+        """Validate a SQLite-consistent snapshot, independent of live sidecars.
+
+        The live ``mode=ro`` probe can still observe transient WAL/SHM/open
+        churn. Use SQLite's backup API to acquire a transactionally consistent
+        copy instead of raw-copying the main DB file; raw copies can be torn in
+        WAL mode and would reintroduce the false-corruption class this verifier
+        is meant to rule out. Return True only when the backup path or copied
+        snapshot independently sees a durable SQLite corruption signal, False
+        when the copied snapshot is healthy, and None when snapshot acquisition
+        is unavailable or inconclusive.
+        """
+        backup_durable_failures = 0
+        last_inconclusive_reason = "snapshot probe unavailable"
+        last_backup_durable_reason = ""
+
+        for attempt in range(1, _KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS + 1):
+            source_conn = None
+            snapshot_conn = None
+            conn = None
+            phase = "source open"
+            quick_row = None
+            try:
+                with tempfile.TemporaryDirectory(prefix="hermes-kanban-db-probe-") as tmpdir:
+                    snapshot_path = Path(tmpdir) / path.name
+                    source_uri = f"{path.as_uri()}?mode=ro"
+                    source_conn = sqlite3.connect(
+                        source_uri,
+                        timeout=5,
+                        isolation_level=None,
+                        uri=True,
+                    )
+                    phase = "snapshot open"
+                    snapshot_conn = sqlite3.connect(
+                        str(snapshot_path),
+                        timeout=5,
+                        isolation_level=None,
+                    )
+                    phase = "backup"
+                    source_conn.backup(snapshot_conn)
+                    snapshot_conn.close()
+                    snapshot_conn = None
+                    source_conn.close()
+                    source_conn = None
+
+                    phase = "snapshot quick_check"
+                    snapshot_uri = f"{snapshot_path.as_uri()}?mode=ro&immutable=1"
+                    conn = sqlite3.connect(
+                        snapshot_uri,
+                        timeout=5,
+                        isolation_level=None,
+                        uri=True,
+                    )
+                    try:
+                        quick_row = conn.execute("PRAGMA quick_check").fetchone()
+                    finally:
+                        conn.close()
+                        conn = None
+            except sqlite3.OperationalError as exc:
+                last_inconclusive_reason = (
+                    f"snapshot probe {phase} transient/open failure on attempt {attempt}: {exc}"
+                )
+            except sqlite3.DatabaseError as exc:
+                if phase == "snapshot quick_check" and _is_durable_corruption_database_error(exc):
+                    return True, f"snapshot probe {phase} raised {exc}"
+
+                if phase == "backup" and _is_durable_corruption_database_error(exc):
+                    backup_durable_failures += 1
+                    last_backup_durable_reason = (
+                        f"snapshot probe {phase} raised {exc} on attempt {attempt}"
+                    )
+                    last_inconclusive_reason = last_backup_durable_reason
+                else:
+                    errname = getattr(exc, "sqlite_errorname", None)
+                    return None, (
+                        f"snapshot probe {phase} DatabaseError on attempt {attempt}: {exc} "
+                        f"(errname={errname})"
+                    )
+            except Exception as exc:
+                return None, f"snapshot probe {phase} unavailable on attempt {attempt}: {exc}"
+            finally:
+                for maybe_conn in (conn, snapshot_conn, source_conn):
+                    if maybe_conn is not None:
+                        try:
+                            maybe_conn.close()
+                        except Exception:
+                            pass
+
+            if quick_row is not None:
+                quick = quick_row[0] if quick_row else "<no row>"
+                if str(quick).lower() == "ok":
+                    return (
+                        False,
+                        f"sqlite backup snapshot quick_check ok on attempt {attempt}",
+                    )
+                return True, f"sqlite backup snapshot quick_check={quick!r}"
+
+            if attempt < _KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+                time.sleep(_KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC)
+
+        if backup_durable_failures == _KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
+            return (
+                True,
+                "snapshot probe backup raised durable DatabaseError across all "
+                f"{_KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS} attempts; last: "
+                f"{last_backup_durable_reason}",
+            )
+        return None, last_inconclusive_reason
 
     db_uri = f"{path.as_uri()}?mode=ro"
     last_failure = "no probe attempts"
@@ -1881,10 +1991,17 @@ def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
         if attempt < _KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
             time.sleep(_KANBAN_DB_CORRUPTION_PROBE_BACKOFF_SEC)
 
-    return (
-        True,
+    live_reason = (
         "confirmation probe failed "
-        f"{_KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x; last: {last_failure}",
+        f"{_KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS}x; last: {last_failure}"
+    )
+    snapshot_confirmed, snapshot_reason = _confirm_snapshot_corruption()
+    if snapshot_confirmed is True:
+        return True, f"{live_reason}; independent {snapshot_reason}"
+    return (
+        False,
+        f"{live_reason}; independent snapshot did not confirm durable corruption: "
+        f"{snapshot_reason}",
     )
 
 
