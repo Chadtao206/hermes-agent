@@ -7018,7 +7018,57 @@ class GatewayRunner:
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
-            except Exception:
+            except Exception as exc:
+                if _is_corrupt_board_db_error(exc):
+                    confirmed, confirmation = _confirm_board_db_corruption(fingerprint[0])
+                    if confirmed:
+                        if fingerprint[0] in tick_recorded_db_paths:
+                            return None
+                        streak = corruption_confirm_streaks.get(fingerprint[0], 0) + 1
+                        corruption_confirm_streaks[fingerprint[0]] = streak
+                        tick_recorded_db_paths.add(fingerprint[0])
+                        if streak < _KANBAN_DB_CORRUPTION_CONFIRM_STREAK:
+                            logger.warning(
+                                "kanban dispatcher: board %s database %s confirmation %d/%d "
+                                "signaled corruption (%s); deferring hard-disable this tick: %s",
+                                slug,
+                                fingerprint[0],
+                                streak,
+                                _KANBAN_DB_CORRUPTION_CONFIRM_STREAK,
+                                confirmation,
+                                exc,
+                            )
+                            return None
+                        disabled_db_paths[fingerprint[0]] = {
+                            "reason": "corrupt_db",
+                            "slug": slug,
+                            "current_fingerprint": fingerprint,
+                            "confirmation": confirmation,
+                            "streak": streak,
+                        }
+                        corruption_confirm_streaks.pop(fingerprint[0], None)
+                        logger.error(
+                            "kanban dispatcher: board %s database %s is not a valid "
+                            "SQLite database; disabling dispatch for this board "
+                            "until the gateway restarts. Restore or repair the board "
+                            "through a quiesced path (`hermes kanban doctor --json` then "
+                            "`hermes kanban repair-db ... --install`) before restart. "
+                            "Confirmation: %s",
+                            slug,
+                            fingerprint[0],
+                            confirmation,
+                        )
+                        return None
+                    corruption_confirm_streaks.pop(fingerprint[0], None)
+                    logger.warning(
+                        "kanban dispatcher: board %s database %s reported corruption/open failure "
+                        "but confirmation did not find durable corruption (%s); treating as transient: %s",
+                        slug,
+                        fingerprint[0],
+                        confirmation,
+                        exc,
+                    )
+                    return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             finally:

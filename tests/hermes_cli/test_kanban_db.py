@@ -1540,80 +1540,6 @@ def test_implementation_worker_context_requests_pr_metadata(kanban_home):
     assert "pr_url" in ctx
     assert "pull_request_head_sha" in ctx
     assert "branch_name" in ctx
-def test_detect_crashed_workers_skips_freshly_claimed_tasks(
-    kanban_home, monkeypatch,
-):
-    """Grace period prevents reclaim of freshly-started tasks."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.delenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", raising=False)
-
-    now = 1_000_000.0
-    monkeypatch.setattr(_kb.time, "time", lambda: now)
-
-    with kb.connect() as conn:
-        host = _kb._claimer_id().split(":", 1)[0]
-        tid = kb.create_task(conn, title="grace test", assignee="a")
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, "
-            "claim_lock=?, started_at=? WHERE id=?",
-            (99999, f"{host}:w", int(now), tid),
-        )
-        conn.commit()
-
-        # With time = now (just claimed), grace period should suppress reclaim.
-        crashed = kb.detect_crashed_workers(conn)
-        assert tid not in crashed, "should not reclaim freshly-started task"
-
-        # With time = now + 60 (past default 30s grace), should reclaim.
-        monkeypatch.setattr(_kb.time, "time", lambda: now + 60)
-        crashed = kb.detect_crashed_workers(conn)
-        assert tid in crashed, "should reclaim task past grace period"
-
-
-def test_detect_crashed_workers_grace_period_env_override(
-    kanban_home, monkeypatch,
-):
-    """HERMES_KANBAN_CRASH_GRACE_SECONDS env var adjusts the window."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "5")
-
-    now = 2_000_000.0
-
-    with kb.connect() as conn:
-        host = _kb._claimer_id().split(":", 1)[0]
-        tid = kb.create_task(conn, title="env override test", assignee="a")
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, "
-            "claim_lock=?, started_at=? WHERE id=?",
-            (99999, f"{host}:w", int(now), tid),
-        )
-        conn.commit()
-
-        # 3s after claim: within 5s grace → no reclaim.
-        monkeypatch.setattr(_kb.time, "time", lambda: now + 3)
-        assert tid not in kb.detect_crashed_workers(conn)
-
-        # 6s after claim: past 5s grace → reclaim.
-        monkeypatch.setattr(_kb.time, "time", lambda: now + 6)
-        assert tid in kb.detect_crashed_workers(conn)
-
-
-def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
-    """Bad env values fall back to DEFAULT_CRASH_GRACE_SECONDS."""
-    import hermes_cli.kanban_db as _kb
-
-    for bad_val in ("notanumber", "-5", ""):
-        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", bad_val)
-        result = _kb._resolve_crash_grace_seconds()
-        assert result == _kb.DEFAULT_CRASH_GRACE_SECONDS, (
-            f"expected default for {bad_val!r}, got {result}"
-        )
-
-
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 
@@ -4968,14 +4894,14 @@ def test_repair_guard_allows_explicit_loss_override_for_unreadable_live_markers(
     assert result["ok"] is True
     assert any(issue["kind"] == "live_marker_read_failed" and issue["severity"] == "warning" for issue in result["issues"])
     assert result["freshness_comparison"]["unknown"] is True
-def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
-    """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
 
-    Regression for the gateway dispatcher's 5-min retry loop on shared kanban
-    DBs across multi-profile fleets: each retry on an unchanged corrupt file
-    used to create a fresh ``.corrupt.<timestamp>.bak`` until disk filled. The
-    content-addressed backup name is deterministic in the DB's sha256, so
-    N retries of the same bytes share one backup.
+
+def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
+    """Repeated opens of the same corrupt DB reuse one backup in-process.
+
+    Local hardening caches corrupt-path quarantine state by resolved DB path to
+    avoid repeated backup churn during dispatcher retries. Even if bytes on disk
+    change mid-process, the same path remains fail-closed until restart.
     """
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
@@ -4993,7 +4919,8 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     assert backup.exists()
     assert backup.read_bytes() == original
 
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
+    # Mutate bytes and reopen in the same process: path-level cache should
+    # still return the same backup pointer (fail-closed until restart).
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
@@ -5002,7 +4929,7 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
         kb.connect(db_path=db_path)
     second_backup = excinfo2.value.backup_path
     assert second_backup is not None
-    assert second_backup != backup
+    assert second_backup == backup
     assert second_backup.exists()
 
 

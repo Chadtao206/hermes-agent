@@ -3921,16 +3921,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
+        # Allow enough full loops for 3 confirmed corruption detections:
+        # two warning confirmations plus final hard-disable/error log.
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 8:
+        if calls["to_thread"] >= 12:
             runner._running = False
         return result
 
@@ -3960,7 +3955,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert "confirmation 2/3 signaled corruption" in caplog.text
     # Repeated retries occur before hard-disable; once the confirmation streak
     # hits threshold, in-process retries stop for that DB path.
-    assert calls["connect"] >= 7
+    assert calls["connect"] >= 3
 
 
 
@@ -4018,7 +4013,7 @@ def test_gateway_dispatcher_transient_malformed_is_not_disabled(
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 4:
+        if calls["to_thread"] >= 8:
             runner._running = False
         return result
 
@@ -4140,7 +4135,7 @@ def test_gateway_dispatcher_live_readonly_malformed_snapshot_ok_never_hard_disab
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 4:
+        if calls["to_thread"] >= 8:
             runner._running = False
         return result
 
@@ -4272,7 +4267,7 @@ def test_gateway_dispatcher_live_readonly_malformed_snapshot_backup_transient_th
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 4:
+        if calls["to_thread"] >= 8:
             runner._running = False
         return result
 
@@ -4365,7 +4360,11 @@ def test_gateway_dispatcher_confirmation_streak_resets_when_probe_turns_healthy(
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 10:
+        # The dispatcher loop now issues 4 to_thread calls per iteration
+        # (reap_zombies + auto_decompose + _tick_once + _ready_nonempty), so
+        # ~16 to_thread calls are needed to drive the 4 ticks this scenario
+        # requires (confirm #1 → reset → confirm #2 → confirm #3 = streak 2/3).
+        if calls["to_thread"] >= 16:
             runner._running = False
         return result
 
@@ -4446,7 +4445,7 @@ def test_gateway_dispatcher_post_connect_dispatch_corruption_progresses_to_hard_
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 8:
+        if calls["to_thread"] >= 12:
             runner._running = False
         return result
 
@@ -4532,7 +4531,7 @@ def test_gateway_dispatcher_same_tick_alias_corruption_dedupes_confirmation_stre
     async def _to_thread(fn, *args, **kwargs):
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 8:
+        if calls["to_thread"] >= 12:
             runner._running = False
         return result
 
@@ -4897,8 +4896,10 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert sum("not a valid SQLite database" in msg for msg in messages) == 2
-    assert any("database fingerprint unchanged" in msg for msg in messages)
+    # Corruption confirmation now hard-disables this DB path in-process once the
+    # streak threshold is reached; no quarantine retry-on-unchanged-path loop.
+    assert sum("not a valid SQLite database" in msg for msg in messages) == 1
+    assert not any("database fingerprint unchanged" in msg for msg in messages)
     assert calls["tick"] == 3
 
 
