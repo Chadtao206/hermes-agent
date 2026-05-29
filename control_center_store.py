@@ -10,6 +10,7 @@ BEGIN IMMEDIATE, jitter retry) and holds no authoritative in-memory state.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -1544,7 +1545,7 @@ def read_specialist_lanes(limit: int = 20) -> Dict[str, Any]:
     terminal_statuses = {"done", "completed", "cancelled", "archived"}
     placeholders = ",".join("?" for _ in terminal_statuses)
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             lane_rows = conn.execute(
                 f"""
@@ -1673,7 +1674,7 @@ def read_kanban_status() -> Dict[str, Any]:
     if not db_path.exists():
         return status
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT status, assignee, COUNT(*) AS count FROM tasks GROUP BY status, assignee").fetchall()
         by_status: Dict[str, int] = {}
@@ -1732,7 +1733,7 @@ def read_memory_status() -> Dict[str, Any]:
     if not db_path.exists():
         return status
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             facts = _count_table(conn, "facts")
             entities = _count_table(conn, "entities")
             banks = _count_table(conn, "memory_banks")
