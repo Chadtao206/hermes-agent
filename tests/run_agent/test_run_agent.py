@@ -3600,6 +3600,118 @@ class TestRunConversation:
         assert "truncated due to output length limit" in result["error"]
         mock_handle_function_call.assert_not_called()
 
+    def test_kanban_block_called_on_normal_text_response_without_closeout(self, agent, monkeypatch):
+        """Regression: normal prose exits in kanban mode must inline-closeout.
+
+        The loop should call kanban_block before returning and mark turn_exit_reason
+        accordingly so CLI fallback is only a defensive backup.
+        """
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_456")
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done. I forgot the terminal kanban tool.",
+            finish_reason="stop",
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["turn_exit_reason"] == "text_response_kanban_autoblocked"
+
+        kanban_block_calls = [
+            c for c in mock_hfc.call_args_list
+            if c[0][0] == "kanban_block"
+        ]
+        assert len(kanban_block_calls) == 1
+        call = kanban_block_calls[0]
+        assert call[0][1]["task_id"] == "t_test_task_456"
+        assert "Protocol violation" in call[0][1]["reason"]
+
+    def test_kanban_autoblock_exit_reason_not_set_when_block_call_rejected(self, agent, monkeypatch):
+        """If inline kanban_block does not return ok=true, don't claim autoblock."""
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_789")
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done. But task already closed elsewhere.",
+            finish_reason="stop",
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"error": "already terminal"}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+        kanban_block_calls = [
+            c for c in mock_hfc.call_args_list
+            if c[0][0] == "kanban_block"
+        ]
+        assert len(kanban_block_calls) == 1
+
+    def test_successful_kanban_block_then_final_text_does_not_autoblock(self, agent, monkeypatch):
+        """Trailing prose after successful kanban_block must not duplicate closeout."""
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_801")
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"kanban_block"}
+
+        tc = _mock_tool_call(
+            name="kanban_block",
+            arguments=json.dumps({"reason": "blocked with evidence"}),
+            call_id="kb1",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="I already blocked it.", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+        assert [c[0][0] for c in mock_hfc.call_args_list] == ["kanban_block"]
+
+    def test_successful_kanban_complete_then_final_text_does_not_autoblock(self, agent, monkeypatch):
+        """Trailing prose after successful kanban_complete must not call block."""
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_802")
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"kanban_complete"}
+
+        tc = _mock_tool_call(
+            name="kanban_complete",
+            arguments=json.dumps({"summary": "completed with evidence"}),
+            call_id="kc1",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="I already completed it.", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+        assert [c[0][0] for c in mock_hfc.call_args_list] == ["kanban_complete"]
+
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must call kanban_block when iteration
         budget is exhausted, otherwise the dispatcher sees a protocol
@@ -3623,7 +3735,7 @@ class TestRunConversation:
         ]
 
         with (
-            patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -3667,7 +3779,7 @@ class TestRunConversation:
         ]
 
         with (
-            patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),

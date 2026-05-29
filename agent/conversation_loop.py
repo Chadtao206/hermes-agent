@@ -127,6 +127,123 @@ def _ra():
     return run_agent
 
 
+def _auto_block_kanban_worker_if_unclosed(
+    *,
+    reason: str,
+    effective_task_id: Optional[str],
+    exit_label: str,
+) -> bool:
+    """Issue an inline ``kanban_block`` when a worker exits without closeout.
+
+    This keeps closeout enforcement inside the runtime loop so all entrypoints
+    (CLI, gateway, run_agent, batch, ACP) block deterministically before
+    process exit when a dispatched worker returns prose without a terminal
+    kanban action.
+    """
+    kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not kanban_task:
+        return False
+
+    try:
+        tool_result = _ra().handle_function_call(
+            "kanban_block",
+            {
+                "task_id": kanban_task,
+                "reason": reason,
+            },
+            task_id=effective_task_id,
+        )
+        parsed_result: Optional[dict[str, Any]] = None
+        if isinstance(tool_result, str):
+            try:
+                maybe = json.loads(tool_result)
+                if isinstance(maybe, dict):
+                    parsed_result = maybe
+            except Exception:
+                parsed_result = None
+        if parsed_result and parsed_result.get("ok") is True:
+            logger.info(
+                "kanban_block called for task %s on turn exit (%s)",
+                kanban_task,
+                exit_label,
+            )
+            return True
+
+        logger.info(
+            "kanban_block did not close task %s on turn exit (%s): %s",
+            kanban_task,
+            exit_label,
+            parsed_result if parsed_result is not None else tool_result,
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "Failed to call kanban_block for task %s on turn exit (%s)",
+            kanban_task,
+            exit_label,
+            exc_info=True,
+        )
+        return False
+
+
+_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+
+
+def _tool_content_as_text(content: Any) -> str:
+    """Return a text view of an OpenAI-style tool-result content payload."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _tool_result_json_object(content: Any) -> Optional[dict[str, Any]]:
+    text = _tool_content_as_text(content).strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _turn_has_successful_terminal_kanban_closeout(
+    messages: list[dict[str, Any]],
+    *,
+    current_turn_user_idx: int,
+) -> bool:
+    """Return True when this turn already ran terminal Kanban closeout.
+
+    The inline closeout repair is for workers that return final prose without
+    terminal Kanban action. If the same turn already executed a successful
+    ``kanban_complete`` or ``kanban_block`` and the model then emits trailing
+    prose, a second synthetic ``kanban_block`` is not a repair: it is a
+    duplicate/spurious closeout attempt. Scope the scan to messages after the
+    current user turn so resumed history cannot suppress a needed closeout in
+    the active turn.
+    """
+    for msg in messages[current_turn_user_idx + 1:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tool_name = msg.get("name") or msg.get("tool_name")
+        if tool_name not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        parsed = _tool_result_json_object(msg.get("content"))
+        if parsed and parsed.get("ok") is True:
+            return True
+    return False
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -3985,8 +4102,23 @@ def run_conversation(
                     messages.pop()
 
                 messages.append(final_msg)
-                
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+                if not _turn_has_successful_terminal_kanban_closeout(
+                    messages,
+                    current_turn_user_idx=current_turn_user_idx,
+                ):
+                    if _auto_block_kanban_worker_if_unclosed(
+                        reason=(
+                            "Protocol violation: kanban worker returned a final response "
+                            "without calling kanban_complete or kanban_block; "
+                            "conversation loop auto-blocked the task before returning."
+                        ),
+                        effective_task_id=effective_task_id,
+                        exit_label="natural_finish_without_closeout",
+                    ):
+                        _turn_exit_reason = "text_response_kanban_autoblocked"
+
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
@@ -4072,34 +4204,19 @@ def run_conversation(
         # protocol violation).  The agent loop strips tools before calling
         # _handle_max_iterations, so the model cannot call kanban_block
         # itself — we must do it on its behalf.
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
-            try:
-                _ra().handle_function_call(
-                    "kanban_block",
-                    {
-                        "task_id": _kanban_task,
-                        "reason": (
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                    },
-                    task_id=effective_task_id,
-                )
-                logger.info(
-                    "kanban_block called for task %s after iteration "
-                    "exhaustion (%d/%d)",
-                    _kanban_task, api_call_count, agent.max_iterations,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to call kanban_block after iteration "
-                    "exhaustion for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+        if not _turn_has_successful_terminal_kanban_closeout(
+            messages,
+            current_turn_user_idx=current_turn_user_idx,
+        ):
+            _auto_block_kanban_worker_if_unclosed(
+                reason=(
+                    f"Iteration budget exhausted "
+                    f"({api_call_count}/{agent.max_iterations}) — "
+                    "task could not complete within the allowed iterations"
+                ),
+                effective_task_id=effective_task_id,
+                exit_label="iteration_exhaustion",
+            )
 
     # Determine if conversation completed successfully
     completed = (
