@@ -2863,10 +2863,18 @@ def _profile_skill_summary(profile_dir: Path, fallback_total: int = 0) -> Tuple[
     return len(skills), sum(1 for skill in skills if skill.get("enabled"))
 
 
-def _profile_to_dict(info) -> Dict[str, Any]:
+def _profile_to_dict(info, *, include_active: bool = False) -> Dict[str, Any]:
     fallback_skill_count = int(_profile_attr(info, "skill_count", 0) or 0)
     profile_dir = Path(str(_profile_attr(info, "path", "") or ""))
-    skill_count, active_skill_count = _profile_skill_summary(profile_dir, fallback_skill_count)
+    if include_active:
+        skill_count, active_skill_count = _profile_skill_summary(profile_dir, fallback_skill_count)
+    else:
+        # Lazy by default: the list endpoint must not walk every profile's
+        # skills/ dir and parse every SKILL.md on a hot request just to compute
+        # the active count. ``active_skill_count`` is left None (frontend renders
+        # "?") and is computed accurately by the per-profile skills endpoint
+        # (``GET /api/profiles/{name}/skills``) when a profile is opened.
+        skill_count, active_skill_count = fallback_skill_count, None
     return {
         "name": _profile_attr(info, "name", ""),
         "path": str(profile_dir),
@@ -2879,21 +2887,26 @@ def _profile_to_dict(info) -> Dict[str, Any]:
     }
 
 
-def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
+def _fallback_profile_dicts(profiles_mod, *, include_active: bool = False) -> List[Dict[str, Any]]:
     def _safe(callable_, default):
         try:
             return callable_()
         except Exception:
             return default
 
+    def _skill_counts(profile_dir: Path) -> Tuple[int, Optional[int]]:
+        # Lazy by default to keep the list endpoint off the per-skill frontmatter
+        # parse storm; see :func:`_profile_to_dict`.
+        fallback = _safe(lambda: profiles_mod._count_skills(profile_dir), 0)
+        if include_active:
+            return _profile_skill_summary(profile_dir, fallback)
+        return fallback, None
+
     profiles: List[Dict[str, Any]] = []
     default_home = profiles_mod._get_default_hermes_home()
     if default_home.is_dir():
         model, provider = _safe(lambda: profiles_mod._read_config_model(default_home), (None, None))
-        skill_count, active_skill_count = _profile_skill_summary(
-            default_home,
-            _safe(lambda: profiles_mod._count_skills(default_home), 0),
-        )
+        skill_count, active_skill_count = _skill_counts(default_home)
         profiles.append({
             "name": "default",
             "path": str(default_home),
@@ -2911,10 +2924,7 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
             if not entry.is_dir() or not profiles_mod._PROFILE_ID_RE.match(entry.name):
                 continue
             model, provider = _safe(lambda entry=entry: profiles_mod._read_config_model(entry), (None, None))
-            skill_count, active_skill_count = _profile_skill_summary(
-                entry,
-                _safe(lambda entry=entry: profiles_mod._count_skills(entry), 0),
-            )
+            skill_count, active_skill_count = _skill_counts(entry)
             profiles.append({
                 "name": entry.name,
                 "path": str(entry),

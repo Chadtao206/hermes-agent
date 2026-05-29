@@ -634,7 +634,10 @@ class TestNewEndpoints:
         assert profiles["default"]["provider"] == "openrouter"
         assert profiles["multi-agent"]["has_env"] is True
         assert profiles["multi-agent"]["skill_count"] == 2
-        assert profiles["multi-agent"]["active_skill_count"] == 1
+        # Lazy: the list endpoint no longer parses every SKILL.md to count active
+        # skills on a hot request. The accurate active count is computed by the
+        # per-profile skills endpoint when a profile is opened.
+        assert profiles["multi-agent"]["active_skill_count"] is None
 
     def test_profiles_create_rename_delete_round_trip(self, monkeypatch):
         # Stub gateway service teardown so the test doesn't shell out to

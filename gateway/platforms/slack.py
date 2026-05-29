@@ -1327,20 +1327,6 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-    def _should_add_receipt_reaction(self, event: dict) -> bool:
-        """Return True when Slack should mark this user message as received.
-
-        This helper is called only after routing gates have accepted the
-        message for Hermes processing. At that point, every non-bot Slack
-        message should get the visible 👀 receipt so users know the gateway
-        received it, including free-response/listen-all channels.
-        """
-        if not self._reactions_enabled():
-            return False
-        if event.get("bot_id") or event.get("subtype") == "bot_message":
-            return False
-        return True
-
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
@@ -2246,11 +2232,11 @@ class SlackAdapter(BasePlatformAdapter):
             auto_skill=_auto_skill,
         )
 
-        # Add an in-progress receipt reaction to every non-bot message that
-        # reaches Hermes processing. Filtering/mention/free-response gating has
-        # already returned for ignored messages above, so this is the visible
-        # "Hermes received it" ack for Slack gateway users.
-        if self._should_add_receipt_reaction(event):
+        # Only react when bot is directly addressed (DM or @mention).
+        # In listen-all channels (require_mention=false), reacting to every
+        # casual message would be noisy.
+        _should_react = (is_dm or is_mentioned) and self._reactions_enabled()
+        if _should_react:
             self._reacting_message_ids.add(ts)
 
         await self.handle_message(msg_event)

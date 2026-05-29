@@ -1208,13 +1208,21 @@ def build_skills_system_prompt(
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):
-            index_lines.append(f"  {category}:")
+            cat_desc = category_descriptions.get(category, "")
+            if cat_desc:
+                index_lines.append(f"  {category}: {cat_desc}")
+            else:
+                index_lines.append(f"  {category}:")
+            # Deduplicate and sort skills within each category
             seen = set()
-            for name, _desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
-                index_lines.append(f"    - {name}")
+                if desc:
+                    index_lines.append(f"    - {name}: {desc}")
+                else:
+                    index_lines.append(f"    - {name}")
 
         result = (
             "## Skills (mandatory)\n"
