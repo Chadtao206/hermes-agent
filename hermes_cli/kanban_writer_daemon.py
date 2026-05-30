@@ -7,6 +7,7 @@ serialized behind one lock, and returns the JSON-able result.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import os
 import queue
 import socketserver
@@ -51,13 +52,15 @@ class WriterDaemon:
     leave a torn write and there is never more than one writer to the file.
     """
 
-    def __init__(self, *, db_path: Path, socket_path: Path):
+    def __init__(self, *, db_path: Path, socket_path: Path, pid_path: Optional[Path] = None):
         self.db_path = Path(db_path)
         self.socket_path = Path(socket_path)
+        self.pid_path = Path(pid_path) if pid_path is not None else self.socket_path.with_name(".kanban-writer.pid")
         self._queue: "queue.Queue[Optional[_WorkItem]]" = queue.Queue()
         self._writer_thread: Optional[threading.Thread] = None
         self._conn = None
         self._server: Optional[socketserver.UnixStreamServer] = None
+        self._pid_fh = None
 
     def _writer_loop(self) -> None:
         os.environ["HERMES_KANBAN_WRITER_OWNER"] = "1"
@@ -93,6 +96,42 @@ class WriterDaemon:
             return proto.Response(req_id, ok=False, error=item.error,
                                   error_type=item.error_type or "Error").to_wire()
         return proto.Response(req_id, ok=True, result=item.result).to_wire()
+
+    def acquire_singleton(self) -> bool:
+        """Take an exclusive advisory lock on the pidfile. Returns False if another
+        live process already owns this board (flock auto-releases on death, so a
+        crashed prior owner does not wedge the board)."""
+        self.pid_path.parent.mkdir(parents=True, exist_ok=True)
+        self._pid_fh = open(self.pid_path, "a+")
+        try:
+            fcntl.flock(self._pid_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._pid_fh.close()
+            self._pid_fh = None
+            return False
+        self._pid_fh.seek(0)
+        self._pid_fh.truncate()
+        self._pid_fh.write(str(os.getpid()))
+        self._pid_fh.flush()
+        return True
+
+    def release_singleton(self) -> None:
+        if self._pid_fh is not None:
+            try:
+                fcntl.flock(self._pid_fh, fcntl.LOCK_UN)
+            finally:
+                self._pid_fh.close()
+                self._pid_fh = None
+
+    def run(self) -> int:
+        """Acquire singleton then serve. No-op (return 0) if another owner exists."""
+        if not self.acquire_singleton():
+            return 0
+        try:
+            self.serve_forever()
+        finally:
+            self.release_singleton()
+        return 0
 
     def serve_forever(self) -> None:
         if self.socket_path.exists():

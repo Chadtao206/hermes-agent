@@ -76,3 +76,18 @@ def test_daemon_serves_many_sequential_clients_distinct_threads(tmp_path):
         assert conn.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == 10
     finally:
         server.shutdown()
+
+
+def test_second_daemon_refuses_when_one_owns_board(tmp_path):
+    db = tmp_path / "kanban.db"
+    sock = tmp_path / ".kanban-writer.sock"
+    pid = tmp_path / ".kanban-writer.pid"
+    s1 = wd.WriterDaemon(db_path=db, socket_path=sock, pid_path=pid)
+    assert s1.acquire_singleton() is True
+    s2 = wd.WriterDaemon(db_path=db, socket_path=sock, pid_path=pid)
+    assert s2.acquire_singleton() is False  # first owner holds the board
+    s1.release_singleton()
+    # After release, a new daemon can acquire it.
+    s3 = wd.WriterDaemon(db_path=db, socket_path=sock, pid_path=pid)
+    assert s3.acquire_singleton() is True
+    s3.release_singleton()

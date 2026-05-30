@@ -795,6 +795,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--force", action="store_true",
                           help=argparse.SUPPRESS)
 
+    # --- db-daemon ---
+    p_db_daemon = sub.add_parser(
+        "db-daemon",
+        help="Run the single-writer DB daemon for non-gateway setups (singleton per board).",
+    )
+    p_db_daemon.add_argument(
+        "--board",
+        default=None,
+        metavar="<slug>",
+        help="Board slug to serve (default: current board)",
+    )
+
     # --- watch ---
     p_watch = sub.add_parser(
         "watch",
@@ -1364,6 +1376,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "tail":     _cmd_tail,
         "dispatch": _cmd_dispatch,
         "daemon":   _cmd_daemon,
+        "db-daemon": _cmd_db_daemon,
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
         "log":      _cmd_log,
@@ -2885,6 +2898,24 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 pass
     print("(dispatcher stopped)")
     return 0
+
+
+def _cmd_db_daemon(args: argparse.Namespace) -> int:
+    """Run the single-writer DB daemon for non-gateway setups.
+
+    Acquires a per-board singleton lock (exclusive flock on a pidfile) so
+    only one db-daemon owns a board's writable connection at a time.  A
+    second invocation for the same board exits silently with code 0 rather
+    than racing or crashing.
+    """
+    from hermes_cli.kanban_writer_daemon import WriterDaemon
+    import hermes_cli.kanban_db as kb
+    board = getattr(args, "board", None)
+    daemon = WriterDaemon(
+        db_path=kb.kanban_db_path(board=board),
+        socket_path=kb.writer_socket_path(board=board),
+    )
+    return daemon.run()
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
