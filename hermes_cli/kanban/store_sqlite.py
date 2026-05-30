@@ -127,10 +127,11 @@ class SqliteKanbanStore:
     def remove_notify_sub(self, **kwargs: Any) -> bool:
         return self._write("remove_notify_sub", **kwargs)
 
-    def list_notify_subs(self):
-        return self._read(lambda c: kb.list_notify_subs(c))
+    def list_notify_subs(self, task_id: Optional[str] = None):
+        return self._read(lambda c: kb.list_notify_subs(c, task_id))
 
     def claim_unseen_events_for_sub(self, **kwargs: Any) -> tuple:
+        # read-probe + conditional cursor-advance; needs a writable conn
         return self._write("claim_unseen_events_for_sub", **kwargs)
 
 
