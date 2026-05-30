@@ -221,3 +221,48 @@ def test_stream_events_corrupt_db_fail_stops_without_generic_warning(monkeypatch
     assert ws.accepted is True
     assert ws.closed is True
     assert ws.close_code == plugin_api.http_status.WS_1011_INTERNAL_ERROR
+
+
+def test_get_board_tolerates_non_utf8_metadata(tmp_path, monkeypatch):
+    """A task_run with non-UTF-8 bytes in `metadata` (a torn-write artifact) must
+    not 500 the whole board: the read connection decodes TEXT leniently.
+
+    Regression for the dashboard 'Failed to load Kanban board: 500' that
+    persisted after the DB was structurally healthy (quick_check ok) because one
+    task_runs.metadata value held invalid UTF-8.
+    """
+    from hermes_cli import kanban_db as kb
+
+    db = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+
+    conn = kb.connect(db_path=db, readonly=False, _bootstrap=True)
+    tid = kb.create_task(conn, title="x", assignee="worker")
+    # Invalid UTF-8 tail (\x9e) in an otherwise-JSON metadata blob.
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, metadata) "
+        "VALUES (?, 'done', 0, CAST(? AS TEXT))",
+        (tid, b'{"verdict":"ok","searchO"}\x9e'),
+    )
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    for sfx in ("-wal", "-shm"):
+        db.with_name(db.name + sfx).unlink(missing_ok=True)
+
+    # Sanity: a strict-decoding read of that column raises (the original 500).
+    strict = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            strict.execute("SELECT * FROM task_runs").fetchall()
+    finally:
+        strict.close()
+
+    # The dashboard read path (snapshot conn + the diagnostics query that
+    # originally 500'd at get_board:735) must now tolerate the bad row.
+    conn = plugin_api._conn(readonly=True)
+    try:
+        diagnostics = plugin_api._compute_task_diagnostics(conn, task_ids=None)
+    finally:
+        conn.close()
+    assert isinstance(diagnostics, dict)

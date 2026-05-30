@@ -141,12 +141,28 @@ def _raise_kanban_db_unavailable(exc: BaseException, board: Optional[str]) -> No
     ) from exc
 
 
+def _lenient_text_factory(value: bytes) -> str:
+    """Decode SQLite TEXT columns tolerantly for the read-only dashboard.
+
+    A torn write (e.g. during a corruption episode) can leave a single column —
+    seen in the wild on ``task_runs.metadata`` — holding bytes that aren't valid
+    UTF-8. ``quick_check``/``integrity_check`` still pass (the b-tree is sound),
+    but the default ``str`` text factory raises ``OperationalError: Could not
+    decode to UTF-8`` the moment such a row is fetched, which surfaced as a board
+    -wide HTTP 500. The dashboard is a display surface, so decode with
+    replacement instead of letting one damaged row take down the whole board.
+    Valid UTF-8 (the overwhelming majority) round-trips identically.
+    """
+    return value.decode("utf-8", "replace")
+
+
 class _SnapshotConn:
     """Connection-like wrapper that keeps a snapshot tempdir alive until close()."""
 
     def __init__(self, cm):
         self._cm = cm
         self._conn = cm.__enter__()
+        self._conn.text_factory = _lenient_text_factory
         self._closed = False
 
     def __getattr__(self, name):
@@ -211,7 +227,9 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
             log.warning("kanban init_db failed: %s", exc)
         except Exception as exc:
             log.warning("kanban init_db failed: %s", exc)
-        return kanban_db.connect(board=board)
+        conn = kanban_db.connect(board=board)
+        conn.text_factory = _lenient_text_factory
+        return conn
     except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
         if _is_corrupt_db_error(exc):
             _raise_kanban_db_unavailable(exc, board)
