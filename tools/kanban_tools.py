@@ -364,29 +364,21 @@ def _handle_show(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        store = _store(board=board)
+        # Multi-read aggregation: one shared snapshot conn for consistency +
+        # to avoid N snapshot copies (the store opens a fresh conn per call).
+        _kb, conn = _connect(board=board)
         try:
-            task = store.get_task(tid)
+            task = _kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            comments = store.list_comments(tid)
-            events = store.list_events(tid)
-            runs = store.list_runs(tid)
-            parents = store.parent_ids(tid)
-            children = store.child_ids(tid)
-            # rollup relation_type and build_worker_context are not store
-            # methods; open a short-lived read connection for these two calls.
-            # NOTE: both `store` and this `conn` are open simultaneously here —
-            # store serves the task/relations reads, conn serves the rollup +
-            # build_worker_context reads that have no store method. Matters for
-            # connection-pool budgeting when Phase 2 ports to Postgres.
-            _kb, conn = _connect(board=board)
-            try:
-                rollup_parents = _kb.parent_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
-                rollup_children = _kb.child_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
-                worker_context = _kb.build_worker_context(conn, tid)
-            finally:
-                conn.close()
+            comments = _kb.list_comments(conn, tid)
+            events = _kb.list_events(conn, tid)
+            runs = _kb.list_runs(conn, tid)
+            parents = _kb.parent_ids(conn, tid)
+            children = _kb.child_ids(conn, tid)
+            rollup_parents = _kb.parent_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
+            rollup_children = _kb.child_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
+            worker_context = _kb.build_worker_context(conn, tid)
 
             def _task_dict(t):
                 return {
@@ -436,7 +428,7 @@ def _handle_show(args: dict, **kw) -> str:
                 "worker_context": worker_context,
             })
         finally:
-            store.close()
+            conn.close()
     except ValueError as e:
         # Invalid board slug surfaces as ValueError from _normalize_board_slug.
         return tool_error(f"kanban_show: {e}")

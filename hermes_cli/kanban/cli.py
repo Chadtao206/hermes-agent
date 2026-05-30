@@ -2035,22 +2035,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    store = _make_store()
-    try:
-        task = store.get_task(args.task_id)
+    # Multi-read aggregation: one shared snapshot conn for consistency +
+    # to avoid N snapshot copies (the store opens a fresh conn per call).
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        comments = store.list_comments(args.task_id)
-        events = store.list_events(args.task_id)
-        parents = store.parent_ids(args.task_id)
-        children = store.child_ids(args.task_id)
-        latest_summary = store.latest_summary(args.task_id)
-    finally:
-        store.close()
-    # Rollup link queries and state-keyed run listing use kwargs the store
-    # protocol does not yet expose, so we keep a raw connection just for them.
-    with kb.connect_closing() as conn:
+        comments = kb.list_comments(conn, args.task_id)
+        events = kb.list_events(conn, args.task_id)
+        parents = kb.parent_ids(conn, args.task_id)
+        children = kb.child_ids(conn, args.task_id)
+        latest_summary = kb.latest_summary(conn, args.task_id)
         rollup_parents = kb.parent_ids(
             conn, args.task_id, relation_type=kb.LINK_RELATION_ROLLUP
         )
