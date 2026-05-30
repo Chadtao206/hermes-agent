@@ -230,3 +230,13 @@ def test_bulk_update_priority_and_assignee_through_daemon(daemon_board):
     assert _col(db, t1, "priority") == 9 and _col(db, t2, "priority") == 9
     assert _col(db, t1, "assignee") == "reviewer"
     assert _col(db, t2, "assignee") == "reviewer"
+
+
+def test_dispatch_degrades_to_noop_under_single_writer(daemon_board):
+    """dispatch_once spawns workers + reclaims, so it can't run on the writer
+    thread; under single-writer the manual nudge returns an informative no-op
+    (the gateway auto-dispatches) instead of a 500."""
+    res = api.dispatch(dry_run=False, max_n=8, board=None)
+    assert res["spawned"] == []
+    assert res["reclaimed"] == 0
+    assert "note" in res and "single-writer" in res["note"]

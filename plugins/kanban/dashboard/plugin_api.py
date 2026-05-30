@@ -2441,6 +2441,19 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    # dispatch_once reclaims tasks (writes) and spawns worker subprocesses, so it
+    # can't run on the single-writer daemon thread. The gateway's embedded
+    # dispatcher already runs it (~10s cadence), so under single-writer a manual
+    # nudge degrades to an informative no-op instead of a DirectWriteForbidden 500.
+    if kanban_db.single_writer_enabled(board=board):
+        body = asdict(kanban_db.DispatchResult())
+        body["dry_run"] = dry_run
+        body["note"] = (
+            "Dispatch runs automatically in the gateway (~10s cadence) under the "
+            "single-writer daemon; manual dispatch from the dashboard is a no-op "
+            "while it is enabled."
+        )
+        return body
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
