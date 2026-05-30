@@ -243,10 +243,40 @@ Every behavioral change is flag-gated to today's behavior by default.
 Branch `feat/kanban-autonomy-hardening` carries 8 unreviewed commits on top of `0bc10f641`
 (C2, T7, T8, T9, WS4, WS5, WS6 — plus the earlier WS1/WS2/WS3 commits already noted above).
 
+## POST-REVIEW (adversarial review + remediation pass) — DONE & MERGED
+Full adversarial review run (8 themes, finding-level verification). 5 findings confirmed, 5
+refuted (4 pre-existing/out-of-scope, 1 non-issue). Fixes landed test-first in commit
+`02b118512`, stash-and-diff confirming an identical `-k kanban` failing set (zero new regressions):
+- **B1 (blocking):** `kanban_list` called `recompute_ready` (a write) on the read-only conn it
+  opens under the flag → errored on every call. Now routes the promotion through `write_session`
+  (flag-off keeps the single-conn path); `recompute_ready` added to `OP_ALLOWLIST` for the
+  orchestrator's remote route. New flag-ON `_handle_list` test.
+- **S1 (should-fix):** removed the dead `dispatcher_disabled` liveness breach + corrected the
+  docstrings — external dispatch (`hermes kanban dispatch`) is first-class, so a gateway-local
+  "dispatcher off" page would false-fire; dispatch stalls are caught by `oldest_ready_age`.
+- **N1:** writer-watchdog / liveness-checker / notifier / dispatcher tasks now tracked in
+  `_background_tasks` so `stop()` cancels them.
+- **N3:** liveness checker folds in subsystem flags before the board open + zeroed-snapshot
+  fallback, so a corrupt/missing board still pages a disabled subsystem.
+- **N2:** documented that T7 routes writes through `write_session` even flag-off (functionally
+  identical via WAL + commit-before-read; not the byte-for-byte legacy single-conn path).
+
+**Smoke-validated (flags ON, isolated `HERMES_HOME`):** 22-check component smoke (real socket /
+RemoteWriter, B1, T7 typed errors, WS6/S1/N3, WS4, WS2 recovery wiring) + a live `GatewayRunner`
+boot (real `_start_kanban_writer_daemon` → in-process write → watchdog tick → liveness tick →
+async loops → `stop()` teardown), all green. Merged to local `main` (fast-forward) and pushed to
+`chad`. Both REMAINING items below are now complete.
+
 ## REMAINING
-- Cross-cutting: a full two-stage review of all unreviewed commits before merge.
-- Manual smoke per workstream (e.g. start the gateway with each flag on, exercise the path) —
-  the suites cover units + integration but not a live end-to-end gateway run.
+- ~~Cross-cutting: a full two-stage review~~ — DONE (adversarial review + remediation, above).
+- ~~Manual smoke per workstream / live end-to-end gateway run~~ — DONE (component smoke + live
+  `GatewayRunner` boot, above).
+- **Rollout:** every behavioral change is still flag-gated OFF by default. Enabling requires
+  setting the `kanban.*` flags in the live `~/.hermes/config.yaml` + a gateway restart.
+- **Out-of-scope follow-up (pre-existing, not introduced here):** `WriterDaemon.execute()`/
+  `_dispatch` block on `item.done.wait()` with no timeout — a dead writer thread hangs callers
+  until watchdog revival (and indefinitely if revival keeps failing). Verbatim at base
+  `0bc10f641`; tracked separately.
 
 ## Known non-issues
 - The broad kanban/gateway suite shows ~34 pre-existing cross-test contamination failures that are
