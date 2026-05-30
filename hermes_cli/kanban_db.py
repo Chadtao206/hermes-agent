@@ -1844,6 +1844,61 @@ def connect_closing(
             pass
 
 
+def single_writer_enabled() -> bool:
+    """True when kanban.single_writer_daemon is enabled in config."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        return False
+    return bool(kanban_cfg.get("single_writer_daemon", False))
+
+
+def writer_socket_path(*, board: Optional[str] = None) -> Path:
+    """Per-board daemon socket, alongside the board DB file."""
+    return kanban_db_path(board=board).parent / ".kanban-writer.sock"
+
+
+def _is_writer_owner() -> bool:
+    return os.environ.get("HERMES_KANBAN_WRITER_OWNER") == "1"
+
+
+class _LocalWriter:
+    """Owner-side / flag-off writer: calls module write fns on a real conn."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, op: str):
+        fn = globals().get(op)
+        if not callable(fn):
+            raise AttributeError(op)
+        def _method(**kwargs):
+            return fn(self._conn, **kwargs)
+        return _method
+
+
+@contextlib.contextmanager
+def write_session(*, board: Optional[str] = None):
+    """Yield a transport-agnostic writer (LocalWriter or RemoteWriter).
+
+    Every cross-process write should go through this. In the owner process or
+    when the daemon flag is off, it is a direct connection; in a client process
+    with the flag on, it proxies to the daemon over the socket.
+    """
+    if single_writer_enabled() and not _is_writer_owner():
+        from hermes_cli.kanban_writer_client import RemoteWriter
+        with RemoteWriter(writer_socket_path(board=board)) as w:
+            yield w
+        return
+    conn = connect(board=board, readonly=False)
+    try:
+        yield _LocalWriter(conn)
+    finally:
+        conn.close()
+
+
 def init_db(
     db_path: Optional[Path] = None,
     *,
