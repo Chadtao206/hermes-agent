@@ -1724,6 +1724,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Storage backend for the kanban board DB. "sqlite" (default) keeps
+        # the historical single-file behavior; "postgres" routes through the
+        # backend-agnostic KanbanStore. Default preserves zero behavior change
+        # for existing and upstream deployments.
+        "backend": "sqlite",
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
