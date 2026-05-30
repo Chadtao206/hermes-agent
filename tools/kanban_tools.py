@@ -376,6 +376,10 @@ def _handle_show(args: dict, **kw) -> str:
             children = store.child_ids(tid)
             # rollup relation_type and build_worker_context are not store
             # methods; open a short-lived read connection for these two calls.
+            # NOTE: both `store` and this `conn` are open simultaneously here —
+            # store serves the task/relations reads, conn serves the rollup +
+            # build_worker_context reads that have no store method. Matters for
+            # connection-pool budgeting when Phase 2 ports to Postgres.
             _kb, conn = _connect(board=board)
             try:
                 rollup_parents = _kb.parent_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
@@ -466,6 +470,7 @@ def _handle_list(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         from hermes_cli import kanban_db as kb
+        rows = []
         store = _store(board=board)
         try:
             # Match CLI list: dependencies that cleared since the last dispatcher
@@ -588,7 +593,7 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
-        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db as kb  # kb used only for the typed-gate exception classes below
         store = _store(board=board)
         try:
             # The write routes through write_session → the daemon under the flag;
