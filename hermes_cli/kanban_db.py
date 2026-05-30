@@ -1655,6 +1655,7 @@ def connect(
     *,
     board: Optional[str] = None,
     readonly: bool = False,
+    _bootstrap: bool = False,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -1678,6 +1679,9 @@ def connect(
     * Neither → :func:`kanban_db_path` resolves via
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
+
+    ``_bootstrap`` is reserved for the WS1 single-writer-daemon work and
+    currently has no effect.
     """
     if db_path is not None:
         path = db_path
@@ -1752,6 +1756,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    migrate_review_status_rows(conn)
                     _INITIALIZED_PATHS.add(resolved)
                     _CORRUPT_PATHS.pop(resolved, None)
         except Exception:
@@ -2233,6 +2238,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+
+def migrate_review_status_rows(conn: sqlite3.Connection) -> int:
+    """One-shot: convert any legacy 'review' tasks to 'ready'. Idempotent."""
+    cur = conn.execute("UPDATE tasks SET status='ready' WHERE status='review'")
+    return cur.rowcount or 0
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
