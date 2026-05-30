@@ -516,3 +516,146 @@ class PostgresKanbanStore:
                 "AND assignee IS NOT NULL AND claim_lock IS NULL",
                 (self.board,))
             return cur.fetchone()["n"] > 0
+
+    # --- links -----------------------------------------------------------
+
+    def link_tasks(self, parent_id: str, child_id: str, *,
+                   relation_type: str = "dependency") -> None:
+        # Phase-2: cycle detection deferred (phase-2-tail)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                for tid in (parent_id, child_id):
+                    cur.execute(
+                        "SELECT id FROM tasks WHERE board=%s AND id=%s",
+                        (self.board, tid))
+                    if cur.fetchone() is None:
+                        raise ValueError(f"task {tid} not found")
+                cur.execute(
+                    "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
+                    "VALUES (%s,%s,%s,%s) ON CONFLICT (board,parent_id,child_id) DO NOTHING",
+                    (self.board, parent_id, child_id, relation_type))
+                if relation_type == "dependency":
+                    cur.execute(
+                        "SELECT status FROM tasks WHERE board=%s AND id=%s",
+                        (self.board, parent_id))
+                    parent_row = cur.fetchone()
+                    if parent_row and parent_row["status"] != "done":
+                        cur.execute(
+                            "UPDATE tasks SET status='todo' "
+                            "WHERE board=%s AND id=%s AND status='ready'",
+                            (self.board, child_id))
+                self._emit(cur, child_id, "linked",
+                           {"parent": parent_id, "child": child_id,
+                            "relation_type": relation_type})
+
+    def unlink_tasks(self, parent_id: str, child_id: str, *,
+                     relation_type: str = "dependency") -> bool:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "DELETE FROM task_links "
+                    "WHERE board=%s AND parent_id=%s AND child_id=%s AND relation_type=%s",
+                    (self.board, parent_id, child_id, relation_type))
+                deleted = cur.rowcount > 0
+                if deleted:
+                    self._emit(cur, child_id, "unlinked",
+                               {"parent": parent_id, "child": child_id,
+                                "relation_type": relation_type})
+        if deleted and relation_type == "dependency":
+            self.recompute_ready()
+        return deleted
+
+    def parent_ids(self, task_id: str, *,
+                   relation_type: Optional[str] = "dependency") -> list:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            if relation_type is None:
+                cur.execute(
+                    "SELECT parent_id FROM task_links "
+                    "WHERE board=%s AND child_id=%s ORDER BY parent_id",
+                    (self.board, task_id))
+            else:
+                cur.execute(
+                    "SELECT parent_id FROM task_links "
+                    "WHERE board=%s AND child_id=%s AND relation_type=%s ORDER BY parent_id",
+                    (self.board, task_id, relation_type))
+            return [r["parent_id"] for r in cur.fetchall()]
+
+    def child_ids(self, task_id: str, *,
+                  relation_type: Optional[str] = "dependency") -> list:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            if relation_type is None:
+                cur.execute(
+                    "SELECT child_id FROM task_links "
+                    "WHERE board=%s AND parent_id=%s ORDER BY child_id",
+                    (self.board, task_id))
+            else:
+                cur.execute(
+                    "SELECT child_id FROM task_links "
+                    "WHERE board=%s AND parent_id=%s AND relation_type=%s ORDER BY child_id",
+                    (self.board, task_id, relation_type))
+            return [r["child_id"] for r in cur.fetchall()]
+
+    # --- comments --------------------------------------------------------
+
+    def add_comment(self, task_id: str, *, author: str, body: str) -> int:
+        if not author:
+            raise ValueError("author cannot be empty")
+        if not body:
+            raise ValueError("body cannot be empty")
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT id FROM tasks WHERE board=%s AND id=%s",
+                    (self.board, task_id))
+                if cur.fetchone() is None:
+                    raise ValueError(f"task {task_id} not found")
+                now = int(time.time())
+                cur.execute(
+                    "INSERT INTO task_comments (board, task_id, author, body, created_at) "
+                    "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                    (self.board, task_id, author, body, now))
+                comment_id = cur.fetchone()["id"]
+                self._emit(cur, task_id, "commented",
+                           {"author": author, "len": len(body)})
+        return comment_id
+
+    def list_comments(self, task_id: str) -> list:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM task_comments "
+                "WHERE board=%s AND task_id=%s ORDER BY created_at ASC",
+                (self.board, task_id))
+            return [Comment(**{k: r[k] for k in Comment.__dataclass_fields__})
+                    for r in cur.fetchall()]
+
+    # --- events ----------------------------------------------------------
+
+    def list_events(self, task_id: str, **kwargs) -> list:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM task_events "
+                "WHERE board=%s AND task_id=%s ORDER BY created_at ASC, id ASC",
+                (self.board, task_id))
+            return [Event(**{k: r[k] for k in Event.__dataclass_fields__})
+                    for r in cur.fetchall()]
+
+    def gc_events(self, *, older_than_seconds: int = 30 * 24 * 3600,
+                  **kwargs) -> int:
+        cutoff = int(time.time()) - older_than_seconds
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "DELETE FROM task_events "
+                "WHERE board=%s AND created_at < %s "
+                "AND task_id IN ("
+                "  SELECT id FROM tasks WHERE board=%s AND status IN ('done','archived')"
+                ")",
+                (self.board, cutoff, self.board))
+            return cur.rowcount
+
+    # --- workspace -------------------------------------------------------
+
+    def set_workspace_path(self, task_id: str, path) -> None:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE tasks SET workspace_path=%s WHERE board=%s AND id=%s",
+                (str(path), self.board, task_id))
