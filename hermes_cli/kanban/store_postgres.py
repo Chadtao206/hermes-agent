@@ -207,6 +207,7 @@ class PostgresKanbanStore:
                 return False
 
     def schedule_task(self, task_id: str, *, reason=None, expected_run_id=None) -> bool:
+        # Phase-2: expected_run_id optimistic-concurrency guard not yet honored (phase-2-tail).
         now = int(time.time())
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
@@ -672,6 +673,7 @@ class PostgresKanbanStore:
         thread_id = thread_id or ''
         now = int(time.time())
         pk = (self.board, task_id, platform, chat_id, thread_id)
+        # Phase-2: SQLite normalizes event_kinds (dedup/str-coerce/strip/drop-empty) via _normalize_event_kinds; PG stores the list as-is (phase-2-tail).
         ek_insert = json.dumps(event_kinds) if isinstance(event_kinds, list) else None
         ic_insert = 1 if include_children else 0
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -746,6 +748,7 @@ class PostgresKanbanStore:
                     "ON CONFLICT (board,task_id,profile,name) DO NOTHING",
                     (*pk, now),
                 )
+                # Phase-2: SQLite normalizes event_kinds (dedup/str-coerce/strip/drop-empty) via _normalize_event_kinds; PG stores the list as-is (phase-2-tail).
                 if event_kinds is not _UNSET:
                     ek_val = json.dumps(event_kinds) if isinstance(event_kinds, list) else None
                     cur.execute(
@@ -1147,3 +1150,6 @@ class PostgresKanbanStore:
 
     def heartbeat_worker(self, **kwargs) -> bool:
         raise NotImplementedError("phase-2-tail: heartbeat_worker")
+
+    def edit_completed_task_result(self, task_id, **kwargs):
+        raise NotImplementedError("phase-2-tail: edit_completed_task_result")
