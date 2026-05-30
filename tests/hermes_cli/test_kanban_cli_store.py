@@ -554,25 +554,14 @@ def test_cli_list_uses_store(monkeypatch):
     assert store.closed
 
 
-# ---------------------------------------------------------------------------
-# _cmd_show routes through kanban_store
-# ---------------------------------------------------------------------------
-
-def test_cli_show_uses_store(monkeypatch):
-    import hermes_cli.kanban as cli
-
-    store = FakeStore()
-    monkeypatch.setattr("hermes_cli.kanban.kanban_store", lambda board=None: store, raising=False)
-
-    ns = argparse.Namespace(task_id="t_fake", state_type=None, state_name=None, json=False)
-    out = StringIO()
-    monkeypatch.setattr(sys, "stdout", out)
-    rc = cli._cmd_show(ns)
-
-    assert rc == 0
-    ops = [c[0] for c in store.calls]
-    assert "get_task" in ops
-    assert store.closed
+# Note: `_cmd_show` is intentionally NOT routed through the store. It is a
+# multi-read aggregation (task + comments + events + runs + parents/children +
+# rollup relations + worker_context); routing each read through the store opens
+# a fresh snapshot connection per call (N full DB-file copies under single-writer)
+# and loses cross-read consistency. Like the dashboard's task-detail endpoint, it
+# keeps all reads on ONE shared snapshot connection. Behavioral coverage for the
+# `show` command lives in tests/hermes_cli/test_kanban_cli.py
+# (test_run_slash_show_includes_comments).
 
 
 # ---------------------------------------------------------------------------
