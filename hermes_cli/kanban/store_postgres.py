@@ -864,10 +864,13 @@ class PostgresKanbanStore:
                     (self.board, task_id))
                 if cur.fetchone() is None:
                     return None
+                # Phase-2: SQLite's last-chance parent-dependency re-check (demote to
+                # 'todo' + return None if a parent is still undone) is deferred
+                # (phase-2-tail). Not reached in Phase 2 — dispatch is Phase 3 glue.
                 cur.execute(
-                    "INSERT INTO task_runs (board,task_id,profile,status,claim_lock,"
+                    "INSERT INTO task_runs (board,task_id,profile,step_key,status,claim_lock,"
                     "claim_expires,max_runtime_seconds,started_at) "
-                    "SELECT %s,%s,assignee,'running',%s,%s,max_runtime_seconds,%s "
+                    "SELECT %s,%s,assignee,current_step_key,'running',%s,%s,max_runtime_seconds,%s "
                     "FROM tasks WHERE board=%s AND id=%s RETURNING id",
                     (self.board, task_id, claimer, now + ttl, now, self.board, task_id))
                 run_id = cur.fetchone()["id"]
