@@ -48,7 +48,13 @@ def make_online_backup(db_path: Path, backup_dir: Path, *, keep: int) -> Optiona
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     target = backup_dir / f"{db_path.name}.online.{stamp}.bak"
-    src = sqlite3.connect(str(db_path)); dst = sqlite3.connect(str(target))
+    # Open the live DB read-only: the backup API only reads the source, and a
+    # writable connection here would be a second writer on the hot WAL board
+    # (bypassing the single-writer daemon guard) — concurrent-connection
+    # pressure that can surface as a transient ``disk I/O error`` to other
+    # readers. The destination is the fresh backup file and must be writable.
+    src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    dst = sqlite3.connect(str(target))
     try:
         src.backup(dst)
     finally:

@@ -1176,6 +1176,13 @@ def test_kanban_notifier_disk_io_disable_is_keyed_by_resolved_path(tmp_path, mon
     monkeypatch.setattr(kb, "list_boards", fake_list_boards)
     monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
     monkeypatch.setattr(kb, "connect", fake_connect)
+    # A bare IOERR is now re-probed first; force the probe to confirm durable
+    # unhealth so the (still-valid) disable path is exercised.
+    monkeypatch.setattr(
+        gateway_run,
+        "_board_db_io_error_is_durable",
+        lambda _p: (True, "probe confirms unhealthy"),
+    )
 
     runner = _make_runner(RecordingAdapter())
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
@@ -1225,6 +1232,13 @@ def test_kanban_notifier_inner_disk_io_disables_board_path(tmp_path, monkeypatch
     monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
     monkeypatch.setattr(kb, "connect", fake_connect)
     monkeypatch.setattr(kb, "list_notify_subs", fake_list_notify_subs)
+    # A bare IOERR is now re-probed first; force the probe to confirm durable
+    # unhealth so the (still-valid) disable path is exercised.
+    monkeypatch.setattr(
+        gateway_run,
+        "_board_db_io_error_is_durable",
+        lambda _p: (True, "probe confirms unhealthy"),
+    )
 
     runner = _make_runner(RecordingAdapter())
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
@@ -1236,6 +1250,50 @@ def test_kanban_notifier_inner_disk_io_disables_board_path(tmp_path, monkeypatch
     disabled = runner._kanban_notifier_disabled_db_paths
     assert str(shared_db.resolve()) in disabled
     assert disabled[str(shared_db.resolve())]["reason"] == "disk_io_error"
+
+
+def test_kanban_notifier_transient_disk_io_does_not_disable(tmp_path, monkeypatch, caplog):
+    """A transient IOERR (isolated re-probe finds the DB healthy) must NOT disable.
+
+    Regression for the worker-spawn WAL/SHM contention blip on the notifier
+    path: before the fix, the first ``disk I/O error`` opening the board latched
+    the notifier disabled-until-restart. Now it is re-probed and, when healthy,
+    treated as transient and retried next tick.
+    """
+    shared_db = tmp_path / "transient-disk-io.db"
+    orders = [
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+        [{"slug": "alias-a", "db_path": str(shared_db)}],
+    ]
+    connect_calls = []
+
+    def fake_list_boards(include_archived=False):
+        return orders.pop(0) if orders else []
+
+    def fake_connect(*, board=None, **kwargs):
+        connect_calls.append(board)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "record_notifier_heartbeat", lambda *a, **kw: None)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    # Force the isolated re-probe to report healthy → transient path.
+    monkeypatch.setattr(
+        gateway_run,
+        "_board_db_io_error_is_durable",
+        lambda _p: (False, "probe quick_check ok"),
+    )
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Not disabled → the board is retried on the second tick instead of skipped.
+    assert connect_calls == ["alias-a", "alias-a"]
+    assert getattr(runner, "_kanban_notifier_disabled_db_paths", {}) == {}
+    assert "treating as a transient" in caplog.text
+    assert "until gateway restart" not in caplog.text
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

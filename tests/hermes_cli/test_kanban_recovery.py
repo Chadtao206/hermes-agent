@@ -39,6 +39,52 @@ def test_recover_restores_from_backup_when_recover_fails(tmp_path, monkeypatch):
     assert ro.execute("SELECT title FROM tasks WHERE id='t1'").fetchone()["title"] == "keep"
 
 
+def test_make_online_backup_opens_source_read_only(tmp_path, monkeypatch):
+    """The online backup must open the live DB read-only, never a second
+    writable connection.
+
+    A raw writable ``sqlite3.connect(db_path)`` bypasses the single-writer guard
+    and adds concurrent-connection pressure to the hot WAL board — a trigger for
+    the transient ``disk I/O error`` the single-writer daemon is meant to avoid.
+    The backup API only needs a read-only source.
+    """
+    db = tmp_path / "kanban.db"
+    _make_good_db(db)
+
+    real_connect = sqlite3.connect
+    opened: list[str] = []
+
+    def spy_connect(target, *args, **kwargs):
+        opened.append(str(target))
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy_connect)
+    out = rec.make_online_backup(db, tmp_path / "backups", keep=3)
+    assert out is not None
+
+    # Every connection opened against the live source path must be read-only.
+    src_opens = [t for t in opened if t.startswith(f"file:{db}") or t == str(db)]
+    assert src_opens, f"expected a connect to source {db}; saw {opened}"
+    assert all("mode=ro" in t for t in src_opens), (
+        f"online backup must open the live DB read-only; got {src_opens}"
+    )
+
+
+def test_make_online_backup_produces_healthy_backup(tmp_path):
+    """Regression: switching the source to read-only must still yield a valid,
+    consistent backup of the live data."""
+    db = tmp_path / "kanban.db"
+    _make_good_db(db)
+    out = rec.make_online_backup(db, tmp_path / "backups", keep=3)
+    assert out is not None and out.exists()
+    ro = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    try:
+        assert ro.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert ro.execute("SELECT title FROM tasks WHERE id='t1'").fetchone()[0] == "keep"
+    finally:
+        ro.close()
+
+
 def test_recover_reports_exhausted_when_no_backup_and_recover_fails(tmp_path, monkeypatch):
     db = tmp_path / "kanban.db"
     _make_good_db(db)

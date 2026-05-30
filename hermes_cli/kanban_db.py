@@ -2837,8 +2837,62 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     return [p for p in parents if p not in present]
 
 
+# Hot read-path resilience against transient WAL/SHM contention.
+#
+# A freshly spawned process opening the hot WAL board DB while the single writer
+# is checkpointing can make a concurrent reader briefly observe SQLITE_IOERR
+# ("disk I/O error") or a transient "database disk image is malformed" even
+# though the file is healthy — `PRAGMA quick_check`/`integrity_check` pass
+# immediately afterward. These blips correlate with dispatcher worker-spawn
+# bursts and recover on a re-read. Retry the hot reads a few times with a tiny
+# backoff so the blip never surfaces to callers (the agent kanban_* tools,
+# workers). Durable corruption (SQLITE_CORRUPT / NOTADB / FORMAT) is NOT retried
+# — it can never recover and must propagate to the corruption-handling path.
+_READ_RETRY_ATTEMPTS = 4
+_READ_RETRY_BACKOFF_SEC = 0.05
+_DURABLE_READ_ERRCODES = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_CORRUPT", 11),
+        getattr(sqlite3, "SQLITE_NOTADB", 26),
+        getattr(sqlite3, "SQLITE_FORMAT", 24),
+    }
+)
+
+
+def _is_transient_read_error(exc: BaseException) -> bool:
+    """True for a recoverable WAL/SHM-contention read error (IOERR / transient
+    malformed), False for durable corruption or any unrelated error."""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    if getattr(exc, "sqlite_errorcode", None) in _DURABLE_READ_ERRCODES:
+        return False
+    msg = str(exc).lower()
+    return "disk i/o error" in msg or "database disk image is malformed" in msg
+
+
+def _read_with_transient_retry(read_fn):
+    """Run a read closure, retrying transient WAL/SHM-contention errors with a
+    short backoff. Re-raises immediately on durable / unrelated errors and after
+    the final attempt."""
+    for attempt in range(_READ_RETRY_ATTEMPTS):
+        try:
+            return read_fn()
+        except sqlite3.DatabaseError as exc:
+            if attempt == _READ_RETRY_ATTEMPTS - 1 or not _is_transient_read_error(exc):
+                raise
+            _log.debug(
+                "kanban read hit transient DB error (attempt %d/%d), retrying: %s",
+                attempt + 1, _READ_RETRY_ATTEMPTS, exc,
+            )
+            time.sleep(_READ_RETRY_BACKOFF_SEC * (attempt + 1))
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = _read_with_transient_retry(
+        lambda: conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    )
     return Task.from_row(row) if row else None
 
 
@@ -2904,7 +2958,7 @@ def list_tasks(
         query += " ORDER BY priority DESC, created_at ASC"
     if limit:
         query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query, params).fetchall()
+    rows = _read_with_transient_retry(lambda: conn.execute(query, params).fetchall())
     return [Task.from_row(r) for r in rows]
 
 

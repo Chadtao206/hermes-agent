@@ -331,12 +331,24 @@ def test_dispatcher_tick_does_not_call_init_db(kanban_home, monkeypatch):
 async def test_dispatcher_quarantines_board_on_disk_io_error(
     kanban_home, monkeypatch, caplog,
 ):
-    """A disk-I/O OperationalError should disable that board for this process."""
+    """A disk-I/O error that an isolated re-probe CONFIRMS unhealthy disables the board.
+
+    A bare ``disk I/O error`` is now re-probed via ``_board_db_io_error_is_durable``
+    before any disable — a transient WAL/SHM blip must NOT quarantine the board.
+    Here we force the probe to confirm durable unhealth so the (still-valid)
+    disable-until-restart path is exercised.
+    """
     from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
     import hermes_cli.config as cli_config
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
+    monkeypatch.setattr(
+        gateway_run,
+        "_board_db_io_error_is_durable",
+        lambda _p: (True, "probe confirms unhealthy"),
+    )
 
     shared_db = kb.kanban_db_path().resolve()
     board_rows = [
@@ -393,12 +405,18 @@ async def test_dispatcher_quarantines_board_on_disk_io_error(
 async def test_dispatcher_quarantines_shared_db_across_aliases(
     kanban_home, monkeypatch, caplog,
 ):
-    """A disk-I/O fault on alias-a should quarantine alias-b for the same DB path."""
+    """A CONFIRMED disk-I/O fault on alias-a should quarantine alias-b for the same DB path."""
     from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
     import hermes_cli.config as cli_config
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
+    monkeypatch.setattr(
+        gateway_run,
+        "_board_db_io_error_is_durable",
+        lambda _p: (True, "probe confirms unhealthy"),
+    )
 
     shared_db = kb.kanban_db_path().resolve()
     boards = [
@@ -453,6 +471,81 @@ async def test_dispatcher_quarantines_shared_db_across_aliases(
     # quarantines this resolved DB path, readonly probes must skip both aliases.
     assert readonly_connect_calls == []
     assert "filesystem-level fault" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_transient_disk_io_error_does_not_quarantine(
+    kanban_home, monkeypatch, caplog,
+):
+    """A transient disk-I/O error (probe finds the DB healthy) must NOT disable.
+
+    Regression for the worker-spawn WAL/SHM contention blip: a dispatcher tick
+    that hits ``disk I/O error`` while an isolated re-probe finds the board
+    healthy should be treated as transient and retried next tick, NOT latched
+    disabled-until-restart. Before the fix the board was quarantined on the
+    first IOERR, turning a recoverable blip into a board-wide outage.
+    """
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+    import hermes_cli.config as cli_config
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    # Force the isolated re-probe to report the DB healthy → transient path.
+    monkeypatch.setattr(
+        gateway_run,
+        "_board_db_io_error_is_durable",
+        lambda _p: (False, "probe quick_check ok"),
+    )
+
+    shared_db = kb.kanban_db_path().resolve()
+
+    real_connect = kb.connect
+    write_connect_calls: list[str] = []
+
+    def fake_list_boards(include_archived=False):
+        # Always present the board so a non-quarantined board is re-attempted
+        # on every tick; a quarantine would stop the writable opens.
+        return [{"slug": "alias-a", "db_path": str(shared_db)}]
+
+    def fake_connect(*, board=None, readonly=False, **kwargs):
+        if readonly:
+            return real_connect(board=board, readonly=True)
+        write_connect_calls.append(board or "")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "list_boards", fake_list_boards)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(
+        cli_config,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+
+    real_sleep = asyncio.sleep
+    sleep_calls = {"count": 0}
+
+    async def fake_sleep(delay):
+        await real_sleep(0)
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 3:
+            runner._running = False
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fake_sleep):
+        await asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=10.0)
+
+    # Board NOT quarantined → it is re-attempted on subsequent ticks instead of
+    # being skipped as a disabled board (a quarantine stops the writable opens).
+    assert len(write_connect_calls) >= 2
+    assert set(write_connect_calls) == {"alias-a"}
+    assert "treating as a transient" in caplog.text
+    assert "until gateway restart" not in caplog.text
 
 
 @pytest.mark.asyncio

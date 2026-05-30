@@ -1775,11 +1775,27 @@ def _collect_kanban_dispatch_warning_details(
 
 
 _DISK_IO_BOARD_DB_GUIDANCE = (
-    "SQLite reported a disk I/O error on board %s (path=%s): %s. "
-    "Dispatch/notifier access is disabled for this board DB until gateway restart. "
-    "This is a filesystem-level fault (not DB corruption): check disk free space, "
-    "mount/filesystem health, and HERMES_HOME permissions; then restart the gateway "
-    "once the underlying volume is healthy."
+    "SQLite reported a disk I/O error on board %s (path=%s): %s. An isolated "
+    "re-probe ALSO failed to read a healthy database (%s), so dispatch/notifier "
+    "access is disabled for this board DB until gateway restart. This is either a "
+    "filesystem-level fault or durable corruption: check disk free space, "
+    "mount/filesystem health, and HERMES_HOME permissions, and run "
+    "`hermes kanban doctor --json` to inspect the board; then restart the gateway "
+    "once it is healthy."
+)
+
+# A bare ``disk I/O error`` on the hot WAL board DB is, in practice, almost always
+# a TRANSIENT blip rather than a durable filesystem fault: a dispatcher
+# worker-spawn burst opens the WAL database concurrently with the writer's
+# checkpoint, and a reader momentarily observes SQLITE_IOERR even though
+# `PRAGMA quick_check`/`integrity_check` pass immediately afterward. Treating
+# the first such error as a process-lifetime disable turned a recoverable blip
+# into a board-wide outage requiring a gateway restart. This message is logged
+# only when a transient IOERR is observed and intentionally NOT disabling.
+_DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE = (
+    "kanban %s: board %s database %s reported a disk I/O error but an isolated "
+    "re-probe found it healthy (%s); treating as a transient WAL/SHM contention "
+    "blip (e.g. a dispatcher worker-spawn burst) and NOT disabling the board: %s"
 )
 
 # Require consecutive corruption confirmations before process-lifetime disable.
@@ -2099,6 +2115,25 @@ def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
         f"{live_reason}; independent snapshot did not confirm durable corruption: "
         f"{snapshot_reason}",
     )
+
+
+def _board_db_io_error_is_durable(db_path: str | Path) -> tuple[bool, str]:
+    """Decide whether a board-DB ``disk I/O error`` should latch the board
+    disabled-until-restart.
+
+    A ``disk I/O error`` on the hot WAL board database is, empirically, almost
+    always a transient WAL/SHM contention blip — a dispatcher worker-spawn burst
+    opens the database concurrently with the writer's checkpoint and a reader
+    briefly observes SQLITE_IOERR even though the file is healthy (isolated
+    integrity probes pass immediately afterward). Re-probe in isolation and only
+    report ``True`` when an independent probe ALSO fails to read a healthy
+    database, mirroring the confirmation the malformed/corrupt path already
+    requires before a process-lifetime disable. Reuses
+    :func:`_confirm_board_db_corruption`, which returns ``False`` for a healthy
+    file and for transient/open failures, so a one-off IOERR is treated as
+    transient instead of disabling the board.
+    """
+    return _confirm_board_db_corruption(db_path)
 
 
 def _spawn_writer_daemons(board_db_paths, *, auto_recovery: bool, keep: int = 6,
@@ -5996,17 +6031,32 @@ class GatewayRunner:
                             )
                         except Exception as exc:
                             if _is_disk_io_board_db_error(exc):
-                                notifier_disabled_db_paths[resolved_db_path] = {
-                                    "reason": "disk_io_error",
-                                    "board": slug,
-                                    "error": str(exc),
-                                }
-                                logger.error(
-                                    _DISK_IO_BOARD_DB_GUIDANCE,
-                                    slug,
-                                    resolved_db_path,
-                                    exc,
+                                confirmed, confirmation = _board_db_io_error_is_durable(
+                                    resolved_db_path
                                 )
+                                if confirmed:
+                                    notifier_disabled_db_paths[resolved_db_path] = {
+                                        "reason": "disk_io_error",
+                                        "board": slug,
+                                        "error": str(exc),
+                                        "confirmation": confirmation,
+                                    }
+                                    logger.error(
+                                        _DISK_IO_BOARD_DB_GUIDANCE,
+                                        slug,
+                                        resolved_db_path,
+                                        exc,
+                                        confirmation,
+                                    )
+                                else:
+                                    logger.warning(
+                                        _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
+                                        "notifier",
+                                        slug,
+                                        resolved_db_path,
+                                        confirmation,
+                                        exc,
+                                    )
                             elif _notifier_db_error_is_corrupt(exc):
                                 confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
                                 if confirmed:
@@ -6171,20 +6221,35 @@ class GatewayRunner:
                                             )
                                     except Exception as exc:
                                         if _is_disk_io_board_db_error(exc):
-                                            notifier_disabled_db_paths[resolved_db_path] = {
-                                                "reason": "disk_io_error",
-                                                "board": slug,
-                                                "task_id": psub.get("task_id"),
-                                                "profile": psub.get("profile"),
-                                                "error": str(exc),
-                                            }
-                                            logger.error(
-                                                _DISK_IO_BOARD_DB_GUIDANCE,
+                                            confirmed, confirmation = _board_db_io_error_is_durable(
+                                                resolved_db_path
+                                            )
+                                            if confirmed:
+                                                notifier_disabled_db_paths[resolved_db_path] = {
+                                                    "reason": "disk_io_error",
+                                                    "board": slug,
+                                                    "task_id": psub.get("task_id"),
+                                                    "profile": psub.get("profile"),
+                                                    "error": str(exc),
+                                                    "confirmation": confirmation,
+                                                }
+                                                logger.error(
+                                                    _DISK_IO_BOARD_DB_GUIDANCE,
+                                                    slug,
+                                                    resolved_db_path,
+                                                    exc,
+                                                    confirmation,
+                                                )
+                                                break
+                                            logger.warning(
+                                                _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
+                                                "notifier profile-event claim",
                                                 slug,
                                                 resolved_db_path,
+                                                confirmation,
                                                 exc,
                                             )
-                                            break
+                                            continue
                                         if _notifier_db_error_is_corrupt(exc):
                                             confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
                                             if confirmed:
@@ -6265,17 +6330,32 @@ class GatewayRunner:
                                 notifier_corruption_streaks.pop(resolved_db_path, None)
                         except Exception as exc:
                             if _is_disk_io_board_db_error(exc):
-                                notifier_disabled_db_paths[resolved_db_path] = {
-                                    "reason": "disk_io_error",
-                                    "board": slug,
-                                    "error": str(exc),
-                                }
-                                logger.error(
-                                    _DISK_IO_BOARD_DB_GUIDANCE,
-                                    slug,
-                                    resolved_db_path,
-                                    exc,
+                                confirmed, confirmation = _board_db_io_error_is_durable(
+                                    resolved_db_path
                                 )
+                                if confirmed:
+                                    notifier_disabled_db_paths[resolved_db_path] = {
+                                        "reason": "disk_io_error",
+                                        "board": slug,
+                                        "error": str(exc),
+                                        "confirmation": confirmation,
+                                    }
+                                    logger.error(
+                                        _DISK_IO_BOARD_DB_GUIDANCE,
+                                        slug,
+                                        resolved_db_path,
+                                        exc,
+                                        confirmation,
+                                    )
+                                else:
+                                    logger.warning(
+                                        _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
+                                        "notifier",
+                                        slug,
+                                        resolved_db_path,
+                                        confirmation,
+                                        exc,
+                                    )
                             elif _notifier_db_error_is_corrupt(exc):
                                 confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
                                 if confirmed:
@@ -7451,16 +7531,29 @@ class GatewayRunner:
                 return None
             except sqlite3.DatabaseError as exc:
                 if _is_disk_io_board_db_error(exc):
-                    disabled_db_paths[fingerprint[0]] = {
-                        "reason": "disk_io_error",
-                        "slug": slug,
-                        "current_fingerprint": fingerprint,
-                        "error": str(exc),
-                    }
-                    logger.error(
-                        _DISK_IO_BOARD_DB_GUIDANCE,
+                    confirmed, confirmation = _board_db_io_error_is_durable(fingerprint[0])
+                    if confirmed:
+                        disabled_db_paths[fingerprint[0]] = {
+                            "reason": "disk_io_error",
+                            "slug": slug,
+                            "current_fingerprint": fingerprint,
+                            "error": str(exc),
+                            "confirmation": confirmation,
+                        }
+                        logger.error(
+                            _DISK_IO_BOARD_DB_GUIDANCE,
+                            slug,
+                            fingerprint[0],
+                            exc,
+                            confirmation,
+                        )
+                        return None
+                    logger.warning(
+                        _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
+                        "dispatcher",
                         slug,
                         fingerprint[0],
+                        confirmation,
                         exc,
                     )
                     return None

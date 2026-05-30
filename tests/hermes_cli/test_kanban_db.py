@@ -5399,3 +5399,72 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Hot-read transient-IOERR retry (#kanban worker-spawn WAL/SHM contention)
+# ---------------------------------------------------------------------------
+class _FlakyConn:
+    """Wraps a real connection, raising ``exc`` on the first ``fail_times``
+    ``execute`` calls, then delegating. Only ``execute`` is used by the hot
+    read functions under test."""
+
+    def __init__(self, real, fail_times, exc):
+        self._real = real
+        self._fail = fail_times
+        self._exc = exc
+        self.calls = 0
+
+    def execute(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls <= self._fail:
+            raise self._exc
+        return self._real.execute(*args, **kwargs)
+
+
+def _seed_one_task(tmp_path):
+    db = tmp_path / "kanban.db"
+    conn = kb.connect(db_path=db, readonly=False, _bootstrap=True)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1','x','todo',0)"
+    )
+    conn.commit()
+    return conn
+
+
+def test_get_task_retries_transient_disk_io_error(tmp_path, monkeypatch):
+    """A transient ``disk I/O error`` on a read is retried, not surfaced.
+
+    Regression for the worker-spawn WAL/SHM contention blip: a freshly spawned
+    process opening the hot WAL board DB during a checkpoint can make a
+    concurrent reader briefly see SQLITE_IOERR even though the file is healthy.
+    """
+    conn = _seed_one_task(tmp_path)
+    monkeypatch.setattr(kb.time, "sleep", lambda *_a, **_k: None)
+    flaky = _FlakyConn(conn, 2, sqlite3.OperationalError("disk I/O error"))
+    task = kb.get_task(flaky, "t1")
+    assert task is not None and task.id == "t1"
+    assert flaky.calls == 3  # two transient failures + one success
+
+
+def test_list_tasks_retries_transient_malformed_error(tmp_path, monkeypatch):
+    conn = _seed_one_task(tmp_path)
+    monkeypatch.setattr(kb.time, "sleep", lambda *_a, **_k: None)
+    flaky = _FlakyConn(
+        conn, 1, sqlite3.DatabaseError("database disk image is malformed")
+    )
+    rows = kb.list_tasks(flaky)
+    assert [t.id for t in rows] == ["t1"]
+    assert flaky.calls == 2
+
+
+def test_get_task_does_not_retry_durable_corruption(tmp_path, monkeypatch):
+    """Durable corruption (SQLITE_CORRUPT errcode) must propagate immediately."""
+    conn = _seed_one_task(tmp_path)
+    monkeypatch.setattr(kb.time, "sleep", lambda *_a, **_k: None)
+    exc = sqlite3.DatabaseError("database disk image is malformed")
+    exc.sqlite_errorcode = getattr(sqlite3, "SQLITE_CORRUPT", 11)
+    flaky = _FlakyConn(conn, 99, exc)
+    with pytest.raises(sqlite3.DatabaseError):
+        kb.get_task(flaky, "t1")
+    assert flaky.calls == 1  # no retry on durable corruption
