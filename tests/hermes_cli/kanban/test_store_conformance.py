@@ -6,3 +6,29 @@ def test_create_then_get(store):
 
 def test_get_missing_returns_none(store):
     assert store.get_task("t_does_not_exist") is None
+
+
+def test_block_unblock_roundtrip(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    assert store.block_task(tid, reason="need input") is True
+    assert store.get_task(tid).status == "blocked"
+    assert store.unblock_task(tid) is True
+    assert store.get_task(tid).status == "ready"
+
+
+def test_priority_and_edit_and_status_direct(store):
+    tid = store.create_task(title="orig", assignee="engineer")
+    assert store.set_task_priority(tid, 7) is True
+    assert store.get_task(tid).priority == 7
+    assert store.edit_task_fields(tid, title="renamed") is True
+    assert store.get_task(tid).title == "renamed"
+    assert store.set_status_direct(tid, "todo") is True
+    assert store.get_task(tid).status == "todo"
+
+
+def test_reassign_and_delete(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    assert store.reassign_task(tid, "reviewer") is True
+    assert store.get_task(tid).assignee == "reviewer"
+    assert store.delete_task(tid) is True
+    assert store.get_task(tid) is None

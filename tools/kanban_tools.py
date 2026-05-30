@@ -183,27 +183,9 @@ def _connect(board: Optional[str] = None):
     # through ``kb.write_session``. Flag off → unchanged (writable connect, which
     # also first-creates/initialises the DB).
     if kb.single_writer_enabled():
+        from hermes_cli.kanban.store_sqlite import _SnapshotReadConn
         return kb, _SnapshotReadConn(kb.snapshot_connect(board=board))
     return kb, kb.connect(board=board)
-
-
-class _SnapshotReadConn:
-    """Closeable wrapper around :func:`kb.snapshot_connect` so callers that do
-    ``kb, conn = _connect(...); try: ...; finally: conn.close()`` get a
-    consistent snapshot reader (read-after-write safe under WAL/SHM churn)."""
-
-    def __init__(self, cm):
-        self._cm = cm
-        self._conn = cm.__enter__()
-        self._closed = False
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-    def close(self):
-        if not self._closed:
-            self._closed = True
-            self._cm.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
