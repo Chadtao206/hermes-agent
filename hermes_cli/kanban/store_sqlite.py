@@ -18,7 +18,7 @@ class SqliteKanbanStore:
     def _read(self, fn):
         """Run a read closure on a fresh read connection (snapshot under
         single-writer, else writable). fn receives the conn."""
-        kb2, conn = _read_conn(self.board)
+        conn = _read_conn(self.board)
         try:
             return fn(conn)
         finally:
@@ -100,5 +100,5 @@ def _read_conn(board):
     """Mirror tools.kanban_tools._connect read policy: snapshot under
     single-writer, else writable connect."""
     if kb.single_writer_enabled():
-        return kb, _SnapshotReadConn(kb.snapshot_connect(board=board))
-    return kb, kb.connect(board=board)
+        return _SnapshotReadConn(kb.snapshot_connect(board=board))
+    return kb.connect(board=board)
