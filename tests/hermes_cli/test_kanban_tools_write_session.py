@@ -1,7 +1,8 @@
 """WS1 Task 7: kanban tool write handlers route through kb.write_session, so a
 worker (a client process, no registered daemon) writes via RemoteWriter instead
 of a direct writable connect (which DirectWriteForbidden would block under the
-single-writer flag). Reads stay on a direct readonly connection.
+single-writer flag). Reads use a snapshot connection (consistent read-after-write
+under WAL/SHM churn; a live mode=ro open can miss freshly-committed WAL writes).
 """
 import json
 import threading
@@ -126,3 +127,34 @@ def test_read_handler_uses_readonly_under_flag(tmp_path, monkeypatch):
         assert res.get("task_id") == tid or res.get("id") == tid or "readable" in json.dumps(res)
     finally:
         server.shutdown()
+
+
+def test_connect_uses_snapshot_reader_under_single_writer(monkeypatch):
+    """Agent-tool reads must use a snapshot connection (not a live mode=ro open)
+    under single-writer, so a just-committed write is visible on read-back. A
+    live mode=ro open can miss WAL-resident commits during churn, which caused
+    'task not found' right after create -> duplicate task creation."""
+    import contextlib
+
+    monkeypatch.setattr(kb, "single_writer_enabled", lambda *a, **k: True)
+    used = {"snapshot": 0}
+
+    @contextlib.contextmanager
+    def fake_snapshot(board=None):
+        used["snapshot"] += 1
+        class _C:
+            pass
+        yield _C()
+
+    def fake_connect(*a, **k):
+        raise AssertionError(
+            "agent reads must not open a live connection under single-writer; "
+            "use snapshot_connect"
+        )
+
+    monkeypatch.setattr(kb, "snapshot_connect", fake_snapshot)
+    monkeypatch.setattr(kb, "connect", fake_connect)
+
+    _kb, conn = kt._connect(board=None)
+    conn.close()
+    assert used["snapshot"] == 1

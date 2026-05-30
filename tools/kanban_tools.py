@@ -174,13 +174,36 @@ def _connect(board: Optional[str] = None):
     """
     from hermes_cli import kanban_db as kb
     # Under the single-writer daemon, client processes (workers, CLI) must not
-    # open a writable connection — the guard raises DirectWriteForbidden. All
-    # reads here are read-only, so open ``mode=ro``; writes go through
-    # ``kb.write_session`` in the individual handlers. Flag off → unchanged
-    # (writable connect, which also first-creates/initialises the DB).
+    # open a writable connection — the guard raises DirectWriteForbidden. Reads
+    # use a SNAPSHOT (copy of the live DB + WAL/SHM sidecars), not a live
+    # ``mode=ro`` open: a ``mode=ro`` connection can miss freshly-committed
+    # WAL-resident writes during WAL/SHM churn, which caused read-after-write
+    # "task not found" right after a successful create → duplicate task creation.
+    # snapshot_connect copies the sidecars, so it sees committed writes. Writes go
+    # through ``kb.write_session``. Flag off → unchanged (writable connect, which
+    # also first-creates/initialises the DB).
     if kb.single_writer_enabled():
-        return kb, kb.connect(board=board, readonly=True)
+        return kb, _SnapshotReadConn(kb.snapshot_connect(board=board))
     return kb, kb.connect(board=board)
+
+
+class _SnapshotReadConn:
+    """Closeable wrapper around :func:`kb.snapshot_connect` so callers that do
+    ``kb, conn = _connect(...); try: ...; finally: conn.close()`` get a
+    consistent snapshot reader (read-after-write safe under WAL/SHM churn)."""
+
+    def __init__(self, cm):
+        self._cm = cm
+        self._conn = cm.__enter__()
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._cm.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
