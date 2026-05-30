@@ -35,7 +35,7 @@ class PostgresKanbanStore:
         return None  # shared pool; owner closes it
 
     # --- helpers ---------------------------------------------------------
-    def _emit(self, cur, task_id: str, kind: str, payload=None, run_id=None) -> None:
+    def _emit(self, cur, task_id: str, kind: str, payload=None, run_id: Optional[int] = None) -> None:
         cur.execute(
             "INSERT INTO task_events (board, task_id, run_id, kind, payload, created_at) "
             "VALUES (%s,%s,%s,%s,%s,%s)",
@@ -46,10 +46,17 @@ class PostgresKanbanStore:
     def _row_to_task(self, row: dict) -> Task:
         d = dict(row)
         d.pop("board", None)
+        for required in ("id", "title", "status", "priority", "created_at",
+                         "workspace_kind"):
+            if d.get(required) is None:
+                raise ValueError(
+                    f"_row_to_task: required column '{required}' missing/NULL")
         sk = d.get("skills")
         if isinstance(sk, str):
             try:
-                d["skills"] = json.loads(sk)
+                parsed = json.loads(sk)
+                d["skills"] = ([str(s) for s in parsed if s]
+                               if isinstance(parsed, list) else None)
             except Exception:
                 d["skills"] = None
         return Task(**{k: d.get(k) for k in Task.__dataclass_fields__})
@@ -61,6 +68,9 @@ class PostgresKanbanStore:
                     idempotency_key=None, max_runtime_seconds=None, skills=None,
                     max_retries=None, initial_status="running", session_id=None,
                     **_ignored: Any) -> str:
+        if initial_status not in _VALID_INITIAL_STATUSES:
+            raise ValueError(
+                f"initial_status must be one of {sorted(_VALID_INITIAL_STATUSES)}")
         now = int(time.time())
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
@@ -119,6 +129,9 @@ class PostgresKanbanStore:
                    include_archived=False, limit=None, order_by=None,
                    workflow_template_id=None, current_step_key=None,
                    **_ignored: Any) -> list[Task]:
+        if order_by:
+            raise NotImplementedError(
+                "phase-2-tail: list_tasks(order_by=...) not yet supported on postgres")
         clauses = ["board=%s"]
         params: list[Any] = [self.board]
         for col, val in (("assignee", assignee), ("status", status),
