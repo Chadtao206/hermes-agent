@@ -34,39 +34,61 @@ Flags (default false; behavior unchanged when off): `kanban.single_writer_daemon
 `kb.single_writer_enabled()`. (Auto-recovery currently enabled via `daemon.enable_auto_recovery()`;
 config flag `kanban.writer_auto_recovery` + backup interval/keep to be wired in Step C/WS2 Task 4.)
 
-## NEXT: Step C — the merged gateway pass (6c + WS2 Task 3) — NOT STARTED
-This is the large, risky surgery on `gateway/run.py` (merge hotspot). It must:
-1. **Daemon lifecycle in gateway** (behind `single_writer_enabled()`): for each board
-   (`kb.list_boards(include_archived=False)`, dedup by resolved DB path) create a `WriterDaemon`,
-   `enable_auto_recovery(backup_dir=<board dir>, keep, interval)`, `acquire_singleton()`,
-   start `serve_forever` on a daemon thread, `register_daemon(db_path, daemon)`. Track in
-   `self._kanban_writer_daemons`. On `stop()` (gateway/run.py:7476): `unregister_daemon(...)` in a
-   `finally` (avoid stale-registry hang) + `daemon.shutdown()`. Start BEFORE the dispatcher/notifier
-   watchers (launched at `gateway/run.py:4906`/`4912`).
-2. **Dispatcher routing:** `_kanban_dispatcher_watcher` (`:6667`) currently runs
-   `kb.dispatch_once(conn, spawn_fn=..., ...)` inside `asyncio.to_thread`. When flag on, route via
-   `await asyncio.to_thread(daemon.execute, "dispatch_once", spawn_fn=..., <kwargs>)`
-   (`dispatch_once(conn, *, spawn_fn, ttl_seconds, dry_run, max_spawn, max_in_progress,
-   failure_limit, stale_timeout_seconds, board, default_assignee, max_in_progress_per_profile)`).
-   Reads elsewhere stay on a read-only conn. `dispatch_once` doesn't call `write_session` internally,
-   so no re-entrancy. spawn_fn is an in-process callable — fine over the queue.
-3. **Notifier restructure (the hard part):** `_kanban_notifier_watcher` (`:5321`) currently opens a
-   WRITABLE `_kb.connect(board=slug)` (`~:5538`) and does reads + writes on it. Under the flag that
-   writable connect now RAISES `DirectWriteForbidden`. Restructure: open `connect(board=slug,
-   readonly=True)` for reads; route every write through the daemon — `record_notifier_heartbeat`,
-   the read-modify-write cursor claims (`claim_unseen_events_for_sub` /
-   `claim_unseen_events_for_profile_sub`), and `record_profile_wake_*` — via
-   `daemon.execute("<op>", ...)` (or `kb.write_session(board=slug)`). Add these op names to
-   in-process use (they're trusted; `execute` allows any callable kb fn, not just OP_ALLOWLIST).
-4. **Backoff instead of hard-disable + watchdog (WS2 Task 3):** the notifier/dispatcher
-   corruption-confirmation hard-disable (`notifier_disabled_db_paths` ~`:5452`; dispatcher
-   ~`:6989`) should, when `kanban.writer_auto_recovery` is on, back off and retry (trust the daemon
-   to heal) instead of permanently disabling. Add a watchdog that restarts a dead writer-daemon
-   thread and emits a high-severity alert only when `daemon.health()["disabled"]` (recovery
-   exhausted). Gate all of this on the flags; flag-off = today's behavior exactly.
+## Step C — the merged gateway pass (6c + WS2 Task 3)
 
-Suggested split: **C1** = lifecycle + dispatcher routing (more localized); **C2** = notifier
-restructure + backoff/watchdog (larger/riskier). Full two-stage review on both.
+### C1 — DONE (`064239eee`, reviewed ✅, flag-off byte-for-byte unchanged, 0 new regressions)
+- Module helper `_spawn_writer_daemons(board_db_paths, *, auto_recovery, keep, interval)` in
+  `gateway/run.py` — dedups by resolved path, `acquire_singleton`, starts thread, `register_daemon`;
+  now exception-safe per board (one bad board logs + cleans up + continues).
+- `GatewayRunner.__init__`: `self._kanban_writer_daemons = []`. New `_start_kanban_writer_daemon()`
+  (reads `kanban.writer_auto_recovery`/`writer_backup_keep`/`writer_backup_interval_seconds` via
+  `load_config()`; enumerates `list_boards(include_archived=False)` → resolves each via
+  `kanban_db_path(board=slug)`). Called immediately before the notifier watcher launches.
+- `stop()/_stop_impl`: unregister-then-shutdown each daemon (best-effort), clears the list.
+- Dispatcher routing: per-board dispatch closure routes `daemon.execute("dispatch_once", <same
+  kwargs>)` when flag on + daemon registered; `except RuntimeError` backs off (no legacy
+  corruption-streak disable); flag-off path unchanged. Tests in
+  `tests/gateway/test_kanban_writer_lifecycle.py` (+ a daemon `execute("dispatch_once", dry_run=True)`
+  test guarding the routed, non-allowlisted op).
+
+### C2 — NOT STARTED (fully scoped + DE-RISKED below)
+**Key finding (de-risks C2):** the notifier HEARTBEAT — the RCA's corrupted table — is ALREADY
+isolated into a sidecar (`kanban_notifier_heartbeats.db` via `hermes_cli/kanban_notifier_sidecar.py`,
+which uses its OWN `sqlite3.connect`, NOT `kb.connect`). `record_notifier_heartbeat(conn, ...)`
+IGNORES `conn` ("must not mutate the main board DB") and swallows errors. So the heartbeat write is
+guard-exempt and needs NO change. The board single-writer daemon + this existing sidecar split
+together cover the RCA. (So the deferred "churn isolation" is effectively already done for heartbeats.)
+
+C2 = route the notifier's remaining BOARD-DB writes through the daemon + backoff/watchdog. Under
+`single_writer_enabled()`:
+1. **Main watcher `_kanban_notifier_watcher` (~`:5407`):** change `conn = _kb.connect(board=slug)`
+   (`:5624`) to `readonly=True` for reads (`list_notify_subs`, `get_task`). Route the read-modify-write
+   cursor claims through the daemon: `claim_unseen_events_for_sub` (`:5716`) and
+   `claim_unseen_events_for_profile_sub` (`:5766`) → `daemon.execute("<op>", task_id=..., ...)`
+   (returns `(old_cursor, cursor, events)`). Reads after the claim use the readonly conn (a tiny
+   snapshot-lag is fine; next tick catches up).
+2. **Notifier helper methods (~`:6237`–`:6390`)** each open `conn = _kb.connect(board=board)` (writable)
+   and do a board write — these ALL trip the guard under the flag and must route through the daemon:
+   - `advance_notify_cursor` (`:6239`), `advance_profile_event_cursor` (`:6299`, `:6351`),
+     `record_profile_wake_success` (`:6349`), `record_profile_wake_failure` (`:6390`), plus the
+     `connect(board=board)` opens at `:6252`, `:6273`, `:6318`, `:6388` (check each: read → readonly;
+     write → `daemon.execute`/`write_session`).
+   - Pattern (repeat ~8×): flag on + `lookup_daemon(kanban_db_path(board=board))` → route the write
+     via `daemon.execute("<write_fn>", **kwargs)`; reads → `connect(readonly=True)`; flag off →
+     unchanged. Consider a small private helper on GatewayRunner, e.g.
+     `_board_write(board, op, **kwargs)` that picks daemon-vs-direct, to avoid repeating the branch.
+3. **Backoff instead of hard-disable + watchdog (WS2 Task 3):** when `writer_auto_recovery` on, the
+   notifier board-conn corruption path (`notifier_disabled_db_paths` ~`:5545`; confirm-streak
+   ~`:5639`) should back off + retry (the daemon owns recovery on its writable conn; the notifier's
+   board conn is now READONLY so it only reads). Add a watchdog (alongside the daemon threads) that
+   restarts a dead writer-daemon thread and emits a high-severity alert ONLY when
+   `daemon.health()["disabled"]` (recovery exhausted). Gate on flags; flag-off = today exactly.
+4. Note: `execute()` allows any callable `kb` fn (not just OP_ALLOWLIST) — the in-process notifier
+   writes (claims, cursor advances, wake records) are trusted, so they route fine.
+
+Full two-stage review. Watch: don't change flag-off behavior; the readonly board conn must still
+detect corruption for the (backoff) path; verify no notifier write path was missed (grep
+`_kb.connect(board=` in the notifier region after editing — every writable one must be gone under flag).
 
 ## REMAINING after Step C
 - **WS1 Task 7** — migrate worker-side tool write handlers in `tools/kanban_tools.py` to
