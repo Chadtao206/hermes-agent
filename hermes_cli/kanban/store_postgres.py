@@ -659,3 +659,145 @@ class PostgresKanbanStore:
             cur.execute(
                 "UPDATE tasks SET workspace_path=%s WHERE board=%s AND id=%s",
                 (str(path), self.board, task_id))
+
+    # --- notify subscriptions --------------------------------------------
+
+    def add_notify_sub(self, *, task_id, platform, chat_id, thread_id=None,
+                       user_id=None, notifier_profile=None, event_kinds=None,
+                       include_children=None) -> None:
+        thread_id = thread_id or ''
+        now = int(time.time())
+        pk = (self.board, task_id, platform, chat_id, thread_id)
+        ek_insert = json.dumps(event_kinds) if isinstance(event_kinds, list) else None
+        ic_insert = 1 if include_children else 0
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "INSERT INTO kanban_notify_subs "
+                    "(board,task_id,platform,chat_id,thread_id,user_id,notifier_profile,"
+                    "created_at,last_event_id,event_kinds,include_children) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s) "
+                    "ON CONFLICT (board,task_id,platform,chat_id,thread_id) DO NOTHING",
+                    (*pk, user_id, notifier_profile, now, ek_insert, ic_insert),
+                )
+                # Selective backfill UPDATEs so they apply whether row was just inserted or pre-existed
+                if notifier_profile is not None:
+                    cur.execute(
+                        "UPDATE kanban_notify_subs SET notifier_profile=%s "
+                        "WHERE board=%s AND task_id=%s AND platform=%s AND chat_id=%s "
+                        "AND thread_id=%s AND notifier_profile IS NULL",
+                        (notifier_profile, *pk),
+                    )
+                if isinstance(event_kinds, list):
+                    cur.execute(
+                        "UPDATE kanban_notify_subs SET event_kinds=%s "
+                        "WHERE board=%s AND task_id=%s AND platform=%s AND chat_id=%s "
+                        "AND thread_id=%s",
+                        (json.dumps(event_kinds), *pk),
+                    )
+                if include_children is not None:
+                    cur.execute(
+                        "UPDATE kanban_notify_subs SET include_children=%s "
+                        "WHERE board=%s AND task_id=%s AND platform=%s AND chat_id=%s "
+                        "AND thread_id=%s",
+                        (1 if include_children else 0, *pk),
+                    )
+
+    def remove_notify_sub(self, *, task_id, platform, chat_id, thread_id=None) -> bool:
+        thread_id = thread_id or ''
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "DELETE FROM kanban_notify_subs "
+                "WHERE board=%s AND task_id=%s AND platform=%s AND chat_id=%s "
+                "AND thread_id=%s",
+                (self.board, task_id, platform, chat_id, thread_id),
+            )
+            return cur.rowcount > 0
+
+    def list_notify_subs(self, task_id=None) -> list:
+        clauses = ["board=%s"]
+        params: list = [self.board]
+        if task_id is not None:
+            clauses.append("task_id=%s")
+            params.append(task_id)
+        sql = "SELECT * FROM kanban_notify_subs WHERE " + " AND ".join(clauses)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, tuple(params))
+            return [dict(r) for r in cur.fetchall()]
+
+    # --- profile event subscriptions -------------------------------------
+
+    def add_profile_event_sub(self, *, task_id, profile, name="",
+                              event_kinds=_UNSET, include_children=None,
+                              wake_agent=None, wake_prompt=_UNSET,
+                              enabled=None) -> None:
+        now = int(time.time())
+        pk = (self.board, task_id, profile, name)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "INSERT INTO kanban_profile_event_subs "
+                    "(board,task_id,profile,name,created_at,last_event_id) "
+                    "VALUES (%s,%s,%s,%s,%s,0) "
+                    "ON CONFLICT (board,task_id,profile,name) DO NOTHING",
+                    (*pk, now),
+                )
+                if event_kinds is not _UNSET:
+                    ek_val = json.dumps(event_kinds) if isinstance(event_kinds, list) else None
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs SET event_kinds=%s "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (ek_val, *pk),
+                    )
+                if include_children is not None:
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs SET include_children=%s "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (1 if include_children else 0, *pk),
+                    )
+                if wake_agent is not None:
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs SET wake_agent=%s "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (1 if wake_agent else 0, *pk),
+                    )
+                if wake_prompt is not _UNSET:
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs SET wake_prompt=%s "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (wake_prompt, *pk),
+                    )
+                if enabled is not None:
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs SET enabled=%s "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (1 if enabled else 0, *pk),
+                    )
+
+    def remove_profile_event_sub(self, *, task_id, profile, name="") -> bool:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "DELETE FROM kanban_profile_event_subs "
+                "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                (self.board, task_id, profile, name),
+            )
+            return cur.rowcount > 0
+
+    def list_profile_event_subs(self, *, task_id=None, profile=None,
+                                enabled_only=True) -> list:
+        clauses = ["board=%s"]
+        params: list = [self.board]
+        if task_id is not None:
+            clauses.append("task_id=%s")
+            params.append(task_id)
+        if profile is not None:
+            clauses.append("profile=%s")
+            params.append(profile)
+        if enabled_only:
+            clauses.append("enabled=1")
+        sql = ("SELECT * FROM kanban_profile_event_subs WHERE "
+               + " AND ".join(clauses)
+               + " ORDER BY created_at ASC")
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, tuple(params))
+            return [dict(r) for r in cur.fetchall()]
