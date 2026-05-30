@@ -147,11 +147,19 @@ typed exception client-side. So `except kb.PRHeadGateError` works on every trans
 Tests: `test_kanban_error_serialization.py`, `test_kanban_writer_typed_errors.py`,
 `test_kanban_tools_write_session.py`.
 
+## WS1 Task 8 — DONE & GREEN (one squashed commit; not yet reviewed)
+`writer_socket_path()` now honors a `HERMES_KANBAN_WRITER_SOCK` override (highest precedence,
+mirroring `HERMES_KANBAN_DB`); new `_writer_client_env(board)` returns that pin under the flag
+(empty when off); `_default_spawn` injects it (`env.update(_writer_client_env(board=board))`).
+So a worker's `write_session` → `RemoteWriter` connects to exactly the daemon the dispatcher knows
+serves this board, immune to path-resolution drift. **Confirmed + resolved the STATUS open
+question:** the old `HERMES_KANBAN_WRITER_OWNER` env is obsolete — nothing reads it; "workers are
+never owners" is enforced structurally by the writer-thread-local guard (a worker has no registered
+in-process daemon and isn't the writer thread → `write_session` picks RemoteWriter; a stray
+writable `connect()` is refused by the Task-4 guard). No owner env is set. Flag off = unchanged.
+Verified regression-free (`-k kanban` failing-set unchanged at 22). Tests: `test_kanban_spawn_env.py`.
+
 ## REMAINING after Step C
-- **WS1 Task 8** — worker spawn env: set `HERMES_KANBAN_WRITER_SOCK`; ensure workers are never
-  owner/writer-thread. Plan Task 8. (Note: enforcement is now thread-local, not env-owner — workers
-  are clients because they have no registered daemon + aren't the writer thread → `write_session`
-  picks RemoteWriter. Confirm the socket path env is still useful or drop it.)
 - **WS1 Task 9** — integration proof (killed client can't corrupt) + `config.yaml` flag docs.
 - **WS2 Task 4** — `config.yaml` flags: `writer_auto_recovery`, `writer_backup_interval_seconds`,
   `writer_backup_keep`; gate the gateway recovery wiring on `writer_auto_recovery`.

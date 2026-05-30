@@ -1876,8 +1876,32 @@ def single_writer_enabled() -> bool:
 
 
 def writer_socket_path(*, board: Optional[str] = None) -> Path:
-    """Per-board daemon socket, alongside the board DB file."""
+    """Per-board daemon socket, alongside the board DB file.
+
+    ``HERMES_KANBAN_WRITER_SOCK`` pins the path directly (highest precedence),
+    mirroring ``HERMES_KANBAN_DB`` for the DB file: the dispatcher injects it
+    into the worker env (see :func:`_writer_client_env`) so a worker's
+    :func:`write_session` → ``RemoteWriter`` connects to exactly the daemon the
+    dispatcher knows serves this board, immune to any path-resolution drift.
+    """
+    override = os.environ.get("HERMES_KANBAN_WRITER_SOCK", "").strip()
+    if override:
+        return Path(override).expanduser()
     return kanban_db_path(board=board).parent / ".kanban-writer.sock"
+
+
+def _writer_client_env(board: Optional[str] = None) -> dict:
+    """Env additions that make a spawned worker a writer *client*.
+
+    Under the single-writer flag, returns ``HERMES_KANBAN_WRITER_SOCK`` pinned
+    to this board's daemon socket. Empty when the flag is off (today's
+    behavior). No owner env is ever set: a worker is a client because it has no
+    registered in-process daemon and is not the writer thread — the
+    writer-thread-local guard enforces this structurally, not via env.
+    """
+    if not single_writer_enabled():
+        return {}
+    return {"HERMES_KANBAN_WRITER_SOCK": str(writer_socket_path(board=board))}
 
 
 class _LocalWriter:
@@ -7962,6 +7986,11 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # Single-writer daemon: pin the writer socket so the worker's write_session
+    # routes to the daemon serving this board (no-op when the flag is off). The
+    # worker is a client by construction — no registered daemon, not the writer
+    # thread — so its writable connect() is refused and writes go over the socket.
+    env.update(_writer_client_env(board=board))
     # Propagate incident-forensics flags from the dispatcher/root config into
     # profile-scoped workers. Named worker profiles load their own config.yaml,
     # so without explicit env propagation the root-level kanban.db_forensics_*
