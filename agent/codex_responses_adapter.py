@@ -1293,7 +1293,14 @@ def _normalize_codex_response(
     # ``function_call`` item. The existing loop already handles message
     # append, dedup, and retry budget.
     leaked_tool_call_text = False
+    reasoning_leak_detected = False
     if final_text and not tool_calls and _TOOL_CALL_LEAK_PATTERN.search(final_text):
+        # A tool call leaked into the text channel is evidence the model's
+        # encrypted reasoning state degenerated (corrupted harmony control
+        # tokens). Mark it so we DON'T replay that reasoning into the retry /
+        # next turn — replaying the corrupt state makes every continuation
+        # degenerate identically, exhaust the retry budget, and protocol-violate.
+        reasoning_leak_detected = True
         # Prefer reconstructing the call the model intended (so e.g. the kanban
         # closeout actually executes) over scrubbing + retrying until the budget
         # exhausts and the worker protocol-violates. Conservative: only a single
@@ -1330,7 +1337,12 @@ def _normalize_codex_response(
         reasoning="\n\n".join(reasoning_parts).strip() if reasoning_parts else None,
         reasoning_content=None,
         reasoning_details=None,
-        codex_reasoning_items=reasoning_items_raw or None,
+        # Drop reasoning items when a tool-call leak was detected: the reasoning
+        # state that produced a garbled call is the suspected root cause, so let
+        # the model re-derive clean reasoning instead of replaying corruption.
+        codex_reasoning_items=(
+            None if reasoning_leak_detected else (reasoning_items_raw or None)
+        ),
         codex_message_items=message_items_raw or None,
     )
 

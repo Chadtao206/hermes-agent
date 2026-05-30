@@ -1485,6 +1485,89 @@ def test_normalize_codex_response_unparseable_leak_falls_back_to_incomplete(monk
     assert (assistant_message.content or "") == ""
 
 
+def _leak_response_with_reasoning(leaked_text):
+    """A Codex response carrying an encrypted reasoning item AND a message that
+    leaked a tool call as text — the degeneration shape."""
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="reasoning", id="rs_real_1",
+                encrypted_content="ENCRYPTED_REASONING_BLOB", summary=[],
+            ),
+            SimpleNamespace(
+                type="message", status="completed",
+                content=[SimpleNamespace(type="output_text", text=leaked_text)],
+            ),
+        ],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="completed", model="gpt-5.3-codex",
+    )
+
+
+def test_normalize_codex_response_drops_reasoning_on_unrecoverable_leak(monkeypatch):
+    """Root-cause mitigation: a leaked tool call is evidence the encrypted
+    reasoning state degenerated. On the incomplete+retry path, the corrupt
+    reasoning items must NOT be replayed (replaying them makes every retry
+    degenerate identically and exhaust the budget → protocol violation)."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    # Single marker, unparseable args → incomplete path (not reconstructed).
+    resp = _leak_response_with_reasoning(
+        'to=functions.kanban_complete {"task_id": "t_x", "summary": "unterminated'
+    )
+    assistant_message, finish_reason = _normalize_codex_response(resp)
+
+    assert finish_reason == "incomplete"
+    assert assistant_message.tool_calls == []
+    # Corrupt reasoning dropped so the retry re-derives clean state.
+    assert assistant_message.codex_reasoning_items is None
+
+
+def test_normalize_codex_response_drops_reasoning_on_reconstructed_leak(monkeypatch):
+    """Even when the leaked call is reconstructed, the reasoning state that
+    produced a garbled call is suspect — drop it so the post-tool turn doesn't
+    replay corruption and re-degenerate."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    resp = _leak_response_with_reasoning(
+        'to=functions.kanban_complete {"task_id": "t_x", "summary": "done"}'
+    )
+    assistant_message, finish_reason = _normalize_codex_response(resp)
+
+    assert finish_reason == "tool_calls"
+    assert assistant_message.tool_calls[0].function.name == "kanban_complete"
+    assert assistant_message.codex_reasoning_items is None
+
+
+def test_normalize_codex_response_preserves_reasoning_without_leak(monkeypatch):
+    """Guard: a clean response (no tool-call leak) keeps its reasoning items so
+    normal multi-turn chain-of-thought continuity is unaffected."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    resp = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="reasoning", id="rs_real_1",
+                encrypted_content="ENCRYPTED_REASONING_BLOB", summary=[],
+            ),
+            SimpleNamespace(
+                type="message", status="completed",
+                content=[SimpleNamespace(type="output_text", text="Here is the summary.")],
+            ),
+        ],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="completed", model="gpt-5.3-codex",
+    )
+    assistant_message, finish_reason = _normalize_codex_response(resp)
+
+    assert finish_reason == "stop"
+    assert assistant_message.codex_reasoning_items
+    assert assistant_message.codex_reasoning_items[0]["encrypted_content"] == "ENCRYPTED_REASONING_BLOB"
+
+
 def test_normalize_codex_response_ignores_tool_call_text_when_real_tool_call_present(monkeypatch):
     """If the model emitted BOTH a structured function_call AND some text that
     happens to contain `to=functions.*` (unlikely but possible), trust the
