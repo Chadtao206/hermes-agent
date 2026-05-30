@@ -76,6 +76,12 @@ class SqliteKanbanStore:
     def delete_task(self, task_id: str) -> bool:
         return self._write("delete_task", task_id=task_id)
 
+    def promote_task(self, task_id: str, **kwargs: Any):
+        return self._write("promote_task", task_id=task_id, **kwargs)
+
+    def set_workspace_path(self, task_id: str, path: str) -> None:
+        return self._write("set_workspace_path", task_id=task_id, path=path)
+
     # --- links -----------------------------------------------------------
     def link_tasks(self, parent_id: str, child_id: str, **kwargs: Any) -> None:
         return self._write("link_tasks", parent_id=parent_id, child_id=child_id, **kwargs)
@@ -99,6 +105,9 @@ class SqliteKanbanStore:
     # --- events ----------------------------------------------------------
     def list_events(self, task_id: str, **kwargs: Any):
         return self._read(lambda c: kb.list_events(c, task_id, **kwargs))
+
+    def gc_events(self, **kwargs: Any) -> int:
+        return self._write("gc_events", **kwargs)
 
     # --- runs ------------------------------------------------------------
     def list_runs(self, task_id: str):

@@ -70,3 +70,26 @@ def test_profile_sub_and_recompute(store):
     assert isinstance(store.recompute_ready(), int)
     assert isinstance(store.has_spawnable_ready(), bool)
     assert store.remove_profile_event_sub(task_id=tid, profile="engineer", name="") is True
+
+
+def test_gc_events_returns_int(store):
+    store.create_task(title="x", assignee="engineer")
+    assert isinstance(store.gc_events(), int)
+
+
+def test_set_workspace_path(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    # set_workspace_path returns None (kb function has no return value)
+    store.set_workspace_path(tid, "/tmp/ws")
+    assert store.get_task(tid).workspace_path == "/tmp/ws"
+
+
+def test_promote_task_is_callable(store):
+    # promote_task requires a specific task state (todo/blocked) and a mandatory
+    # `actor` kwarg; rather than wiring up full state, just confirm the method
+    # exists, is callable, and returns a (bool, str|None) tuple on a missing task.
+    tid = store.create_task(title="x", assignee="engineer")
+    result = store.promote_task(tid, actor="ops")
+    assert isinstance(result, tuple) and len(result) == 2
+    ok, err = result
+    assert isinstance(ok, bool)

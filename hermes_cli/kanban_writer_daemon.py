@@ -43,6 +43,12 @@ OP_ALLOWLIST = frozenset({
     "claim_unseen_events_for_profile_sub",
     # Notifier heartbeat write: upserts last_seen timestamp for a notifier.
     "record_notifier_heartbeat",
+    # Operator-driven task promotion: moves todo/blocked -> ready with audit trail.
+    "promote_task",
+    # Store workspace path on a task (worker scratch-dir tracking).
+    "set_workspace_path",
+    # Garbage-collect old task_events rows for terminal tasks.
+    "gc_events",
 })
 
 
