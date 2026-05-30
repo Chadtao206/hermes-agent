@@ -9,7 +9,10 @@ from typing import Any, Optional
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from hermes_cli.kanban_db import Task, Run, Event, Comment  # reuse dataclasses
+from hermes_cli import kanban_db
+from hermes_cli.kanban_db import (  # reuse dataclasses
+    Task, Run, Event, Comment, DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
+)
 from hermes_cli.kanban import pg_pool
 
 _VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
@@ -1174,13 +1177,14 @@ class PostgresKanbanStore:
     def record_notifier_heartbeat(self, **kwargs) -> None:
         # Notifier-heartbeat telemetry is board-independent and intentionally
         # lives in a shared SQLite sidecar for BOTH backends, never in the
-        # board DB. Delegate to the same module kanban_db uses.
-        from hermes_cli import kanban_notifier_sidecar
-        return kanban_notifier_sidecar.record_notifier_heartbeat(**kwargs)
+        # board DB. Delegate to the kanban_db wrapper (not the raw sidecar) so
+        # PG inherits its swallow-and-warn guard: a corrupt sidecar must not
+        # crash a notifier tick. Gives byte-identical cross-backend behavior.
+        return kanban_db.record_notifier_heartbeat(**kwargs)
 
     def list_notifier_heartbeats(self, **kwargs) -> list:
-        from hermes_cli import kanban_notifier_sidecar
-        return kanban_notifier_sidecar.list_notifier_heartbeats(**kwargs)
+        # Delegate to the kanban_db wrapper for cross-backend parity.
+        return kanban_db.list_notifier_heartbeats(**kwargs)
 
     def heartbeat_worker(
         self,
@@ -1190,9 +1194,6 @@ class PostgresKanbanStore:
         expected_run_id: Optional[int] = None,
         min_event_interval_seconds: Optional[int] = None,
     ) -> bool:
-        from hermes_cli.kanban_db import (
-            DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
-        )
         if min_event_interval_seconds is None:
             min_event_interval_seconds = DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS
         min_event_interval_seconds = max(0, int(min_event_interval_seconds or 0))
@@ -1213,7 +1214,7 @@ class PostgresKanbanStore:
                 if cur.rowcount != 1:
                     return False
                 if expected_run_id is not None:
-                    run_id: Optional[int] = int(expected_run_id)
+                    run_id = int(expected_run_id)
                 else:
                     cur.execute(
                         "SELECT current_run_id FROM tasks "
