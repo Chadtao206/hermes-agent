@@ -1865,13 +1865,31 @@ def connect_closing(
 
 
 def single_writer_enabled() -> bool:
-    """True when kanban.single_writer_daemon is enabled in config."""
+    """True when the single-writer daemon governs writes for this process.
+
+    Resolved in order:
+
+    1. ``HERMES_KANBAN_WRITER_SOCK`` pinned in the env. The dispatcher sets this
+       on a worker ONLY when its gateway runs the daemon (see
+       :func:`_writer_client_env`). Workers run under a profile-scoped
+       ``HERMES_HOME`` whose ``config.yaml`` usually lacks ``single_writer_daemon``,
+       so reading config alone a worker sees ``False`` and opens a *direct*
+       writable connection to the SHARED board (pinned via ``HERMES_KANBAN_DB``)
+       — a second writer that corrupts the DB. Honouring the pin makes the
+       worker route writes through the daemon instead.
+    2. ``kanban.single_writer_daemon`` in the caller's config.
+    3. Fail closed: if config can't be read, assume the daemon governs writes so
+       a stray writable connect is refused rather than risking a silent second
+       writer on a shared board.
+    """
+    if os.environ.get("HERMES_KANBAN_WRITER_SOCK", "").strip():
+        return True
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
         kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     except Exception:
-        return False
+        return True
     return bool(kanban_cfg.get("single_writer_daemon", False))
 
 

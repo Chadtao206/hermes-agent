@@ -5468,3 +5468,40 @@ def test_get_task_does_not_retry_durable_corruption(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.DatabaseError):
         kb.get_task(flaky, "t1")
     assert flaky.calls == 1  # no retry on durable corruption
+
+
+# ---------------------------------------------------------------------------
+# single_writer_enabled() resolution: env pin + fail-closed
+# ---------------------------------------------------------------------------
+def test_single_writer_enabled_honors_socket_env(monkeypatch):
+    """A pinned HERMES_KANBAN_WRITER_SOCK forces single-writer ON, even when the
+    caller's (profile-scoped) config lacks the flag — the dispatcher sets it on
+    workers only when its gateway runs the daemon, so the worker must route
+    writes to it instead of opening a second writable connection."""
+    import hermes_cli.config as cfg
+    monkeypatch.setenv("HERMES_KANBAN_WRITER_SOCK", "/tmp/some-board/.kanban-writer.sock")
+    # Profile config without the flag would otherwise yield False.
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {}})
+    assert kb.single_writer_enabled() is True
+
+
+def test_single_writer_enabled_fails_closed_on_config_error(monkeypatch):
+    """If config can't be read, assume the daemon governs writes (refuse stray
+    writable connects) rather than silently allowing a second writer."""
+    import hermes_cli.config as cfg
+    monkeypatch.delenv("HERMES_KANBAN_WRITER_SOCK", raising=False)
+    def _boom():
+        raise RuntimeError("config unreadable")
+    monkeypatch.setattr(cfg, "load_config", _boom)
+    assert kb.single_writer_enabled() is True
+
+
+def test_single_writer_enabled_reads_config_flag(monkeypatch):
+    import hermes_cli.config as cfg
+    monkeypatch.delenv("HERMES_KANBAN_WRITER_SOCK", raising=False)
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {"single_writer_daemon": True}})
+    assert kb.single_writer_enabled() is True
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {"single_writer_daemon": False}})
+    assert kb.single_writer_enabled() is False
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {}})
+    assert kb.single_writer_enabled() is False
