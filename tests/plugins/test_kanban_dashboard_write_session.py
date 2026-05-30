@@ -156,3 +156,45 @@ def test_all_dashboard_write_ops_are_allowlisted():
     routed = set(re.findall(r"\bw\.(\w+)\(", src))
     missing = routed - wd.OP_ALLOWLIST
     assert not missing, f"dashboard routes ops not in OP_ALLOWLIST: {sorted(missing)}"
+
+
+def _col(db: Path, tid: str, col: str):
+    con = _ro(db)
+    try:
+        return con.execute(f"SELECT {col} FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_update_task_status_priority_title_through_daemon(daemon_board):
+    from fastapi import HTTPException
+
+    db = daemon_board
+    tid = _new_task(title="orig", assignee="engineer")
+
+    # status: -> blocked -> ready (unblock) -> todo (direct)
+    api.update_task(tid, api.UpdateTaskBody(status="blocked", block_reason="x"), board=None)
+    assert _col(db, tid, "status") == "blocked"
+    api.update_task(tid, api.UpdateTaskBody(status="ready"), board=None)
+    assert _col(db, tid, "status") == "ready"
+    api.update_task(tid, api.UpdateTaskBody(status="todo"), board=None)
+    assert _col(db, tid, "status") == "todo"
+
+    # priority
+    api.update_task(tid, api.UpdateTaskBody(priority=7), board=None)
+    assert _col(db, tid, "priority") == 7
+
+    # title / body
+    api.update_task(tid, api.UpdateTaskBody(title="renamed", body="newbody"), board=None)
+    assert _col(db, tid, "title") == "renamed"
+    assert _col(db, tid, "body") == "newbody"
+
+    # empty title -> 400 (handler pre-validation, before any write)
+    with pytest.raises(HTTPException) as ei:
+        api.update_task(tid, api.UpdateTaskBody(title="   "), board=None)
+    assert ei.value.status_code == 400
+
+    # 'running' is rejected with 400, not routed
+    with pytest.raises(HTTPException) as ei2:
+        api.update_task(tid, api.UpdateTaskBody(status="running"), board=None)
+    assert ei2.value.status_code == 400

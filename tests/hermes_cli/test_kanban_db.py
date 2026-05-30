@@ -5599,3 +5599,28 @@ def test_readonly_corrupt_cache_reprobes_and_self_heals_after_recovery(tmp_path,
     finally:
         c.close()
     assert key not in kb._CORRUPT_PATHS
+
+
+def test_set_task_priority_and_edit_fields_and_status_direct(tmp_path):
+    """Unit-test the kb ops backing PATCH /tasks (priority / title-body / status)."""
+    db = tmp_path / "kanban.db"
+    conn = kb.connect(db_path=db, readonly=False, _bootstrap=True)
+    try:
+        tid = kb.create_task(conn, title="orig", assignee="worker")
+
+        assert kb.set_task_priority(conn, tid, 7) is True
+        assert kb.get_task(conn, tid).priority == 7
+        assert kb.set_task_priority(conn, "nope", 1) is False
+
+        assert kb.edit_task_fields(conn, tid, title="renamed", body="b") is True
+        t = kb.get_task(conn, tid)
+        assert t.title == "renamed" and t.body == "b"
+        with pytest.raises(ValueError):
+            kb.edit_task_fields(conn, tid, title="   ")
+        assert kb.edit_task_fields(conn, tid) is False  # no fields
+
+        assert kb.set_status_direct(conn, tid, "todo") is True
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.set_status_direct(conn, "nope", "ready") is False
+    finally:
+        conn.close()

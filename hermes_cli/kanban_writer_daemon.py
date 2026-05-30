@@ -31,6 +31,8 @@ OP_ALLOWLIST = frozenset({
     "unlink_tasks", "reclaim_task", "reassign_task", "assign_task",
     "schedule_task", "archive_task", "add_notify_sub", "remove_notify_sub",
     "remove_profile_event_sub",
+    # Dashboard PATCH /tasks field edits (status drag-drop, priority, title/body).
+    "set_status_direct", "set_task_priority", "edit_task_fields",
 })
 
 

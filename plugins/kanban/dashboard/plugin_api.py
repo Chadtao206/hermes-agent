@@ -1118,64 +1118,87 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
-    board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    from hermes_cli.kanban_writer_client import RemoteWriteError
 
+    board = _resolve_board(board)
+    # Validate inputs that the kb layer would only reject mid-write (over the
+    # socket a kb ValueError surfaces as RemoteWriteError, not ValueError, so we
+    # can't rely on `except ValueError` to map it to 400).
+    if payload.title is not None and not payload.title.strip():
+        raise HTTPException(status_code=400, detail="title cannot be empty")
+    if payload.status == "running":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+        )
+    if payload.status is not None and payload.status not in {
+        "done", "blocked", "scheduled", "ready", "archived", "todo", "triage",
+    }:
+        raise HTTPException(status_code=400, detail=f"unknown status: {payload.status}")
+
+    # Existence check on a read-only connection.
+    rconn = _conn(board=board, readonly=True)
+    try:
+        if kanban_db.get_task(rconn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    finally:
+        rconn.close()
+
+    def _read_status() -> Optional[str]:
+        rc = _conn(board=board, readonly=True)
+        try:
+            t = kanban_db.get_task(rc, task_id)
+            return t.status if t else None
+        finally:
+            rc.close()
+
+    # All mutations route through the single-writer daemon.
+    with kanban_db.write_session(board=board) as w:
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:
-                ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
-                )
-            except RuntimeError as e:
+                ok = w.assign_task(task_id=task_id, profile=payload.assignee or None)
+            except RuntimeError as e:  # LocalWriter / DaemonWriter path
                 raise HTTPException(status_code=409, detail=str(e))
+            except RemoteWriteError as e:  # socket path
+                if e.error_type == "RuntimeError":
+                    raise HTTPException(status_code=409, detail=str(e))
+                raise
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
-            ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
+                ok = w.complete_task(
+                    task_id=task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = w.block_task(task_id=task_id, reason=payload.block_reason)
             elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                ok = w.schedule_task(task_id=task_id, reason=payload.block_reason)
             elif s == "ready":
-                # Re-open a blocked/scheduled task, or just an explicit status set.
-                current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                # Re-open a blocked/scheduled task, else a direct drag-drop set.
+                if _read_status() in ("blocked", "scheduled"):
+                    ok = w.unblock_task(task_id=task_id)
                 else:
-                    # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
+                    ok = w.set_status_direct(task_id=task_id, new_status="ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
-            elif s == "running":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
-                )
-            elif s in ("todo", "triage", "scheduled"):
-                ok = _set_status_direct(conn, task_id, s)
-            else:
-                raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+                ok = w.archive_task(task_id=task_id)
+            else:  # todo / triage
+                ok = w.set_status_direct(task_id=task_id, new_status=s)
             if not ok:
-                # For ``ready``, name the blocking parent(s) so the dashboard
-                # can render an actionable toast instead of a silent no-op.
-                # See #26744.
+                # For ``ready``, name the blocking parent(s) (see #26744).
                 if s == "ready":
-                    blockers = _parents_blocking_ready(conn, task_id)
+                    rc = _conn(board=board, readonly=True)
+                    try:
+                        blockers = _parents_blocking_ready(rc, task_id)
+                    finally:
+                        rc.close()
                     if blockers:
                         names = ", ".join(
                             f"{p['title']!r} ({p['id']}, status={p['status']})"
@@ -1195,44 +1218,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
-            with kanban_db.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET priority = ? WHERE id = ?",
-                    (int(payload.priority), task_id),
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'reprioritized', ?, ?)",
-                    (task_id, json.dumps({"priority": int(payload.priority)}),
-                     int(time.time())),
-                )
+            w.set_task_priority(task_id=task_id, priority=int(payload.priority))
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+            w.edit_task_fields(task_id=task_id, title=payload.title, body=payload.body)
 
-        updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+    rconn = _conn(board=board, readonly=True)
+    try:
+        updated = kanban_db.get_task(rconn, task_id)
     finally:
-        conn.close()
+        rconn.close()
+    return {"task": _task_dict(updated) if updated else None}
 
 
 # ---------------------------------------------------------------------------

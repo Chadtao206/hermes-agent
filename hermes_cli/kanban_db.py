@@ -3097,6 +3097,155 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         return True
 
 
+def set_status_direct(
+    conn: sqlite3.Connection, task_id: str, new_status: str,
+) -> bool:
+    """Direct status write for drag-drop moves not covered by the structured
+    complete/block/unblock/archive verbs (e.g. todo<->ready, running<->ready).
+    Appends a ``status`` event for the live feed.
+
+    Moving OFF ``running`` to a non-terminal status closes the active run with
+    outcome='reclaimed' so attempt history isn't orphaned. Returns False when
+    the transition is refused (unknown task, or 'ready' with a not-done parent).
+
+    Moved from the dashboard plugin so it can run on the single-writer daemon
+    thread via write_session; the logic is unchanged.
+    """
+    with write_txn(conn):
+        prev = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        if new_status == "ready":
+            parent_statuses = conn.execute(
+                "SELECT t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            if parent_statuses and not all(
+                p["status"] == "done" for p in parent_statuses
+            ):
+                return False
+
+        was_running = prev["status"] == "running"
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and new_status not in {"done", "archived"}
+        )
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, "
+            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
+            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "WHERE id = ?",
+            (new_status, new_status, new_status, new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = None
+        if was_running and new_status != "running" and prev["current_run_id"]:
+            run_id = _end_run(
+                conn, task_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=f"status changed to {new_status} (dashboard/direct)",
+            )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'status', ?, ?)",
+            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+        )
+        if reopening_satisfied_parent:
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                        "VALUES (?, 'status', ?, ?)",
+                        (
+                            child_id,
+                            json.dumps(
+                                {
+                                    "status": "todo",
+                                    "reason": "parent_reopened",
+                                    "parent": task_id,
+                                }
+                            ),
+                            int(time.time()),
+                        ),
+                    )
+    if new_status in {"done", "ready"}:
+        recompute_ready(conn)
+    return True
+
+
+def set_task_priority(conn: sqlite3.Connection, task_id: str, priority: int) -> bool:
+    """Set a task's priority and append a ``reprioritized`` event. Returns False
+    if the task does not exist."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ?", (int(priority), task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'reprioritized', ?, ?)",
+            (task_id, json.dumps({"priority": int(priority)}), int(time.time())),
+        )
+        return True
+
+
+def edit_task_fields(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+) -> bool:
+    """Edit a task's title and/or body and append an ``edited`` event. Raises
+    ValueError on an empty title; returns False if the task does not exist or no
+    field was supplied."""
+    if title is None and body is None:
+        return False
+    with write_txn(conn):
+        sets: list[str] = []
+        vals: list[Any] = []
+        if title is not None:
+            stripped = title.strip()
+            if not stripped:
+                raise ValueError("title cannot be empty")
+            sets.append("title = ?")
+            vals.append(stripped)
+        if body is not None:
+            sets.append("body = ?")
+            vals.append(body)
+        vals.append(task_id)
+        cur = conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'edited', NULL, ?)",
+            (task_id, int(time.time())),
+        )
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
