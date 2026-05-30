@@ -1864,7 +1864,7 @@ def connect_closing(
             pass
 
 
-def single_writer_enabled() -> bool:
+def single_writer_enabled(board: Optional[str] = None) -> bool:
     """True when the single-writer daemon governs writes for this process.
 
     Resolved in order:
@@ -1890,7 +1890,45 @@ def single_writer_enabled() -> bool:
         kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     except Exception:
         return True
-    return bool(kanban_cfg.get("single_writer_daemon", False))
+    if bool(kanban_cfg.get("single_writer_daemon", False)):
+        return True
+    # 4. Board-scoped: a writer daemon actively serving THIS board governs all
+    #    of its writers, even a caller whose own (profile-scoped) config doesn't
+    #    set the flag. This closes the manual ``hermes -p <profile> kanban ...``
+    #    gap — a process pinned to a shared, daemon-served board must route
+    #    writes through the daemon rather than open a second writable connection.
+    #    Only reached when neither the env pin nor the config flag applies, so it
+    #    adds no cost to the hot worker/gateway paths.
+    return _writer_daemon_is_live(board=board)
+
+
+def _writer_daemon_is_live(board: Optional[str] = None) -> bool:
+    """True iff a writer daemon is actively listening on this board's socket.
+
+    Probes connectability rather than mere file existence: the daemon unlinks
+    its socket on clean shutdown, but a crash can leave a stale path. A stale or
+    absent socket fails the connect and we fall back to config-driven behavior,
+    so a stopped gateway never wedges standalone CLI writes.
+    """
+    import socket as _socket
+    try:
+        sock_path = writer_socket_path(board=board)
+        if not sock_path.exists():
+            return False
+    except OSError:
+        return False
+    probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.25)
+        probe.connect(str(sock_path))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
 
 
 def _promote_scheduled_enabled() -> bool:

@@ -5505,3 +5505,34 @@ def test_single_writer_enabled_reads_config_flag(monkeypatch):
     assert kb.single_writer_enabled() is False
     monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {}})
     assert kb.single_writer_enabled() is False
+
+
+def test_single_writer_enabled_board_scoped_live_daemon(tmp_path, monkeypatch):
+    """A live writer-daemon socket for the target board forces single-writer ON,
+    even when the caller's config lacks the flag (covers a profile CLI / any
+    process pinned to a shared, daemon-served board). A stale/absent socket does
+    NOT — so a stopped gateway can't wedge standalone CLI writes."""
+    import socket as _socket
+    import hermes_cli.config as cfg
+    monkeypatch.delenv("HERMES_KANBAN_WRITER_SOCK", raising=False)
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {}})  # flag OFF
+    db = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    sock_path = kb.writer_socket_path()
+
+    # No socket -> config-driven (False).
+    assert kb.single_writer_enabled() is False
+
+    # Live listener at the board socket -> single-writer ON.
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+    try:
+        assert kb.single_writer_enabled() is True
+    finally:
+        srv.close()
+    sock_path.unlink(missing_ok=True)
+
+    # Stale regular file at the socket path (no listener) -> NOT single-writer.
+    sock_path.touch()
+    assert kb.single_writer_enabled() is False
