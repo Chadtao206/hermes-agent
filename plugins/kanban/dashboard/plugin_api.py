@@ -236,6 +236,17 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
         raise
 
 
+def _store(board: Optional[str] = None):
+    """Return a KanbanStore for the given board.
+
+    The store owns connection lifecycle; callers MUST call store.close()
+    in a finally block. Behavior-identical to the existing _conn / write_session
+    paths for operations that have a 1:1 store method.
+    """
+    from hermes_cli.kanban.store import kanban_store
+    return kanban_store(board=board)
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -1152,7 +1163,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         finally:
             rc.close()
 
-    # All mutations route through the single-writer daemon.
+    # Phase 1: intentionally kept on write_session — this block performs multiple
+    # writer operations (assign_task, complete_task/block_task/schedule_task/
+    # unblock_task/set_status_direct/archive_task, set_task_priority, edit_task_fields)
+    # with per-op RuntimeError/RemoteWriteError exception handling and intermediate
+    # _read_status() calls. Opening one store per operation would multiply connection
+    # setup and complicate the multi-branch flow; revisit if the store grows a
+    # batch-write API.
     with kanban_db.write_session(board=board) as w:
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -1239,8 +1256,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    with kanban_db.write_session(board=board) as w:
-        ok = w.delete_task(task_id=task_id)
+    store = _store(board=board)
+    try:
+        ok = store.delete_task(task_id=task_id)
+    finally:
+        store.close()
     if not ok:
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     return {"deleted": True, "task_id": task_id}
@@ -1283,16 +1303,15 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     board = _resolve_board(board)
-    rconn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        if kanban_db.get_task(rconn, task_id) is None:
+        if store.get_task(task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-    finally:
-        rconn.close()
-    with kanban_db.write_session(board=board) as w:
-        w.add_comment(
+        store.add_comment(
             task_id=task_id, author=payload.author or "dashboard", body=payload.body,
         )
+    finally:
+        store.close()
     return {"ok": True}
 
 
@@ -1308,12 +1327,14 @@ class LinkBody(BaseModel):
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    store = _store(board=board)
     try:
-        with kanban_db.write_session(board=board) as w:
-            w.link_tasks(parent_id=payload.parent_id, child_id=payload.child_id)
-        return {"ok": True}
+        store.link_tasks(parent_id=payload.parent_id, child_id=payload.child_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        store.close()
+    return {"ok": True}
 
 
 @router.delete("/links")
@@ -1323,8 +1344,11 @@ def delete_link(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    with kanban_db.write_session(board=board) as w:
-        ok = w.unlink_tasks(parent_id=parent_id, child_id=child_id)
+    store = _store(board=board)
+    try:
+        ok = store.unlink_tasks(parent_id=parent_id, child_id=child_id)
+    finally:
+        store.close()
     return {"ok": bool(ok)}
 
 
@@ -1361,6 +1385,13 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     # Reads off a read-only snapshot; every mutation through the single-writer
     # daemon. Distinct ids are independent, so reading each id's pre-batch state
     # from one snapshot is correct.
+    # Phase 1: intentionally kept on write_session — this block iterates over
+    # many ids and performs multiple writer operations per id (archive_task,
+    # complete_task/block_task/schedule_task/unblock_task/set_status_direct,
+    # assign_task/reassign_task, set_task_priority) inside a single session,
+    # reading pre-batch state from a shared rconn snapshot. Converting to per-
+    # operation store calls would open one store per operation across the batch,
+    # multiplying connection setup; revisit if the store grows a batch-write API.
     rconn = _conn(board=board, readonly=True)
     try:
         with kanban_db.write_session(board=board) as w:
@@ -1604,14 +1635,14 @@ def get_run_endpoint(
     404 when no such run exists.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        r = kanban_db.get_run(conn, run_id)
+        r = store.get_run(run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
         return {"run": _run_dict(r)}
     finally:
-        conn.close()
+        store.close()
 
 
 @router.get("/runs/{run_id}/inspect")
@@ -1633,13 +1664,13 @@ def inspect_run_endpoint(
     ``reason="psutil not available"``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        r = kanban_db.get_run(conn, run_id)
+        r = store.get_run(run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     finally:
-        conn.close()
+        store.close()
 
     if r.ended_at is not None:
         return {"run_id": run_id, "alive": False, "reason": "run already ended"}
@@ -1710,20 +1741,19 @@ def terminate_run_endpoint(
     ``/runs/{run_id}/inspect``) but no termination control surface.
     """
     board = _resolve_board(board)
-    rconn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        r = kanban_db.get_run(rconn, run_id)
+        r = store.get_run(run_id)
+        if r is None:
+            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        if r.ended_at is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"run {run_id} already ended",
+            )
+        ok = store.reclaim_task(task_id=r.task_id, reason=payload.reason)
     finally:
-        rconn.close()
-    if r is None:
-        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
-    if r.ended_at is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run {run_id} already ended",
-        )
-    with kanban_db.write_session(board=board) as w:
-        ok = w.reclaim_task(task_id=r.task_id, reason=payload.reason)
+        store.close()
     if not ok:
         raise HTTPException(
             status_code=409,
@@ -1757,8 +1787,11 @@ def reclaim_task_endpoint(
     ``hermes kanban reclaim <task_id> --reason ...``.
     """
     board = _resolve_board(board)
-    with kanban_db.write_session(board=board) as w:
-        ok = w.reclaim_task(task_id=task_id, reason=payload.reason)
+    store = _store(board=board)
+    try:
+        ok = store.reclaim_task(task_id=task_id, reason=payload.reason)
+    finally:
+        store.close()
     if not ok:
         raise HTTPException(
             status_code=409,
@@ -1845,13 +1878,16 @@ def reassign_task_endpoint(
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
     """
     board = _resolve_board(board)
-    with kanban_db.write_session(board=board) as w:
-        ok = w.reassign_task(
+    store = _store(board=board)
+    try:
+        ok = store.reassign_task(
             task_id=task_id,
             profile=payload.profile or None,
             reclaim_first=bool(payload.reclaim_first),
             reason=payload.reason,
         )
+    finally:
+        store.close()
     if not ok:
         raise HTTPException(
             status_code=409,
@@ -1971,11 +2007,11 @@ def get_home_channels(
     subscribed_homes: set[tuple[str, str, str]] = set()
     if task_id:
         board = _resolve_board(board)
-        conn = _conn(board=board, readonly=True)
+        store = _store(board=board)
         try:
-            subs = kanban_db.list_notify_subs(conn, task_id)
+            subs = store.list_notify_subs(task_id)
         finally:
-            conn.close()
+            store.close()
         for sub in subs:
             key = (
                 str(sub.get("platform") or ""),
@@ -2007,21 +2043,20 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
                    f"gateway.platforms.{platform}.home_channel in config.yaml.",
         )
     board = _resolve_board(board)
-    rconn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        task = kanban_db.get_task(rconn, task_id)
-    finally:
-        rconn.close()
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-    with kanban_db.write_session(board=board) as w:
-        w.add_notify_sub(
+        task = store.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        store.add_notify_sub(
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
             notifier_profile=_active_profile_name(),
         )
+    finally:
+        store.close()
     return {"ok": True, "task_id": task_id, "home_channel": home}
 
 
@@ -2036,13 +2071,16 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             detail=f"No home channel configured for platform {platform!r}.",
         )
     board = _resolve_board(board)
-    with kanban_db.write_session(board=board) as w:
-        w.remove_notify_sub(
+    store = _store(board=board)
+    try:
+        store.remove_notify_sub(
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
         )
+    finally:
+        store.close()
     return {"ok": True, "task_id": task_id, "home_channel": home}
 
 
@@ -2119,15 +2157,15 @@ def list_profile_subs(task_id: str, board: Optional[str] = Query(None)):
     round-trip.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        if kanban_db.get_task(conn, task_id) is None:
+        if store.get_task(task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        rows = kanban_db.list_profile_event_subs(
-            conn, task_id=task_id, enabled_only=False,
+        rows = store.list_profile_event_subs(
+            task_id=task_id, enabled_only=False,
         )
     finally:
-        conn.close()
+        store.close()
     return {
         "profile_subs": [_serialize_profile_sub(r) for r in rows],
         "default_event_kinds": list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS),
@@ -2158,42 +2196,37 @@ def upsert_profile_sub(
         )
 
     board = _resolve_board(board)
-    rconn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        if kanban_db.get_task(rconn, task_id) is None:
+        if store.get_task(task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-    finally:
-        rconn.close()
 
-    add_kwargs: dict[str, Any] = {
-        "task_id": task_id,
-        "profile": profile,
-        "name": payload.name or "",
-    }
-    if payload.use_default_events:
-        add_kwargs["event_kinds"] = None
-    elif payload.event_kinds is not None:
-        add_kwargs["event_kinds"] = payload.event_kinds
-    if payload.include_children is not None:
-        add_kwargs["include_children"] = bool(payload.include_children)
-    if payload.wake_agent is not None:
-        add_kwargs["wake_agent"] = bool(payload.wake_agent)
-    if payload.clear_wake_prompt:
-        add_kwargs["wake_prompt"] = None
-    elif payload.wake_prompt is not None:
-        add_kwargs["wake_prompt"] = payload.wake_prompt
-    if payload.enabled is not None:
-        add_kwargs["enabled"] = bool(payload.enabled)
+        add_kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "profile": profile,
+            "name": payload.name or "",
+        }
+        if payload.use_default_events:
+            add_kwargs["event_kinds"] = None
+        elif payload.event_kinds is not None:
+            add_kwargs["event_kinds"] = payload.event_kinds
+        if payload.include_children is not None:
+            add_kwargs["include_children"] = bool(payload.include_children)
+        if payload.wake_agent is not None:
+            add_kwargs["wake_agent"] = bool(payload.wake_agent)
+        if payload.clear_wake_prompt:
+            add_kwargs["wake_prompt"] = None
+        elif payload.wake_prompt is not None:
+            add_kwargs["wake_prompt"] = payload.wake_prompt
+        if payload.enabled is not None:
+            add_kwargs["enabled"] = bool(payload.enabled)
 
-    with kanban_db.write_session(board=board) as w:
-        w.add_profile_event_sub(**add_kwargs)
-    rconn = _conn(board=board, readonly=True)
-    try:
-        rows = kanban_db.list_profile_event_subs(
-            rconn, task_id=task_id, profile=profile, enabled_only=False,
+        store.add_profile_event_sub(**add_kwargs)
+        rows = store.list_profile_event_subs(
+            task_id=task_id, profile=profile, enabled_only=False,
         )
     finally:
-        rconn.close()
+        store.close()
 
     stored = next(
         (r for r in rows if (r.get("name") or "") == (payload.name or "")),
@@ -2215,10 +2248,13 @@ def remove_profile_sub(
 ):
     """Remove a profile wake subscription. 404 if the row does not exist."""
     board = _resolve_board(board)
-    with kanban_db.write_session(board=board) as w:
-        ok = w.remove_profile_event_sub(
+    store = _store(board=board)
+    try:
+        ok = store.remove_profile_event_sub(
             task_id=task_id, profile=profile, name=name or "",
         )
+    finally:
+        store.close()
     if not ok:
         raise HTTPException(
             status_code=404,
@@ -2243,11 +2279,11 @@ def get_stats(board: Optional[str] = Query(None)):
     board themselves.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        return kanban_db.board_stats(conn)
+        return store.board_stats()
     finally:
-        conn.close()
+        store.close()
 
 
 @router.get("/assignees")
@@ -2260,11 +2296,11 @@ def get_assignees(board: Optional[str] = Query(None)):
     appears in the picker before it's been given any task.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board, readonly=True)
+    store = _store(board=board)
     try:
-        return {"assignees": kanban_db.known_assignees(conn)}
+        return {"assignees": store.known_assignees()}
     finally:
-        conn.close()
+        store.close()
 
 
 # ---------------------------------------------------------------------------

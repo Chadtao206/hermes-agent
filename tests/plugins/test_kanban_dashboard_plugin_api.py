@@ -288,9 +288,6 @@ def test_get_board_tolerates_non_utf8_metadata(tmp_path, monkeypatch):
     "invoke",
     [
         lambda: plugin_api.get_task_log("t_demo", board=None),
-        lambda: plugin_api.list_profile_subs("t_demo", board=None),
-        lambda: plugin_api.get_stats(board=None),
-        lambda: plugin_api.get_assignees(board=None),
         lambda: plugin_api.list_diagnostics(board=None),
     ],
 )
@@ -312,3 +309,34 @@ def test_read_endpoints_use_readonly_conn(monkeypatch, invoke):
     with pytest.raises(RuntimeError, match="stop"):
         invoke()
     assert calls == [True], "read endpoint must use readonly=True"
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: plugin_api.list_profile_subs("t_demo", board=None),
+        lambda: plugin_api.get_stats(board=None),
+        lambda: plugin_api.get_assignees(board=None),
+    ],
+)
+def test_store_read_endpoints_use_store(monkeypatch, invoke):
+    """Endpoints converted to KanbanStore routing must call _store(), not _conn().
+
+    The store always opens snapshot (read-only) connections internally, so
+    routing through it satisfies the same DirectWriteForbidden guard that the
+    original readonly=True tests enforce. Verify _store is invoked.
+    """
+
+    def _recording_store(*args, **kwargs):
+        raise RuntimeError("stop:store")
+
+    def _fail_conn(*args, **kwargs):
+        raise AssertionError(
+            "store-routed read endpoint must not call _conn(); use _store() instead"
+        )
+
+    monkeypatch.setattr(plugin_api, "_store", _recording_store)
+    monkeypatch.setattr(plugin_api, "_conn", _fail_conn)
+    with pytest.raises(RuntimeError, match="stop:store"):
+        invoke()
+
