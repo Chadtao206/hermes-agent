@@ -159,7 +159,8 @@ class PostgresKanbanStore:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
-                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s "
+                    "FOR UPDATE",
                     (self.board, task_id))
                 row = cur.fetchone()
                 current_run_id = row["current_run_id"] if row else None
@@ -210,7 +211,8 @@ class PostgresKanbanStore:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
-                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s "
+                    "FOR UPDATE",
                     (self.board, task_id))
                 row = cur.fetchone()
                 current_run_id = row["current_run_id"] if row else None
@@ -240,7 +242,8 @@ class PostgresKanbanStore:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
-                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s "
+                    "FOR UPDATE",
                     (self.board, task_id))
                 row = cur.fetchone()
                 current_run_id = row["current_run_id"] if row else None
@@ -304,7 +307,8 @@ class PostgresKanbanStore:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
-                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s "
+                    "FOR UPDATE",
                     (self.board, task_id))
                 row = cur.fetchone()
                 current_run_id = row["current_run_id"] if row else None
@@ -814,10 +818,13 @@ class PostgresKanbanStore:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
-                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s "
+                    "FOR UPDATE",
                     (self.board, task_id))
                 row = cur.fetchone()
                 current_run_id = row["current_run_id"] if row else None
+                if expected_run_id is not None and current_run_id != expected_run_id:
+                    return False
                 cur.execute(
                     "UPDATE tasks SET status='done', completed_at=%s, result=%s, "
                     "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
@@ -972,6 +979,8 @@ class PostgresKanbanStore:
                     "AND chat_id=%s AND thread_id=%s AND last_event_id=%s",
                     (new_cursor, self.board, task_id, platform,
                      chat_id, thread_id, old_cursor))
+                if cur.rowcount != 1:
+                    return (old_cursor, old_cursor, [])
                 events = [
                     Event(**{k: r[k] for k in Event.__dataclass_fields__})
                     for r in event_rows
@@ -1040,6 +1049,8 @@ class PostgresKanbanStore:
                     "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s "
                     "AND last_event_id=%s",
                     (new_cursor, self.board, task_id, profile, name, old_cursor))
+                if cur.rowcount != 1:
+                    return (old_cursor, old_cursor, [])
                 return (old_cursor, new_cursor, claimed_events)
 
     # --- board stats and assignees ---------------------------------------
