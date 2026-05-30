@@ -1718,13 +1718,16 @@ def connect(
     # Single-writer daemon: client processes must not open a writable connection
     # directly — all writes route through write_session() to the daemon. This
     # guard turns a stray direct write into a loud failure instead of a silent
-    # second writer. The owner process (daemon/gateway, marked by the env var)
-    # and explicit file-creation/bootstrap callers are exempt.
-    if single_writer_enabled() and not _is_writer_owner() and not _bootstrap:
-        raise DirectWriteForbidden(
-            "writable kanban.connect() called in a client process while "
-            "kanban.single_writer_daemon is enabled; use kb.write_session() instead"
-        )
+    # second writer. Only the daemon's dedicated writer thread (marked via a
+    # thread-local) and explicit file-creation/bootstrap callers are exempt.
+    if single_writer_enabled() and not _bootstrap:
+        from hermes_cli import kanban_writer_daemon as _wd
+        if not _wd.in_writer_thread():
+            raise DirectWriteForbidden(
+                "writable kanban.connect() called outside the single-writer "
+                "daemon thread while kanban.single_writer_daemon is enabled; "
+                "use kb.write_session() instead"
+            )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     # Serialize first-connect setup (header validation, integrity probe, WAL
@@ -1877,10 +1880,6 @@ def writer_socket_path(*, board: Optional[str] = None) -> Path:
     return kanban_db_path(board=board).parent / ".kanban-writer.sock"
 
 
-def _is_writer_owner() -> bool:
-    return os.environ.get("HERMES_KANBAN_WRITER_OWNER") == "1"
-
-
 class _LocalWriter:
     """Owner-side / flag-off writer: calls module write fns on a real conn."""
 
@@ -1896,19 +1895,39 @@ class _LocalWriter:
         return _method
 
 
+class _DaemonWriter:
+    """In-process writer: routes ops to a registered daemon's writer thread."""
+
+    def __init__(self, daemon):
+        self._daemon = daemon
+
+    def __getattr__(self, op: str):
+        if op.startswith("__"):
+            raise AttributeError(op)
+        def _method(**kwargs):
+            return self._daemon.execute(op, **kwargs)
+        return _method
+
+
 @contextlib.contextmanager
 def write_session(*, board: Optional[str] = None):
-    """Yield a transport-agnostic writer (LocalWriter or RemoteWriter).
-
-    Every cross-process write should go through this. In the owner process or
-    when the daemon flag is off, it is a direct connection; in a client process
-    with the flag on, it proxies to the daemon over the socket.
-    """
-    if single_writer_enabled() and not _is_writer_owner():
-        from hermes_cli.kanban_writer_client import RemoteWriter
-        with RemoteWriter(writer_socket_path(board=board)) as w:
-            yield w
-        return
+    """Yield a transport-agnostic writer. With the single-writer flag on:
+    in-process (a daemon is registered for this board) -> route to its writer
+    thread; client process -> RemoteWriter over the socket. Flag off (or
+    re-entrant on the writer thread) -> a direct LocalWriter connection."""
+    if single_writer_enabled():
+        from hermes_cli import kanban_writer_daemon as _wd
+        db = kanban_db_path(board=board)
+        daemon = _wd.lookup_daemon(db)
+        if daemon is not None and not _wd.in_writer_thread():
+            yield _DaemonWriter(daemon)
+            return
+        if daemon is None and not _wd.in_writer_thread():
+            from hermes_cli.kanban_writer_client import RemoteWriter
+            with RemoteWriter(writer_socket_path(board=board)) as w:
+                yield w
+            return
+    # Flag off, or re-entrant call already ON the writer thread -> direct conn.
     conn = connect(board=board, readonly=False)
     try:
         yield _LocalWriter(conn)

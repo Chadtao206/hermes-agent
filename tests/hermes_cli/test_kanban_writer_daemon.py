@@ -78,6 +78,29 @@ def test_daemon_serves_many_sequential_clients_distinct_threads(tmp_path):
         server.shutdown()
 
 
+def test_daemon_execute_in_process_returns_raw(tmp_path):
+    db = tmp_path / "kanban.db"; sock = tmp_path / ".kanban-writer.sock"
+    server = wd.WriterDaemon(db_path=db, socket_path=sock)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _wait_for_sock(sock)
+    try:
+        new_id = server.execute("create_task", title="ip", assignee="engineer")
+        assert isinstance(new_id, str)
+        conn = kb.connect(db_path=db, readonly=True)
+        assert conn.execute("SELECT title FROM tasks WHERE id=?", (new_id,)).fetchone()["title"] == "ip"
+    finally:
+        server.shutdown()
+
+
+def test_registry_register_lookup_unregister(tmp_path):
+    db = tmp_path / "kanban.db"
+    server = wd.WriterDaemon(db_path=db, socket_path=tmp_path / ".s")
+    wd.register_daemon(db, server)
+    assert wd.lookup_daemon(db) is server
+    wd.unregister_daemon(db)
+    assert wd.lookup_daemon(db) is None
+
+
 def test_second_daemon_refuses_when_one_owns_board(tmp_path):
     db = tmp_path / "kanban.db"
     sock = tmp_path / ".kanban-writer.sock"

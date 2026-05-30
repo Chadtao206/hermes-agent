@@ -24,6 +24,33 @@ OP_ALLOWLIST = frozenset({
 })
 
 
+_WRITER_TLS = threading.local()
+
+
+def in_writer_thread() -> bool:
+    """True only on a WriterDaemon's dedicated writer thread."""
+    return getattr(_WRITER_TLS, "is_writer", False)
+
+
+_REGISTRY: dict[str, "WriterDaemon"] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def register_daemon(db_path, daemon: "WriterDaemon") -> None:
+    with _REGISTRY_LOCK:
+        _REGISTRY[str(Path(db_path).resolve())] = daemon
+
+
+def unregister_daemon(db_path) -> None:
+    with _REGISTRY_LOCK:
+        _REGISTRY.pop(str(Path(db_path).resolve()), None)
+
+
+def lookup_daemon(db_path) -> "Optional[WriterDaemon]":
+    with _REGISTRY_LOCK:
+        return _REGISTRY.get(str(Path(db_path).resolve()))
+
+
 def _to_jsonable(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return dataclasses.asdict(value)
@@ -63,7 +90,7 @@ class WriterDaemon:
         self._pid_fh = None
 
     def _writer_loop(self) -> None:
-        os.environ["HERMES_KANBAN_WRITER_OWNER"] = "1"
+        _WRITER_TLS.is_writer = True
         self._conn = kb.connect(db_path=self.db_path, readonly=False)
         try:
             while True:
@@ -72,7 +99,7 @@ class WriterDaemon:
                     break
                 try:
                     fn = getattr(kb, item.op)
-                    item.result = _to_jsonable(fn(self._conn, **item.kwargs))
+                    item.result = fn(self._conn, **item.kwargs)
                 except Exception as exc:
                     item.error = str(exc)
                     item.error_type = type(exc).__name__
@@ -95,7 +122,28 @@ class WriterDaemon:
         if item.error is not None:
             return proto.Response(req_id, ok=False, error=item.error,
                                   error_type=item.error_type or "Error").to_wire()
-        return proto.Response(req_id, ok=True, result=item.result).to_wire()
+        return proto.Response(req_id, ok=True, result=_to_jsonable(item.result)).to_wire()
+
+    def execute(self, op: str, **kwargs):
+        """In-process synchronous write via the single writer thread. For trusted
+        in-process callers (gateway dispatcher/notifier). Returns the raw result;
+        raises RuntimeError carrying the original error type/message on failure.
+
+        Callers MUST NOT pass an op whose function itself calls write_session()
+        (it would re-enqueue onto this same thread and deadlock); the kanban write
+        fns operate directly on the provided conn, so this holds today."""
+        if not callable(getattr(kb, op, None)):
+            raise ValueError(f"unknown kanban write op: {op}")
+        # Don't enqueue onto a writer thread that isn't draining the queue — a
+        # stale registry entry would otherwise hang the caller on done.wait().
+        if self._writer_thread is None or not self._writer_thread.is_alive():
+            raise RuntimeError(f"writer daemon not running; cannot execute {op}")
+        item = _WorkItem(op, kwargs)
+        self._queue.put(item)
+        item.done.wait()
+        if item.error is not None:
+            raise RuntimeError(f"{item.error_type}: {item.error}")
+        return item.result
 
     def acquire_singleton(self) -> bool:
         """Take an exclusive advisory lock on the pidfile. Returns False if another
