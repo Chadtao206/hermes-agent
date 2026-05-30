@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -13,6 +13,18 @@ from hermes_cli import kanban_db
 from hermes_cli.kanban_db import (  # reuse dataclasses
     Task, Run, Event, Comment, DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
     DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS,
+)
+from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across backends
+    HallucinatedCardsError, PRHeadGateError, ExternalHandoffGateError,
+    LINK_RELATION_DEPENDENCY,
+    _lane_type_for_assignee,
+    _closeout_pr_evidence,
+    _closeout_external_handoff_evidence,
+    _external_handoff_required,
+    _extract_reviewed_pr_head_sha,
+    _extract_pr_head_sha,
+    _TASK_ID_PROSE_RE,
+    _EXTERNAL_HANDOFF_METADATA_KEYS,
 )
 from hermes_cli.kanban import pg_pool
 
@@ -813,16 +825,322 @@ class PostgresKanbanStore:
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
 
-    # --- complete_task (basic) -------------------------------------------
+    # --- complete_task (full parity) -------------------------------------
+    #
+    # Mirrors kanban_db.complete_task (the sqlite reference) faithfully.
+    # Sanctioned PG-only divergences: every WHERE/INSERT is board-scoped
+    # (board=%s); run metadata is JSONB (Jsonb() on write, already-a-dict on
+    # read, no json.loads); the pure metadata/regex helpers are imported and
+    # reused from kanban_db rather than reimplemented. OS-level workspace/tmux
+    # cleanup never happens in the store — it is delegated to the caller via
+    # the optional on_cleanup hook (Part B wires the rmtree+tmux-kill fn).
+
+    def _pg_terminal_run_already_closed(
+        self, cur, task_id: str, expected_run_id: Optional[int],
+        *, outcome: str, task_status: str,
+    ) -> bool:
+        """Duplicate-closeout idempotency check (board-scoped)."""
+        if expected_run_id is None:
+            return False
+        cur.execute(
+            "SELECT t.status AS task_status, r.outcome, r.ended_at "
+            "FROM task_runs r JOIN tasks t "
+            "ON t.board=r.board AND t.id=r.task_id "
+            "WHERE r.board=%s AND r.id=%s AND r.task_id=%s",
+            (self.board, int(expected_run_id), task_id))
+        row = cur.fetchone()
+        return bool(
+            row
+            and row["task_status"] == task_status
+            and row["outcome"] == outcome
+            and row["ended_at"] is not None
+        )
+
+    def _pg_expected_parent_pr_head_sha(
+        self, task_id: str,
+    ) -> Optional[tuple[str, str, Optional[int]]]:
+        """Return ``(sha, parent_task_id, parent_run_id)`` from done parents."""
+        for parent_id in self.parent_ids(
+                task_id, relation_type=LINK_RELATION_DEPENDENCY):
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT id, metadata FROM task_runs "
+                    "WHERE board=%s AND task_id=%s AND outcome='completed' "
+                    "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC",
+                    (self.board, parent_id))
+                rows = cur.fetchall()
+                for row in rows:
+                    # task_runs.metadata is JSONB — already a dict, no json.loads.
+                    sha = _extract_pr_head_sha(row["metadata"])
+                    if sha:
+                        return sha, parent_id, int(row["id"])
+                cur.execute(
+                    "SELECT result FROM tasks "
+                    "WHERE board=%s AND id=%s AND status='done'",
+                    (self.board, parent_id))
+                task_row = cur.fetchone()
+            # Legacy/manual fallback: only honor explicit SHA-looking text.
+            if task_row:
+                sha = _extract_pr_head_sha(task_row["result"])
+                if sha:
+                    return sha, parent_id, None
+        return None
+
+    def _pg_enforce_review_pr_head_gate(
+        self, task_id: str, metadata: Optional[dict], *, summary: Optional[str],
+    ) -> None:
+        task = self.get_task(task_id)
+        if not task or _lane_type_for_assignee(task.assignee) != "review":
+            return
+        expected = self._pg_expected_parent_pr_head_sha(task_id)
+        if expected is None:
+            return
+        expected_sha, parent_task_id, parent_run_id = expected
+        reviewed_sha = _extract_reviewed_pr_head_sha(metadata)
+        if reviewed_sha == expected_sha:
+            return
+        payload = {
+            "expected_pr_head_sha": expected_sha,
+            "reviewed_pr_head_sha": reviewed_sha,
+            "parent_task_id": parent_task_id,
+            "parent_run_id": parent_run_id,
+            "summary_preview": (
+                (summary or "").strip().splitlines()[0][:200] if summary else None
+            ),
+        }
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                self._emit(cur, task_id,
+                           "completion_blocked_pr_head_gate", payload)
+        raise PRHeadGateError(
+            task_id=task_id,
+            expected_sha=expected_sha,
+            reviewed_sha=reviewed_sha,
+            parent_task_id=parent_task_id,
+            parent_run_id=parent_run_id,
+        )
+
+    def _pg_enforce_external_handoff_gate(
+        self, task_id: str, metadata: Optional[dict], *, summary: Optional[str],
+    ) -> None:
+        if not _external_handoff_required(metadata):
+            return
+        if _closeout_external_handoff_evidence(metadata):
+            return
+        payload = {
+            "required": True,
+            "accepted_keys": list(_EXTERNAL_HANDOFF_METADATA_KEYS),
+            "summary_preview": (
+                (summary or "").strip().splitlines()[0][:200] if summary else None
+            ),
+        }
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                self._emit(cur, task_id,
+                           "completion_blocked_external_handoff_gate", payload)
+        raise ExternalHandoffGateError(task_id=task_id)
+
+    def _pg_verify_created_cards(
+        self, completing_task_id: str, claimed_ids: Iterable[str],
+    ) -> tuple[list[str], list[str]]:
+        """Partition claimed_ids into (verified, phantom) — board-scoped."""
+        claimed = [str(x).strip() for x in (claimed_ids or []) if str(x).strip()]
+        if not claimed:
+            return [], []
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for cid in claimed:
+            if cid not in seen:
+                seen.add(cid)
+                ordered.append(cid)
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT assignee FROM tasks WHERE board=%s AND id=%s",
+                (self.board, completing_task_id))
+            row = cur.fetchone()
+            if row is None:
+                return [], ordered
+            completing_assignee = row["assignee"]
+            cur.execute(
+                "SELECT id, created_by FROM tasks "
+                "WHERE board=%s AND id = ANY(%s)",
+                (self.board, ordered))
+            found = {r["id"]: r["created_by"] for r in cur.fetchall()}
+        linked_children: set[str] = set(self.child_ids(completing_task_id))
+        verified: list[str] = []
+        phantom: list[str] = []
+        for cid in ordered:
+            if cid not in found:
+                phantom.append(cid)
+                continue
+            created_by = found.get(cid)
+            if completing_assignee and created_by == completing_assignee:
+                verified.append(cid)
+            elif created_by == completing_task_id:
+                verified.append(cid)
+            elif cid in linked_children:
+                verified.append(cid)
+            else:
+                phantom.append(cid)
+        return verified, phantom
+
+    def _pg_scan_prose_for_phantom_ids(self, text: str) -> list[str]:
+        """Regex-scan free-form text for t_<hex> refs that don't exist."""
+        if not text:
+            return []
+        matches = _TASK_ID_PROSE_RE.findall(text)
+        if not matches:
+            return []
+        seen: set[str] = set()
+        unique: list[str] = []
+        for m in matches:
+            if m not in seen:
+                seen.add(m)
+                unique.append(m)
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id FROM tasks WHERE board=%s AND id = ANY(%s)",
+                (self.board, unique))
+            existing = {r["id"] for r in cur.fetchall()}
+        return [m for m in unique if m not in existing]
+
+    def _pg_closeout_packet(
+        self, cur, task_id: str, *, run_id: Optional[int],
+        outcome: str, summary: Optional[str], metadata: Optional[dict],
+    ) -> dict:
+        """Build the deterministic closeout packet (board-scoped read)."""
+        cur.execute(
+            "SELECT assignee, status, branch_name FROM tasks "
+            "WHERE board=%s AND id=%s",
+            (self.board, task_id))
+        row = cur.fetchone()
+        assignee = row["assignee"] if row else None
+        status = row["status"] if row else None
+        task_branch = row["branch_name"] if row else None
+        md_keys: list[str] = []
+        if isinstance(metadata, dict):
+            md_keys = sorted(
+                str(k) for k in metadata.keys() if k != "closeout_packet")
+        preview = (summary or "").strip().splitlines()[0][:400] if summary else None
+        packet = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "run_id": int(run_id) if run_id is not None else None,
+            "outcome": outcome,
+            "terminal_status": status,
+            "assignee": assignee,
+            "lane_type": _lane_type_for_assignee(assignee),
+            "summary_preview": preview,
+            "metadata_keys": md_keys,
+        }
+        packet.update(_closeout_pr_evidence(metadata, task_branch=task_branch))
+        external = _closeout_external_handoff_evidence(metadata)
+        if external:
+            packet["external_handoff"] = external
+        return packet
+
+    def _pg_metadata_with_closeout_packet(
+        self, cur, task_id: str, metadata: Optional[dict], *,
+        run_id: Optional[int], outcome: str, summary: Optional[str],
+    ) -> dict:
+        enriched = dict(metadata or {})
+        enriched["closeout_packet"] = self._pg_closeout_packet(
+            cur, task_id, run_id=run_id, outcome=outcome,
+            summary=summary, metadata=enriched)
+        return enriched
+
+    def _pg_synthesize_ended_run(
+        self, cur, task_id: str, *, outcome: str,
+        summary: Optional[str] = None, error: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> int:
+        """Insert a zero-duration, already-closed run (board-scoped).
+
+        Used when complete_task fires on a never-claimed task so the handoff
+        fields are not silently lost. Does NOT touch the tasks row.
+        """
+        now = int(time.time())
+        cur.execute(
+            "SELECT assignee, current_step_key FROM tasks "
+            "WHERE board=%s AND id=%s",
+            (self.board, task_id))
+        trow = cur.fetchone()
+        profile = trow["assignee"] if trow else None
+        step_key = trow["current_step_key"] if trow else None
+        cur.execute(
+            "INSERT INTO task_runs (board, task_id, profile, step_key, "
+            "status, outcome, summary, error, metadata, started_at, ended_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (self.board, task_id, profile, step_key,
+             outcome, outcome, summary, error,
+             Jsonb(metadata) if metadata else None, now, now))
+        return int(cur.fetchone()["id"])
+
+    def _pg_clear_failure_counter(self, task_id: str) -> None:
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "UPDATE tasks SET consecutive_failures=0, "
+                    "last_failure_error=NULL WHERE board=%s AND id=%s",
+                    (self.board, task_id))
 
     def complete_task(self, task_id: str, *, result=None, summary=None,
                       metadata=None, created_cards=None,
-                      expected_run_id=None) -> bool:
-        if created_cards:
-            raise NotImplementedError(
-                "phase-2-tail: complete_task created_cards gating")
+                      expected_run_id=None,
+                      on_cleanup: Optional[Callable[[str], None]] = None) -> bool:
         now = int(time.time())
-        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        handoff_summary = summary if summary is not None else result
+
+        # Step 1: idempotent duplicate closeout for the same run_id.
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            if self._pg_terminal_run_already_closed(
+                    cur, task_id, expected_run_id,
+                    outcome="completed", task_status="done"):
+                return True
+
+        # Step 2: reviewer PR-head gate (DB/metadata-only). Raises on mismatch.
+        self._pg_enforce_review_pr_head_gate(
+            task_id, metadata, summary=handoff_summary)
+
+        # Step 3: opt-in external-handoff gate. Raises if required w/o evidence.
+        self._pg_enforce_external_handoff_gate(
+            task_id, metadata, summary=handoff_summary)
+
+        # Step 4: created_cards gate BEFORE the main txn. A rejection is
+        # auditable (its own tiny txn) and never mutates task state.
+        if created_cards:
+            verified_cards, phantom_cards = self._pg_verify_created_cards(
+                task_id, created_cards)
+            if phantom_cards:
+                with self._pool.connection() as conn, \
+                        conn.cursor(row_factory=dict_row) as cur:
+                    with conn.transaction():
+                        self._emit(
+                            cur, task_id, "completion_blocked_hallucination",
+                            {
+                                "phantom_cards": phantom_cards,
+                                "verified_cards": verified_cards,
+                                "summary_preview": (
+                                    (summary or result or "").strip()
+                                    .splitlines()[0][:200]
+                                    if (summary or result) else None
+                                ),
+                            })
+                raise HallucinatedCardsError(phantom_cards, task_id)
+        else:
+            verified_cards = []
+
+        # Step 5: main write txn.
+        run_id: Optional[int] = None
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
                     "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s "
@@ -830,32 +1148,116 @@ class PostgresKanbanStore:
                     (self.board, task_id))
                 row = cur.fetchone()
                 current_run_id = row["current_run_id"] if row else None
-                if expected_run_id is not None and current_run_id != expected_run_id:
-                    return False
-                cur.execute(
-                    "UPDATE tasks SET status='done', completed_at=%s, result=%s, "
-                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
-                    "WHERE board=%s AND id=%s "
-                    "AND status IN ('running','ready','blocked','scheduled')",
-                    (now, result, self.board, task_id))
+                if expected_run_id is None:
+                    cur.execute(
+                        "UPDATE tasks SET status='done', result=%s, "
+                        "completed_at=%s, claim_lock=NULL, claim_expires=NULL, "
+                        "worker_pid=NULL WHERE board=%s AND id=%s "
+                        "AND status IN ('running','ready','blocked','scheduled')",
+                        (result, now, self.board, task_id))
+                else:
+                    cur.execute(
+                        "UPDATE tasks SET status='done', result=%s, "
+                        "completed_at=%s, claim_lock=NULL, claim_expires=NULL, "
+                        "worker_pid=NULL WHERE board=%s AND id=%s "
+                        "AND status IN ('running','ready','blocked','scheduled') "
+                        "AND current_run_id=%s",
+                        (result, now, self.board, task_id, int(expected_run_id)))
                 if cur.rowcount != 1:
                     return False
-                if current_run_id is not None:
-                    run_summary = summary if summary is not None else result
+                active_run_id = current_run_id
+                closeout_metadata = self._pg_metadata_with_closeout_packet(
+                    cur, task_id, metadata,
+                    run_id=active_run_id, outcome="completed",
+                    summary=handoff_summary)
+                # End the current run (inline _end_run, enriched w/ packet).
+                if active_run_id is not None:
                     cur.execute(
                         "UPDATE task_runs SET status='done', outcome='completed', "
                         "summary=%s, metadata=%s, ended_at=%s, "
                         "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
                         "WHERE board=%s AND id=%s AND ended_at IS NULL",
-                        (run_summary,
-                         Jsonb(metadata) if metadata is not None else None,
-                         now, self.board, current_run_id))
-                    cur.execute(
-                        "UPDATE tasks SET current_run_id=NULL "
-                        "WHERE board=%s AND id=%s",
-                        (self.board, task_id))
-                self._emit(cur, task_id, "completed", {})
+                        (handoff_summary, Jsonb(closeout_metadata), now,
+                         self.board, active_run_id))
+                    if cur.rowcount == 1:
+                        run_id = active_run_id
+                        cur.execute(
+                            "UPDATE tasks SET current_run_id=NULL "
+                            "WHERE board=%s AND id=%s",
+                            (self.board, task_id))
+                # No active run + handoff data: synthesize a zero-duration run
+                # so the handoff isn't lost, re-resolving the packet w/ run_id.
+                if run_id is None and (summary or metadata or result):
+                    closeout_metadata = self._pg_metadata_with_closeout_packet(
+                        cur, task_id, metadata,
+                        run_id=None, outcome="completed",
+                        summary=handoff_summary)
+                    run_id = self._pg_synthesize_ended_run(
+                        cur, task_id, outcome="completed",
+                        summary=handoff_summary, metadata=closeout_metadata)
+                # If we now have a run_id but the packet still points at None,
+                # re-resolve the packet w/ the real run_id and persist it.
+                if run_id is not None:
+                    packet = closeout_metadata.get("closeout_packet")
+                    if isinstance(packet, dict) and packet.get("run_id") is None:
+                        closeout_metadata = \
+                            self._pg_metadata_with_closeout_packet(
+                                cur, task_id, metadata,
+                                run_id=run_id, outcome="completed",
+                                summary=handoff_summary)
+                        cur.execute(
+                            "UPDATE task_runs SET metadata=%s "
+                            "WHERE board=%s AND id=%s",
+                            (Jsonb(closeout_metadata), self.board, run_id))
+                # Build the completed event payload.
+                ev_summary = handoff_summary or ""
+                ev_summary = (ev_summary.strip().splitlines()[0][:400]
+                              if ev_summary else "")
+                completed_payload: dict = {
+                    "result_len": len(result) if result else 0,
+                    "summary": ev_summary or None,
+                }
+                if isinstance(closeout_metadata.get("closeout_packet"), dict):
+                    completed_payload["closeout_packet"] = \
+                        closeout_metadata["closeout_packet"]
+                if verified_cards:
+                    completed_payload["verified_cards"] = verified_cards
+                md_artifacts = closeout_metadata.get("artifacts")
+                if isinstance(md_artifacts, (list, tuple)):
+                    cleaned_artifacts = [
+                        str(p).strip() for p in md_artifacts
+                        if isinstance(p, str) and str(p).strip()
+                    ]
+                    if cleaned_artifacts:
+                        completed_payload["artifacts"] = cleaned_artifacts
+                self._emit(cur, task_id, "completed", completed_payload,
+                           run_id=run_id)
+
+        # Step 6: prose-scan (own txn, after main commit). Advisory, never blocks.
+        scan_text = " ".join(filter(None, [summary, result]))
+        if scan_text:
+            phantom_refs = self._pg_scan_prose_for_phantom_ids(scan_text)
+            phantom_refs = [p for p in phantom_refs
+                            if p not in set(verified_cards)]
+            if phantom_refs:
+                with self._pool.connection() as conn, \
+                        conn.cursor(row_factory=dict_row) as cur:
+                    with conn.transaction():
+                        self._emit(
+                            cur, task_id,
+                            "suspected_hallucinated_references",
+                            {"phantom_refs": phantom_refs,
+                             "source": "completion_summary"},
+                            run_id=run_id)
+
+        # Step 7: wipe the consecutive-failures counter.
+        self._pg_clear_failure_counter(task_id)
+        # Step 8: recompute ready status for dependents.
         self.recompute_ready()
+        # Step 9: OS-level cleanup is delegated. The store never touches the
+        # filesystem/tmux; fire the hook now that completion is durable.
+        if on_cleanup is not None:
+            on_cleanup(task_id)
         return True
 
     # --- claim_task (atomic ready->running) ------------------------------

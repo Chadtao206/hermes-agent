@@ -1,6 +1,8 @@
 import time
 from uuid import uuid4
 
+from hermes_cli.kanban_db import HallucinatedCardsError
+
 
 def test_create_then_get(store):
     tid = store.create_task(title="hello", assignee="engineer")
@@ -233,6 +235,86 @@ def test_notify_cursor_advance_rewind(store):
     assert store.rewind_notify_cursor(
         task_id=tid, platform="telegram", chat_id="c1",
         claimed_cursor=5, old_cursor=1) is False
+
+
+def test_complete_hallucinated_cards_rejected(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    try:
+        store.complete_task(
+            tid,
+            summary="made t_deadbeefcafe",
+            created_cards=["t_deadbeefcafe"],
+        )
+        raised = False
+    except HallucinatedCardsError:
+        raised = True
+    assert raised, "expected HallucinatedCardsError for a phantom created_card"
+    # Task state must NOT be mutated by a phantom-card rejection.
+    assert store.get_task(tid).status == "running"
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "completion_blocked_hallucination" in kinds
+    assert "completed" not in kinds
+
+
+def test_complete_with_verified_cards(store):
+    # Parent P (assignee "engineer") and a child card C whose created_by
+    # matches P's assignee profile — satisfies the created_by==assignee
+    # trust condition of _verify_created_cards on both backends.
+    parent = store.create_task(title="parent", assignee="engineer")
+    claimed = store.claim_task(parent, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    child = store.create_task(
+        title="spawned card", assignee="engineer", created_by="engineer")
+    assert store.complete_task(
+        parent, summary="done", created_cards=[child]) is True
+    assert store.get_task(parent).status == "done"
+    completed = [e for e in store.list_events(parent) if e.kind == "completed"]
+    assert completed, "expected a completed event"
+    payload = completed[-1].payload
+    assert isinstance(payload, dict)
+    assert child in (payload.get("verified_cards") or [])
+
+
+def test_complete_closeout_packet_present(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    assert store.complete_task(
+        tid,
+        summary="all done",
+        metadata={"pr_url": "https://github.com/x/y/pull/1"},
+    ) is True
+    completed = [e for e in store.list_events(tid) if e.kind == "completed"]
+    assert completed, "expected a completed event"
+    payload = completed[-1].payload
+    assert isinstance(payload, dict)
+    packet = payload.get("closeout_packet")
+    assert isinstance(packet, dict)
+    assert packet.get("schema_version") == 1
+    assert packet.get("outcome") == "completed"
+    assert packet.get("pr_url") == "https://github.com/x/y/pull/1"
+
+
+def test_complete_on_cleanup_hook(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    calls: list[str] = []
+    assert store.complete_task(
+        tid, summary="done", on_cleanup=lambda t: calls.append(t)) is True
+    assert store.get_task(tid).status == "done"
+    backend = type(store).__name__
+    if backend == "PostgresKanbanStore":
+        # The store owns no filesystem/tmux work, so it must invoke the hook.
+        assert calls == [tid]
+    elif backend == "SqliteKanbanStore":
+        # kanban_db.complete_task does its own _cleanup_workspace internally;
+        # the store drops the hook so cleanup is not double-driven.
+        assert calls == []
+    else:
+        raise AssertionError(f"unexpected backend {backend}")
 
 
 def test_profile_event_cursor_advance_rewind(store):

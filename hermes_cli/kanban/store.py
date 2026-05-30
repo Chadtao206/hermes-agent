@@ -40,6 +40,7 @@ class KanbanStore(Protocol):
         metadata=None,
         created_cards=None,
         expected_run_id: Optional[int] = None,
+        on_cleanup=None,
     ) -> bool: ...
 
     def block_task(

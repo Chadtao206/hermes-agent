@@ -40,7 +40,12 @@ class SqliteKanbanStore:
     def list_tasks(self, **kwargs: Any):
         return self._read(lambda c: kb.list_tasks(c, **kwargs))
 
-    def complete_task(self, task_id: str, **kwargs: Any) -> bool:
+    def complete_task(self, task_id: str, *, on_cleanup=None,
+                       **kwargs: Any) -> bool:
+        # on_cleanup is part of the cross-backend complete_task contract but
+        # is a no-op here: kanban_db.complete_task does its own
+        # _cleanup_workspace internally and does NOT accept this kwarg, so we
+        # drop it before delegating. Behavior on sqlite is unchanged.
         return self._write("complete_task", task_id=task_id, **kwargs)
 
     def block_task(self, task_id: str, **kwargs: Any) -> bool:
