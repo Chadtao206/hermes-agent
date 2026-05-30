@@ -1239,14 +1239,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        ok = kanban_db.delete_task(conn, task_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        return {"deleted": True, "task_id": task_id}
-    finally:
-        conn.close()
+    with kanban_db.write_session(board=board) as w:
+        ok = w.delete_task(task_id=task_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    return {"deleted": True, "task_id": task_id}
 
 
 def _parents_blocking_ready(
@@ -1270,108 +1267,6 @@ def _parents_blocking_ready(
         {"id": r["id"], "title": r["title"], "status": r["status"]}
         for r in rows
     ]
-
-
-def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
-) -> bool:
-    """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
-
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
-    """
-    with kanban_db.write_txn(conn):
-        # Snapshot current state so we know whether to close a run.
-        prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if prev is None:
-            return False
-
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        if new_status == "ready":
-            parent_statuses = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if parent_statuses and not all(
-                p["status"] == "done" for p in parent_statuses
-            ):
-                return False
-
-        was_running = prev["status"] == "running"
-        reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
-        )
-
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (new_status, new_status, new_status, new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        run_id = None
-        if was_running and new_status != "running" and prev["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {new_status} (dashboard/direct)",
-            )
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
-        )
-        if reopening_satisfied_parent:
-            # A parent leaving done/archived invalidates any direct child that
-            # was sitting in ready solely because that parent used to satisfy
-            # the dependency gate. Demote those children immediately so the
-            # dashboard does not keep advertising stale-ready work.
-            for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-                (task_id,),
-            ).fetchall():
-                child_id = row["child_id"]
-                demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
-                    "WHERE id = ? AND status = 'ready'",
-                    (child_id,),
-                )
-                if demoted.rowcount == 1:
-                    conn.execute(
-                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                        "VALUES (?, 'status', ?, ?)",
-                        (
-                            child_id,
-                            json.dumps(
-                                {
-                                    "status": "todo",
-                                    "reason": "parent_reopened",
-                                    "parent": task_id,
-                                }
-                            ),
-                            int(time.time()),
-                        ),
-                    )
-    # If we re-opened something, children may have gone stale.
-    if new_status in {"done", "ready"}:
-        kanban_db.recompute_ready(conn)
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1456,94 +1351,91 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     This is an *independent* iteration — per-task failures don't abort
     siblings. Returns per-id outcome so the UI can surface partials.
     """
+    from hermes_cli.kanban_writer_client import RemoteWriteError
+
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    # Reads off a read-only snapshot; every mutation through the single-writer
+    # daemon. Distinct ids are independent, so reading each id's pre-batch state
+    # from one snapshot is correct.
+    rconn = _conn(board=board, readonly=True)
     try:
-        for tid in ids:
-            entry: dict[str, Any] = {"id": tid, "ok": True}
-            try:
-                task = kanban_db.get_task(conn, tid)
-                if task is None:
-                    entry.update(ok=False, error="not found")
-                    results.append(entry)
-                    continue
-                if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
-                        entry.update(ok=False, error="archive refused")
-                if payload.status is not None and not payload.archive:
-                    s = payload.status
-                    if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
-                    elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
-                    elif s == "ready":
-                        cur = kanban_db.get_task(conn, tid)
-                        if cur and cur.status in ("blocked", "scheduled"):
-                            ok = kanban_db.unblock_task(conn, tid)
-                        else:
-                            ok = _set_status_direct(conn, tid, "ready")
-                    elif s == "running":
-                        entry.update(
-                            ok=False,
-                            error=(
-                                "Cannot set status to 'running' directly; "
-                                "use the dispatcher/claim path"
-                            ),
-                        )
+        with kanban_db.write_session(board=board) as w:
+            for tid in ids:
+                entry: dict[str, Any] = {"id": tid, "ok": True}
+                try:
+                    task = kanban_db.get_task(rconn, tid)
+                    if task is None:
+                        entry.update(ok=False, error="not found")
                         results.append(entry)
                         continue
-                    elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
-                    elif s in {"todo", "triage"}:
-                        ok = _set_status_direct(conn, tid, s)
-                    else:
-                        entry.update(ok=False, error=f"unknown status {s!r}")
-                        results.append(entry)
-                        continue
-                    if not ok:
-                        entry.update(ok=False, error=f"transition to {s!r} refused")
-                if payload.assignee is not None:
-                    try:
-                        if payload.reclaim_first:
-                            ok = kanban_db.reassign_task(
-                                conn, tid, payload.assignee or None,
-                                reclaim_first=True,
+                    if payload.archive:
+                        if not w.archive_task(task_id=tid):
+                            entry.update(ok=False, error="archive refused")
+                    if payload.status is not None and not payload.archive:
+                        s = payload.status
+                        if s == "done":
+                            ok = w.complete_task(
+                                task_id=tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
                             )
+                        elif s == "blocked":
+                            ok = w.block_task(task_id=tid)
+                        elif s == "ready":
+                            cur = kanban_db.get_task(rconn, tid)
+                            if cur and cur.status in ("blocked", "scheduled"):
+                                ok = w.unblock_task(task_id=tid)
+                            else:
+                                ok = w.set_status_direct(task_id=tid, new_status="ready")
+                        elif s == "running":
+                            entry.update(
+                                ok=False,
+                                error=(
+                                    "Cannot set status to 'running' directly; "
+                                    "use the dispatcher/claim path"
+                                ),
+                            )
+                            results.append(entry)
+                            continue
+                        elif s == "scheduled":
+                            ok = w.schedule_task(task_id=tid)
+                        elif s in {"todo", "triage"}:
+                            ok = w.set_status_direct(task_id=tid, new_status=s)
                         else:
-                            ok = kanban_db.assign_task(
-                                conn, tid, payload.assignee or None,
-                            )
+                            entry.update(ok=False, error=f"unknown status {s!r}")
+                            results.append(entry)
+                            continue
                         if not ok:
-                            entry.update(ok=False, error="assign refused")
-                    except RuntimeError as e:
-                        entry.update(ok=False, error=str(e))
-                if payload.priority is not None:
-                    with kanban_db.write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET priority = ? WHERE id = ?",
-                            (int(payload.priority), tid),
-                        )
-                        conn.execute(
-                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                            "VALUES (?, 'reprioritized', ?, ?)",
-                            (tid, json.dumps({"priority": int(payload.priority)}),
-                             int(time.time())),
-                        )
-            except Exception as e:  # defensive — one bad id shouldn't kill the batch
-                entry.update(ok=False, error=str(e))
-            results.append(entry)
-        return {"results": results}
+                            entry.update(ok=False, error=f"transition to {s!r} refused")
+                    if payload.assignee is not None:
+                        try:
+                            if payload.reclaim_first:
+                                ok = w.reassign_task(
+                                    task_id=tid,
+                                    profile=payload.assignee or None,
+                                    reclaim_first=True,
+                                )
+                            else:
+                                ok = w.assign_task(
+                                    task_id=tid, profile=payload.assignee or None,
+                                )
+                            if not ok:
+                                entry.update(ok=False, error="assign refused")
+                        except (RuntimeError, RemoteWriteError) as e:
+                            entry.update(ok=False, error=str(e))
+                    if payload.priority is not None:
+                        w.set_task_priority(task_id=tid, priority=int(payload.priority))
+                except Exception as e:  # defensive — one bad id shouldn't kill the batch
+                    entry.update(ok=False, error=str(e))
+                results.append(entry)
     finally:
-        conn.close()
+        rconn.close()
+    return {"results": results}
 
 
 # ---------------------------------------------------------------------------
@@ -1627,7 +1519,6 @@ def list_diagnostics(
         }
     finally:
         conn.close()
-
 
 
 # ---------------------------------------------------------------------------

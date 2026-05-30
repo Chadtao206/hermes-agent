@@ -198,3 +198,35 @@ def test_update_task_status_priority_title_through_daemon(daemon_board):
     with pytest.raises(HTTPException) as ei2:
         api.update_task(tid, api.UpdateTaskBody(status="running"), board=None)
     assert ei2.value.status_code == 400
+
+
+def test_delete_task_through_daemon(daemon_board):
+    from fastapi import HTTPException
+
+    db = daemon_board
+    tid = _new_task(title="todelete")
+    api.delete_task(tid, board=None)
+    con = _ro(db)
+    try:
+        assert con.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone() is None
+    finally:
+        con.close()
+    with pytest.raises(HTTPException) as ei:
+        api.delete_task(tid, board=None)
+    assert ei.value.status_code == 404
+
+
+def test_bulk_update_priority_and_assignee_through_daemon(daemon_board):
+    db = daemon_board
+    t1 = _new_task(title="a", assignee="engineer")
+    t2 = _new_task(title="b", assignee="engineer")
+    res = api.bulk_update(
+        api.BulkTaskBody(ids=[t1, t2, "nope"], priority=9, assignee="reviewer"),
+        board=None,
+    )
+    byid = {r["id"]: r for r in res["results"]}
+    assert byid[t1]["ok"] and byid[t2]["ok"]
+    assert byid["nope"]["ok"] is False and "not found" in byid["nope"]["error"]
+    assert _col(db, t1, "priority") == 9 and _col(db, t2, "priority") == 9
+    assert _col(db, t1, "assignee") == "reviewer"
+    assert _col(db, t2, "assignee") == "reviewer"

@@ -33,6 +33,8 @@ OP_ALLOWLIST = frozenset({
     "remove_profile_event_sub",
     # Dashboard PATCH /tasks field edits (status drag-drop, priority, title/body).
     "set_status_direct", "set_task_priority", "edit_task_fields",
+    # Dashboard DELETE /tasks and bulk actions.
+    "delete_task",
 })
 
 
