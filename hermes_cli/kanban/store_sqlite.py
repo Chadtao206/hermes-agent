@@ -120,6 +120,19 @@ class SqliteKanbanStore:
     def edit_completed_task_result(self, task_id: str, **kwargs: Any) -> bool:
         return self._write("edit_completed_task_result", task_id=task_id, **kwargs)
 
+    # --- notify subs + event claiming ------------------------------------
+    def add_notify_sub(self, **kwargs: Any) -> int:
+        return self._write("add_notify_sub", **kwargs)
+
+    def remove_notify_sub(self, **kwargs: Any) -> bool:
+        return self._write("remove_notify_sub", **kwargs)
+
+    def list_notify_subs(self):
+        return self._read(lambda c: kb.list_notify_subs(c))
+
+    def claim_unseen_events_for_sub(self, **kwargs: Any) -> tuple:
+        return self._write("claim_unseen_events_for_sub", **kwargs)
+
 
 class _SnapshotReadConn:
     """Closeable wrapper around :func:`kb.snapshot_connect` so callers that do

@@ -37,6 +37,8 @@ OP_ALLOWLIST = frozenset({
     "delete_task",
     # Dashboard recovery: retroactively update result on a completed task.
     "edit_completed_task_result",
+    # Notifier event-claim write: advances last_event_id cursor for a sub.
+    "claim_unseen_events_for_sub",
 })
 
 

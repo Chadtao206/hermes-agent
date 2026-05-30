@@ -50,3 +50,11 @@ def test_comment_roundtrip(store):
     assert isinstance(cid, int)
     bodies = [c["body"] if isinstance(c, dict) else c.body for c in store.list_comments(tid)]
     assert "note" in bodies
+
+
+def test_notify_sub_add_list_remove(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_notify_sub(task_id=tid, platform="telegram", chat_id="c1")
+    subs = store.list_notify_subs()
+    assert any((s["task_id"] if isinstance(s, dict) else s.task_id) == tid for s in subs)
+    assert store.remove_notify_sub(task_id=tid, platform="telegram", chat_id="c1") is True
