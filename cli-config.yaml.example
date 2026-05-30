@@ -1191,3 +1191,12 @@ kanban:
   # ladder (only used when writer_auto_recovery is true).
   writer_backup_interval_seconds: 300   # how often the daemon snapshots the board
   writer_backup_keep: 6                 # how many timestamped backups to retain
+
+  # Auto-unpark of active-PR scheduled tasks (WS4). When the respawn guard
+  # detects a recent PR URL on a task it parks the task in `scheduled` to avoid
+  # a duplicate PR. With this on, the dispatcher re-evaluates that same guard
+  # each tick and promotes the task back to `ready` once the PR comment ages out
+  # of the guard window — instead of leaving it parked until the reconciler or a
+  # human notices. Only active_pr parks are touched; time-based / operator
+  # `scheduled` parks are left alone. Default false (today's behavior).
+  promote_scheduled_on_guard_clear: false

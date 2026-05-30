@@ -1875,6 +1875,22 @@ def single_writer_enabled() -> bool:
     return bool(kanban_cfg.get("single_writer_daemon", False))
 
 
+def _promote_scheduled_enabled() -> bool:
+    """True when kanban.promote_scheduled_on_guard_clear is enabled (WS4).
+
+    Gates the dispatcher's auto-promotion of active_pr scheduled parks back to
+    ready. Defaults false → today's behavior (parked tasks wait for the
+    reconciler/operator). Reads config defensively.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        return False
+    return bool(kanban_cfg.get("promote_scheduled_on_guard_clear", False))
+
+
 def writer_socket_path(*, board: Optional[str] = None) -> Path:
     """Per-board daemon socket, alongside the board DB file.
 
@@ -7147,6 +7163,30 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def active_pr_guard_holds(
+    conn: sqlite3.Connection, *, task_id: str, assignee: Optional[str],
+) -> bool:
+    """True iff the ``active_pr`` respawn-guard condition currently holds.
+
+    A non-reviewer task has a GitHub PR URL in a comment newer than
+    ``_RESPAWN_GUARD_PR_WINDOW`` — a prior worker already opened a PR, so
+    re-spawning risks a duplicate. Reviewer lanes are exempt (they often spawn
+    *after* the engineer comments PR URLs). Shared by the dispatcher park site
+    (:func:`check_respawn_guard`) and the scheduled un-park promoter
+    (:func:`promote_cleared_scheduled`) so both evaluate one predicate.
+    """
+    if (assignee or "").casefold() == "reviewer":
+        return False
+    pr_cutoff = int(time.time()) - _RESPAWN_GUARD_PR_WINDOW
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        (task_id, pr_cutoff),
+    ).fetchall():
+        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            return True
+    return False
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -7207,17 +7247,60 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
     # Reviewer/final-acceptance cards often need to spawn *after* the engineer
     # comments PR URLs. The active-PR guard prevents duplicate PR creation for
-    # implementer cards; it must not suppress reviewer lanes.
-    if (row["assignee"] or "").casefold() != "reviewer":
-        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-        for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-            (task_id, pr_cutoff),
-        ).fetchall():
-            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-                return "active_pr"
+    # implementer cards; it must not suppress reviewer lanes. Shared predicate
+    # with the scheduled un-park promoter (see active_pr_guard_holds).
+    if active_pr_guard_holds(conn, task_id=task_id, assignee=row["assignee"]):
+        return "active_pr"
 
     return None
+
+
+def promote_cleared_scheduled(conn: sqlite3.Connection) -> int:
+    """Un-park ``scheduled`` tasks the respawn guard parked for ``active_pr``,
+    once that guard clears, by transitioning them back to ``ready`` so normal
+    dispatch picks them up. Returns the number promoted.
+
+    Targets ONLY active_pr parks: identified by ``respawn_guard='active_pr'`` on
+    the task's most recent ``scheduled`` event (the marker the dispatcher park
+    site writes). Time-based / operator parks (``schedule_task``) carry no such
+    marker and are left untouched. Re-evaluates the *same* predicate that parked
+    the task (:func:`active_pr_guard_holds`); a task whose PR comment is still
+    within the guard window stays parked.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks WHERE status = 'scheduled'"
+    ).fetchall()
+    promoted = 0
+    for row in rows:
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if not ev or not ev["payload"]:
+            continue
+        try:
+            payload = json.loads(ev["payload"]) or {}
+        except (ValueError, TypeError):
+            continue
+        if payload.get("respawn_guard") != "active_pr":
+            continue  # time-based / operator park — leave alone
+        if active_pr_guard_holds(conn, task_id=row["id"], assignee=row["assignee"]):
+            continue  # PR still recent — stay parked
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status = 'scheduled'",
+                (row["id"],),
+            )
+            if cur.rowcount != 1:
+                continue  # raced with another transition; skip
+            _append_event(
+                conn, row["id"], "ready",
+                {"reason": "active_pr respawn guard cleared; auto-promoted to ready"},
+            )
+        promoted += 1
+    return promoted
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -7345,6 +7428,11 @@ def dispatch_once(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     result.timed_out = enforce_max_runtime(conn)
+    # WS4: un-park active_pr scheduled tasks whose PR guard has cleared, before
+    # the todo→ready promotion + ready scan, so they dispatch this same tick.
+    # Behind kanban.promote_scheduled_on_guard_clear (default off → unchanged).
+    if not dry_run and _promote_scheduled_enabled():
+        promote_cleared_scheduled(conn)
     result.promoted = recompute_ready(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -7573,9 +7661,13 @@ def dispatch_once(
                             conn, row["id"], outcome="scheduled", summary=reason,
                             metadata={"respawn_guard": guard_reason},
                         )
+                        # Structured marker so the scheduled un-park promoter
+                        # (promote_cleared_scheduled) can target ONLY active_pr
+                        # parks and leave time/operator scheduled parks alone.
                         _append_event(
                             conn, row["id"], "scheduled",
-                            {"reason": reason}, run_id=run_id,
+                            {"reason": reason, "respawn_guard": guard_reason},
+                            run_id=run_id,
                         )
             continue
         if dry_run:

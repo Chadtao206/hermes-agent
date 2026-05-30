@@ -180,10 +180,21 @@ gated on `writer_auto_recovery` (`_kanban_writer_recovery_cfg()` → `_spawn_wri
 auto_recovery=...)` enables recovery only when true; `_writer_auto_recovery_enabled()` gates the
 notifier backoff). No separate work remains for WS2 Task 4.
 
-## REMAINING after Step C
-- **WS4** — scheduled-park stall fix. **WS5** — `kanban_reconcile` agent tool. **WS6** — board-liveness SLO.
-  (Plans: `04-`, `05-`, `06-`.)
-- Cross-cutting: a full two-stage review of the WS1 + C2 work (none of these commits is reviewed yet).
+## WS4 — DONE & GREEN (one squashed commit; not yet reviewed)
+Scheduled-park silent-stall fixed. `active_pr_guard_holds(conn, *, task_id, assignee)` extracted
+from `check_respawn_guard` so park + un-park share one predicate; the dispatcher park site now
+stamps a structured `respawn_guard='active_pr'` marker on the `scheduled` event payload.
+`promote_cleared_scheduled(conn)` un-parks scheduled/active_pr tasks back to `ready` once the PR
+comment ages out of the guard window (re-evaluating the same predicate), targeting ONLY tasks with
+that marker — time-based/operator `schedule_task` parks are untouched. Wired into `dispatch_once`
+(before `recompute_ready`, skipped on `dry_run`) behind `kanban.promote_scheduled_on_guard_clear`
+(default false → unchanged); flag documented in `cli-config.yaml.example`. Verified regression-free
+(`-k kanban` failing-set unchanged at 22). Tests: `test_kanban_active_pr_guard.py`,
+`test_kanban_promote_scheduled.py`, `test_kanban_dispatch_promotes_scheduled.py`.
+
+## REMAINING
+- **WS5** — `kanban_reconcile` agent tool. **WS6** — board-liveness SLO. (Plans: `05-`, `06-`.)
+- Cross-cutting: a full two-stage review of the WS1 + C2 + WS4 work (none of these commits is reviewed yet).
 
 ## Known non-issues
 - The broad kanban/gateway suite shows ~34 pre-existing cross-test contamination failures that are
