@@ -1165,3 +1165,29 @@ display:
 #   # default — works on Fly.io out of the box).
 #   #
 #   #   public_url: "https://example.com/hermes"
+
+# ---------------------------------------------------------------------------
+# Kanban orchestrator (Jensen) — board database write architecture
+# ---------------------------------------------------------------------------
+kanban:
+  # Single-writer daemon. When true, ALL board writes funnel through one owner
+  # process (the gateway, or a standalone `hermes kanban db-daemon`); the
+  # dispatcher, notifier, workers, and CLI become clients that send writes over
+  # a local Unix socket. Reads stay direct and read-only. This structurally
+  # eliminates concurrent-writer corruption and the SIGKILL-mid-write torn-page
+  # hazard (workers never hold a writable handle). Default false (every process
+  # opens its own writable connection, as before).
+  single_writer_daemon: false
+
+  # Bounded automatic corruption recovery, owned by the writer daemon. Only
+  # meaningful when single_writer_daemon is true. On a corruption signal the
+  # daemon closes, runs the recovery ladder (WAL checkpoint → sqlite `.recover`
+  # → restore-from-backup), reopens, and retries the write once; if recovery is
+  # exhausted it disables the board and the gateway watchdog pages a human.
+  # Default false (a corruption signal surfaces as an error, as before).
+  writer_auto_recovery: false
+
+  # Periodic online backup cadence + retention for the writer daemon's recovery
+  # ladder (only used when writer_auto_recovery is true).
+  writer_backup_interval_seconds: 300   # how often the daemon snapshots the board
+  writer_backup_keep: 6                 # how many timestamped backups to retain

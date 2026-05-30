@@ -159,12 +159,31 @@ in-process daemon and isn't the writer thread → `write_session` picks RemoteWr
 writable `connect()` is refused by the Task-4 guard). No owner env is set. Flag off = unchanged.
 Verified regression-free (`-k kanban` failing-set unchanged at 22). Tests: `test_kanban_spawn_env.py`.
 
+## WS1 Task 9 — DONE & GREEN (one squashed commit; not yet reviewed) → **WS1 COMPLETE**
+WS1 acceptance gate proven: `tests/hermes_cli/test_kanban_writer_integration.py` spins up the
+daemon, hammers it with 6 concurrent `RemoteWriter` clients (+ a 7th client process SIGKILL'd
+mid-write), and asserts the board still passes `PRAGMA integrity_check` with all committed rows
+intact — the structural cure (no client holds a writable handle; only the daemon's one writer
+thread writes) holds. Flag docs added to `cli-config.yaml.example` (new `kanban:` section). The
+repo has no tracked `config.yaml` (that's the user's live file — left untouched). Verified
+regression-free (`-k kanban` failing-set unchanged at 22).
+
+**WS1 (single-writer daemon) is now end-to-end complete:** protocol, daemon, client, guard,
+lifecycle, gateway start/stop + dispatcher routing (C1), notifier routing + watchdog (C2),
+tool-handler migration + typed-error preservation (Task 7), worker spawn env (Task 8), and the
+kill-during-write acceptance proof (Task 9).
+
+## WS2 Task 4 — effectively DONE (folded into Task 9's config edit + earlier wiring)
+The `kanban:` section in `cli-config.yaml.example` now documents `writer_auto_recovery`,
+`writer_backup_interval_seconds`, and `writer_backup_keep`. The gateway recovery wiring is already
+gated on `writer_auto_recovery` (`_kanban_writer_recovery_cfg()` → `_spawn_writer_daemons(...,
+auto_recovery=...)` enables recovery only when true; `_writer_auto_recovery_enabled()` gates the
+notifier backoff). No separate work remains for WS2 Task 4.
+
 ## REMAINING after Step C
-- **WS1 Task 9** — integration proof (killed client can't corrupt) + `config.yaml` flag docs.
-- **WS2 Task 4** — `config.yaml` flags: `writer_auto_recovery`, `writer_backup_interval_seconds`,
-  `writer_backup_keep`; gate the gateway recovery wiring on `writer_auto_recovery`.
 - **WS4** — scheduled-park stall fix. **WS5** — `kanban_reconcile` agent tool. **WS6** — board-liveness SLO.
   (Plans: `04-`, `05-`, `06-`.)
+- Cross-cutting: a full two-stage review of the WS1 + C2 work (none of these commits is reviewed yet).
 
 ## Known non-issues
 - The broad kanban/gateway suite shows ~34 pre-existing cross-test contamination failures that are
