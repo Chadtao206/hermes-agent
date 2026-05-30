@@ -1139,17 +1139,120 @@ class PostgresKanbanStore:
 
     # --- deferred sidecar methods ----------------------------------------
 
-    def list_profile_wake_events(self, **kwargs) -> list:
-        raise NotImplementedError("phase-2-tail: list_profile_wake_events")
+    def list_profile_wake_events(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        profile: Optional[str] = None,
+        name: Optional[str] = None,
+        since_id: int = 0,
+        limit: int = 200,
+    ) -> list:
+        where = ["board = %s", "id > %s"]
+        params: list[Any] = [self.board, int(since_id)]
+        if task_id is not None:
+            where.append("task_id = %s")
+            params.append(task_id)
+        if profile is not None:
+            where.append("profile = %s")
+            params.append(profile)
+        if name is not None:
+            where.append("name = %s")
+            params.append(name)
+        sql = (
+            "SELECT id, task_id, profile, name, status, error, "
+            "       claimed_event_cursor, created_at "
+            "FROM kanban_profile_wake_events "
+            "WHERE " + " AND ".join(where) + " "
+            "ORDER BY id ASC LIMIT %s"
+        )
+        params.append(int(limit))
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
 
     def record_notifier_heartbeat(self, **kwargs) -> None:
-        raise NotImplementedError("phase-2-tail: record_notifier_heartbeat")
+        # Notifier-heartbeat telemetry is board-independent and intentionally
+        # lives in a shared SQLite sidecar for BOTH backends, never in the
+        # board DB. Delegate to the same module kanban_db uses.
+        from hermes_cli import kanban_notifier_sidecar
+        return kanban_notifier_sidecar.record_notifier_heartbeat(**kwargs)
 
     def list_notifier_heartbeats(self, **kwargs) -> list:
-        raise NotImplementedError("phase-2-tail: list_notifier_heartbeats")
+        from hermes_cli import kanban_notifier_sidecar
+        return kanban_notifier_sidecar.list_notifier_heartbeats(**kwargs)
 
-    def heartbeat_worker(self, **kwargs) -> bool:
-        raise NotImplementedError("phase-2-tail: heartbeat_worker")
+    def heartbeat_worker(
+        self,
+        *,
+        task_id: str,
+        note: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+        min_event_interval_seconds: Optional[int] = None,
+    ) -> bool:
+        from hermes_cli.kanban_db import (
+            DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
+        )
+        if min_event_interval_seconds is None:
+            min_event_interval_seconds = DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS
+        min_event_interval_seconds = max(0, int(min_event_interval_seconds or 0))
+        now = int(time.time())
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                if expected_run_id is None:
+                    cur.execute(
+                        "UPDATE tasks SET last_heartbeat_at=%s "
+                        "WHERE board=%s AND id=%s AND status='running'",
+                        (now, self.board, task_id))
+                else:
+                    cur.execute(
+                        "UPDATE tasks SET last_heartbeat_at=%s "
+                        "WHERE board=%s AND id=%s AND status='running' "
+                        "AND current_run_id=%s",
+                        (now, self.board, task_id, int(expected_run_id)))
+                if cur.rowcount != 1:
+                    return False
+                if expected_run_id is not None:
+                    run_id: Optional[int] = int(expected_run_id)
+                else:
+                    cur.execute(
+                        "SELECT current_run_id FROM tasks "
+                        "WHERE board=%s AND id=%s",
+                        (self.board, task_id))
+                    row = cur.fetchone()
+                    run_id = (int(row["current_run_id"])
+                              if row and row["current_run_id"] else None)
+                if run_id is not None:
+                    cur.execute(
+                        "UPDATE task_runs SET last_heartbeat_at=%s "
+                        "WHERE board=%s AND id=%s",
+                        (now, self.board, run_id))
+
+                should_append_event = True
+                if min_event_interval_seconds:
+                    if run_id is None:
+                        cur.execute(
+                            "SELECT created_at FROM task_events "
+                            "WHERE board=%s AND task_id=%s AND kind='heartbeat' "
+                            "ORDER BY id DESC LIMIT 1",
+                            (self.board, task_id))
+                    else:
+                        cur.execute(
+                            "SELECT created_at FROM task_events "
+                            "WHERE board=%s AND task_id=%s AND kind='heartbeat' "
+                            "AND run_id=%s ORDER BY id DESC LIMIT 1",
+                            (self.board, task_id, run_id))
+                    last_event = cur.fetchone()
+                    if last_event is not None:
+                        should_append_event = (
+                            now - int(last_event["created_at"])
+                            >= min_event_interval_seconds
+                        )
+                if should_append_event:
+                    self._emit(cur, task_id, "heartbeat",
+                               {"note": note} if note else None,
+                               run_id=run_id)
+        return True
 
     def edit_completed_task_result(self, task_id, **kwargs):
         raise NotImplementedError("phase-2-tail: edit_completed_task_result")

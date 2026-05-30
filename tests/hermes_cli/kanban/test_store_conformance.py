@@ -1,3 +1,7 @@
+import time
+from uuid import uuid4
+
+
 def test_create_then_get(store):
     tid = store.create_task(title="hello", assignee="engineer")
     t = store.get_task(tid)
@@ -130,3 +134,40 @@ def test_claim_task_atomic(store):
     assert t1 is not None and t1.status == "running"
     # second claim of the same (now-running) task returns None
     assert store.claim_task(tid, claimer="w2") is None
+
+
+def test_heartbeat_worker(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    assert store.heartbeat_worker(task_id=tid) is True
+    # a task left in ready (never claimed) cannot heartbeat
+    tid2 = store.create_task(title="y", assignee="engineer")
+    assert store.heartbeat_worker(task_id=tid2) is False
+
+
+def test_notifier_heartbeat_roundtrip(store):
+    # The notifier-heartbeat sidecar is a shared SQLite DB keyed by
+    # board_slug/db_path; use a unique key per run so the two backend
+    # parametrizations don't collide.
+    unique = uuid4().hex
+    notifier_id = "n_" + unique
+    board_slug = "bs_" + unique
+    db_path = "/tmp/hb_" + unique + ".sqlite3"
+    store.record_notifier_heartbeat(
+        notifier_id=notifier_id,
+        board_slug=board_slug,
+        db_path=db_path,
+        notifier_profile="engineer",
+        host="testhost",
+        pid=4242,
+        started_at=int(time.time()),
+    )
+    rows = store.list_notifier_heartbeats(board_slug=board_slug, db_path=db_path)
+    ids = [r["notifier_id"] if isinstance(r, dict) else r.notifier_id for r in rows]
+    assert notifier_id in ids
+
+
+def test_list_profile_wake_events_empty(store):
+    rows = store.list_profile_wake_events()
+    assert isinstance(rows, list)
