@@ -2010,6 +2010,51 @@ def _confirm_board_db_corruption(db_path: str | Path) -> tuple[bool, str]:
     )
 
 
+def _spawn_writer_daemons(board_db_paths, *, auto_recovery: bool, keep: int = 6,
+                          interval: int = 300):
+    """Start + register one WriterDaemon per distinct resolved board DB path.
+    Returns the list of daemons that successfully acquired their singleton."""
+    import threading as _threading
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_writer_daemon as _wd
+    started = []
+    seen = set()
+    for db_path in board_db_paths:
+        key = str(_Path(db_path).resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        daemon = None
+        try:
+            daemon = _wd.WriterDaemon(
+                db_path=_Path(db_path),
+                socket_path=_Path(db_path).parent / ".kanban-writer.sock",
+            )
+            if auto_recovery:
+                daemon.enable_auto_recovery(backup_dir=_Path(db_path).parent, keep=keep,
+                                            interval=interval)
+            if not daemon.acquire_singleton():
+                continue  # another owner already serves this board on this host
+            t = _threading.Thread(target=daemon.serve_forever, daemon=True,
+                                  name=f"kanban-writer-{_Path(db_path).name}")
+            t.start()
+            _wd.register_daemon(db_path, daemon)
+            started.append(daemon)
+        except Exception:
+            logger.exception(
+                "kanban writer daemon: failed to start board %s; skipping", db_path
+            )
+            try:
+                _wd.unregister_daemon(db_path)
+                if daemon is not None:
+                    daemon.shutdown()
+                    daemon.release_singleton()
+            except Exception:
+                pass
+            continue
+    return started
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -2062,6 +2107,7 @@ class GatewayRunner:
         )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        self._kanban_writer_daemons: list = []
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -4900,6 +4946,10 @@ class GatewayRunner:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+        # Start the single-writer daemon(s) BEFORE the dispatcher tick runs so
+        # the writer thread exists + is registered for in-process routing.
+        self._start_kanban_writer_daemon()
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -5317,6 +5367,42 @@ class GatewayRunner:
             return get_active_profile_name() or "default"
         except Exception:
             return "default"
+
+    def _start_kanban_writer_daemon(self) -> None:
+        import hermes_cli.kanban_db as _kb
+        if not _kb.single_writer_enabled():
+            return
+        try:
+            from hermes_cli.config import load_config as _load_config
+            cfg = _load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception:
+            kanban_cfg = {}
+        auto_recovery = bool(kanban_cfg.get("writer_auto_recovery", False))
+        keep = int(kanban_cfg.get("writer_backup_keep", 6))
+        interval = int(kanban_cfg.get("writer_backup_interval_seconds", 300))
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception as exc:
+            logger.warning("kanban writer daemon: could not enumerate boards: %s", exc)
+            return
+        db_paths = []
+        for b in boards:
+            try:
+                slug = b.get("slug") if isinstance(b, dict) else None
+                if not slug:
+                    continue
+                db_paths.append(_kb.kanban_db_path(board=slug))
+            except Exception as exc:
+                logger.warning(
+                    "kanban writer daemon: could not resolve DB for board %r: %s",
+                    b, exc,
+                )
+        self._kanban_writer_daemons = _spawn_writer_daemons(
+            db_paths, auto_recovery=auto_recovery, keep=keep, interval=interval)
+        if self._kanban_writer_daemons:
+            logger.info("kanban writer daemon: started %d board writer(s)",
+                        len(self._kanban_writer_daemons))
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -6928,6 +7014,25 @@ class GatewayRunner:
             if fingerprint[1] is not None:
                 last_seen_live_fingerprints[slug] = fingerprint
             try:
+                from hermes_cli import kanban_writer_daemon as _wd
+                _daemon = (_wd.lookup_daemon(_kb.kanban_db_path(board=slug))
+                           if _kb.single_writer_enabled() else None)
+                if _daemon is not None:
+                    # Single-writer path: route the dispatch through the
+                    # in-process writer thread. `conn` stays None so the
+                    # `finally` conn-close is a no-op for this branch.
+                    result = _daemon.execute(
+                        "dispatch_once",
+                        board=slug,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    )
+                    corruption_confirm_streaks.pop(fingerprint[0], None)
+                    return result
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
@@ -6947,6 +7052,15 @@ class GatewayRunner:
                 )
                 corruption_confirm_streaks.pop(fingerprint[0], None)
                 return result
+            except RuntimeError as exc:
+                # Daemon-routed dispatch failed (recovery exhausted or daemon
+                # down). The daemon owns recovery; back off this tick instead
+                # of the legacy corruption-streak disable.
+                logger.error(
+                    "kanban dispatcher: writer daemon dispatch error for board %s: %s",
+                    slug, exc,
+                )
+                return None
             except sqlite3.DatabaseError as exc:
                 if _is_disk_io_board_db_error(exc):
                     disabled_db_paths[fingerprint[0]] = {
@@ -7535,6 +7649,17 @@ class GatewayRunner:
 
             self._running = False
             self._draining = True
+
+            # Tear down kanban writer daemons (unregister BEFORE shutdown so no
+            # in-process caller routes to a stopping daemon).
+            for _daemon in getattr(self, "_kanban_writer_daemons", []):
+                try:
+                    import hermes_cli.kanban_writer_daemon as _wd
+                    _wd.unregister_daemon(_daemon.db_path)
+                    _daemon.shutdown()
+                except Exception as _e:
+                    logger.debug("kanban writer daemon shutdown error: %s", _e)
+            self._kanban_writer_daemons = []
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.

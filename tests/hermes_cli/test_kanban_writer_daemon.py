@@ -175,3 +175,22 @@ def test_force_backup_now_creates_snapshot(tmp_path):
         assert snap is not None and snap.exists()
     finally:
         server.shutdown()
+
+
+def test_daemon_executes_dispatch_once_dry_run(tmp_path):
+    import time
+    from pathlib import Path
+    db = tmp_path / "kanban.db"; sock = tmp_path / ".kanban-writer.sock"
+    server = wd.WriterDaemon(db_path=db, socket_path=sock)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    for _ in range(100):
+        if Path(sock).exists(): break
+        time.sleep(0.02)
+    try:
+        server.execute("create_task", title="d", assignee="engineer")
+        # Route the actual dispatcher op through the daemon's writer thread.
+        # dry_run=True so it computes a tick without spawning any worker.
+        result = server.execute("dispatch_once", dry_run=True)
+        assert result is not None  # a DispatchResult came back, no error raised
+    finally:
+        server.shutdown()
