@@ -39,6 +39,7 @@ class KanbanStore(Protocol):
         summary=None,
         metadata=None,
         created_cards=None,
+        expected_run_id: Optional[int] = None,
     ) -> bool: ...
 
     def block_task(
@@ -162,7 +163,7 @@ class KanbanStore(Protocol):
 
     def board_stats(self) -> dict: ...
 
-    def known_assignees(self) -> list[str]: ...
+    def known_assignees(self) -> list[dict]: ...
 
     # ------------------------------------------------------------------
     # Lifecycle
