@@ -51,7 +51,44 @@ config flag `kanban.writer_auto_recovery` + backup interval/keep to be wired in 
   `tests/gateway/test_kanban_writer_lifecycle.py` (+ a daemon `execute("dispatch_once", dry_run=True)`
   test guarding the routed, non-allowlisted op).
 
-### C2 — NOT STARTED (fully scoped + DE-RISKED below)
+### C2 — DONE & GREEN (one squashed commit; not yet reviewed)
+All four pieces below are done, tested (TDD red→green), and verified regression-free:
+the `tests/hermes_cli/ -k kanban` failing-set is **byte-identical pre- and post-C2** (22
+pre-existing contamination failures, pass individually — confirmed by stashing the C2 source
+changes and re-running). Committed as one squashed commit (per user request; see `git log` —
+the C2 commit subject is "route notifier board writes through single-writer daemon + watchdog").
+Still pending: full two-stage review.
+
+- **Pure helpers (WS2 Task 3):** `_writer_auto_recovery_enabled()` (reads
+  `kanban.writer_auto_recovery`) + `_classify_board_write_error(msg, *, disabled_set, db_path)`
+  → `"backoff_retry"` / `"disable"` / `"other"` (never mutates the set; caller owns side effects).
+  Tests: `tests/gateway/test_kanban_writer_watchdog.py`.
+- **`GatewayRunner._board_write(board, op, **kwargs)`** — daemon-vs-direct router mirroring C1.
+  The 7 notifier write helpers (`_kanban_advance`/`_unsub`/`_rewind`, `_kanban_profile_advance`/
+  `_rewind`/`_record_success`/`_record_failure`) now route through it; the two `record_*` keep
+  their legacy-fallback by picking the op name then routing. Flag off → direct write (unchanged).
+- **`_collect` (in `_kanban_notifier_watcher`):** per board, `board_daemon = lookup_daemon(...)`
+  when flag on; conn opened `readonly=True` when a daemon owns the board (reads only), and both
+  `claim_unseen_events_for_sub` + `claim_unseen_events_for_profile_sub` read-modify-writes route
+  through `board_daemon.execute(...)`. Corruption-confirm funnel
+  (`_record_notifier_corruption_confirmation`) backs off (no hard-disable, no streak mutation)
+  when `single_writer_enabled()` + classifier says `backoff_retry`. Flag off = byte-for-byte.
+- **Watchdog (WS2 Task 3):** `WriterDaemon` gains `is_alive()`, `wait_until_serving()`
+  (+ `_writer_ready` Event, set in `_writer_loop`), and `restart_writer_thread()` (in-place
+  revival — no socket/singleton churn). `_spawn_writer_daemons` now waits for readiness before
+  registering (closes the startup race / duplicate-writer window). `GatewayRunner` gains
+  `_writer_watchdog_tick()` (revive dead thread; alert-once via `_emit_writer_daemon_alert` when
+  `health()["disabled"]`; re-arms alert when the board recovers) + the async
+  `_kanban_writer_watchdog()` loop, started right after `_start_kanban_writer_daemon()`.
+  Config read factored into `_kanban_writer_recovery_cfg()`. Tests:
+  `tests/gateway/test_kanban_writer_watchdog_restart.py`,
+  `tests/gateway/test_kanban_notifier_single_writer.py`.
+
+Grep check done: no writable `_kb.connect(board=` remains on any notifier write path under the
+flag — every cursor/claim/wake write routes through the daemon; only `readonly=True` reads stay
+on a direct conn.
+
+#### Original scope notes (for reference)
 **Key finding (de-risks C2):** the notifier HEARTBEAT — the RCA's corrupted table — is ALREADY
 isolated into a sidecar (`kanban_notifier_heartbeats.db` via `hermes_cli/kanban_notifier_sidecar.py`,
 which uses its OWN `sqlite3.connect`, NOT `kb.connect`). `record_notifier_heartbeat(conn, ...)`

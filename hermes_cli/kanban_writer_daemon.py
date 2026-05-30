@@ -85,6 +85,10 @@ class WriterDaemon:
         self.pid_path = Path(pid_path) if pid_path is not None else self.socket_path.with_name(".kanban-writer.pid")
         self._queue: "queue.Queue[Optional[_WorkItem]]" = queue.Queue()
         self._writer_thread: Optional[threading.Thread] = None
+        # Set once the writer thread has opened its connection and is draining
+        # the queue. Lets callers (and the gateway watchdog) wait for a real
+        # ready state instead of racing thread startup.
+        self._writer_ready = threading.Event()
         self._conn = None
         self._server: Optional[socketserver.UnixStreamServer] = None
         self._pid_fh = None
@@ -118,9 +122,39 @@ class WriterDaemon:
             "last_recovery": self._last_recovery,
         }
 
+    def is_alive(self) -> bool:
+        """True when the dedicated writer-loop thread is running (i.e. queued
+        ops will be drained). The gateway watchdog uses this to detect a writer
+        thread that died unexpectedly."""
+        t = self._writer_thread
+        return t is not None and t.is_alive()
+
+    def wait_until_serving(self, timeout: float = 5.0) -> bool:
+        """Block until the writer thread has opened its connection and is
+        draining the queue. Returns False on timeout. Callers register a daemon
+        only after this returns True so no one races thread startup."""
+        return self._writer_ready.wait(timeout)
+
+    def restart_writer_thread(self) -> bool:
+        """Revive the writer-loop thread in place if it died.
+
+        The socket server and singleton lock are left untouched, so in-process
+        ``execute()`` callers (the gateway dispatcher/notifier) can write again
+        immediately. The loop reopens its own writable connection on start.
+        Returns True only when a fresh thread was actually started (no-op + False
+        when the thread is already alive)."""
+        if self.is_alive():
+            return False
+        self._writer_ready.clear()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, name="kanban-writer-loop", daemon=True)
+        self._writer_thread.start()
+        return True
+
     def _writer_loop(self) -> None:
         _WRITER_TLS.is_writer = True
         self._conn = kb.connect(db_path=self.db_path, readonly=False)
+        self._writer_ready.set()
         try:
             while True:
                 item = self._queue.get()

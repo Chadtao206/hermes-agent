@@ -1819,6 +1819,67 @@ def _is_durable_corruption_database_error(exc: sqlite3.DatabaseError) -> bool:
     )
 
 
+def _writer_auto_recovery_enabled() -> bool:
+    """True when ``kanban.writer_auto_recovery`` is on (daemon owns recovery).
+
+    When enabled, the single-writer daemon self-heals corruption on its own
+    writable connection, so the gateway's dispatcher/notifier back off and
+    retry on a corruption-shaped error instead of permanently disabling the
+    board for the process. Reads config defensively; any failure → False
+    (today's permanent-disable behavior).
+    """
+    try:
+        from hermes_cli.config import load_config as _load_config
+        cfg = _load_config()
+        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        return False
+    return bool(kanban_cfg.get("writer_auto_recovery", False))
+
+
+def _board_write_error_is_corruption(error_msg: str) -> bool:
+    """True when a board-write error string looks like durable DB corruption.
+
+    Mirrors the substrings the notifier/connect paths treat as corruption so
+    the backoff decision matches the existing hard-disable triggers.
+    """
+    msg = (error_msg or "").lower()
+    return (
+        "database disk image is malformed" in msg
+        or "file is not a database" in msg
+        or "file is encrypted or is not a database" in msg
+        or "quick_check" in msg
+        or "integrity_check" in msg
+        or "profile-event table invariant failed" in msg
+    )
+
+
+def _classify_board_write_error(
+    error_msg: str, *, disabled_set: dict, db_path: str,
+) -> str:
+    """Decide how a board-write error should be handled.
+
+    Returns one of:
+
+    * ``"backoff_retry"`` — corruption-shaped error AND auto-recovery is on.
+      The daemon owns recovery on its writable connection, so the caller logs
+      and retries next tick WITHOUT touching ``disabled_set``.
+    * ``"disable"`` — corruption-shaped error with auto-recovery off; the
+      caller keeps today's permanent per-process disable behavior.
+    * ``"other"`` — not corruption-shaped; the caller keeps its existing
+      non-disable handling for transient/unknown errors.
+
+    Never mutates ``disabled_set`` itself — the decision is the contract; the
+    caller owns the side effects so the existing disable bookkeeping (streaks,
+    payloads) is unchanged.
+    """
+    if not _board_write_error_is_corruption(error_msg):
+        return "other"
+    if _writer_auto_recovery_enabled():
+        return "backoff_retry"
+    return "disable"
+
+
 def _board_db_header_looks_like_sqlite(path: Path) -> bool | None:
     try:
         with path.open("rb") as fh:
@@ -2038,6 +2099,17 @@ def _spawn_writer_daemons(board_db_paths, *, auto_recovery: bool, keep: int = 6,
             t = _threading.Thread(target=daemon.serve_forever, daemon=True,
                                   name=f"kanban-writer-{_Path(db_path).name}")
             t.start()
+            # Register only after the writer thread is actually draining the
+            # queue, so in-process callers (and the watchdog) never race startup
+            # and never spawn a duplicate writer.
+            if not daemon.wait_until_serving(timeout=5):
+                logger.warning(
+                    "kanban writer daemon: board %s writer thread did not become "
+                    "ready in time; skipping", db_path,
+                )
+                daemon.shutdown()
+                daemon.release_singleton()
+                continue
             _wd.register_daemon(db_path, daemon)
             started.append(daemon)
         except Exception:
@@ -4950,6 +5022,10 @@ class GatewayRunner:
         # the writer thread exists + is registered for in-process routing.
         self._start_kanban_writer_daemon()
 
+        # Watchdog: revive a writer thread that died, page a human when a board
+        # exhausts recovery. No-op when the single-writer flag is off.
+        asyncio.create_task(self._kanban_writer_watchdog())
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -5368,19 +5444,27 @@ class GatewayRunner:
         except Exception:
             return "default"
 
-    def _start_kanban_writer_daemon(self) -> None:
-        import hermes_cli.kanban_db as _kb
-        if not _kb.single_writer_enabled():
-            return
+    def _kanban_writer_recovery_cfg(self) -> tuple[bool, int, int]:
+        """Read ``(auto_recovery, backup_keep, backup_interval_seconds)`` from
+        config, defensively. Shared by daemon start and watchdog restart so a
+        revived daemon keeps the same recovery posture."""
         try:
             from hermes_cli.config import load_config as _load_config
             cfg = _load_config()
             kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         except Exception:
             kanban_cfg = {}
-        auto_recovery = bool(kanban_cfg.get("writer_auto_recovery", False))
-        keep = int(kanban_cfg.get("writer_backup_keep", 6))
-        interval = int(kanban_cfg.get("writer_backup_interval_seconds", 300))
+        return (
+            bool(kanban_cfg.get("writer_auto_recovery", False)),
+            int(kanban_cfg.get("writer_backup_keep", 6)),
+            int(kanban_cfg.get("writer_backup_interval_seconds", 300)),
+        )
+
+    def _start_kanban_writer_daemon(self) -> None:
+        import hermes_cli.kanban_db as _kb
+        if not _kb.single_writer_enabled():
+            return
+        auto_recovery, keep, interval = self._kanban_writer_recovery_cfg()
         try:
             boards = _kb.list_boards(include_archived=False)
         except Exception as exc:
@@ -5403,6 +5487,84 @@ class GatewayRunner:
         if self._kanban_writer_daemons:
             logger.info("kanban writer daemon: started %d board writer(s)",
                         len(self._kanban_writer_daemons))
+
+    def _emit_writer_daemon_alert(self, db_path, health: dict) -> None:
+        """Page a human when a board's writer daemon has exhausted bounded
+        recovery (``health()["disabled"]``) — the board cannot self-heal and
+        needs a quiesced manual repair. High-severity log line; a richer alert
+        sink (WS6) can be wired here later."""
+        logger.error(
+            "kanban writer daemon: board DB %s has exhausted automatic recovery "
+            "and is DISABLED (%s); manual repair required — dispatch/notify for "
+            "this board are stalled until it is fixed",
+            db_path, health.get("detail"),
+        )
+
+    def _writer_watchdog_tick(self) -> None:
+        """One watchdog pass over the owned writer daemons.
+
+        * recovery exhausted (``health()["disabled"]``) → alert once, leave it
+          for a human (don't churn-restart a board that can't self-heal);
+        * writer thread died but recovery is fine → revive it in place so
+          in-process writes resume without a gateway restart.
+
+        No-op when the single-writer flag is off. Never raises — a watchdog that
+        crashes is worse than one that skips a tick.
+        """
+        import hermes_cli.kanban_db as _kb
+        if not _kb.single_writer_enabled():
+            return
+        alerted = getattr(self, "_kanban_writer_alerted_paths", None)
+        if alerted is None:
+            alerted = set()
+            self._kanban_writer_alerted_paths = alerted
+        for daemon in list(getattr(self, "_kanban_writer_daemons", [])):
+            try:
+                health = daemon.health()
+            except Exception:
+                health = {"disabled": False}
+            db_key = str(daemon.db_path.resolve())
+            if health.get("disabled"):
+                if db_key not in alerted:
+                    alerted.add(db_key)
+                    try:
+                        self._emit_writer_daemon_alert(daemon.db_path, health)
+                    except Exception as exc:
+                        logger.debug("kanban writer daemon alert failed: %s", exc)
+                continue
+            # Board healthy again → re-arm its alert so a future exhaustion pages.
+            alerted.discard(db_key)
+            try:
+                if daemon.restart_writer_thread():
+                    logger.error(
+                        "kanban writer daemon: writer thread for %s had died; "
+                        "revived in place", daemon.db_path,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "kanban writer daemon: failed to revive writer thread for %s: %s",
+                    daemon.db_path, exc,
+                )
+
+    async def _kanban_writer_watchdog(self, interval: float = 10.0) -> None:
+        """Background loop: periodically run :meth:`_writer_watchdog_tick`.
+
+        Started alongside the writer daemon(s). The per-tick logic is sync and
+        cheap (thread liveness + ``health()`` checks), pushed to a thread so the
+        event loop never blocks. No-op body when the flag is off."""
+        import hermes_cli.kanban_db as _kb
+        if not _kb.single_writer_enabled():
+            return
+        await asyncio.sleep(interval)
+        while self._running:
+            try:
+                await asyncio.to_thread(self._writer_watchdog_tick)
+            except Exception as exc:
+                logger.debug("kanban writer watchdog tick failed: %s", exc)
+            for _ in range(int(max(1, interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -5518,6 +5680,24 @@ class GatewayRunner:
         ) -> bool:
             if resolved_db_path in tick_recorded_db_paths:
                 return False
+            # Single-writer + auto-recovery: the board's writer daemon owns
+            # corruption recovery on its writable connection. The notifier's
+            # board conn is read-only, so a corruption signal here means the
+            # file is being healed under us — back off this tick and retry
+            # rather than permanently disabling the board for the process.
+            if _kb.single_writer_enabled() and _classify_board_write_error(
+                str(exc),
+                disabled_set=notifier_disabled_db_paths,
+                db_path=resolved_db_path,
+            ) == "backoff_retry":
+                tick_recorded_db_paths.add(resolved_db_path)
+                logger.warning(
+                    "kanban notifier: board %s database %s signaled corruption (%s); "
+                    "writer auto-recovery on, backing off this tick (daemon owns "
+                    "recovery): %s",
+                    slug, resolved_db_path, confirmation, exc,
+                )
+                return False
             streak = notifier_corruption_streaks.get(resolved_db_path, 0) + 1
             notifier_corruption_streaks[resolved_db_path] = streak
             tick_recorded_db_paths.add(resolved_db_path)
@@ -5620,8 +5800,27 @@ class GatewayRunner:
                                 slug, exc,
                             )
                         confirmed_corruption_this_tick = False
+                        # Single-writer: the board's writer daemon owns the only
+                        # writable connection. The notifier reads through a
+                        # read-only conn and routes its read-modify-write event
+                        # claims through the daemon's writer thread (a direct
+                        # writable open here would trip DirectWriteForbidden).
+                        # Flag off (or no local daemon) → today's writable conn.
+                        board_daemon = None
+                        if _kb.single_writer_enabled():
+                            try:
+                                from hermes_cli import kanban_writer_daemon as _wd
+                                board_daemon = _wd.lookup_daemon(
+                                    _kb.kanban_db_path(board=slug)
+                                )
+                            except Exception:
+                                board_daemon = None
                         try:
-                            conn = _kb.connect(board=slug)
+                            conn = (
+                                _kb.connect(board=slug, readonly=True)
+                                if board_daemon is not None
+                                else _kb.connect(board=slug)
+                            )
                         except Exception as exc:
                             if _is_disk_io_board_db_error(exc):
                                 notifier_disabled_db_paths[resolved_db_path] = {
@@ -5713,8 +5912,7 @@ class GatewayRunner:
                                     tuple(sub_kinds) if sub_kinds else TERMINAL_KINDS
                                 )
                                 include_children = bool(sub.get("include_children"))
-                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                    conn,
+                                claim_kwargs = dict(
                                     task_id=sub["task_id"],
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
@@ -5722,6 +5920,14 @@ class GatewayRunner:
                                     kinds=effective_kinds,
                                     include_children=include_children,
                                 )
+                                if board_daemon is not None:
+                                    old_cursor, cursor, events = board_daemon.execute(
+                                        "claim_unseen_events_for_sub", **claim_kwargs,
+                                    )
+                                else:
+                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                        conn, **claim_kwargs,
+                                    )
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
@@ -5776,12 +5982,20 @@ class GatewayRunner:
                                     pro_subs = []
                                 for psub in pro_subs:
                                     try:
-                                        old_pc, pc, p_events = claim_pro(
-                                            conn,
+                                        pclaim_kwargs = dict(
                                             task_id=psub["task_id"],
                                             profile=psub["profile"],
                                             name=psub.get("name") or "",
                                         )
+                                        if board_daemon is not None:
+                                            old_pc, pc, p_events = board_daemon.execute(
+                                                "claim_unseen_events_for_profile_sub",
+                                                **pclaim_kwargs,
+                                            )
+                                        else:
+                                            old_pc, pc, p_events = claim_pro(
+                                                conn, **pclaim_kwargs,
+                                            )
                                     except Exception as exc:
                                         if _is_disk_io_board_db_error(exc):
                                             notifier_disabled_db_paths[resolved_db_path] = {
@@ -6225,6 +6439,33 @@ class GatewayRunner:
                     return
                 await asyncio.sleep(1)
 
+    def _board_write(self, board: Optional[str], op: str, **kwargs):
+        """Perform a single board mutation, routing through the single-writer
+        daemon when it owns this board.
+
+        Under ``kanban.single_writer_daemon`` the gateway runs the board's
+        writer daemon in-process; a direct writable ``connect`` here would trip
+        the guard (``DirectWriteForbidden``). When a daemon is registered for
+        the board we hand the op to its writer thread via ``execute`` (which
+        accepts any callable ``kanban_db`` write fn, not just the wire
+        allowlist). Flag off — or flag on but no local daemon, a
+        misconfiguration the guard surfaces loudly — falls back to a direct
+        writable connection, exactly today's behavior.
+
+        Mirrors the dispatcher's daemon-vs-direct routing (Step C1).
+        """
+        from hermes_cli import kanban_db as _kb
+        if _kb.single_writer_enabled():
+            from hermes_cli import kanban_writer_daemon as _wd
+            daemon = _wd.lookup_daemon(_kb.kanban_db_path(board=board))
+            if daemon is not None:
+                return daemon.execute(op, **kwargs)
+        conn = _kb.connect(board=board)
+        try:
+            return getattr(_kb, op)(conn, **kwargs)
+        finally:
+            conn.close()
+
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
     ) -> None:
@@ -6233,33 +6474,25 @@ class GatewayRunner:
         ``board`` scopes the DB connection to the board that owns this
         subscription. Unsub cursors in one board can't touch another's.
         """
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.advance_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
-            )
-        finally:
-            conn.close()
+        self._board_write(
+            board,
+            "advance_notify_cursor",
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+            new_cursor=cursor,
+        )
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.remove_notify_sub(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-            )
-        finally:
-            conn.close()
+        self._board_write(
+            board,
+            "remove_notify_sub",
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+        )
 
     def _kanban_rewind(
         self,
@@ -6269,20 +6502,16 @@ class GatewayRunner:
         board: Optional[str] = None,
     ) -> None:
         """Sync helper: undo a claimed notification cursor after send failure."""
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
-            )
-        finally:
-            conn.close()
+        self._board_write(
+            board,
+            "rewind_notify_cursor",
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or "",
+            claimed_cursor=claimed_cursor,
+            old_cursor=old_cursor,
+        )
 
     # ---- Profile-level event subscription helpers (Phase 2) ----
 
@@ -6293,19 +6522,15 @@ class GatewayRunner:
         board: Optional[str],
         last_wake_at: Optional[int],
     ) -> None:
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.advance_profile_event_cursor(
-                conn,
-                task_id=sub["task_id"],
-                profile=sub["profile"],
-                name=sub.get("name") or "",
-                new_cursor=cursor,
-                last_wake_at=last_wake_at,
-            )
-        finally:
-            conn.close()
+        self._board_write(
+            board,
+            "advance_profile_event_cursor",
+            task_id=sub["task_id"],
+            profile=sub["profile"],
+            name=sub.get("name") or "",
+            new_cursor=cursor,
+            last_wake_at=last_wake_at,
+        )
 
     def _kanban_profile_rewind(
         self,
@@ -6314,19 +6539,15 @@ class GatewayRunner:
         old_cursor: int,
         board: Optional[str] = None,
     ) -> None:
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.rewind_profile_event_cursor(
-                conn,
-                task_id=sub["task_id"],
-                profile=sub["profile"],
-                name=sub.get("name") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
-            )
-        finally:
-            conn.close()
+        self._board_write(
+            board,
+            "rewind_profile_event_cursor",
+            task_id=sub["task_id"],
+            profile=sub["profile"],
+            name=sub.get("name") or "",
+            claimed_cursor=claimed_cursor,
+            old_cursor=old_cursor,
+        )
 
     def _kanban_profile_record_success(
         self,
@@ -6344,29 +6565,26 @@ class GatewayRunner:
         is missing (mid-upgrade gateway).
         """
         from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            recorder = getattr(_kb, "record_profile_wake_success", None)
-            if recorder is None:  # pragma: no cover — defensive
-                _kb.advance_profile_event_cursor(
-                    conn,
-                    task_id=sub["task_id"],
-                    profile=sub["profile"],
-                    name=sub.get("name") or "",
-                    new_cursor=claimed_cursor,
-                    last_wake_at=last_wake_at,
-                )
-                return
-            recorder(
-                conn,
+        if getattr(_kb, "record_profile_wake_success", None) is None:  # pragma: no cover — defensive
+            self._board_write(
+                board,
+                "advance_profile_event_cursor",
                 task_id=sub["task_id"],
                 profile=sub["profile"],
                 name=sub.get("name") or "",
                 new_cursor=claimed_cursor,
                 last_wake_at=last_wake_at,
             )
-        finally:
-            conn.close()
+            return
+        self._board_write(
+            board,
+            "record_profile_wake_success",
+            task_id=sub["task_id"],
+            profile=sub["profile"],
+            name=sub.get("name") or "",
+            new_cursor=claimed_cursor,
+            last_wake_at=last_wake_at,
+        )
 
     def _kanban_profile_record_failure(
         self,
@@ -6385,30 +6603,27 @@ class GatewayRunner:
         subscription, and append a ``status='failed'`` wake event row.
         """
         from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            recorder = getattr(_kb, "record_profile_wake_failure", None)
-            if recorder is None:  # pragma: no cover — defensive
-                _kb.rewind_profile_event_cursor(
-                    conn,
-                    task_id=sub["task_id"],
-                    profile=sub["profile"],
-                    name=sub.get("name") or "",
-                    claimed_cursor=claimed_cursor,
-                    old_cursor=old_cursor,
-                )
-                return
-            recorder(
-                conn,
+        if getattr(_kb, "record_profile_wake_failure", None) is None:  # pragma: no cover — defensive
+            self._board_write(
+                board,
+                "rewind_profile_event_cursor",
                 task_id=sub["task_id"],
                 profile=sub["profile"],
                 name=sub.get("name") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
-                error=error,
             )
-        finally:
-            conn.close()
+            return
+        self._board_write(
+            board,
+            "record_profile_wake_failure",
+            task_id=sub["task_id"],
+            profile=sub["profile"],
+            name=sub.get("name") or "",
+            claimed_cursor=claimed_cursor,
+            old_cursor=old_cursor,
+            error=error,
+        )
 
     def _build_kanban_event_wake_prompt(
         self,
