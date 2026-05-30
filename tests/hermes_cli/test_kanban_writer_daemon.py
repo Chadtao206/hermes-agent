@@ -114,3 +114,64 @@ def test_second_daemon_refuses_when_one_owns_board(tmp_path):
     s3 = wd.WriterDaemon(db_path=db, socket_path=sock, pid_path=pid)
     assert s3.acquire_singleton() is True
     s3.release_singleton()
+
+
+def test_daemon_heals_on_corruption_signal_and_retries(tmp_path, monkeypatch):
+    import sqlite3
+    from hermes_cli import kanban_db as kb
+    db = tmp_path / "kanban.db"; sock = tmp_path / ".kanban-writer.sock"
+    server = wd.WriterDaemon(db_path=db, socket_path=sock)
+    server.enable_auto_recovery(backup_dir=tmp_path, keep=2)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _wait_for_sock(sock)
+    try:
+        # Make the FIRST create_task raise a corruption signal, then behave normally.
+        real = kb.create_task
+        calls = {"n": 0}
+        def flaky(conn, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return real(conn, **kw)
+        monkeypatch.setattr(kb, "create_task", flaky)
+        # The op should heal (checkpoint rung on the healthy file) + retry + succeed.
+        new_id = server.execute("create_task", title="post-heal", assignee="engineer")
+        assert isinstance(new_id, str)
+        assert server.health()["disabled"] is False
+        assert server.health()["last_recovery"] is not None  # recovery ran
+    finally:
+        server.shutdown()
+
+
+def test_daemon_disables_when_recovery_exhausted(tmp_path, monkeypatch):
+    import sqlite3
+    from hermes_cli import kanban_db as kb
+    db = tmp_path / "kanban.db"; sock = tmp_path / ".kanban-writer.sock"
+    server = wd.WriterDaemon(db_path=db, socket_path=sock)
+    server.enable_auto_recovery(backup_dir=tmp_path, keep=2)
+    server._fail_recovery_for_test = True  # force recover_board -> exhausted
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _wait_for_sock(sock)
+    try:
+        def boom(conn, **kw):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        monkeypatch.setattr(kb, "create_task", boom)
+        with __import__("pytest").raises(Exception):
+            server.execute("create_task", title="x", assignee="engineer")
+        assert server.health()["disabled"] is True
+    finally:
+        server.shutdown()
+
+
+def test_force_backup_now_creates_snapshot(tmp_path):
+    db = tmp_path / "kanban.db"; sock = tmp_path / ".kanban-writer.sock"
+    server = wd.WriterDaemon(db_path=db, socket_path=sock)
+    server.enable_auto_recovery(backup_dir=tmp_path, keep=2)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _wait_for_sock(sock)
+    try:
+        server.execute("create_task", title="snap", assignee="engineer")
+        snap = server.force_backup_now()
+        assert snap is not None and snap.exists()
+    finally:
+        server.shutdown()

@@ -88,6 +88,35 @@ class WriterDaemon:
         self._conn = None
         self._server: Optional[socketserver.UnixStreamServer] = None
         self._pid_fh = None
+        # Recovery/backup state (defaults: recovery OFF, behavior unchanged).
+        self._auto_recovery = False
+        self._backup_dir: Optional[Path] = None
+        self._backup_keep = 6
+        self._backup_interval = 300
+        self._disabled: Optional[dict] = None
+        self._last_recovery: Optional[dict] = None
+        self._backup_thread: Optional[threading.Thread] = None
+        self._stop_backup = threading.Event()
+        self._fail_recovery_for_test = False  # test hook: force recover_board to "fail"
+
+    def enable_auto_recovery(self, *, backup_dir, keep: int = 6, interval: int = 300) -> None:
+        self._auto_recovery = True
+        self._backup_dir = Path(backup_dir)
+        self._backup_keep = keep
+        self._backup_interval = interval
+
+    def force_backup_now(self):
+        from hermes_cli import kanban_recovery as rec
+        if self._backup_dir is None:
+            return None
+        return rec.make_online_backup(self.db_path, self._backup_dir, keep=self._backup_keep)
+
+    def health(self) -> dict:
+        return {
+            "disabled": self._disabled is not None,
+            "detail": self._disabled,
+            "last_recovery": self._last_recovery,
+        }
 
     def _writer_loop(self) -> None:
         _WRITER_TLS.is_writer = True
@@ -98,8 +127,7 @@ class WriterDaemon:
                 if item is None:  # shutdown sentinel
                     break
                 try:
-                    fn = getattr(kb, item.op)
-                    item.result = fn(self._conn, **item.kwargs)
+                    item.result = self._run_op(item.op, item.kwargs)
                 except Exception as exc:
                     item.error = str(exc)
                     item.error_type = type(exc).__name__
@@ -107,6 +135,48 @@ class WriterDaemon:
                     item.done.set()
         finally:
             self._checkpoint_and_close()
+
+    def _run_op(self, op: str, kwargs: dict):
+        from hermes_cli import kanban_recovery as rec
+        fn = getattr(kb, op)
+        try:
+            return fn(self._conn, **kwargs)
+        except Exception as exc:
+            if not (self._auto_recovery and rec.is_corruption_signal(exc)):
+                raise
+            self._heal()                       # close, recover_board, reopen
+            if self._disabled is not None:
+                raise                          # recovery exhausted; surface the error
+            return fn(self._conn, **kwargs)    # retry once on the healed conn
+
+    def _heal(self) -> None:
+        from hermes_cli import kanban_recovery as rec
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+        backup_dir = self._backup_dir or self.db_path.parent
+        if self._fail_recovery_for_test:
+            result = rec.RecoveryResult(False, "exhausted")
+        else:
+            result = rec.recover_board(self.db_path, backup_dir=backup_dir,
+                                       keep=self._backup_keep)
+        self._last_recovery = {"method": result.method, "healed": result.healed,
+                               "quarantine": result.quarantine}
+        if not result.healed:
+            self._disabled = {"reason": "recovery_exhausted", **self._last_recovery}
+        # Reopen on the writer thread (guard-exempt) so subsequent ops have a conn.
+        self._conn = kb.connect(db_path=self.db_path, readonly=False)
+
+    def _backup_loop(self) -> None:
+        from hermes_cli import kanban_recovery as rec
+        while not self._stop_backup.wait(self._backup_interval):
+            try:
+                rec.make_online_backup(self.db_path, self._backup_dir, keep=self._backup_keep)
+            except Exception:
+                pass  # backup is best-effort; never crash the daemon over it
 
     def _dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:
         req_id = payload.get("req_id", "")
@@ -188,6 +258,11 @@ class WriterDaemon:
         self._writer_thread = threading.Thread(
             target=self._writer_loop, name="kanban-writer-loop", daemon=True)
         self._writer_thread.start()
+        if self._auto_recovery and self._backup_dir is not None:
+            self._stop_backup.clear()
+            self._backup_thread = threading.Thread(target=self._backup_loop,
+                                                   name="kanban-writer-backup", daemon=True)
+            self._backup_thread.start()
         daemon = self
 
         class Handler(socketserver.BaseRequestHandler):
@@ -208,6 +283,9 @@ class WriterDaemon:
         try:
             self._server.serve_forever(poll_interval=0.2)
         finally:
+            self._stop_backup.set()  # stop the periodic backup thread
+            if self._backup_thread is not None:
+                self._backup_thread.join(timeout=10)
             self._queue.put(None)  # stop the writer thread -> it checkpoints+closes
             if self._writer_thread is not None:
                 self._writer_thread.join(timeout=10)
