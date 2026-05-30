@@ -20,7 +20,8 @@ from hermes_cli import kanban_writer_protocol as proto
 
 OP_ALLOWLIST = frozenset({
     "create_task", "complete_task", "block_task", "unblock_task",
-    "link_tasks", "heartbeat_worker", "add_profile_event_sub",
+    "link_tasks", "heartbeat_worker", "heartbeat_claim", "add_comment",
+    "add_profile_event_sub",
 })
 
 
@@ -61,7 +62,8 @@ def _to_jsonable(value: Any) -> Any:
 
 
 class _WorkItem:
-    __slots__ = ("op", "kwargs", "result", "error", "error_type", "done")
+    __slots__ = ("op", "kwargs", "result", "error", "error_type", "exc",
+                 "error_payload", "done")
 
     def __init__(self, op: str, kwargs: dict[str, Any]):
         self.op = op
@@ -69,6 +71,11 @@ class _WorkItem:
         self.result: Any = None
         self.error: Optional[str] = None
         self.error_type: Optional[str] = None
+        # The original exception object (for in-process re-raise) and its
+        # JSON-able payload (for the wire) — both set only for known typed
+        # write-gate errors; None otherwise.
+        self.exc: Optional[BaseException] = None
+        self.error_payload: Optional[dict] = None
         self.done = threading.Event()
 
 
@@ -165,6 +172,8 @@ class WriterDaemon:
                 except Exception as exc:
                     item.error = str(exc)
                     item.error_type = type(exc).__name__
+                    item.exc = exc
+                    item.error_payload = kb.serialize_kanban_error(exc)
                 finally:
                     item.done.set()
         finally:
@@ -225,7 +234,8 @@ class WriterDaemon:
         item.done.wait()
         if item.error is not None:
             return proto.Response(req_id, ok=False, error=item.error,
-                                  error_type=item.error_type or "Error").to_wire()
+                                  error_type=item.error_type or "Error",
+                                  error_payload=item.error_payload).to_wire()
         return proto.Response(req_id, ok=True, result=_to_jsonable(item.result)).to_wire()
 
     def execute(self, op: str, **kwargs):
@@ -246,6 +256,12 @@ class WriterDaemon:
         self._queue.put(item)
         item.done.wait()
         if item.error is not None:
+            # Known write-gate exceptions are re-raised as their original typed
+            # object (same process → attributes intact) so callers' `except
+            # kb.<Error>` clauses match. Everything else keeps the generic
+            # RuntimeError contract the dispatcher's backoff relies on.
+            if item.exc is not None and item.error_payload is not None:
+                raise item.exc
             raise RuntimeError(f"{item.error_type}: {item.error}")
         return item.result
 

@@ -4337,6 +4337,63 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# --- Write-gate exception (de)serialization across the single-writer boundary --
+#
+# When a write runs on the daemon's writer thread (in-process) or on the daemon
+# across the socket (RemoteWriter), an exception raised inside the write fn would
+# otherwise reach the caller flattened to a generic RuntimeError/RemoteWriteError
+# — losing the typed class and its structured attributes that tool handlers catch
+# (e.g. ``except PRHeadGateError`` reading ``.expected_sha``). These helpers let
+# the daemon ship a small JSON-able payload and the caller rebuild the original
+# exception type + attributes, so ``except kb.<Error>`` works on every transport.
+#
+# Registry entry: name -> (class, mode, field_names). ``mode`` is "kw" when the
+# constructor takes the fields as keywords, "pos" when positional. Field values
+# must be JSON-able (the gate errors use only str / int / list[str] / None).
+_RECONSTRUCTABLE_ERRORS: dict[str, tuple[type, str, tuple[str, ...]]] = {
+    "PRHeadGateError": (
+        PRHeadGateError, "kw",
+        ("task_id", "expected_sha", "reviewed_sha", "parent_task_id", "parent_run_id"),
+    ),
+    "ExternalHandoffGateError": (ExternalHandoffGateError, "kw", ("task_id",)),
+    "HallucinatedCardsError": (
+        HallucinatedCardsError, "pos", ("phantom", "completing_task_id"),
+    ),
+}
+
+
+def serialize_kanban_error(exc: BaseException) -> Optional[dict]:
+    """Return a JSON-able ``{"type", "fields"}`` payload for a known write-gate
+    exception, or ``None`` if ``exc`` isn't one we reconstruct across the wire."""
+    entry = _RECONSTRUCTABLE_ERRORS.get(type(exc).__name__)
+    if entry is None:
+        return None
+    cls, _mode, fields = entry
+    if not isinstance(exc, cls):  # name collision with a non-kanban class
+        return None
+    return {"type": type(exc).__name__,
+            "fields": {f: getattr(exc, f, None) for f in fields}}
+
+
+def reconstruct_kanban_error(payload: Optional[dict]) -> Optional[BaseException]:
+    """Rebuild the original exception from :func:`serialize_kanban_error`'s
+    payload. Returns ``None`` for empty/unknown payloads or if reconstruction
+    fails — callers fall back to a generic error in that case."""
+    if not payload:
+        return None
+    entry = _RECONSTRUCTABLE_ERRORS.get(payload.get("type"))
+    if entry is None:
+        return None
+    cls, mode, fields = entry
+    data = payload.get("fields") or {}
+    try:
+        if mode == "kw":
+            return cls(**{f: data.get(f) for f in fields})
+        return cls(*[data.get(f) for f in fields])
+    except Exception:
+        return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,

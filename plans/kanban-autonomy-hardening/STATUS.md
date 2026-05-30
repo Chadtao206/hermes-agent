@@ -127,9 +127,27 @@ Full two-stage review. Watch: don't change flag-off behavior; the readonly board
 detect corruption for the (backoff) path; verify no notifier write path was missed (grep
 `_kb.connect(board=` in the notifier region after editing — every writable one must be gone under flag).
 
+## WS1 Task 7 — DONE & GREEN (one squashed commit; not yet reviewed)
+Migrated every `tools/kanban_tools.py` write handler to `kb.write_session` (create, complete,
+block, unblock, link, comment, heartbeat + the `_auto_heartbeat` bridge); reads — including
+read-after-write (`latest_run`/`get_task`) — stay on a direct conn, and `_connect` now opens
+`readonly=True` under the flag so client read handlers don't trip `DirectWriteForbidden`. Added
+`add_comment` + `heartbeat_claim` to `OP_ALLOWLIST` (they cross the wire from workers). Verified
+regression-free: `tests/hermes_cli/ -k kanban` failing-set unchanged (22 pre-existing
+contamination failures, identical to the C2 baseline).
+
+**Sub-feature (needed for fidelity, not in the original plan):** typed write-gate exceptions now
+survive the single-writer boundary. `complete_task`'s `PRHeadGateError`/`HallucinatedCardsError`
+(and `ExternalHandoffGateError`) would otherwise flatten to `RuntimeError`/`RemoteWriteError`,
+breaking `_handle_complete`'s `except kb.<Error>` guidance. Added `kb.serialize_kanban_error()` /
+`reconstruct_kanban_error()` + a registry; `Response.error_payload` on the wire; the daemon stores
+the original exc + payload, `execute()` re-raises the typed object in-process (RuntimeError for
+non-gate errors, preserving the dispatcher's backoff contract), and `RemoteWriter` reconstructs the
+typed exception client-side. So `except kb.PRHeadGateError` works on every transport.
+Tests: `test_kanban_error_serialization.py`, `test_kanban_writer_typed_errors.py`,
+`test_kanban_tools_write_session.py`.
+
 ## REMAINING after Step C
-- **WS1 Task 7** — migrate worker-side tool write handlers in `tools/kanban_tools.py` to
-  `kb.write_session` (so workers RPC the daemon). Plan: `plans/.../01-single-writer-daemon.md` Task 7.
 - **WS1 Task 8** — worker spawn env: set `HERMES_KANBAN_WRITER_SOCK`; ensure workers are never
   owner/writer-thread. Plan Task 8. (Note: enforcement is now thread-local, not env-owner — workers
   are clients because they have no registered daemon + aren't the writer thread → `write_session`

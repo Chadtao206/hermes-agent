@@ -68,9 +68,13 @@ class Response:
     result: Any = None
     error: str = ""
     error_type: str = ""
+    # JSON-able payload for reconstructing a known typed exception client-side
+    # (see kanban_db.serialize_kanban_error). None for non-reconstructable errors.
+    error_payload: Any = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "req_id": self.req_id, "ok": self.ok, "result": self.result,
             "error": self.error, "error_type": self.error_type,
+            "error_payload": self.error_payload,
         }

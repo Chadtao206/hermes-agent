@@ -47,6 +47,13 @@ class RemoteWriter:
             self._sock.sendall(proto.encode(req.to_wire()))
             resp = proto.read_frame(self._sock.recv)
         if not resp.get("ok"):
+            # Rebuild a known typed write-gate exception (with attributes) so
+            # the caller's `except kb.<Error>` clause matches just as it would
+            # for an in-process write. Falls back to RemoteWriteError otherwise.
+            from hermes_cli import kanban_db as _kb
+            typed = _kb.reconstruct_kanban_error(resp.get("error_payload"))
+            if typed is not None:
+                raise typed
             raise RemoteWriteError(resp.get("error", "remote write failed"),
                                    resp.get("error_type", ""))
         return resp.get("result")

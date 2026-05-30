@@ -173,6 +173,13 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
+    # Under the single-writer daemon, client processes (workers, CLI) must not
+    # open a writable connection — the guard raises DirectWriteForbidden. All
+    # reads here are read-only, so open ``mode=ro``; writes go through
+    # ``kb.write_session`` in the individual handlers. Flag off → unchanged
+    # (writable connect, which also first-creates/initialises the DB).
+    if kb.single_writer_enabled():
+        return kb, kb.connect(board=board, readonly=True)
     return kb, kb.connect(board=board)
 
 
@@ -232,11 +239,11 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
     _auto_heartbeat_last_attempt = now
     try:
-        kb, conn = _connect()
-        try:
+        from hermes_cli import kanban_db as kb
+        with kb.write_session() as w:
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
             try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+                w.heartbeat_claim(task_id=tid, claimer=claim_lock)
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
             run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
@@ -246,14 +253,9 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                w.heartbeat_worker(task_id=tid, note=None, expected_run_id=run_id)
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
@@ -558,56 +560,63 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
+        from hermes_cli import kanban_db as kb
+        # The write routes through write_session → the daemon under the flag;
+        # typed write-gate exceptions are reconstructed across the boundary so
+        # these `except` clauses still match (see kb.serialize_kanban_error).
         try:
-            try:
-                ok = kb.complete_task(
-                    conn, tid,
+            with kb.write_session(board=board) as w:
+                ok = w.complete_task(
+                    task_id=tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
-            except kb.PRHeadGateError as pr_err:
-                reviewed = pr_err.reviewed_sha or "missing"
-                return tool_error(
-                    f"kanban_complete blocked: final-review PR-head gate failed. "
-                    f"Current parent PR head is {pr_err.expected_sha} "
-                    f"from parent task {pr_err.parent_task_id}; your "
-                    f"reviewed_pr_head_sha was {reviewed}. Your task is still "
-                    f"in-flight (no state change). If you reviewed the current "
-                    f"head, retry kanban_complete with the same summary and "
-                    f"metadata.reviewed_pr_head_sha={pr_err.expected_sha}. "
-                    f"If the PR changed or you cannot verify that SHA, call "
-                    f"kanban_block with the exact verification gap instead."
-                )
-            except kb.HallucinatedCardsError as hall_err:
-                # Structured rejection — surface the phantom ids so the
-                # worker can retry with a corrected list or drop the
-                # field. Audit event already landed in the DB.
-                #
-                # The task itself was NOT mutated (the gate runs before
-                # the write txn), so the worker can simply call
-                # kanban_complete again. Spell that out — without it the
-                # model often interprets a tool_error as a terminal
-                # failure and either blocks or crashes the run instead
-                # of retrying. See #22923.
-                return tool_error(
-                    f"kanban_complete blocked: the following created_cards "
-                    f"do not exist or were not created by this worker: "
-                    f"{', '.join(hall_err.phantom)}. "
-                    f"Your task is still in-flight (no state change). "
-                    f"Retry kanban_complete with the same summary/metadata "
-                    f"and either drop these ids from created_cards, or pass "
-                    f"created_cards=[] to skip the card-claim check entirely."
-                )
-            if not ok:
-                return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
-                )
+        except kb.PRHeadGateError as pr_err:
+            reviewed = pr_err.reviewed_sha or "missing"
+            return tool_error(
+                f"kanban_complete blocked: final-review PR-head gate failed. "
+                f"Current parent PR head is {pr_err.expected_sha} "
+                f"from parent task {pr_err.parent_task_id}; your "
+                f"reviewed_pr_head_sha was {reviewed}. Your task is still "
+                f"in-flight (no state change). If you reviewed the current "
+                f"head, retry kanban_complete with the same summary and "
+                f"metadata.reviewed_pr_head_sha={pr_err.expected_sha}. "
+                f"If the PR changed or you cannot verify that SHA, call "
+                f"kanban_block with the exact verification gap instead."
+            )
+        except kb.HallucinatedCardsError as hall_err:
+            # Structured rejection — surface the phantom ids so the
+            # worker can retry with a corrected list or drop the
+            # field. Audit event already landed in the DB.
+            #
+            # The task itself was NOT mutated (the gate runs before
+            # the write txn), so the worker can simply call
+            # kanban_complete again. Spell that out — without it the
+            # model often interprets a tool_error as a terminal
+            # failure and either blocks or crashes the run instead
+            # of retrying. See #22923.
+            return tool_error(
+                f"kanban_complete blocked: the following created_cards "
+                f"do not exist or were not created by this worker: "
+                f"{', '.join(hall_err.phantom)}. "
+                f"Your task is still in-flight (no state change). "
+                f"Retry kanban_complete with the same summary/metadata "
+                f"and either drop these ids from created_cards, or pass "
+                f"created_cards=[] to skip the card-claim check entirely."
+            )
+        if not ok:
+            return tool_error(
+                f"could not complete {tid} (unknown id or already terminal)"
+            )
+        # Read-after-write: the cursor/run is committed; read it back on a
+        # direct (read-only under the flag) connection.
+        kb, conn = _connect(board=board)
+        try:
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
+        return _ok(task_id=tid, run_id=run.id if run else None)
     except ValueError as e:
         return tool_error(f"kanban_complete: {e}")
     except Exception as e:
@@ -630,22 +639,24 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
-            ok = kb.block_task(
-                conn, tid,
+        from hermes_cli import kanban_db as kb
+        with kb.write_session(board=board) as w:
+            ok = w.block_task(
+                task_id=tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
             )
-            if not ok:
-                return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
-                )
+        if not ok:
+            return tool_error(
+                f"could not block {tid} (unknown id or not in "
+                f"running/ready)"
+            )
+        kb, conn = _connect(board=board)
+        try:
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
+        return _ok(task_id=tid, run_id=run.id if run else None)
     except ValueError as e:
         return tool_error(f"kanban_block: {e}")
     except Exception as e:
@@ -674,29 +685,26 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     note = args.get("note")
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
+        from hermes_cli import kanban_db as kb
+        with kb.write_session(board=board) as w:
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
             # (see _default_spawn in kanban_db.py); falling back to the
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            w.heartbeat_claim(task_id=tid, claimer=claim_lock)
 
-            ok = kb.heartbeat_worker(
-                conn,
-                tid,
+            ok = w.heartbeat_worker(
+                task_id=tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
             )
-            if not ok:
-                return tool_error(
-                    f"could not heartbeat {tid} (unknown id or not running)"
-                )
-            return _ok(task_id=tid)
-        finally:
-            conn.close()
+        if not ok:
+            return tool_error(
+                f"could not heartbeat {tid} (unknown id or not running)"
+            )
+        return _ok(task_id=tid)
     except ValueError as e:
         return tool_error(f"kanban_heartbeat: {e}")
     except Exception as e:
@@ -727,12 +735,10 @@ def _handle_comment(args: dict, **kw) -> str:
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
-        finally:
-            conn.close()
+        from hermes_cli import kanban_db as kb
+        with kb.write_session(board=board) as w:
+            cid = w.add_comment(task_id=tid, author=author, body=str(body))
+        return _ok(task_id=tid, comment_id=cid)
     except ValueError as e:
         return tool_error(f"kanban_comment: {e}")
     except Exception as e:
@@ -787,10 +793,9 @@ def _handle_create(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
-            new_tid = kb.create_task(
-                conn,
+        from hermes_cli import kanban_db as kb
+        with kb.write_session(board=board) as w:
+            new_tid = w.create_task(
                 title=str(title).strip(),
                 body=body,
                 assignee=str(assignee),
@@ -810,13 +815,15 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+        kb, conn = _connect(board=board)
+        try:
             new_task = kb.get_task(conn, new_tid)
-            return _ok(
-                task_id=new_tid,
-                status=new_task.status if new_task else None,
-            )
         finally:
             conn.close()
+        return _ok(
+            task_id=new_tid,
+            status=new_task.status if new_task else None,
+        )
     except ValueError as e:
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
@@ -837,14 +844,12 @@ def _handle_unblock(args: dict, **kw) -> str:
         return ownership_err
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
-            ok = kb.unblock_task(conn, str(tid))
-            if not ok:
-                return tool_error(f"could not unblock {tid} (not blocked or unknown)")
-            return _ok(task_id=str(tid), status="ready")
-        finally:
-            conn.close()
+        from hermes_cli import kanban_db as kb
+        with kb.write_session(board=board) as w:
+            ok = w.unblock_task(task_id=str(tid))
+        if not ok:
+            return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+        return _ok(task_id=str(tid), status="ready")
     except ValueError as e:
         return tool_error(f"kanban_unblock: {e}")
     except Exception as e:
@@ -861,17 +866,14 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
-            kb.link_tasks(
-                conn,
+        from hermes_cli import kanban_db as kb
+        with kb.write_session(board=board) as w:
+            w.link_tasks(
                 parent_id=parent_id,
                 child_id=child_id,
                 relation_type=relation_type,
             )
-            return _ok(parent_id=parent_id, child_id=child_id, relation_type=relation_type)
-        finally:
-            conn.close()
+        return _ok(parent_id=parent_id, child_id=child_id, relation_type=relation_type)
     except ValueError as e:
         # Covers cycle + self-parent rejections
         return tool_error(f"kanban_link: {e}")
