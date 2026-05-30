@@ -801,3 +801,307 @@ class PostgresKanbanStore:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
+
+    # --- complete_task (basic) -------------------------------------------
+
+    def complete_task(self, task_id: str, *, result=None, summary=None,
+                      metadata=None, created_cards=None,
+                      expected_run_id=None) -> bool:
+        if created_cards:
+            raise NotImplementedError(
+                "phase-2-tail: complete_task created_cards gating")
+        now = int(time.time())
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    (self.board, task_id))
+                row = cur.fetchone()
+                current_run_id = row["current_run_id"] if row else None
+                cur.execute(
+                    "UPDATE tasks SET status='done', completed_at=%s, result=%s, "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                    "WHERE board=%s AND id=%s "
+                    "AND status IN ('running','ready','blocked','scheduled')",
+                    (now, result, self.board, task_id))
+                if cur.rowcount != 1:
+                    return False
+                if current_run_id is not None:
+                    run_summary = summary if summary is not None else result
+                    cur.execute(
+                        "UPDATE task_runs SET status='done', outcome='completed', "
+                        "summary=%s, metadata=%s, ended_at=%s, "
+                        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                        "WHERE board=%s AND id=%s AND ended_at IS NULL",
+                        (run_summary,
+                         Jsonb(metadata) if metadata is not None else None,
+                         now, self.board, current_run_id))
+                    cur.execute(
+                        "UPDATE tasks SET current_run_id=NULL "
+                        "WHERE board=%s AND id=%s",
+                        (self.board, task_id))
+                self._emit(cur, task_id, "completed", {})
+        self.recompute_ready()
+        return True
+
+    # --- runs -------------------------------------------------------------
+
+    def _row_to_run(self, row: dict) -> Run:
+        d = dict(row)
+        d.pop("board", None)
+        # metadata is JSONB — already a dict on read, no json.loads needed
+        return Run(**{k: d.get(k) for k in Run.__dataclass_fields__})
+
+    def list_runs(self, task_id: str, *, include_active=True,
+                  state_type=None, state_name=None) -> list:
+        if state_type is not None or state_name is not None:
+            raise NotImplementedError(
+                "phase-2-tail: list_runs state filters")
+        sql = ("SELECT * FROM task_runs WHERE board=%s AND task_id=%s"
+               + ("" if include_active else " AND ended_at IS NOT NULL")
+               + " ORDER BY started_at ASC, id ASC")
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, (self.board, task_id))
+            return [self._row_to_run(r) for r in cur.fetchall()]
+
+    def get_run(self, run_id: int) -> Optional[Run]:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM task_runs WHERE board=%s AND id=%s",
+                (self.board, run_id))
+            row = cur.fetchone()
+            return self._row_to_run(row) if row else None
+
+    def latest_run(self, task_id: str) -> Optional[Run]:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM task_runs WHERE board=%s AND task_id=%s "
+                "ORDER BY started_at DESC, id DESC LIMIT 1",
+                (self.board, task_id))
+            row = cur.fetchone()
+            return self._row_to_run(row) if row else None
+
+    def latest_summary(self, task_id: str) -> Optional[str]:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT summary FROM task_runs "
+                "WHERE board=%s AND task_id=%s AND summary IS NOT NULL AND summary<>'' "
+                "ORDER BY COALESCE(ended_at,started_at) DESC, id DESC LIMIT 1",
+                (self.board, task_id))
+            row = cur.fetchone()
+            return row["summary"] if row else None
+
+    def latest_summaries(self, task_ids) -> dict:
+        if not task_ids:
+            return {}
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT task_id, summary FROM ("
+                "  SELECT task_id, summary, "
+                "         ROW_NUMBER() OVER ("
+                "           PARTITION BY task_id "
+                "           ORDER BY COALESCE(ended_at,started_at) DESC, id DESC"
+                "         ) rn "
+                "  FROM task_runs "
+                "  WHERE board=%s AND task_id = ANY(%s) "
+                "    AND summary IS NOT NULL AND summary<>''"
+                ") t WHERE rn=1",
+                (self.board, list(task_ids)))
+            return {r["task_id"]: r["summary"] for r in cur.fetchall()}
+
+    # --- event claiming (notify subs) ------------------------------------
+
+    def claim_unseen_events_for_sub(self, *, task_id, platform, chat_id,
+                                    thread_id=None, kinds=None,
+                                    include_children=False) -> tuple:
+        thread_id = thread_id or ''
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT last_event_id, event_kinds, include_children "
+                    "FROM kanban_notify_subs "
+                    "WHERE board=%s AND task_id=%s AND platform=%s "
+                    "AND chat_id=%s AND thread_id=%s FOR UPDATE",
+                    (self.board, task_id, platform, chat_id, thread_id))
+                sub_row = cur.fetchone()
+                if sub_row is None:
+                    return (0, 0, [])
+                old_cursor = int(sub_row["last_event_id"])
+                row_include_children = bool(sub_row["include_children"])
+                # Determine task scope
+                scope = [task_id]
+                if include_children or row_include_children:
+                    cur.execute(
+                        "SELECT child_id FROM task_links "
+                        "WHERE board=%s AND parent_id=%s",
+                        (self.board, task_id))
+                    for r in cur.fetchall():
+                        scope.append(r["child_id"])
+                # Determine effective event kinds
+                ek_raw = sub_row["event_kinds"]
+                if kinds is not None:
+                    effective_kinds = list(kinds)
+                elif ek_raw:
+                    try:
+                        effective_kinds = json.loads(ek_raw)
+                    except Exception:
+                        effective_kinds = None
+                else:
+                    effective_kinds = None
+                # Query events
+                if effective_kinds is not None:
+                    cur.execute(
+                        "SELECT * FROM task_events "
+                        "WHERE board=%s AND task_id = ANY(%s) "
+                        "AND id > %s AND kind = ANY(%s) ORDER BY id ASC",
+                        (self.board, scope, old_cursor, effective_kinds))
+                else:
+                    cur.execute(
+                        "SELECT * FROM task_events "
+                        "WHERE board=%s AND task_id = ANY(%s) "
+                        "AND id > %s ORDER BY id ASC",
+                        (self.board, scope, old_cursor))
+                event_rows = cur.fetchall()
+                if not event_rows:
+                    return (old_cursor, old_cursor, [])
+                new_cursor = max(r["id"] for r in event_rows)
+                # CAS advance
+                cur.execute(
+                    "UPDATE kanban_notify_subs SET last_event_id=%s "
+                    "WHERE board=%s AND task_id=%s AND platform=%s "
+                    "AND chat_id=%s AND thread_id=%s AND last_event_id=%s",
+                    (new_cursor, self.board, task_id, platform,
+                     chat_id, thread_id, old_cursor))
+                events = [
+                    Event(**{k: r[k] for k in Event.__dataclass_fields__})
+                    for r in event_rows
+                ]
+                return (old_cursor, new_cursor, events)
+
+    # --- event claiming (profile subs) -----------------------------------
+
+    def claim_unseen_events_for_profile_sub(self, *, task_id, profile,
+                                            name="") -> tuple:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT last_event_id, event_kinds, include_children "
+                    "FROM kanban_profile_event_subs "
+                    "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s "
+                    "FOR UPDATE",
+                    (self.board, task_id, profile, name))
+                sub_row = cur.fetchone()
+                if sub_row is None:
+                    return (0, 0, [])
+                old_cursor = int(sub_row["last_event_id"])
+                # Determine task scope
+                scope = [task_id]
+                if sub_row["include_children"]:
+                    cur.execute(
+                        "SELECT child_id FROM task_links "
+                        "WHERE board=%s AND parent_id=%s",
+                        (self.board, task_id))
+                    for r in cur.fetchall():
+                        scope.append(r["child_id"])
+                # Determine effective event kinds
+                ek_raw = sub_row["event_kinds"]
+                if ek_raw:
+                    try:
+                        effective_kinds = json.loads(ek_raw)
+                    except Exception:
+                        effective_kinds = list(_DEFAULT_NOTIFY_TERMINAL_KINDS)
+                else:
+                    effective_kinds = list(_DEFAULT_NOTIFY_TERMINAL_KINDS)
+                # Scan events
+                cur.execute(
+                    "SELECT * FROM task_events "
+                    "WHERE board=%s AND task_id = ANY(%s) "
+                    "AND id > %s AND kind = ANY(%s) ORDER BY id ASC",
+                    (self.board, scope, old_cursor, effective_kinds))
+                event_rows = cur.fetchall()
+                if not event_rows:
+                    return (old_cursor, old_cursor, [])
+                new_cursor = max(r["id"] for r in event_rows)
+                claimed_events = []
+                now = int(time.time())
+                for r in event_rows:
+                    cur.execute(
+                        "INSERT INTO kanban_profile_event_claims "
+                        "(board, event_id, profile, name, root_task_id, claimed_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (board, event_id, profile, name) DO NOTHING",
+                        (self.board, r["id"], profile, name, task_id, now))
+                    if cur.rowcount == 1:
+                        claimed_events.append(
+                            Event(**{k: r[k] for k in Event.__dataclass_fields__}))
+                # CAS advance over ALL scanned events
+                cur.execute(
+                    "UPDATE kanban_profile_event_subs SET last_event_id=%s "
+                    "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s "
+                    "AND last_event_id=%s",
+                    (new_cursor, self.board, task_id, profile, name, old_cursor))
+                return (old_cursor, new_cursor, claimed_events)
+
+    # --- board stats and assignees ---------------------------------------
+
+    def board_stats(self) -> dict:
+        now = int(time.time())
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks "
+                "WHERE board=%s AND status != 'archived' GROUP BY status",
+                (self.board,))
+            by_status = {r["status"]: int(r["n"]) for r in cur.fetchall()}
+            cur.execute(
+                "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+                "WHERE board=%s AND status != 'archived' AND assignee IS NOT NULL "
+                "GROUP BY assignee, status",
+                (self.board,))
+            by_assignee: dict = {}
+            for r in cur.fetchall():
+                by_assignee.setdefault(r["assignee"], {})[r["status"]] = int(r["n"])
+            cur.execute(
+                "SELECT MIN(created_at) AS ts FROM tasks "
+                "WHERE board=%s AND status='ready'",
+                (self.board,))
+            oldest_row = cur.fetchone()
+            oldest_ready_age = (
+                (now - int(oldest_row["ts"]))
+                if oldest_row and oldest_row["ts"] is not None else None
+            )
+        return {
+            "by_status": by_status,
+            "by_assignee": by_assignee,
+            "oldest_ready_age_seconds": oldest_ready_age,
+            "now": now,
+        }
+
+    def known_assignees(self) -> list:
+        # Phase-2: on-disk profile detection deferred (phase-2-tail)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+                "WHERE board=%s AND status != 'archived' AND assignee IS NOT NULL "
+                "GROUP BY assignee, status",
+                (self.board,))
+            counts: dict = {}
+            for r in cur.fetchall():
+                counts.setdefault(r["assignee"], {})[r["status"]] = int(r["n"])
+        return [
+            {"name": name, "on_disk": False, "counts": cnt}
+            for name, cnt in sorted(counts.items())
+        ]
+
+    # --- deferred sidecar methods ----------------------------------------
+
+    def list_profile_wake_events(self, **kwargs) -> list:
+        raise NotImplementedError("phase-2-tail: list_profile_wake_events")
+
+    def record_notifier_heartbeat(self, **kwargs) -> None:
+        raise NotImplementedError("phase-2-tail: record_notifier_heartbeat")
+
+    def list_notifier_heartbeats(self, **kwargs) -> list:
+        raise NotImplementedError("phase-2-tail: list_notifier_heartbeats")
+
+    def heartbeat_worker(self, **kwargs) -> bool:
+        raise NotImplementedError("phase-2-tail: heartbeat_worker")

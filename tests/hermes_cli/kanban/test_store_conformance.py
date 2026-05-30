@@ -93,3 +93,31 @@ def test_promote_task_is_callable(store):
     assert isinstance(result, tuple) and len(result) == 2
     ok, err = result
     assert isinstance(ok, bool)
+
+
+def test_complete_basic_and_runs_and_summary(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    assert store.complete_task(tid, result="done-res", summary="sum") is True
+    assert store.get_task(tid).status == "done"
+    s = store.latest_summary(tid)
+    assert s is None or isinstance(s, str)
+    assert isinstance(store.list_runs(tid), list)
+
+
+def test_events_recorded_and_listed(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.set_task_priority(tid, 3)
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "created" in kinds and "reprioritized" in kinds
+
+
+def test_notify_event_claiming_cursor(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_notify_sub(task_id=tid, platform="telegram", chat_id="c1")
+    store.add_comment(tid, author="ops", body="n1")
+    old, new, evs = store.claim_unseen_events_for_sub(
+        task_id=tid, platform="telegram", chat_id="c1")
+    assert new >= old and isinstance(evs, list)
+    old2, new2, evs2 = store.claim_unseen_events_for_sub(
+        task_id=tid, platform="telegram", chat_id="c1")
+    assert new2 == new and evs2 == []
