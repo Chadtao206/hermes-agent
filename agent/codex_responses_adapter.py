@@ -230,6 +230,81 @@ def _derive_responses_function_call_id(
     return f"fc_{digest}"
 
 
+def _extract_balanced_json_object(text: str, start: int) -> Optional[str]:
+    """Return the first balanced ``{...}`` JSON object at/after ``start``.
+
+    String-aware (braces inside JSON string literals don't affect depth), so it
+    survives garbled channel tokens preceding the object. Returns None if no
+    balanced object is found (e.g. truncated/garbled args).
+    """
+    i = text.find("{", start)
+    if i < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(i, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
+
+
+def _reconstruct_leaked_tool_calls(text: str) -> List[Any]:
+    """Reconstruct a tool call the model emitted as garbled harmony *text*.
+
+    The Codex backend occasionally degenerates and serializes a function call
+    into the assistant text channel with corrupted harmony control tokens
+    (``<|channel|>commentary`` rendered as multilingual unicode), so the backend
+    never emits a structured ``function_call`` item. The model's intent is still
+    recoverable: ``to=functions.<name>`` followed by a JSON args object.
+
+    Conservative on purpose — only reconstruct when there is EXACTLY ONE
+    ``to=functions.<name>`` marker with a parseable JSON object. Multiple markers
+    signal the hallucinated call/result pattern (the Taiwan-embassy incident),
+    where executing a fabricated call is unsafe and the caller should fall back
+    to the incomplete+retry path instead. Returns ``[]`` when nothing safe to
+    reconstruct.
+    """
+    markers = list(re.finditer(r"to=functions\.([A-Za-z_][A-Za-z0-9_]*)", text))
+    if len(markers) != 1:
+        return []
+    marker = markers[0]
+    fn_name = marker.group(1)
+    candidate = _extract_balanced_json_object(text, marker.end())
+    if candidate is None:
+        return []
+    try:
+        parsed = json.loads(candidate)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    arguments = json.dumps(parsed, ensure_ascii=False)
+    call_id = _deterministic_call_id(fn_name, arguments, 0)
+    response_item_id = _derive_responses_function_call_id(call_id, None)
+    return [SimpleNamespace(
+        id=call_id,
+        call_id=call_id,
+        response_item_id=response_item_id,
+        type="function",
+        function=SimpleNamespace(name=fn_name, arguments=arguments),
+    )]
+
+
 # ---------------------------------------------------------------------------
 # Schema conversion
 # ---------------------------------------------------------------------------
@@ -1219,17 +1294,35 @@ def _normalize_codex_response(
     # append, dedup, and retry budget.
     leaked_tool_call_text = False
     if final_text and not tool_calls and _TOOL_CALL_LEAK_PATTERN.search(final_text):
-        leaked_tool_call_text = True
-        logger.warning(
-            "Codex response contains leaked tool-call text in assistant content "
-            "(no structured function_call items). Treating as incomplete so the "
-            "continuation path can re-elicit a proper tool call. Leaked snippet: %r",
-            final_text[:300],
-        )
-        # Clear the text so downstream code doesn't surface the garbage as
-        # a summary. The encrypted reasoning items (if any) are preserved
-        # so the model keeps its chain-of-thought on the retry.
-        final_text = ""
+        # Prefer reconstructing the call the model intended (so e.g. the kanban
+        # closeout actually executes) over scrubbing + retrying until the budget
+        # exhausts and the worker protocol-violates. Conservative: only a single
+        # leaked marker with parseable JSON args reconstructs (see helper).
+        recovered = _reconstruct_leaked_tool_calls(final_text)
+        if recovered:
+            tool_calls = recovered
+            logger.warning(
+                "Codex emitted a tool call as garbled harmony text (no structured "
+                "function_call item); reconstructed function_call name=%r from the "
+                "leaked text so it executes. Leaked snippet: %r",
+                recovered[0].function.name, final_text[:300],
+            )
+            # Don't surface the garbled text as an assistant summary alongside
+            # the reconstructed call.
+            final_text = ""
+        else:
+            leaked_tool_call_text = True
+            logger.warning(
+                "Codex response contains leaked tool-call text in assistant content "
+                "(no structured function_call items, not safely reconstructable). "
+                "Treating as incomplete so the continuation path can re-elicit a "
+                "proper tool call. Leaked snippet: %r",
+                final_text[:300],
+            )
+            # Clear the text so downstream code doesn't surface the garbage as
+            # a summary. The encrypted reasoning items (if any) are preserved
+            # so the model keeps its chain-of-thought on the retry.
+            final_text = ""
 
     assistant_message = SimpleNamespace(
         content=final_text,

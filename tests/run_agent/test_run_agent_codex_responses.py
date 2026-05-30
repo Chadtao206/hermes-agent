@@ -1418,6 +1418,73 @@ def test_normalize_codex_response_detects_leaked_tool_call_text(monkeypatch):
     assert assistant_message.tool_calls == []
 
 
+def test_normalize_codex_response_reconstructs_garbled_closeout(monkeypatch):
+    """A SINGLE tool call the model emitted as garbled harmony text (degenerate
+    channel control tokens rendered as multilingual unicode) must be
+    RECONSTRUCTED into a real function_call so the call (e.g. the kanban
+    closeout) actually executes — instead of being scrubbed + retried until the
+    budget exhausts and the worker protocol-violates. Mirrors the real logs:
+    `<garbled> to=functions.kanban_complete <garbled-commentary-channel> {json}`.
+    """
+    agent = _build_agent(monkeypatch)
+    import json as _json
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    leaked_content = (
+        "Implemented the migration module, tests, and runbook; all green. Closing out.\n"
+        "անոց to=functions.kanban_complete "
+        "մեկնաբանություն  ฯjson\n"
+        '{"task_id": "t_abc123", "summary": "Added migration module + tests + runbook"}'
+    )
+    response = SimpleNamespace(
+        output=[SimpleNamespace(
+            type="message", status="completed",
+            content=[SimpleNamespace(type="output_text", text=leaked_content)],
+        )],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="completed", model="gpt-5.3-codex",
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "tool_calls"
+    assert len(assistant_message.tool_calls) == 1
+    tc = assistant_message.tool_calls[0]
+    assert tc.function.name == "kanban_complete"
+    assert _json.loads(tc.function.arguments) == {
+        "task_id": "t_abc123",
+        "summary": "Added migration module + tests + runbook",
+    }
+    # The garbled text must NOT be surfaced as an assistant summary.
+    assert (assistant_message.content or "") == ""
+
+
+def test_normalize_codex_response_unparseable_leak_falls_back_to_incomplete(monkeypatch):
+    """If the leaked tool-call args can't be parsed as JSON, do NOT fabricate a
+    call — fall back to the conservative incomplete+retry path."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    leaked_content = (
+        "Closing out.\n"
+        'to=functions.kanban_complete {"task_id": "t_x", "summary": "oops unterminated'
+    )
+    response = SimpleNamespace(
+        output=[SimpleNamespace(
+            type="message", status="completed",
+            content=[SimpleNamespace(type="output_text", text=leaked_content)],
+        )],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="completed", model="gpt-5.3-codex",
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "incomplete"
+    assert assistant_message.tool_calls == []
+    assert (assistant_message.content or "") == ""
+
+
 def test_normalize_codex_response_ignores_tool_call_text_when_real_tool_call_present(monkeypatch):
     """If the model emitted BOTH a structured function_call AND some text that
     happens to contain `to=functions.*` (unlikely but possible), trust the
