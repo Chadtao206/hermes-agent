@@ -58,12 +58,9 @@ _COMPACT_NOTIFY_KINDS = {
     "expired_claim_candidate",
     "old_ready_nonspawnable",
     "old_ready_spawnable",
-    "old_review_nonspawnable",
-    "old_review_spawnable",
     "orphan_claim_lock_observed",
     "pre_spawn_validation_decision",
     "repeated_failure_signature_decision",
-    "review_skill_provenance_missing",
     "stale_heartbeat_observed",
     "stale_run_metadata",
 }
@@ -584,46 +581,6 @@ def _profile_spawnable(profile: Optional[str]) -> bool:
         return True
 
 
-def _has_sdlc_review_skill() -> bool:
-    """Best-effort local inventory check for the legacy review skill.
-
-    Phase 1A never blocks on this.  It is used only to produce a diagnostic
-    action when review work exists and the hard-coded review skill cannot be
-    found in the usual root/profile skill stores.
-    """
-    roots: list[Path] = []
-    try:
-        from hermes_constants import get_default_hermes_root, get_hermes_home
-        default_root = get_default_hermes_root()
-        roots.append(default_root / "skills")
-        roots.append(get_hermes_home() / "skills")
-        profiles_root = default_root / "profiles"
-        if profiles_root.is_dir():
-            roots.extend(p / "skills" for p in profiles_root.iterdir() if p.is_dir())
-    except Exception:
-        roots.append(Path.home() / ".hermes" / "skills")
-
-    seen: set[Path] = set()
-    for root in roots:
-        try:
-            resolved = root.resolve()
-        except OSError:
-            resolved = root
-        if resolved in seen or not root.is_dir():
-            continue
-        seen.add(resolved)
-        direct = root / "sdlc-review" / "SKILL.md"
-        if direct.is_file():
-            return True
-        try:
-            for candidate in root.rglob("sdlc-review/SKILL.md"):
-                if candidate.is_file():
-                    return True
-        except OSError:
-            continue
-    return False
-
-
 def _host_prefix() -> str:
     try:
         return f"{kb._claimer_id().split(':', 1)[0]}:"
@@ -717,11 +674,6 @@ def _pre_spawn_validation_errors_for_reconcile(task: kb.Task) -> list[str]:
 
     if profile_ok:
         skills = list(task.skills or [])
-        if task.status == "review" and "sdlc-review" not in skills:
-            # Review dispatch force-loads sdlc-review immediately before
-            # spawn. Validate that implicit skill too, otherwise the worker
-            # can fail at CLI startup before doing any review work.
-            skills.append("sdlc-review")
         if skills:
             home = kb._profile_home_for_spawn(task)
             missing = [
@@ -1098,7 +1050,7 @@ def collect_reconcile_actions(
         """
         SELECT id, status, title, assignee, created_at
           FROM tasks
-         WHERE status IN ('ready','review')
+         WHERE status = 'ready'
            AND claim_lock IS NULL
          ORDER BY priority DESC, created_at, id
         """
@@ -1204,46 +1156,31 @@ def collect_reconcile_actions(
             },
         ))
 
-    for status in ("ready", "review"):
-        for row in conn.execute(
-            """
-            SELECT id, title, assignee, created_at
-              FROM tasks
-             WHERE status = ? AND claim_lock IS NULL
-             ORDER BY created_at, id
-            """,
-            (status,),
-        ):
-            age = as_of - int(row["created_at"])
-            if age < ready_age_seconds:
-                continue
-            spawnable = _profile_spawnable(row["assignee"])
-            kind = f"old_{status}_{'spawnable' if spawnable else 'nonspawnable'}"
-            actions.append(_action(
-                kind,
-                row["id"],
-                "warning" if spawnable else "info",
-                f"{status} task has not been claimed within threshold",
-                safe_to_apply=False,
-                details={
-                    "assignee": row["assignee"],
-                    "age_seconds": age,
-                    "created_at": row["created_at"],
-                    "spawnable_profile": spawnable,
-                },
-            ))
-
-    review_count = int(conn.execute(
-        "SELECT COUNT(*) FROM tasks WHERE status = 'review'"
-    ).fetchone()[0])
-    if review_count and not _has_sdlc_review_skill():
+    for row in conn.execute(
+        """
+        SELECT id, title, assignee, created_at
+          FROM tasks
+         WHERE status = 'ready' AND claim_lock IS NULL
+         ORDER BY created_at, id
+        """,
+    ):
+        age = as_of - int(row["created_at"])
+        if age < ready_age_seconds:
+            continue
+        spawnable = _profile_spawnable(row["assignee"])
+        kind = f"old_ready_{'spawnable' if spawnable else 'nonspawnable'}"
         actions.append(_action(
-            "review_skill_provenance_missing",
-            None,
-            "warning",
-            "review dispatch injects sdlc-review, but the skill was not found locally; diagnostic only",
+            kind,
+            row["id"],
+            "warning" if spawnable else "info",
+            "ready task has not been claimed within threshold",
             safe_to_apply=False,
-            details={"review_task_count": review_count, "skill": "sdlc-review"},
+            details={
+                "assignee": row["assignee"],
+                "age_seconds": age,
+                "created_at": row["created_at"],
+                "spawnable_profile": spawnable,
+            },
         ))
 
     return _sort_actions(actions)
@@ -2158,7 +2095,6 @@ def _detail_highlights_for_reconcile_text(action: dict[str, Any]) -> str:
         "task_count",
         "signature_threshold",
         "total_consecutive_failures",
-        "review_task_count",
         "skill",
         "run_id",
     ):

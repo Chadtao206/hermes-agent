@@ -1716,9 +1716,7 @@ def _format_kanban_dispatch_summary(slug: str, summary: dict[str, Any]) -> str:
     parts = [
         f"kanban dispatcher [{slug}]",
         f"ready={summary.get('ready_count', 0)}",
-        f"review={summary.get('review_count', 0)}",
         f"spawnable_ready={summary.get('spawnable_ready', 0)}",
-        f"spawnable_review={summary.get('spawnable_review', 0)}",
         f"spawned={summary.get('spawned', 0)}",
         f"spawn_attempts={summary.get('spawn_attempts', 0)}",
         f"spawn_failures={summary.get('spawn_failures', 0)}",
@@ -7135,8 +7133,6 @@ class GatewayRunner:
                     conn = _kb.connect(board=slug, readonly=True)
                     if _kb.has_spawnable_ready(conn):
                         return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
                 except Exception:
                     continue
                 finally:
@@ -7305,10 +7301,6 @@ class GatewayRunner:
                             int(s.get("ready_count", 0))
                             for s in summaries_by_board.values()
                         )
-                        total_review = sum(
-                            int(s.get("review_count", 0))
-                            for s in summaries_by_board.values()
-                        )
                         total_spawned = sum(
                             int(s.get("spawned", 0))
                             for s in summaries_by_board.values()
@@ -7318,14 +7310,13 @@ class GatewayRunner:
                             example_cap=3,
                         )
                         logger.warning(
-                            "kanban dispatcher health: bad_ticks=%d ready=%d review=%d "
+                            "kanban dispatcher health: bad_ticks=%d ready=%d "
                             "spawned=%d respawn_guarded_by_reason=%s examples=%s. "
                             "Ready queue is non-empty but no workers spawned this window. "
                             "Check profile health (venv, PATH, credentials) and "
                             "`hermes kanban list --status ready`.",
                             bad_ticks,
                             total_ready,
-                            total_review,
                             total_spawned,
                             guard_counts or {},
                             examples or [],

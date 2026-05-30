@@ -362,7 +362,7 @@ NOTIFIER_HEARTBEAT_LIST_LIMIT = _notifier_sidecar.NOTIFIER_HEARTBEAT_LIST_LIMIT
 DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS = 60
 DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS = 60
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 LINK_RELATION_DEPENDENCY = "dependency"
@@ -3870,81 +3870,6 @@ def claim_task(
         return get_task(conn, task_id)
 
 
-def claim_review_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
-) -> Optional[Task]:
-    """Atomically transition ``review -> running``.
-
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``review`` status).
-
-    Unlike ``claim_task`` (which handles ``ready -> running``), this
-    does NOT check parent dependencies — the task already passed that
-    gate on its original ``todo -> ready -> running`` transition.
-
-    Creates a new run entry so the review agent's lifecycle is tracked
-    independently from the original worker run.
-    """
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
-        if cur.rowcount != 1:
-            return None
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        run_cur = conn.execute(
-            """
-            INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
-        )
-        run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
-            run_id=run_id,
-        )
-        return get_task(conn, task_id)
-
-
 def heartbeat_claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5773,12 +5698,8 @@ class DispatchResult:
     failed validation. Stored as ``(task_id, reason)`` pairs."""
     ready_count: int = 0
     """Ready rows considered this tick before skip/guard decisions."""
-    review_count: int = 0
-    """Review rows considered this tick before skip decisions."""
     spawnable_ready: int = 0
     """Ready rows assigned to an existing Hermes profile."""
-    spawnable_review: int = 0
-    """Review rows assigned to an existing Hermes profile."""
     spawn_attempts: int = 0
     """Spawn attempts after claim succeeded."""
     spawn_failures: int = 0
@@ -5804,9 +5725,7 @@ class DispatchResult:
                 bucket.append(task_id)
         return {
             "ready_count": self.ready_count,
-            "review_count": self.review_count,
             "spawnable_ready": self.spawnable_ready,
-            "spawnable_review": self.spawnable_review,
             "spawn_attempts": self.spawn_attempts,
             "spawn_failures": self.spawn_failures,
             "spawned": len(self.spawned),
@@ -6962,7 +6881,7 @@ def _record_pre_spawn_validation_failure(
             "SELECT consecutive_failures, status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if row is None or row["status"] not in {"ready", "review"}:
+        if row is None or row["status"] != "ready":
             return False
         failures = int(row["consecutive_failures"] or 0) + 1
         cur = conn.execute(
@@ -6975,7 +6894,7 @@ def _record_pre_spawn_validation_failure(
                    consecutive_failures = ?,
                    last_failure_error = ?
              WHERE id = ?
-               AND status IN ('ready', 'review')
+               AND status = 'ready'
                AND claim_lock IS NULL
             """,
             (failures, reason[:500], task_id),
@@ -7161,31 +7080,6 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
-
-
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7301,22 +7195,13 @@ def dispatch_once(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
     result.ready_count = len(ready_rows)
-    result.review_count = len(review_rows)
-    # Honour kanban.max_in_progress as a live-concurrency cap across BOTH
-    # ready and review queues. Review-only ticks (ready empty, review non-empty)
-    # must still respect the same cap.
     if max_in_progress is not None:
         # max_spawn and max_in_progress are both total live-concurrency caps,
         # so the effective cap is the stricter one.
         if max_spawn is None or max_spawn > max_in_progress:
             max_spawn = max_in_progress
-        if (ready_rows or review_rows) and max_spawn is not None and running_count >= max_spawn:
+        if ready_rows and max_spawn is not None and running_count >= max_spawn:
             result.max_in_progress_blocked = True
             return result
     spawned = 0
@@ -7562,92 +7447,6 @@ def dispatch_once(
             # that keeps timing out after spawn loop forever. The
             # counter is cleared only on successful completion (see
             # complete_task).
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
-                key = str(claimed.assignee)
-                _per_profile_running[key] = _per_profile_running.get(key, 0) + 1
-        except Exception as exc:
-            _record_dispatch_spawn_failure(claimed.id, str(exc))
-
-    # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
-    #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
-    for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
-            break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
-            continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(str(row["assignee"]), 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], str(row["assignee"]), current)
-                )
-                continue
-        result.spawnable_review += 1
-        task_for_validation = get_task(conn, row["id"])
-        if task_for_validation is None:
-            continue
-        validation_errors = _workspace_pre_spawn_errors(task_for_validation)
-        if validation_errors:
-            reason = "; ".join(validation_errors)
-            result.pre_spawn_blocked.append((row["id"], reason))
-            if not dry_run:
-                if _record_pre_spawn_validation_failure(conn, row["id"], validation_errors):
-                    result.auto_blocked.append(row["id"])
-            continue
-        if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
-            if _per_profile_cap is not None and row["assignee"]:
-                key = str(row["assignee"])
-                _per_profile_running[key] = _per_profile_running.get(key, 0) + 1
-            continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
-        result.spawn_attempts += 1
-        try:
-            workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            _record_dispatch_spawn_failure(claimed.id, f"workspace: {exc}")
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load sdlc-review skill for review agents.  The
-        # _default_spawn function already auto-loads kanban-worker, and
-        # appends task.skills via --skills.  Setting task.skills here
-        # means the review agent gets both kanban-worker (lifecycle)
-        # and sdlc-review (review logic: AC verification, merge, etc.).
-        claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:

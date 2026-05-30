@@ -2827,7 +2827,6 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                     f"[{_fmt_ts(now)}] WARN dispatcher health: "
                     f"bad_ticks={health_state['bad_ticks']} "
                     f"ready={diag.get('ready_count', 0)} "
-                    f"review={diag.get('review_count', 0)} "
                     f"spawned={diag.get('spawned', 0)} "
                     f"respawn_guarded_by_reason={diag.get('respawn_guarded_by_reason', {})} "
                     f"examples={examples}. "

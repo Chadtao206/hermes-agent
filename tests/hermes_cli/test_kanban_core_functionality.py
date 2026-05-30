@@ -3760,9 +3760,7 @@ def test_format_kanban_dispatch_summary_includes_guard_counts():
 
     summary = {
         "ready_count": 2,
-        "review_count": 1,
         "spawnable_ready": 1,
-        "spawnable_review": 0,
         "spawned": 0,
         "spawn_attempts": 1,
         "spawn_failures": 1,

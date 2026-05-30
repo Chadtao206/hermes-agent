@@ -837,25 +837,6 @@ def test_pre_spawn_validation_surfaces_missing_forced_skill(kanban_home, monkeyp
         assert task.status == "ready"
 
 
-def test_pre_spawn_validation_surfaces_review_sdlc_skill_gap(kanban_home, monkeypatch):
-    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: True)
-    monkeypatch.setattr(rec, "_has_sdlc_review_skill", lambda: True)
-    now = 1_700_000_000
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="review", assignee="reviewer")
-        conn.execute(
-            "UPDATE tasks SET status = 'review', created_at = ? WHERE id = ?",
-            (now - 3600, task_id),
-        )
-
-    result = rec.run_reconciler(now=now, ready_age_seconds=60)
-    actions = _actions(result, "pre_spawn_validation_decision")
-
-    assert len(actions) == 1
-    assert actions[0]["task_id"] == task_id
-    assert "missing forced skill(s): sdlc-review" in actions[0]["details"]["validation_errors"]
-
-
 def test_pre_spawn_validation_surfaces_workspace_shape_error(kanban_home, monkeypatch):
     monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: True)
     now = 1_700_000_000
@@ -1375,47 +1356,6 @@ def test_bulk_stale_run_metadata_reconcile_apply_converges(kanban_home):
             task = kb.get_task(conn, task_id)
             assert task is not None
             assert task.status == "done"
-
-
-def test_old_ready_and_review_spawnable_classification(kanban_home, monkeypatch):
-    now = 1_700_000_000
-    monkeypatch.setattr(rec, "_profile_spawnable", lambda profile: profile == "engineer")
-    with kb.connect() as conn:
-        ready = kb.create_task(conn, title="ready", assignee="engineer")
-        blocked_ready = kb.create_task(conn, title="ready nonspawn", assignee="not-a-profile")
-        review = kb.create_task(conn, title="review", assignee="engineer")
-        review_nonspawn = kb.create_task(conn, title="review nonspawn", assignee="not-a-profile")
-        conn.execute(
-            "UPDATE tasks SET status = 'ready', created_at = ? WHERE id IN (?, ?)",
-            (now - 3600, ready, blocked_ready),
-        )
-        conn.execute(
-            "UPDATE tasks SET status = 'review', created_at = ? WHERE id IN (?, ?)",
-            (now - 3600, review, review_nonspawn),
-        )
-
-    result = rec.run_reconciler(now=now, ready_age_seconds=60)
-    kinds = _kinds(result)
-
-    assert "old_ready_spawnable" in kinds
-    assert "old_ready_nonspawnable" in kinds
-    assert "old_review_spawnable" in kinds
-    assert "old_review_nonspawnable" in kinds
-
-
-def test_review_skill_provenance_missing_is_diagnostic_only(kanban_home, monkeypatch):
-    monkeypatch.setattr(rec, "_has_sdlc_review_skill", lambda: False)
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="review", assignee="reviewer")
-        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
-
-    result = rec.run_reconciler(now=1_700_000_000)
-    actions = _actions(result, "review_skill_provenance_missing")
-
-    assert len(actions) == 1
-    assert actions[0]["task_id"] is None
-    assert actions[0]["safe_to_apply"] is False
-    assert actions[0]["details"]["skill"] == "sdlc-review"
 
 
 def test_reconcile_cli_json_is_read_only(kanban_home):

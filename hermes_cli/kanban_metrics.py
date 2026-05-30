@@ -176,7 +176,7 @@ def _current_state_metrics(conn: sqlite3.Connection) -> dict[str, Any]:
         """
         SELECT
             SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_tasks,
-            SUM(CASE WHEN status IN ('ready','review') THEN 1 ELSE 0 END) AS spawnable_pending_tasks,
+            SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS spawnable_pending_tasks,
             SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked_tasks,
             SUM(CASE WHEN current_run_id IS NOT NULL THEN 1 ELSE 0 END) AS current_run_pointers,
             COALESCE(MAX(consecutive_failures), 0) AS max_consecutive_failures,

@@ -2856,9 +2856,7 @@ def test_dispatch_result_summary_defaults():
     """DispatchResult.summary returns stable zero defaults for diagnostics."""
     diag = kb.DispatchResult().summary()
     assert diag["ready_count"] == 0
-    assert diag["review_count"] == 0
     assert diag["spawnable_ready"] == 0
-    assert diag["spawnable_review"] == 0
     assert diag["spawn_attempts"] == 0
     assert diag["spawn_failures"] == 0
     assert diag["respawn_guarded"] == 0
@@ -4291,10 +4289,10 @@ def test_dispatch_max_spawn_and_max_in_progress_share_concurrency_cap(
         assert res.max_in_progress_blocked is False
 
 
-def test_dispatch_max_in_progress_blocks_review_only_when_at_effective_cap(
+def test_dispatch_max_in_progress_blocks_when_at_effective_cap(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review-only ticks must honor max_in_progress saturation."""
+    """max_in_progress saturation blocks dispatch even when ready queue has tasks."""
     spawns = []
 
     def fake_spawn(task, workspace, board=None):
@@ -4303,10 +4301,9 @@ def test_dispatch_max_in_progress_blocks_review_only_when_at_effective_cap(
 
     with kb.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
-        review = kb.create_task(conn, title="review", assignee="bob")
+        waiting = kb.create_task(conn, title="waiting", assignee="bob")
         kb.claim_task(conn, running)
-        _set_task_status(conn, review, "review")
-
+        # waiting is in 'ready' (default after create) — but cap=1 running means blocked
         res = kb.dispatch_once(
             conn,
             spawn_fn=fake_spawn,
@@ -4317,8 +4314,8 @@ def test_dispatch_max_in_progress_blocks_review_only_when_at_effective_cap(
         assert res.max_in_progress_blocked is True
         assert res.spawned == []
         assert spawns == []
-        review_task = kb.get_task(conn, review)
-        assert review_task is not None and review_task.status == "review"
+        waiting_task = kb.get_task(conn, waiting)
+        assert waiting_task is not None and waiting_task.status == "ready"
 
 
 def test_dispatch_max_spawn_and_max_in_progress_zero_running_preserves_parallelism(
@@ -4334,8 +4331,8 @@ def test_dispatch_max_spawn_and_max_in_progress_zero_running_preserves_paralleli
     with kb.connect() as conn:
         ready_a = kb.create_task(conn, title="ready-a", assignee="alice")
         ready_b = kb.create_task(conn, title="ready-b", assignee="bob")
-        review = kb.create_task(conn, title="review", assignee="carol")
-        _set_task_status(conn, review, "review")
+        blocked = kb.create_task(conn, title="blocked", assignee="carol")
+        kb.block_task(conn, blocked, reason="waiting on something")
 
         res = kb.dispatch_once(
             conn,
@@ -4347,8 +4344,8 @@ def test_dispatch_max_spawn_and_max_in_progress_zero_running_preserves_paralleli
         assert res.max_in_progress_blocked is False
         assert len(res.spawned) == 2
         assert spawns == [ready_a, ready_b]
-        review_task = kb.get_task(conn, review)
-        assert review_task is not None and review_task.status == "review"
+        blocked_task = kb.get_task(conn, blocked)
+        assert blocked_task is not None and blocked_task.status == "blocked"
 
 
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):
@@ -4364,182 +4361,6 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=None)
 
     assert len(spawns) == 4, f"expected 4 spawns (unlimited), got {len(spawns)}"
-
-# Review column dispatch
-# ---------------------------------------------------------------------------
-
-
-def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
-    """Test helper: set a task's status directly."""
-    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
-
-
-def test_claim_review_task_transitions_to_running(kanban_home):
-    """claim_review_task atomically transitions review -> running."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
-        _set_task_status(conn, t, "review")
-        claimed = kb.claim_review_task(conn, t)
-    assert claimed is not None
-    assert claimed.status == "running"
-    assert claimed.claim_lock is not None
-
-
-def test_claim_review_task_fails_on_non_review(kanban_home):
-    """claim_review_task returns None if task is not in review status."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="ready task", assignee="alice")
-        # Task is in 'ready', not 'review'
-        claimed = kb.claim_review_task(conn, t)
-    assert claimed is None
-
-
-def test_claim_review_task_fails_when_already_claimed(kanban_home):
-    """claim_review_task returns None if the task was already claimed."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
-        _set_task_status(conn, t, "review")
-        first = kb.claim_review_task(conn, t)
-        assert first is not None
-        second = kb.claim_review_task(conn, t)
-    assert second is None
-
-
-def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
-    """dispatch_once dry-run sees review tasks and reports them as spawned."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
-        _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
-    assert len(res.spawned) == 1
-    assert res.spawned[0][0] == t
-    # Dry run must NOT mutate status.
-    with kb.connect() as conn:
-        assert kb.get_task(conn, t).status == "review"
-
-
-def test_dispatch_review_spawns_with_correct_skills(
-    kanban_home, all_assignees_spawnable,
-):
-    """Review tasks get sdlc-review skill set before spawning."""
-    spawned_tasks = []
-
-    def capture_spawn(task, workspace, board=None):
-        spawned_tasks.append(task)
-        return 42  # fake PID
-
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
-        _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
-    assert len(res.spawned) == 1
-    assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
-
-
-def test_dispatch_review_skips_unassigned(kanban_home):
-    """Unassigned review tasks go to skipped_unassigned, not spawned."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review floater")
-        _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
-    assert t in res.skipped_unassigned
-    assert not res.spawned
-
-
-def test_dispatch_review_counts_toward_max_spawn(
-    kanban_home, all_assignees_spawnable,
-):
-    """Review spawns count against max_spawn alongside ready tasks."""
-    spawns = []
-
-    def fake_spawn(task, workspace, board=None):
-        spawns.append(task.id)
-        return 42
-
-    with kb.connect() as conn:
-        # Create 2 ready tasks + 1 review task, max_spawn=2
-        t1 = kb.create_task(conn, title="ready 1", assignee="alice")
-        t2 = kb.create_task(conn, title="ready 2", assignee="bob")
-        t3 = kb.create_task(conn, title="review", assignee="alice")
-        _set_task_status(conn, t3, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
-    # Only 2 should spawn (ready tasks get priority in the loop)
-    assert len(res.spawned) == 2
-    assert len(spawns) == 2
-
-
-def test_dispatch_review_spawns_when_ready_empty(
-    kanban_home, all_assignees_spawnable,
-):
-    """When only review tasks exist, they still get dispatched."""
-    spawns = []
-
-    def fake_spawn(task, workspace, board=None):
-        spawns.append(task.id)
-        return 42
-
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
-        _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
-    assert len(res.spawned) == 1
-    assert spawns[0] == t
-
-
-def test_has_spawnable_review_true(kanban_home):
-    """has_spawnable_review returns True when review tasks exist with real profiles."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="default")
-        _set_task_status(conn, t, "review")
-        # default profile should exist in the test env
-        assert kb.has_spawnable_review(conn) is True
-
-
-def test_has_spawnable_review_false_on_empty(kanban_home):
-    """has_spawnable_review returns False when no review tasks exist."""
-    with kb.connect() as conn:
-        assert kb.has_spawnable_review(conn) is False
-
-
-def test_has_spawnable_review_false_when_only_terminal_lanes(
-    kanban_home, monkeypatch,
-):
-    """has_spawnable_review returns False when review tasks are terminal lanes."""
-    from hermes_cli import profiles
-    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review", assignee="orion-cc")
-        _set_task_status(conn, t, "review")
-        assert kb.has_spawnable_review(conn) is False
-
-
-def test_dispatch_review_skips_nonspawnable(kanban_home, monkeypatch):
-    """Review tasks with non-existent profiles go to skipped_nonspawnable."""
-    from hermes_cli import profiles
-    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="review", assignee="orion-cc")
-        _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
-    assert t in res.skipped_nonspawnable
-    assert not res.spawned
-
-
-def test_review_status_in_valid_statuses():
-    """'review' is a valid task status."""
-    assert "review" in kb.VALID_STATUSES
-
-
-def test_dispatch_review_does_not_claim_ready_tasks(
-    kanban_home, all_assignees_spawnable,
-):
-    """Review dispatch uses claim_review_task, which only claims review tasks."""
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="ready task", assignee="alice")
-        # claim_review_task should NOT claim a ready task
-        claimed = kb.claim_review_task(conn, t)
-    assert claimed is None
 
 # Stale detection — detect_stale_running
 # ---------------------------------------------------------------------------

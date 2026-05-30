@@ -484,7 +484,6 @@ async def test_dispatcher_ready_probe_uses_readonly_connect(kanban_home, monkeyp
     monkeypatch.setattr(kb, "connect", fake_connect)
     monkeypatch.setattr(kb, "dispatch_once", lambda *args, **kwargs: SimpleNamespace(summary=lambda: {}))
     monkeypatch.setattr(kb, "has_spawnable_ready", lambda _conn: False)
-    monkeypatch.setattr(kb, "has_spawnable_review", lambda _conn: False)
     monkeypatch.setattr(
         cli_config,
         "load_config",

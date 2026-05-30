@@ -231,7 +231,7 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "done",
 ]
 
 
