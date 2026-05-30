@@ -190,7 +190,7 @@ class PostgresKanbanStore:
                     "SELECT 1 FROM task_links l "
                     "JOIN tasks t ON t.board=l.board AND t.id=l.parent_id "
                     "WHERE l.board=%s AND l.child_id=%s AND l.relation_type='dependency' "
-                    "AND t.status != 'done' LIMIT 1",
+                    "AND t.status NOT IN ('done','archived') LIMIT 1",
                     (self.board, task_id))
                 has_incomplete_parent = cur.fetchone() is not None
                 target = "todo" if has_incomplete_parent else "ready"
@@ -255,7 +255,7 @@ class PostgresKanbanStore:
                             "UPDATE task_runs SET status=%s, outcome=%s, ended_at=%s, "
                             "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
                             "WHERE board=%s AND id=%s AND ended_at IS NULL",
-                            ('archived', 'reclaimed', now, self.board, current_run_id))
+                            ('reclaimed', 'reclaimed', now, self.board, current_run_id))
                         cur.execute(
                             "UPDATE tasks SET current_run_id=NULL "
                             "WHERE board=%s AND id=%s",
@@ -337,10 +337,15 @@ class PostgresKanbanStore:
                         "SELECT 1 FROM task_links l "
                         "JOIN tasks t ON t.board=l.board AND t.id=l.parent_id "
                         "WHERE l.board=%s AND l.child_id=%s "
-                        "AND l.relation_type='dependency' AND t.status != 'done' LIMIT 1",
+                        "AND l.relation_type='dependency' AND t.status NOT IN ('done','archived') LIMIT 1",
                         (self.board, task_id))
                     if cur.fetchone() is not None:
                         return False
+                cur.execute(
+                    "SELECT status FROM tasks WHERE board=%s AND id=%s",
+                    (self.board, task_id))
+                old_row = cur.fetchone()
+                old_status = old_row["status"] if old_row else None
                 cur.execute(
                     "UPDATE tasks SET status=%s, "
                     "claim_lock=(CASE WHEN %s='running' THEN claim_lock ELSE NULL END), "
@@ -350,6 +355,17 @@ class PostgresKanbanStore:
                     (new_status, new_status, new_status, new_status, self.board, task_id))
                 if cur.rowcount == 1:
                     self._emit(cur, task_id, "status", {"status": new_status})
+                    if old_status in ("done", "archived") and new_status not in ("done", "archived"):
+                        cur.execute(
+                            "SELECT child_id FROM task_links WHERE board=%s AND parent_id=%s "
+                            "AND relation_type='dependency'", (self.board, task_id))
+                        child_ids = [r["child_id"] for r in cur.fetchall()]
+                        for cid in child_ids:
+                            cur.execute(
+                                "UPDATE tasks SET status='todo' WHERE board=%s AND id=%s "
+                                "AND status='ready'", (self.board, cid))
+                            if cur.rowcount == 1:
+                                self._emit(cur, cid, "status", {"status": "todo"})
                     result = True
                 else:
                     result = False
@@ -449,9 +465,11 @@ class PostgresKanbanStore:
                     "UPDATE tasks SET status='ready' WHERE board=%s AND id=%s "
                     "AND status IN ('todo','blocked')",
                     (self.board, task_id))
-                self._emit(cur, task_id, "promoted_manual",
-                           {"actor": actor, "reason": reason, "forced": force})
-                return (True, None)
+                if cur.rowcount == 1:
+                    self._emit(cur, task_id, "promoted_manual",
+                               {"actor": actor, "reason": reason, "forced": force})
+                    return (True, None)
+                return (False, f"task {task_id} status changed concurrently; promote had no effect")
 
     def recompute_ready(self) -> int:
         # Phase-2 simplification: sticky-block re-promotion deferred (phase-2-tail);
@@ -482,7 +500,7 @@ class PostgresKanbanStore:
                         cur.execute(
                             "UPDATE tasks SET status='ready', consecutive_failures=0, "
                             "last_failure_error=NULL "
-                            "WHERE board=%s AND id=%s AND status IN ('todo','blocked')",
+                            "WHERE board=%s AND id=%s AND status='todo'",
                             (self.board, tid))
                         if cur.rowcount == 1:
                             self._emit(cur, tid, "promoted")
