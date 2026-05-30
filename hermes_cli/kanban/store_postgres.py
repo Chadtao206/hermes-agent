@@ -851,6 +851,34 @@ class PostgresKanbanStore:
         self.recompute_ready()
         return True
 
+    # --- claim_task (atomic ready->running) ------------------------------
+
+    def claim_task(self, task_id, *, ttl_seconds=None, claimer=None):
+        now = int(time.time())
+        ttl = int(ttl_seconds) if ttl_seconds else 900
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT id FROM tasks WHERE board=%s AND id=%s AND status='ready' "
+                    "AND claim_lock IS NULL FOR UPDATE SKIP LOCKED",
+                    (self.board, task_id))
+                if cur.fetchone() is None:
+                    return None
+                cur.execute(
+                    "INSERT INTO task_runs (board,task_id,profile,status,claim_lock,"
+                    "claim_expires,max_runtime_seconds,started_at) "
+                    "SELECT %s,%s,assignee,'running',%s,%s,max_runtime_seconds,%s "
+                    "FROM tasks WHERE board=%s AND id=%s RETURNING id",
+                    (self.board, task_id, claimer, now + ttl, now, self.board, task_id))
+                run_id = cur.fetchone()["id"]
+                cur.execute(
+                    "UPDATE tasks SET status='running', claim_lock=%s, claim_expires=%s, "
+                    "started_at=COALESCE(started_at,%s), current_run_id=%s "
+                    "WHERE board=%s AND id=%s",
+                    (claimer, now + ttl, now, run_id, self.board, task_id))
+                self._emit(cur, task_id, "claimed", {"claimer": claimer}, run_id=run_id)
+        return self.get_task(task_id)
+
     # --- runs -------------------------------------------------------------
 
     def _row_to_run(self, row: dict) -> Run:

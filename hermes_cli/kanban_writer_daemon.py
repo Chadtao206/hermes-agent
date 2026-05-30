@@ -49,6 +49,8 @@ OP_ALLOWLIST = frozenset({
     "set_workspace_path",
     # Garbage-collect old task_events rows for terminal tasks.
     "gc_events",
+    # Dispatcher atomic ready->running claim (SKIP LOCKED on pg).
+    "claim_task",
 })
 
 

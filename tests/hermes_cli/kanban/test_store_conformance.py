@@ -121,3 +121,12 @@ def test_notify_event_claiming_cursor(store):
     old2, new2, evs2 = store.claim_unseen_events_for_sub(
         task_id=tid, platform="telegram", chat_id="c1")
     assert new2 == new and evs2 == []
+
+
+def test_claim_task_atomic(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    assert store.get_task(tid).status == "ready"
+    t1 = store.claim_task(tid, claimer="w1")
+    assert t1 is not None and t1.status == "running"
+    # second claim of the same (now-running) task returns None
+    assert store.claim_task(tid, claimer="w2") is None

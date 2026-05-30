@@ -61,6 +61,9 @@ class SqliteKanbanStore:
     def reassign_task(self, task_id: str, profile: Optional[str], **kwargs: Any) -> bool:
         return self._write("reassign_task", task_id=task_id, profile=profile, **kwargs)
 
+    def claim_task(self, task_id: str, **kwargs: Any):
+        return self._write("claim_task", task_id=task_id, **kwargs)
+
     def reclaim_task(self, task_id: str, **kwargs: Any) -> bool:
         return self._write("reclaim_task", task_id=task_id, **kwargs)
 
