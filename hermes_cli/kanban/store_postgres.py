@@ -1119,6 +1119,7 @@ class PostgresKanbanStore:
 
     def advance_profile_event_cursor(self, *, task_id, profile, name="",
                                      new_cursor, last_wake_at=None) -> None:
+        name = name or ""
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 if last_wake_at is None:
@@ -1138,6 +1139,7 @@ class PostgresKanbanStore:
 
     def rewind_profile_event_cursor(self, *, task_id, profile, name="",
                                     claimed_cursor, old_cursor) -> bool:
+        name = name or ""
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
@@ -1157,6 +1159,7 @@ class PostgresKanbanStore:
 
     def record_profile_wake_success(self, *, task_id, profile, name="",
                                     new_cursor, last_wake_at) -> int:
+        name = name or ""
         when = int(last_wake_at)
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
@@ -1182,6 +1185,7 @@ class PostgresKanbanStore:
         error=None, at=None,
         min_event_interval_seconds=DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS,
     ) -> int:
+        name = name or ""
         when = int(at if at is not None else time.time())
         min_event_interval_seconds = max(0, int(min_event_interval_seconds or 0))
         sanitized = kanban_db._sanitize_wake_error(error)

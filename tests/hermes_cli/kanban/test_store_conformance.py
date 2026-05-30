@@ -233,3 +233,28 @@ def test_notify_cursor_advance_rewind(store):
     assert store.rewind_notify_cursor(
         task_id=tid, platform="telegram", chat_id="c1",
         claimed_cursor=5, old_cursor=1) is False
+
+
+def test_profile_event_cursor_advance_rewind(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+    when = int(time.time())
+    store.advance_profile_event_cursor(
+        task_id=tid, profile="engineer", new_cursor=5, last_wake_at=when)
+    subs = store.list_profile_event_subs(
+        task_id=tid, profile="engineer", enabled_only=False)
+    assert subs and int(_field(subs[0], "last_event_id")) == 5
+    assert _field(subs[0], "last_wake_at") is not None
+    assert store.rewind_profile_event_cursor(
+        task_id=tid, profile="engineer",
+        claimed_cursor=5, old_cursor=2)
+    subs = store.list_profile_event_subs(
+        task_id=tid, profile="engineer", enabled_only=False)
+    assert int(_field(subs[0], "last_event_id")) == 2
+    # Stale CAS: claimed_cursor no longer matches the row -> no rewind.
+    assert not store.rewind_profile_event_cursor(
+        task_id=tid, profile="engineer",
+        claimed_cursor=5, old_cursor=0)
+    subs = store.list_profile_event_subs(
+        task_id=tid, profile="engineer", enabled_only=False)
+    assert int(_field(subs[0], "last_event_id")) == 2
