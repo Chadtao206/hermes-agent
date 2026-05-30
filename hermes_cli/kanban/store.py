@@ -172,6 +172,17 @@ class KanbanStore(Protocol):
     def close(self) -> None: ...
 
 
+def kanban_store(board: Optional[str] = None) -> "KanbanStore":
+    """Return the configured KanbanStore for a board. Postgres backend lands in
+    Phase 2; until then selecting it raises NotImplementedError loudly rather
+    than silently falling back."""
+    backend = resolve_backend()
+    if backend == "sqlite":
+        from .store_sqlite import SqliteKanbanStore
+        return SqliteKanbanStore(board=board)
+    raise NotImplementedError(f"kanban backend '{backend}' not available yet")
+
+
 def resolve_backend() -> str:
     """Return the configured kanban backend ('sqlite' default). Reads config
     defensively; any failure falls back to 'sqlite' so default deployments and
