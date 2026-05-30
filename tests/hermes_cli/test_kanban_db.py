@@ -5536,3 +5536,66 @@ def test_single_writer_enabled_board_scoped_live_daemon(tmp_path, monkeypatch):
     # Stale regular file at the socket path (no listener) -> NOT single-writer.
     sock_path.touch()
     assert kb.single_writer_enabled() is False
+
+
+def test_readonly_corrupt_cache_reprobes_and_self_heals_after_recovery(tmp_path, monkeypatch):
+    """A long-lived read-only reader must drop a cached 'corrupt' verdict once
+    the DB is recovered, without restarting the process.
+
+    Regression for the dashboard-500-after-recovery: read-only callers never
+    re-init the DB, so the corrupt-path cache used to latch for the process
+    lifetime. With the re-check TTL, an expired verdict triggers a fresh probe
+    that clears the cache when the DB is healthy again.
+    """
+    db = tmp_path / "kanban.db"
+    # Build a healthy DB, checkpoint, and drop sidecars so we operate on the
+    # main file only (bootstrap is exempt from the single-writer guard).
+    conn = kb.connect(db_path=db, readonly=False, _bootstrap=True)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1','x','todo',0)"
+    )
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    for sfx in ("-wal", "-shm"):
+        db.with_name(db.name + sfx).unlink(missing_ok=True)
+    healthy_bytes = db.read_bytes()
+
+    key = str(db.resolve())
+    kb._clear_corrupt(key)  # isolate from any process-global state
+    # Simulate a fresh read-only reader that never ran a writable init of this
+    # path (the bootstrap connect above marked it locally, which would otherwise
+    # short-circuit the health probe).
+    kb._INITIALIZED_PATHS.discard(key)
+
+    # Controllable monotonic clock for deterministic TTL behavior.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(kb.time, "monotonic", lambda: clock["t"])
+
+    # Corrupt the b-tree (header stays valid so the integrity probe is what trips).
+    data = bytearray(healthy_bytes)
+    for i in range(100, 1600):
+        data[i] = 0xFF
+    db.write_bytes(bytes(data))
+
+    # 1) First read detects + caches corruption.
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db, readonly=True)
+    assert key in kb._CORRUPT_PATHS
+
+    # 2) DB recovered on disk, but still within TTL -> trusts the cached verdict
+    #    (fast fail, no re-probe).
+    db.write_bytes(healthy_bytes)
+    clock["t"] += 1.0
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db, readonly=True)
+
+    # 3) After the TTL elapses -> re-probe sees a healthy DB, clears the verdict,
+    #    and the read succeeds. No process restart needed.
+    clock["t"] += kb._CORRUPT_PATH_RECHECK_TTL_SEC + 1.0
+    c = kb.connect(db_path=db, readonly=True)
+    try:
+        assert kb.get_task(c, "t1").id == "t1"
+    finally:
+        c.close()
+    assert key not in kb._CORRUPT_PATHS

@@ -1352,6 +1352,38 @@ _INITIALIZED_PATHS: set[str] = set()
 # .corrupt.<timestamp>.bak copy on every attempted open. A later successful
 # quiesced repair swaps in a new DB via a fresh process/restart path.
 _CORRUPT_PATHS: dict[str, tuple[Optional[Path], str]] = {}
+# Monotonic timestamp of each corrupt verdict. A long-lived read-only process
+# (dashboard, watchdog) never re-inits the DB, so without a re-check it would
+# serve a stale "corrupt" verdict for its whole lifetime — even after the DB is
+# repaired/recovered out from under it (exactly the dashboard-500-after-recovery
+# case). Once a verdict is older than the TTL, the next access re-probes the
+# file: a recovered DB clears the verdict and reads resume; a still-corrupt DB
+# refreshes the verdict (reusing the original backup, no new .corrupt.bak spam).
+_CORRUPT_PATHS_AT: dict[str, float] = {}
+_CORRUPT_PATH_RECHECK_TTL_SEC = float(
+    os.environ.get("HERMES_KANBAN_CORRUPT_RECHECK_TTL_SEC", "").strip() or 30.0
+)
+
+
+def _corrupt_verdict_is_fresh(resolved_key: str) -> bool:
+    """True if the cached corrupt verdict is recent enough to trust without a
+    re-probe. A missing timestamp is treated as stale (re-probe) defensively."""
+    ts = _CORRUPT_PATHS_AT.get(resolved_key)
+    if ts is None:
+        return False
+    return (time.monotonic() - ts) < _CORRUPT_PATH_RECHECK_TTL_SEC
+
+
+def _mark_corrupt(resolved_key: str, backup: Optional[Path], reason: str) -> None:
+    _CORRUPT_PATHS[resolved_key] = (backup, reason)
+    _CORRUPT_PATHS_AT[resolved_key] = time.monotonic()
+
+
+def _clear_corrupt(resolved_key: str) -> None:
+    _CORRUPT_PATHS.pop(resolved_key, None)
+    _CORRUPT_PATHS_AT.pop(resolved_key, None)
+
+
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
@@ -1601,9 +1633,11 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     resolved_key = str(resolved)
     cached_corrupt = _CORRUPT_PATHS.get(resolved_key)
-    if cached_corrupt is not None:
+    if cached_corrupt is not None and _corrupt_verdict_is_fresh(resolved_key):
         backup_path, cached_reason = cached_corrupt
         raise KanbanDbCorruptError(resolved, backup_path, cached_reason)
+    # A stale verdict falls through to a fresh probe below: the DB may have been
+    # recovered/repaired since it was cached. A healthy probe clears the verdict.
     if resolved_key in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
@@ -1627,6 +1661,10 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                         error=last_database_error,
                         extra={"attempt": attempt, "max_attempts": max_attempts},
                     )
+                # Healthy. If a stale corrupt verdict was cached (TTL re-probe of
+                # a DB recovered out from under a long-lived reader), drop it so
+                # reads resume without restarting the process.
+                _clear_corrupt(resolved_key)
                 return
         except sqlite3.OperationalError:
             # Lock contention, busy, transient IO — not corruption. Let it propagate.
@@ -1650,9 +1688,15 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             extra={"attempt": attempt, "max_attempts": max_attempts, "reason": reason},
         )
     if reason is None:
+        _clear_corrupt(resolved_key)
         return
-    backup = _backup_corrupt_db(resolved)
-    _CORRUPT_PATHS[resolved_key] = (backup, reason)
+    # Still corrupt. On a TTL re-probe of an already-known-corrupt path, reuse
+    # the original backup instead of writing a fresh .corrupt.<ts>.bak every
+    # re-check; otherwise capture a first backup now. Refresh the verdict's
+    # timestamp either way so the next re-probe is another TTL away.
+    prior = _CORRUPT_PATHS.get(resolved_key)
+    backup = prior[0] if prior is not None else _backup_corrupt_db(resolved)
+    _mark_corrupt(resolved_key, backup, reason)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -1702,11 +1746,13 @@ def connect(
         _validate_sqlite_header(path)
         path_key = str(path.resolve())
         cached_corrupt = _CORRUPT_PATHS.get(path_key)
-        if cached_corrupt is not None:
+        if cached_corrupt is not None and _corrupt_verdict_is_fresh(path_key):
             backup_path, cached_reason = cached_corrupt
             raise KanbanDbCorruptError(path.resolve(), backup_path, cached_reason)
         # Full integrity probe — catches corruption past the header (malformed
-        # pages, broken internal metadata).
+        # pages, broken internal metadata). A stale corrupt verdict falls through
+        # to here; the guard re-probes and clears it if the DB has recovered, so
+        # a long-lived read-only process (dashboard) self-heals without restart.
         _guard_existing_db_is_healthy(path)
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30)
@@ -1778,7 +1824,7 @@ def connect(
                     _migrate_add_optional_columns(conn)
                     migrate_review_status_rows(conn)
                     _INITIALIZED_PATHS.add(resolved)
-                    _CORRUPT_PATHS.pop(resolved, None)
+                    _clear_corrupt(resolved)
         except Exception:
             conn.close()
             raise
@@ -2056,7 +2102,7 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-        _CORRUPT_PATHS.pop(resolved, None)
+        _clear_corrupt(resolved)
     with contextlib.closing(connect(path)):
         pass
     return path
