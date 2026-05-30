@@ -1742,6 +1742,7 @@ def terminate_run_endpoint(
     """
     board = _resolve_board(board)
     store = _store(board=board)
+    ok = False
     try:
         r = store.get_run(run_id)
         if r is None:
