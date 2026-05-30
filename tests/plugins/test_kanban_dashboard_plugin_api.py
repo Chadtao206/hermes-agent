@@ -266,3 +266,33 @@ def test_get_board_tolerates_non_utf8_metadata(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert isinstance(diagnostics, dict)
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: plugin_api.get_task_log("t_demo", board=None),
+        lambda: plugin_api.list_profile_subs("t_demo", board=None),
+        lambda: plugin_api.get_stats(board=None),
+        lambda: plugin_api.get_assignees(board=None),
+        lambda: plugin_api.list_diagnostics(board=None),
+    ],
+)
+def test_read_endpoints_use_readonly_conn(monkeypatch, invoke):
+    """Per-ticket / board read endpoints must open a read-only (snapshot) conn.
+
+    Regression: under the single-writer daemon a writable connect raises
+    DirectWriteForbidden, so read endpoints that used the writable `_conn`
+    returned HTTP 500 (the dashboard's 'worker log' and 'Wake Hermes profiles'
+    sections). Reads must pass readonly=True.
+    """
+    calls: list[bool] = []
+
+    def _recording_conn(*args, **kwargs):
+        calls.append(bool(kwargs.get("readonly", False)))
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(plugin_api, "_conn", _recording_conn)
+    with pytest.raises(RuntimeError, match="stop"):
+        invoke()
+    assert calls == [True], "read endpoint must use readonly=True"

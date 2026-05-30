@@ -1575,7 +1575,7 @@ def list_diagnostics(
     directly when it isn't.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
         if not diags_by_task:
@@ -1658,7 +1658,7 @@ def list_active_workers(
     its task without a second round-trip.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         rows = conn.execute(
             """
@@ -1717,7 +1717,7 @@ def get_run_endpoint(
     404 when no such run exists.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         r = kanban_db.get_run(conn, run_id)
         if r is None:
@@ -1746,7 +1746,7 @@ def inspect_run_endpoint(
     ``reason="psutil not available"``.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         r = kanban_db.get_run(conn, run_id)
         if r is None:
@@ -2089,7 +2089,7 @@ def get_home_channels(
     subscribed_homes: set[tuple[str, str, str]] = set()
     if task_id:
         board = _resolve_board(board)
-        conn = _conn(board=board)
+        conn = _conn(board=board, readonly=True)
         try:
             subs = kanban_db.list_notify_subs(conn, task_id)
         finally:
@@ -2241,7 +2241,7 @@ def list_profile_subs(task_id: str, board: Optional[str] = Query(None)):
     round-trip.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -2363,7 +2363,7 @@ def get_stats(board: Optional[str] = Query(None)):
     board themselves.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         return kanban_db.board_stats(conn)
     finally:
@@ -2380,7 +2380,7 @@ def get_assignees(board: Optional[str] = Query(None)):
     appears in the picker before it's been given any task.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         return {"assignees": kanban_db.known_assignees(conn)}
     finally:
@@ -2406,7 +2406,7 @@ def get_task_log(
     generations, so disk usage per task is bounded at ~4 MiB.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    conn = _conn(board=board, readonly=True)
     try:
         task = kanban_db.get_task(conn, task_id)
     finally:
