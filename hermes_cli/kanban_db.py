@@ -1490,6 +1490,12 @@ def _validate_sqlite_header(path: Path) -> None:
     )
 
 
+class DirectWriteForbidden(RuntimeError):
+    """Raised when a client process opens a writable kanban connection while
+    the single-writer daemon is enabled. All writes must go through
+    write_session() (which proxies to the daemon)."""
+
+
 class KanbanDbCorruptError(RuntimeError):
     """Raised when an existing kanban DB file fails integrity checks.
 
@@ -1680,8 +1686,8 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
 
-    ``_bootstrap`` is reserved for the WS1 single-writer-daemon work and
-    currently has no effect.
+    ``_bootstrap`` exempts the caller from the single-writer guard; use it
+    for file creation / bootstrapping the DB before the daemon owns it.
     """
     if db_path is not None:
         path = db_path
@@ -1708,6 +1714,17 @@ def connect(
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    # Single-writer daemon: client processes must not open a writable connection
+    # directly — all writes route through write_session() to the daemon. This
+    # guard turns a stray direct write into a loud failure instead of a silent
+    # second writer. The owner process (daemon/gateway, marked by the env var)
+    # and explicit file-creation/bootstrap callers are exempt.
+    if single_writer_enabled() and not _is_writer_owner() and not _bootstrap:
+        raise DirectWriteForbidden(
+            "writable kanban.connect() called in a client process while "
+            "kanban.single_writer_daemon is enabled; use kb.write_session() instead"
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     # Serialize first-connect setup (header validation, integrity probe, WAL
