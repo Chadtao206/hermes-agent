@@ -39,6 +39,10 @@ OP_ALLOWLIST = frozenset({
     "edit_completed_task_result",
     # Notifier event-claim write: advances last_event_id cursor for a sub.
     "claim_unseen_events_for_sub",
+    # Profile-event sub cursor-advance (read-probe + claim inside same txn).
+    "claim_unseen_events_for_profile_sub",
+    # Notifier heartbeat write: upserts last_seen timestamp for a notifier.
+    "record_notifier_heartbeat",
 })
 
 

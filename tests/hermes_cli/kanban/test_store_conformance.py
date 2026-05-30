@@ -60,3 +60,13 @@ def test_notify_sub_add_list_remove(store):
     scoped = store.list_notify_subs(task_id=tid)
     assert scoped and all((s["task_id"] if isinstance(s, dict) else s.task_id) == tid for s in scoped)
     assert store.remove_notify_sub(task_id=tid, platform="telegram", chat_id="c1") is True
+
+
+def test_profile_sub_and_recompute(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+    subs = store.list_profile_event_subs(task_id=tid, profile="engineer", enabled_only=False)
+    assert subs
+    assert isinstance(store.recompute_ready(), int)
+    assert isinstance(store.has_spawnable_ready(), bool)
+    assert store.remove_profile_event_sub(task_id=tid, profile="engineer", name="") is True

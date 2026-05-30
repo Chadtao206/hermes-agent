@@ -134,6 +134,45 @@ class SqliteKanbanStore:
         # read-probe + conditional cursor-advance; needs a writable conn
         return self._write("claim_unseen_events_for_sub", **kwargs)
 
+    # --- profile-event subs + wake events --------------------------------
+    def add_profile_event_sub(self, **kwargs: Any):
+        return self._write("add_profile_event_sub", **kwargs)
+
+    def remove_profile_event_sub(self, **kwargs: Any) -> bool:
+        return self._write("remove_profile_event_sub", **kwargs)
+
+    def list_profile_event_subs(self, **kwargs: Any):
+        return self._read(lambda c: kb.list_profile_event_subs(c, **kwargs))
+
+    def claim_unseen_events_for_profile_sub(self, **kwargs: Any) -> tuple:
+        return self._write("claim_unseen_events_for_profile_sub", **kwargs)
+
+    def list_profile_wake_events(self, **kwargs: Any):
+        return self._read(lambda c: kb.list_profile_wake_events(c, **kwargs))
+
+    # --- notifier heartbeats ---------------------------------------------
+    def record_notifier_heartbeat(self, **kwargs: Any):
+        return self._write("record_notifier_heartbeat", **kwargs)
+
+    def list_notifier_heartbeats(self, **kwargs: Any):
+        return self._read(lambda c: kb.list_notifier_heartbeats(c, **kwargs))
+
+    # --- worker heartbeat + dispatch reads -------------------------------
+    def heartbeat_worker(self, **kwargs: Any) -> bool:
+        return self._write("heartbeat_worker", **kwargs)
+
+    def recompute_ready(self) -> int:
+        return self._write("recompute_ready")
+
+    def has_spawnable_ready(self) -> bool:
+        return self._read(lambda c: kb.has_spawnable_ready(c))
+
+    def board_stats(self):
+        return self._read(lambda c: kb.board_stats(c))
+
+    def known_assignees(self):
+        return self._read(lambda c: kb.known_assignees(c))
+
 
 class _SnapshotReadConn:
     """Closeable wrapper around :func:`kb.snapshot_connect` so callers that do
