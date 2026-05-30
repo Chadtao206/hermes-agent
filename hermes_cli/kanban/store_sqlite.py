@@ -76,6 +76,50 @@ class SqliteKanbanStore:
     def delete_task(self, task_id: str) -> bool:
         return self._write("delete_task", task_id=task_id)
 
+    # --- links -----------------------------------------------------------
+    def link_tasks(self, parent_id: str, child_id: str, **kwargs: Any) -> None:
+        return self._write("link_tasks", parent_id=parent_id, child_id=child_id, **kwargs)
+
+    def unlink_tasks(self, parent_id: str, child_id: str, **kwargs: Any) -> bool:
+        return self._write("unlink_tasks", parent_id=parent_id, child_id=child_id, **kwargs)
+
+    def parent_ids(self, task_id: str) -> list[str]:
+        return self._read(lambda c: kb.parent_ids(c, task_id))
+
+    def child_ids(self, task_id: str) -> list[str]:
+        return self._read(lambda c: kb.child_ids(c, task_id))
+
+    # --- comments --------------------------------------------------------
+    def add_comment(self, task_id: str, *, author: str, body: str) -> int:
+        return self._write("add_comment", task_id=task_id, author=author, body=body)
+
+    def list_comments(self, task_id: str):
+        return self._read(lambda c: kb.list_comments(c, task_id))
+
+    # --- events ----------------------------------------------------------
+    def list_events(self, task_id: str, **kwargs: Any):
+        return self._read(lambda c: kb.list_events(c, task_id, **kwargs))
+
+    # --- runs ------------------------------------------------------------
+    def list_runs(self, task_id: str):
+        return self._read(lambda c: kb.list_runs(c, task_id))
+
+    def get_run(self, run_id: int):
+        return self._read(lambda c: kb.get_run(c, run_id))
+
+    def latest_run(self, task_id: str):
+        return self._read(lambda c: kb.latest_run(c, task_id))
+
+    def latest_summary(self, task_id: str):
+        return self._read(lambda c: kb.latest_summary(c, task_id))
+
+    def latest_summaries(self, task_ids):
+        return self._read(lambda c: kb.latest_summaries(c, task_ids))
+
+    # --- dashboard recovery ----------------------------------------------
+    def edit_completed_task_result(self, task_id: str, **kwargs: Any) -> bool:
+        return self._write("edit_completed_task_result", task_id=task_id, **kwargs)
+
 
 class _SnapshotReadConn:
     """Closeable wrapper around :func:`kb.snapshot_connect` so callers that do

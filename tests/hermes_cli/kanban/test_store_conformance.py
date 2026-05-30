@@ -32,3 +32,21 @@ def test_reassign_and_delete(store):
     assert store.get_task(tid).assignee == "reviewer"
     assert store.delete_task(tid) is True
     assert store.get_task(tid) is None
+
+
+def test_link_unlink_and_parents_children(store):
+    p = store.create_task(title="parent", assignee="engineer")
+    c = store.create_task(title="child", assignee="engineer")
+    store.link_tasks(p, c)
+    assert c in store.child_ids(p)
+    assert p in store.parent_ids(c)
+    assert store.unlink_tasks(p, c) is True
+    assert store.child_ids(p) == []
+
+
+def test_comment_roundtrip(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    cid = store.add_comment(tid, author="ops", body="note")
+    assert isinstance(cid, int)
+    bodies = [c["body"] if isinstance(c, dict) else c.body for c in store.list_comments(tid)]
+    assert "note" in bodies

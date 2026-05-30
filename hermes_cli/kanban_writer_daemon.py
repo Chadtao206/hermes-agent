@@ -35,6 +35,8 @@ OP_ALLOWLIST = frozenset({
     "set_status_direct", "set_task_priority", "edit_task_fields",
     # Dashboard DELETE /tasks and bulk actions.
     "delete_task",
+    # Dashboard recovery: retroactively update result on a completed task.
+    "edit_completed_task_result",
 })
 
 
