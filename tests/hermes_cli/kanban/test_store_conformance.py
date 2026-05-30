@@ -171,3 +171,65 @@ def test_notifier_heartbeat_roundtrip(store):
 def test_list_profile_wake_events_empty(store):
     rows = store.list_profile_wake_events()
     assert isinstance(rows, list)
+
+
+def _field(row, key):
+    return row[key] if isinstance(row, dict) else getattr(row, key)
+
+
+def test_profile_wake_success_advances_and_clears(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+    # Generate a terminal-kind event the default profile sub watches.
+    store.block_task(tid, reason="need input")
+    old, new, evs = store.claim_unseen_events_for_profile_sub(
+        task_id=tid, profile="engineer")
+    assert new >= old and isinstance(evs, list)
+    when = int(time.time())
+    wid = store.record_profile_wake_success(
+        task_id=tid, profile="engineer", new_cursor=new, last_wake_at=when)
+    assert isinstance(wid, int) and wid > 0
+    wake_rows = store.list_profile_wake_events(task_id=tid)
+    assert any(_field(r, "status") == "success" for r in wake_rows)
+    subs = store.list_profile_event_subs(
+        task_id=tid, profile="engineer", enabled_only=False)
+    assert subs
+    assert int(_field(subs[0], "last_event_id")) >= new
+
+
+def test_profile_wake_failure_rewinds(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+    store.block_task(tid, reason="need input")
+    old, new, evs = store.claim_unseen_events_for_profile_sub(
+        task_id=tid, profile="engineer")
+    assert new > old and evs
+    wid = store.record_profile_wake_failure(
+        task_id=tid, profile="engineer",
+        claimed_cursor=new, old_cursor=old, error="boom")
+    assert isinstance(wid, int) and wid > 0
+    subs = store.list_profile_event_subs(
+        task_id=tid, profile="engineer", enabled_only=False)
+    assert subs
+    assert int(_field(subs[0], "last_event_id")) == old
+    assert int(_field(subs[0], "wake_failure_count")) == 1
+    wake_rows = store.list_profile_wake_events(task_id=tid)
+    assert any(_field(r, "status") == "failed" for r in wake_rows)
+
+
+def test_notify_cursor_advance_rewind(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    store.add_notify_sub(task_id=tid, platform="telegram", chat_id="c1")
+    store.advance_notify_cursor(
+        task_id=tid, platform="telegram", chat_id="c1", new_cursor=5)
+    subs = store.list_notify_subs(task_id=tid)
+    assert subs and int(_field(subs[0], "last_event_id")) == 5
+    assert store.rewind_notify_cursor(
+        task_id=tid, platform="telegram", chat_id="c1",
+        claimed_cursor=5, old_cursor=2) is True
+    subs = store.list_notify_subs(task_id=tid)
+    assert int(_field(subs[0], "last_event_id")) == 2
+    # Stale CAS: claimed_cursor no longer matches the row -> no rewind.
+    assert store.rewind_notify_cursor(
+        task_id=tid, platform="telegram", chat_id="c1",
+        claimed_cursor=5, old_cursor=1) is False

@@ -51,6 +51,10 @@ OP_ALLOWLIST = frozenset({
     "gc_events",
     # Dispatcher atomic ready->running claim (SKIP LOCKED on pg).
     "claim_task",
+    # Notifier post-delivery cursor mutations + profile-wake recording.
+    "advance_notify_cursor", "rewind_notify_cursor",
+    "advance_profile_event_cursor", "rewind_profile_event_cursor",
+    "record_profile_wake_success", "record_profile_wake_failure",
 })
 
 

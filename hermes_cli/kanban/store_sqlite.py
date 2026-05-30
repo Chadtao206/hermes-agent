@@ -146,6 +146,12 @@ class SqliteKanbanStore:
         # read-probe + conditional cursor-advance; needs a writable conn
         return self._write("claim_unseen_events_for_sub", **kwargs)
 
+    def advance_notify_cursor(self, **kwargs: Any) -> None:
+        return self._write("advance_notify_cursor", **kwargs)
+
+    def rewind_notify_cursor(self, **kwargs: Any) -> bool:
+        return self._write("rewind_notify_cursor", **kwargs)
+
     # --- profile-event subs + wake events --------------------------------
     def add_profile_event_sub(self, **kwargs: Any):
         return self._write("add_profile_event_sub", **kwargs)
@@ -158,6 +164,18 @@ class SqliteKanbanStore:
 
     def claim_unseen_events_for_profile_sub(self, **kwargs: Any) -> tuple:
         return self._write("claim_unseen_events_for_profile_sub", **kwargs)
+
+    def advance_profile_event_cursor(self, **kwargs: Any) -> None:
+        return self._write("advance_profile_event_cursor", **kwargs)
+
+    def rewind_profile_event_cursor(self, **kwargs: Any) -> bool:
+        return self._write("rewind_profile_event_cursor", **kwargs)
+
+    def record_profile_wake_success(self, **kwargs: Any) -> int:
+        return self._write("record_profile_wake_success", **kwargs)
+
+    def record_profile_wake_failure(self, **kwargs: Any) -> int:
+        return self._write("record_profile_wake_failure", **kwargs)
 
     def list_profile_wake_events(self, **kwargs: Any):
         return self._read(lambda c: kb.list_profile_wake_events(c, **kwargs))

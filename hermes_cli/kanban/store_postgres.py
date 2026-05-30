@@ -12,6 +12,7 @@ from psycopg.types.json import Jsonb
 from hermes_cli import kanban_db
 from hermes_cli.kanban_db import (  # reuse dataclasses
     Task, Run, Event, Comment, DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
+    DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS,
 )
 from hermes_cli.kanban import pg_pool
 
@@ -1024,6 +1025,32 @@ class PostgresKanbanStore:
                 ]
                 return (old_cursor, new_cursor, events)
 
+    def advance_notify_cursor(self, *, task_id, platform, chat_id,
+                              thread_id=None, new_cursor) -> None:
+        thread_id = thread_id or ''
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "UPDATE kanban_notify_subs "
+                    "SET last_event_id = GREATEST(last_event_id, %s) "
+                    "WHERE board=%s AND task_id=%s AND platform=%s "
+                    "AND chat_id=%s AND thread_id=%s",
+                    (int(new_cursor), self.board, task_id, platform,
+                     chat_id, thread_id))
+
+    def rewind_notify_cursor(self, *, task_id, platform, chat_id,
+                             thread_id=None, claimed_cursor, old_cursor) -> bool:
+        thread_id = thread_id or ''
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "UPDATE kanban_notify_subs SET last_event_id=%s "
+                    "WHERE board=%s AND task_id=%s AND platform=%s "
+                    "AND chat_id=%s AND thread_id=%s AND last_event_id=%s",
+                    (int(old_cursor), self.board, task_id, platform,
+                     chat_id, thread_id, int(claimed_cursor)))
+                return cur.rowcount > 0
+
     # --- event claiming (profile subs) -----------------------------------
 
     def claim_unseen_events_for_profile_sub(self, *, task_id, profile,
@@ -1089,6 +1116,116 @@ class PostgresKanbanStore:
                 if cur.rowcount != 1:
                     return (old_cursor, old_cursor, [])
                 return (old_cursor, new_cursor, claimed_events)
+
+    def advance_profile_event_cursor(self, *, task_id, profile, name="",
+                                     new_cursor, last_wake_at=None) -> None:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                if last_wake_at is None:
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs "
+                        "SET last_event_id = GREATEST(last_event_id, %s) "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (int(new_cursor), self.board, task_id, profile, name))
+                else:
+                    cur.execute(
+                        "UPDATE kanban_profile_event_subs "
+                        "SET last_event_id = GREATEST(last_event_id, %s), "
+                        "    last_wake_at = %s "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                        (int(new_cursor), int(last_wake_at),
+                         self.board, task_id, profile, name))
+
+    def rewind_profile_event_cursor(self, *, task_id, profile, name="",
+                                    claimed_cursor, old_cursor) -> bool:
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "UPDATE kanban_profile_event_subs SET last_event_id=%s "
+                    "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s "
+                    "AND last_event_id=%s",
+                    (int(old_cursor), self.board, task_id, profile, name,
+                     int(claimed_cursor)))
+                rewound = cur.rowcount > 0
+                cur.execute(
+                    "DELETE FROM kanban_profile_event_claims "
+                    "WHERE board=%s AND root_task_id=%s AND profile=%s AND name=%s "
+                    "AND event_id > %s AND event_id <= %s",
+                    (self.board, task_id, profile, name,
+                     int(old_cursor), int(claimed_cursor)))
+                return rewound
+
+    def record_profile_wake_success(self, *, task_id, profile, name="",
+                                    new_cursor, last_wake_at) -> int:
+        when = int(last_wake_at)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "UPDATE kanban_profile_event_subs SET "
+                    "    last_event_id      = GREATEST(last_event_id, %s), "
+                    "    last_wake_at       = %s, "
+                    "    last_wake_error_at = NULL, "
+                    "    last_wake_error    = NULL, "
+                    "    wake_failure_count = 0 "
+                    "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                    (int(new_cursor), when, self.board, task_id, profile, name))
+                cur.execute(
+                    "INSERT INTO kanban_profile_wake_events "
+                    "(board, task_id, profile, name, status, error, "
+                    " claimed_event_cursor, created_at) "
+                    "VALUES (%s,%s,%s,%s,'success',NULL,%s,%s) RETURNING id",
+                    (self.board, task_id, profile, name, int(new_cursor), when))
+                return int(cur.fetchone()["id"])
+
+    def record_profile_wake_failure(
+        self, *, task_id, profile, name="", claimed_cursor, old_cursor,
+        error=None, at=None,
+        min_event_interval_seconds=DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS,
+    ) -> int:
+        when = int(at if at is not None else time.time())
+        min_event_interval_seconds = max(0, int(min_event_interval_seconds or 0))
+        sanitized = kanban_db._sanitize_wake_error(error)
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                # CAS-guarded cursor rewind (mirrors rewind_profile_event_cursor).
+                cur.execute(
+                    "UPDATE kanban_profile_event_subs SET last_event_id=%s "
+                    "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s "
+                    "AND last_event_id=%s",
+                    (int(old_cursor), self.board, task_id, profile, name,
+                     int(claimed_cursor)))
+                cur.execute(
+                    "DELETE FROM kanban_profile_event_claims "
+                    "WHERE board=%s AND root_task_id=%s AND profile=%s AND name=%s "
+                    "AND event_id > %s AND event_id <= %s",
+                    (self.board, task_id, profile, name,
+                     int(old_cursor), int(claimed_cursor)))
+                cur.execute(
+                    "UPDATE kanban_profile_event_subs SET "
+                    "    last_wake_error_at = %s, "
+                    "    last_wake_error    = %s, "
+                    "    wake_failure_count = wake_failure_count + 1 "
+                    "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s",
+                    (when, sanitized, self.board, task_id, profile, name))
+                if min_event_interval_seconds:
+                    cur.execute(
+                        "SELECT id FROM kanban_profile_wake_events "
+                        "WHERE board=%s AND task_id=%s AND profile=%s AND name=%s "
+                        "  AND status='failed' AND created_at >= %s "
+                        "ORDER BY id DESC LIMIT 1",
+                        (self.board, task_id, profile, name,
+                         when - min_event_interval_seconds))
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        return int(existing["id"])
+                cur.execute(
+                    "INSERT INTO kanban_profile_wake_events "
+                    "(board, task_id, profile, name, status, error, "
+                    " claimed_event_cursor, created_at) "
+                    "VALUES (%s,%s,%s,%s,'failed',%s,%s,%s) RETURNING id",
+                    (self.board, task_id, profile, name, sanitized,
+                     int(claimed_cursor), when))
+                return int(cur.fetchone()["id"])
 
     # --- board stats and assignees ---------------------------------------
 
