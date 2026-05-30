@@ -18,7 +18,10 @@ _self = _sys.modules[__name__]
 for _name in dir(_cli):
     if not _name.startswith("__"):
         setattr(_self, _name, getattr(_cli, _name))
-del _name
 
 # Canonical store exports win for these names (imported last on purpose).
 from .store import KanbanStore, kanban_store, resolve_backend  # noqa: F401,E402
+
+# Tidy up bookkeeping locals so they don't leak into hermes_cli.kanban's namespace.
+for _bk in ("_name", "_self", "_sys", "_cli", "_bk"):
+    globals().pop(_bk, None)
