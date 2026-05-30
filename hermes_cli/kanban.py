@@ -32,6 +32,31 @@ from hermes_cli import kanban_reconciler as krec
 from hermes_cli import kanban_db_repair as krepair
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
+# ---------------------------------------------------------------------------
+# Store factory import — module-level so tests can monkeypatch
+# hermes_cli.kanban.kanban_store.  Handlers call _make_store() which looks
+# up kanban_store on the hermes_cli.kanban package object at call time,
+# making the monkeypatch effective even though this file is loaded as a
+# sub-module of that package.
+# ---------------------------------------------------------------------------
+from hermes_cli.kanban.store import kanban_store  # noqa: F401 (re-exported)
+
+
+def _make_store():
+    """Return a KanbanStore for the current board.
+
+    Looks up ``kanban_store`` on the ``hermes_cli.kanban`` package object at
+    call time so that test monkeypatching of ``hermes_cli.kanban.kanban_store``
+    takes effect inside every handler that calls ``_make_store()``.
+    """
+    import sys as _sys
+    _pkg = _sys.modules.get("hermes_cli.kanban")
+    if _pkg is not None and hasattr(_pkg, "kanban_store"):
+        return _pkg.kanban_store(board=None)
+    # Fallback: use the locally imported factory (e.g. when the package is
+    # not yet in sys.modules during early startup or testing).
+    return kanban_store(board=None)
+
 
 # ---------------------------------------------------------------------------
 # Small formatting helpers
@@ -1821,13 +1846,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        ok = kb.heartbeat_worker(
-            conn,
-            args.task_id,
+    store = _make_store()
+    try:
+        ok = store.heartbeat_worker(
+            task_id=args.task_id,
             note=getattr(args, "note", None),
             expected_run_id=_worker_run_id_for(args.task_id),
         )
+    finally:
+        store.close()
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
         return 1
@@ -1836,8 +1863,11 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
 
 
 def _cmd_assignees(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        data = kb.known_assignees(conn)
+    store = _make_store()
+    try:
+        data = store.known_assignees()
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps(data, indent=2, ensure_ascii=False))
         return 0
@@ -1877,9 +1907,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
+    store = _make_store()
+    try:
+        task_id = store.create_task(
             title=args.title,
             body=args.body,
             assignee=args.assignee,
@@ -1897,7 +1927,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             initial_status=getattr(args, "initial_status", "running"),
         )
-        task = kb.get_task(conn, task_id)
+        task = store.get_task(task_id)
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1952,12 +1984,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
-        tasks = kb.list_tasks(
-            conn,
+        store.recompute_ready()
+        tasks = store.list_tasks(
             assignee=assignee,
             status=args.status,
             tenant=args.tenant,
@@ -1967,6 +1999,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
@@ -2001,15 +2035,22 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task = kb.get_task(conn, args.task_id)
+    store = _make_store()
+    try:
+        task = store.get_task(args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        comments = kb.list_comments(conn, args.task_id)
-        events = kb.list_events(conn, args.task_id)
-        parents = kb.parent_ids(conn, args.task_id)
-        children = kb.child_ids(conn, args.task_id)
+        comments = store.list_comments(args.task_id)
+        events = store.list_events(args.task_id)
+        parents = store.parent_ids(args.task_id)
+        children = store.child_ids(args.task_id)
+        latest_summary = store.latest_summary(args.task_id)
+    finally:
+        store.close()
+    # Rollup link queries and state-keyed run listing use kwargs the store
+    # protocol does not yet expose, so we keep a raw connection just for them.
+    with kb.connect_closing() as conn:
         rollup_parents = kb.parent_ids(
             conn, args.task_id, relation_type=kb.LINK_RELATION_ROLLUP
         )
@@ -2017,11 +2058,6 @@ def _cmd_show(args: argparse.Namespace) -> int:
             conn, args.task_id, relation_type=kb.LINK_RELATION_ROLLUP
         )
         runs = kb.list_runs(conn, args.task_id, **rsk)
-        # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
-        # ``tasks.result`` is left NULL unless the caller explicitly passed
-        # ``result=``. Surfacing the latest summary here keeps ``show`` from
-        # looking like a no-op when the worker actually did real work.
-        latest_summary = kb.latest_summary(conn, args.task_id)
 
     if getattr(args, "json", False):
         payload = {
@@ -2179,8 +2215,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    store = _make_store()
+    try:
+        ok = store.assign_task(args.task_id, profile)
+    finally:
+        store.close()
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -2189,11 +2228,14 @@ def _cmd_assign(args: argparse.Namespace) -> int:
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        ok = kb.reclaim_task(
-            conn, args.task_id,
+    store = _make_store()
+    try:
+        ok = store.reclaim_task(
+            args.task_id,
             reason=getattr(args, "reason", None),
         )
+    finally:
+        store.close()
     if not ok:
         print(
             f"cannot reclaim {args.task_id} (not running or unknown id)",
@@ -2206,12 +2248,15 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.reassign_task(
-            conn, args.task_id, profile,
+    store = _make_store()
+    try:
+        ok = store.reassign_task(
+            args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
         )
+    finally:
+        store.close()
     if not ok:
         print(
             f"cannot reassign {args.task_id} "
@@ -2360,20 +2405,22 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 def _cmd_link(args: argparse.Namespace) -> int:
     relation_type = getattr(args, "relation_type", kb.LINK_RELATION_DEPENDENCY)
-    with kb.connect_closing() as conn:
-        kb.link_tasks(
-            conn, args.parent_id, args.child_id, relation_type=relation_type
-        )
+    store = _make_store()
+    try:
+        store.link_tasks(args.parent_id, args.child_id, relation_type=relation_type)
+    finally:
+        store.close()
     print(f"Linked {args.parent_id} -> {args.child_id} ({relation_type})")
     return 0
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     relation_type = getattr(args, "relation_type", kb.LINK_RELATION_DEPENDENCY)
-    with kb.connect_closing() as conn:
-        ok = kb.unlink_tasks(
-            conn, args.parent_id, args.child_id, relation_type=relation_type
-        )
+    store = _make_store()
+    try:
+        ok = store.unlink_tasks(args.parent_id, args.child_id, relation_type=relation_type)
+    finally:
+        store.close()
     if not ok:
         print(
             f"No such link: {args.parent_id} -> {args.child_id} ({relation_type})",
@@ -2416,8 +2463,11 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
-    with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+    store = _make_store()
+    try:
+        store.add_comment(args.task_id, author=author, body=body)
+    finally:
+        store.close()
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -2463,10 +2513,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
     failed: list[str] = []
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
+            if not store.complete_task(
+                tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
@@ -2476,6 +2527,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
+    finally:
+        store.close()
     return 0 if not failed else 1
 
 
@@ -2490,19 +2543,22 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
-    with kb.connect_closing() as conn:
-        if not kb.edit_completed_task_result(
-            conn,
+    store = _make_store()
+    try:
+        ok = store.edit_completed_task_result(
             args.task_id,
             result=args.result,
             summary=getattr(args, "summary", None),
             metadata=metadata,
-        ):
-            print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
-                file=sys.stderr,
-            )
-            return 1
+        )
+    finally:
+        store.close()
+    if not ok:
+        print(
+            f"cannot edit {args.task_id} (unknown id or task is not done)",
+            file=sys.stderr,
+        )
+        return 1
     print(f"Edited {args.task_id}")
     return 0
 
@@ -2512,12 +2568,12 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
+                store.add_comment(tid, author=author, body=f"BLOCKED: {reason}")
+            if not store.block_task(
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
@@ -2526,6 +2582,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
                 print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
+    finally:
+        store.close()
     return 0 if not failed else 1
 
 
@@ -2534,12 +2592,12 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
-            if not kb.schedule_task(
-                conn,
+                store.add_comment(tid, author=author, body=f"SCHEDULED: {reason}")
+            if not store.schedule_task(
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
@@ -2548,6 +2606,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+    finally:
+        store.close()
     return 0 if not failed else 1
 
 
@@ -2561,15 +2621,18 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         reason = reason.strip() or None
     author = _profile_author() if reason else None
     failed: list[str] = []
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+                store.add_comment(tid, author=author, body=f"UNBLOCK: {reason}")
+            if not store.unblock_task(tid):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+    finally:
+        store.close()
     return 0 if not failed else 1
 
 
@@ -2587,10 +2650,10 @@ def _cmd_promote(args: argparse.Namespace) -> int:
             seen.add(tid)
 
     results: list[dict[str, object]] = []
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         for tid in ids:
-            ok, err = kb.promote_task(
-                conn,
+            ok, err = store.promote_task(
                 tid,
                 actor=author,
                 reason=reason,
@@ -2605,6 +2668,8 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 "reason": reason,
                 "error": err,
             })
+    finally:
+        store.close()
 
     failed = [r for r in results if not r["promoted"]]
     if as_json:
@@ -2634,21 +2699,26 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     failed: list[str] = []
-    with kb.connect_closing() as conn:
-        if purge_ids:
+    if purge_ids:
+        # delete_archived_task is not in the store protocol; use raw conn.
+        with kb.connect_closing() as conn:
             for tid in purge_ids:
                 if not kb.delete_archived_task(conn, tid):
                     failed.append(tid)
                     print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
                 else:
                     print(f"Deleted {tid}")
-            return 0 if not failed else 1
+        return 0 if not failed else 1
+    store = _make_store()
+    try:
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            if not store.archive_task(tid):
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
+    finally:
+        store.close()
     return 0 if not failed else 1
 
 
@@ -3002,8 +3072,11 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        stats = kb.board_stats(conn)
+    store = _make_store()
+    try:
+        stats = store.board_stats()
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
@@ -3039,8 +3112,11 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_list(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        subs = kb.list_notify_subs(conn, args.task_id)
+    store = _make_store()
+    try:
+        subs = store.list_notify_subs(args.task_id)
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps(subs, indent=2, ensure_ascii=False))
         return 0
@@ -3056,12 +3132,15 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        ok = kb.remove_notify_sub(
-            conn, task_id=args.task_id,
+    store = _make_store()
+    try:
+        ok = store.remove_notify_sub(
+            task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id,
         )
+    finally:
+        store.close()
     if not ok:
         print("(no such subscription)", file=sys.stderr)
         return 1
@@ -3152,13 +3231,15 @@ def _cmd_profile_subs_list(args: argparse.Namespace) -> int:
     task_id = getattr(args, "task_id", None)
     profile = getattr(args, "profile", None)
     enabled_only = not getattr(args, "all", False)
-    with kb.connect() as conn:
-        subs = kb.list_profile_event_subs(
-            conn,
+    store = _make_store()
+    try:
+        subs = store.list_profile_event_subs(
             task_id=task_id,
             profile=profile,
             enabled_only=enabled_only,
         )
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps(subs, indent=2, ensure_ascii=False, default=str))
         return 0
@@ -3270,10 +3351,13 @@ def _cmd_profile_subs_remove(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban profile-subs remove: {exc}", file=sys.stderr)
         return 2
-    with kb.connect() as conn:
-        ok = kb.remove_profile_event_sub(
-            conn, task_id=task_id, profile=profile, name=name,
+    store = _make_store()
+    try:
+        ok = store.remove_profile_event_sub(
+            task_id=task_id, profile=profile, name=name,
         )
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps({"removed": ok, "sub_id": args.sub_id}))
         return 0 if ok else 1
@@ -3394,8 +3478,17 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        runs = kb.list_runs(conn, args.task_id, **rsk)
+    if rsk:
+        # State-keyed run listing uses kwargs not exposed by the store protocol;
+        # fall back to a raw connection.
+        with kb.connect_closing() as conn:
+            runs = kb.list_runs(conn, args.task_id, **rsk)
+    else:
+        store = _make_store()
+        try:
+            runs = store.list_runs(args.task_id)
+        finally:
+            store.close()
     if getattr(args, "json", False):
         print(json.dumps([
             {
@@ -3791,10 +3884,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
-    with kb.connect_closing() as conn:
-        removed_events = kb.gc_events(
-            conn, older_than_seconds=event_days * 24 * 3600,
+    store = _make_store()
+    try:
+        removed_events = store.gc_events(
+            older_than_seconds=event_days * 24 * 3600,
         )
+    finally:
+        store.close()
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
