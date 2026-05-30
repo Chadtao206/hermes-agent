@@ -23,10 +23,13 @@ class Liveness:
     oldest_ready_age_seconds: int = 0
     oldest_blocked_done_parents_age_seconds: int = 0
     oldest_stale_running_age_seconds: int = 0
-    dispatcher_enabled: bool = True
     notifier_enabled: bool = True
     writer_daemon_disabled: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    # Note: there is no gateway-local "dispatcher_enabled" signal. Dispatch
+    # stalls are caught by oldest_ready_age_seconds, which is correct whether the
+    # dispatcher runs in-gateway or as an external `hermes kanban dispatch`
+    # process; a binary in-gateway flag would false-page the external case.
 
 
 @dataclass
@@ -87,8 +90,10 @@ def evaluate(snap: Liveness, *, thresholds: dict[str, int]) -> list[Breach]:
     """Return the threshold breaches in ``snap``.
 
     Age dimensions breach when ``value > threshold``. The boolean subsystem
-    signals (dispatcher/notifier disabled, writer daemon recovery-exhausted)
-    always breach when set — they are binary "this is broken now" conditions.
+    signals (notifier disabled, writer daemon recovery-exhausted) always breach
+    when set — they are binary "this is broken now" conditions owned by this
+    gateway. (Dispatch health is covered by the oldest_ready age dimension, not
+    a binary flag — see Liveness.)
     """
     breaches: list[Breach] = []
     for dim, limit in thresholds.items():
@@ -99,8 +104,6 @@ def evaluate(snap: Liveness, *, thresholds: dict[str, int]) -> list[Breach]:
             breaches.append(Breach(dim, value, int(limit)))
     if snap.writer_daemon_disabled:
         breaches.append(Breach("writer_daemon_disabled", 1, 0))
-    if not snap.dispatcher_enabled:
-        breaches.append(Breach("dispatcher_disabled", 1, 0))
     if not snap.notifier_enabled:
         breaches.append(Breach("notifier_disabled", 1, 0))
     return breaches

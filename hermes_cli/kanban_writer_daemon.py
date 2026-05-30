@@ -22,6 +22,9 @@ OP_ALLOWLIST = frozenset({
     "create_task", "complete_task", "block_task", "unblock_task",
     "link_tasks", "heartbeat_worker", "heartbeat_claim", "add_comment",
     "add_profile_event_sub",
+    # kanban_list (orchestrator, a remote client) promotes ready tasks before
+    # listing; the write must cross the wire since its conn is read-only.
+    "recompute_ready",
 })
 
 

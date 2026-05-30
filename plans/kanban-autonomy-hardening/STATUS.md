@@ -136,6 +136,16 @@ read-after-write (`latest_run`/`get_task`) — stay on a direct conn, and `_conn
 regression-free: `tests/hermes_cli/ -k kanban` failing-set unchanged (22 pre-existing
 contamination failures, identical to the C2 baseline).
 
+**Flag-off fidelity caveat (T7):** routing the write handlers through `write_session` is
+*unconditional*, so even with `single_writer_daemon` OFF a write tool now opens a fresh
+`_LocalWriter` conn for the write and a *separate* `_connect()` for the read-after-write (two
+connections), where the pre-T7 code used one. This is functionally identical (WAL + `synchronous=
+FULL`; the writer conn commits+closes before the reader opens in-process) but is NOT byte-for-byte
+the old flag-off path — the legacy single-connection write+read is no longer exercised. Intentional.
+(Review fix B1: `_handle_list`'s `recompute_ready` — a write — is the one handler that *does* branch
+on the flag, because its listing conn is read-only under the flag; flag-off keeps its original
+single-connection path. `recompute_ready` added to `OP_ALLOWLIST` for the orchestrator's remote route.)
+
 **Sub-feature (needed for fidelity, not in the original plan):** typed write-gate exceptions now
 survive the single-writer boundary. `complete_task`'s `PRHeadGateError`/`HallucinatedCardsError`
 (and `ExternalHandoffGateError`) would otherwise flatten to `RuntimeError`/`RemoteWriteError`,

@@ -5054,23 +5054,31 @@ class GatewayRunner:
 
         # Watchdog: revive a writer thread that died, page a human when a board
         # exhausts recovery. No-op when the single-writer flag is off.
-        asyncio.create_task(self._kanban_writer_watchdog())
+        task = asyncio.create_task(self._kanban_writer_watchdog())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         # Board-liveness checker: page on a stalled board (oldest ready/blocked/
         # stale-running past threshold, or a disabled subsystem). No-op when
         # kanban.liveness_alerts is off.
-        asyncio.create_task(self._kanban_liveness_checker())
+        task = asyncio.create_task(self._kanban_liveness_checker())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
-        asyncio.create_task(self._kanban_notifier_watcher())
+        task = asyncio.create_task(self._kanban_notifier_watcher())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
-        asyncio.create_task(self._kanban_dispatcher_watcher())
+        task = asyncio.create_task(self._kanban_dispatcher_watcher())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -5643,8 +5651,10 @@ class GatewayRunner:
 
     def _liveness_subsystem_flags(self, slug: str, resolved_db_path: str):
         """Best-effort current subsystem state for a board, folded into the
-        liveness snapshot: dispatcher/notifier disabled sets + writer-daemon
-        recovery exhaustion. Each guarded so a missing attr never breaks a tick."""
+        liveness snapshot: the notifier disabled-set + writer-daemon recovery
+        exhaustion. Each guarded so a missing attr never breaks a tick. (Dispatch
+        health is covered by the oldest_ready age breach, not a binary flag —
+        the dispatcher may legitimately run outside this gateway.)"""
         notifier_disabled = False
         try:
             disabled = getattr(self, "_kanban_notifier_disabled_db_paths", {}) or {}
@@ -5684,21 +5694,26 @@ class GatewayRunner:
             if key in seen:
                 continue
             seen.add(key)
-            if not path.exists():
-                continue
-            try:
-                conn = _kb.connect(board=slug, readonly=True)
-            except Exception as exc:
-                logger.debug("kanban liveness: cannot open board %s: %s", slug, exc)
-                continue
-            try:
-                snap = _liv.compute_board_liveness(conn, now=int(time.time()))
-            except Exception as exc:
-                logger.debug("kanban liveness: compute failed for %s: %s", slug, exc)
-                continue
-            finally:
-                conn.close()
+            # Subsystem flags are gateway-local state, NOT read from the board
+            # file — fold them in first so a corrupt/missing/unreadable DB still
+            # pages on a disabled subsystem (writer-daemon recovery exhaustion is
+            # precisely when the file is unreadable). The age dimensions are then
+            # filled from a read-only open when one is possible, else left zeroed.
             notifier_disabled, writer_disabled = self._liveness_subsystem_flags(slug, key)
+            snap = None
+            if path.exists():
+                try:
+                    conn = _kb.connect(board=slug, readonly=True)
+                    try:
+                        snap = _liv.compute_board_liveness(conn, now=int(time.time()))
+                    finally:
+                        conn.close()
+                except Exception as exc:
+                    logger.debug("kanban liveness: cannot read board %s: %s", slug, exc)
+            if snap is None:
+                # Board absent or unreadable: ages unknown → zeroed (no false age
+                # breach), but subsystem breaches below still surface.
+                snap = _liv.Liveness()
             snap.notifier_enabled = not notifier_disabled
             snap.writer_daemon_disabled = writer_disabled
             breaches = _liv.evaluate(snap, thresholds=thresholds)

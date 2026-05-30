@@ -68,7 +68,12 @@ def test_stale_running_uses_heartbeat(tmp_path):
 
 
 def test_evaluate_flags_subsystem_disabled():
-    snap = liv.Liveness(dispatcher_enabled=False, notifier_enabled=False,
-                        writer_daemon_disabled=True)
+    snap = liv.Liveness(notifier_enabled=False, writer_daemon_disabled=True)
     dims = {b.dimension for b in liv.evaluate(snap, thresholds={})}
-    assert {"dispatcher_disabled", "notifier_disabled", "writer_daemon_disabled"} <= dims
+    assert {"notifier_disabled", "writer_daemon_disabled"} <= dims
+    # Dispatch stalls surface via the age-based oldest_ready breach (which is
+    # agnostic to WHERE the dispatcher runs), not a gateway-local binary
+    # "dispatcher_disabled" signal — that would false-page deployments whose
+    # dispatcher legitimately runs outside the gateway (kanban.dispatch_in_gateway
+    # =false + an external `hermes kanban dispatch`).
+    assert "dispatcher_disabled" not in dims

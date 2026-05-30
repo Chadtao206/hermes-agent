@@ -92,6 +92,30 @@ def test_simple_write_handlers_under_flag(tmp_path, monkeypatch):
         server.shutdown()
 
 
+def test_list_handler_recomputes_ready_under_flag(tmp_path, monkeypatch):
+    """_handle_list calls recompute_ready (a write). Under the flag the list
+    connection is read-only, so the promotion must route through the writer
+    instead of attempting a write on the ro conn — which raised
+    'attempt to write a readonly database' and surfaced as a tool_error on
+    EVERY kanban_list call (the B1 regression). The routed write also has to
+    cross the socket, so recompute_ready must be on OP_ALLOWLIST or _dispatch
+    would reject it. The cleared dependency must be visible as ready."""
+    db, sock, server = _serve_unregistered(tmp_path, monkeypatch)
+    try:
+        parent = server.execute("create_task", title="parent", assignee="worker")
+        child = server.execute("create_task", title="child", assignee="worker")
+        server.execute("link_tasks", parent_id=parent, child_id=child)
+        server.execute("complete_task", task_id=parent, summary="done")
+
+        res = json.loads(kt._handle_list({}))
+        assert "error" not in res, res  # no readonly-write error; no allowlist rejection
+        statuses = {t["id"]: t["status"] for t in res["tasks"]}
+        assert statuses.get(child) == "ready", statuses
+        assert isinstance(res["promoted"], int)  # field intact; count is 0 here
+    finally:
+        server.shutdown()
+
+
 def test_read_handler_uses_readonly_under_flag(tmp_path, monkeypatch):
     db, sock, server = _serve_unregistered(tmp_path, monkeypatch)
     try:

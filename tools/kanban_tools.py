@@ -445,11 +445,21 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
-        try:
-            # Match CLI list: dependencies that cleared since the last
-            # dispatcher tick should be visible to orchestrators immediately.
+        from hermes_cli import kanban_db as kb
+        # Match CLI list: dependencies that cleared since the last dispatcher
+        # tick should be visible to orchestrators immediately. recompute_ready
+        # is a write, but under the single-writer flag the list connection is
+        # read-only, so route the promotion through the writer; the read-only
+        # listing below then sees the committed promotions. Flag off → the
+        # original single-connection write+read path is unchanged.
+        if kb.single_writer_enabled():
+            with kb.write_session(board=board) as w:
+                promoted = w.recompute_ready()
+            _, conn = _connect(board=board)
+        else:
+            _, conn = _connect(board=board)
             promoted = kb.recompute_ready(conn)
+        try:
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             rows = kb.list_tasks(
