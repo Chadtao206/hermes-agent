@@ -373,7 +373,7 @@ def _jensen_prompt_text(result: dict[str, Any], *, examples: int) -> str:
         "",
         rec.format_reconcile_text(result, max_examples=examples),
         "",
-        "Recommended Jensen action: inspect the decision-required examples, choose keep-parked/unblock/close/remediate explicitly, then re-run `hermes kanban reconcile --json`.",
+        "Recommended Jensen action: call kanban_reconcile{action:\"list\"} to fetch the live decision packets, choose keep_parked/unblock/keep_blocked/close/remediate explicitly, then kanban_reconcile{action:\"apply\", task_id, option, packet_signature} (the signature is re-validated against a fresh pass before any write). Options outside the auto-apply allowlist return needs_human — escalate those to a person.",
     ]
     return "\n".join(lines).strip()
 

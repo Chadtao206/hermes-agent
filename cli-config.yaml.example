@@ -1200,3 +1200,13 @@ kanban:
   # human notices. Only active_pr parks are touched; time-based / operator
   # `scheduled` parks are left alone. Default false (today's behavior).
   promote_scheduled_on_guard_clear: false
+
+  # Which reconcile decision options the orchestrator's `kanban_reconcile`
+  # tool may auto-apply (WS5). The apply path always re-validates the packet
+  # signature against a fresh reconcile pass before mutating; options NOT in
+  # this list return `needs_human` so risky transitions still escalate to a
+  # person. Defaults to the safe, reversible set below when unset.
+  reconcile_tool_auto_options:
+    - unblock
+    - keep_blocked
+    - keep_parked

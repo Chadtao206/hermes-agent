@@ -882,6 +882,112 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+# --- kanban_reconcile (orchestrator) ---------------------------------------
+# Thin seams over kanban_reconciler so the handler stays testable without a
+# live board, and so the apply path reuses the CLI's exact entry points (which
+# already re-validate the packet signature against a fresh reconcile pass).
+
+_RECONCILE_DEFAULT_AUTO_OPTIONS = ("unblock", "keep_blocked", "keep_parked")
+
+
+def _reconcile_collect(board: Optional[str] = None) -> dict:
+    """Return the current decision packets (+ wake mode) for ``board``."""
+    from hermes_cli import kanban_reconciler as krec
+    result = krec.run_reconciler(board=board)
+    wake = result.get("wake_triage") or {}
+    return {
+        "packets": wake.get("decision_packets", []),
+        "mode": wake.get("mode"),
+        "wake_agent": bool(wake.get("wake_agent", False)),
+        "board": result.get("board"),
+    }
+
+
+def _reconcile_apply(**kwargs) -> dict:
+    """Apply one gated reconcile decision (re-validates the packet signature)."""
+    from hermes_cli import kanban_reconciler as krec
+    return krec.apply_reconcile_decision(**kwargs)
+
+
+def _reconcile_auto_options() -> set:
+    """Options the tool may auto-apply (config ``kanban.reconcile_tool_auto_options``).
+
+    Defaults to the safe, reversible set. Anything outside it returns
+    ``needs_human`` so risky transitions still escalate to a person.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        kanban_cfg = {}
+    opts = kanban_cfg.get("reconcile_tool_auto_options")
+    if not isinstance(opts, (list, tuple)):
+        opts = _RECONCILE_DEFAULT_AUTO_OPTIONS
+    return {str(o).strip() for o in opts if str(o).strip()}
+
+
+def _handle_reconcile(args: dict, **kw) -> str:
+    """Orchestrator tool: list reconcile decision packets, or apply an
+    allowlisted option (with packet-signature re-validation)."""
+    guard = _require_orchestrator_tool("kanban_reconcile")
+    if guard:
+        return guard
+    action = str(args.get("action") or "list").strip().lower()
+    board = args.get("board")
+    try:
+        if action == "list":
+            data = _reconcile_collect(board=board)
+            return _ok(
+                action="list",
+                packets=data.get("packets", []),
+                mode=data.get("mode"),
+                wake_agent=data.get("wake_agent", False),
+            )
+        if action == "apply":
+            task_id = str(args.get("task_id") or "").strip()
+            option = str(args.get("option") or "").strip()
+            packet_signature = str(args.get("packet_signature") or "").strip()
+            missing = [
+                n for n, v in (
+                    ("task_id", task_id), ("option", option),
+                    ("packet_signature", packet_signature),
+                ) if not v
+            ]
+            if missing:
+                return tool_error(
+                    "kanban_reconcile apply requires: " + ", ".join(missing)
+                    + " (get task_id, option, and packet_signature from action='list')"
+                )
+            if option not in _reconcile_auto_options():
+                return json.dumps({
+                    "needs_human": True,
+                    "task_id": task_id,
+                    "option": option,
+                    "reason": (
+                        f"option '{option}' is not in the auto-apply allowlist "
+                        "(kanban.reconcile_tool_auto_options); escalate to a human "
+                        "to apply it via `hermes kanban reconcile --apply-option`."
+                    ),
+                }, ensure_ascii=False)
+            result = _reconcile_apply(
+                task_id=task_id,
+                option=option,
+                packet_signature=packet_signature,
+                confirm_dry_run=True,
+                board=board,
+                author="jensen",
+                pr_head_sha=str(args.get("pr_head_sha") or ""),
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return tool_error(
+            f"unknown action '{action}'; expected 'list' or 'apply'"
+        )
+    except Exception as e:
+        logger.exception("kanban_reconcile failed")
+        return tool_error(f"kanban_reconcile: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -1307,6 +1413,60 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_RECONCILE_SCHEMA = {
+    "name": "kanban_reconcile",
+    "description": (
+        "Resolve kanban reconcile decision packets (orchestrator-only). "
+        "action='list' returns the current jensen_decision_required packets, "
+        "each with a packet_signature and suggested_options. action='apply' "
+        "applies one option for a task — the reconciler re-validates the "
+        "packet_signature against a fresh pass before mutating, so stale wake "
+        "output is never applied blindly. Options outside the configured "
+        "auto-apply allowlist return needs_human (escalate to a person). Pass "
+        "the task_id, option, and packet_signature exactly as returned by "
+        "action='list'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "apply"],
+                "default": "list",
+                "description": "'list' the packets, or 'apply' one option.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task id to apply a decision to (required for apply).",
+            },
+            "option": {
+                "type": "string",
+                "description": (
+                    "Decision option to apply (required for apply), e.g. "
+                    "'unblock'/'keep_blocked'/'keep_parked'. Must be one of the "
+                    "packet's suggested_options and in the auto-apply allowlist."
+                ),
+            },
+            "packet_signature": {
+                "type": "string",
+                "description": (
+                    "packet_signature from action='list' (required for apply); "
+                    "re-validated against a fresh reconcile pass before any write."
+                ),
+            },
+            "pr_head_sha": {
+                "type": "string",
+                "description": (
+                    "Verified current PR head SHA — only needed for the "
+                    "remediate_parent_closeout option."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["action"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -1416,4 +1576,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_reconcile",
+    toolset="kanban",
+    schema=KANBAN_RECONCILE_SCHEMA,
+    handler=_handle_reconcile,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧭",
 )

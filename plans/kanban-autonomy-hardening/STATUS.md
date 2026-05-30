@@ -192,9 +192,24 @@ that marker — time-based/operator `schedule_task` parks are untouched. Wired i
 (`-k kanban` failing-set unchanged at 22). Tests: `test_kanban_active_pr_guard.py`,
 `test_kanban_promote_scheduled.py`, `test_kanban_dispatch_promotes_scheduled.py`.
 
+## WS5 — DONE & GREEN (one squashed commit; not yet reviewed)
+`kanban_reconcile` orchestrator tool added. `action='list'` returns the live decision packets
+(`run_reconciler(...)["wake_triage"]["decision_packets"]`, each with `packet_signature` +
+`suggested_options`); `action='apply'` gates the option against `kanban.reconcile_tool_auto_options`
+(default `unblock`/`keep_blocked`/`keep_parked`) — allowed options call
+`apply_reconcile_decision(..., confirm_dry_run=True, author="jensen")` (which re-validates the
+signature against a fresh pass before any write), non-allowlisted options return `needs_human`.
+Orchestrator-only (`check_fn=_check_kanban_orchestrator_mode` + `_require_orchestrator_tool`
+runtime guard). Registered in the registry + `toolsets.py` (both kanban lists); Jensen's
+wake-triage prompt now routes to the tool instead of "re-run `hermes kanban reconcile`";
+`reconcile_tool_auto_options` documented in `cli-config.yaml.example`. Updated the exact-set
+toolset-visibility assertion in `tests/tools/test_kanban_tools.py`. Verified regression-free
+(`-k kanban` failing-set unchanged at 22; `-k reconcile`/`-k toolset` green). Tests:
+`test_kanban_reconcile_tool.py`, `test_kanban_reconcile_tool_schema.py`.
+
 ## REMAINING
-- **WS5** — `kanban_reconcile` agent tool. **WS6** — board-liveness SLO. (Plans: `05-`, `06-`.)
-- Cross-cutting: a full two-stage review of the WS1 + C2 + WS4 work (none of these commits is reviewed yet).
+- **WS6** — board-liveness SLO + stall alerts. (Plan: `06-`.)
+- Cross-cutting: a full two-stage review of the WS1 + C2 + WS4 + WS5 work (none of these commits is reviewed yet).
 
 ## Known non-issues
 - The broad kanban/gateway suite shows ~34 pre-existing cross-test contamination failures that are
