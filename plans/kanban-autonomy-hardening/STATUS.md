@@ -207,9 +207,36 @@ toolset-visibility assertion in `tests/tools/test_kanban_tools.py`. Verified reg
 (`-k kanban` failing-set unchanged at 22; `-k reconcile`/`-k toolset` green). Tests:
 `test_kanban_reconcile_tool.py`, `test_kanban_reconcile_tool_schema.py`.
 
+## WS6 — DONE & GREEN (one squashed commit; not yet reviewed)
+Board-liveness SLO + stall alerts. New `hermes_cli/kanban_liveness.py`:
+`compute_board_liveness(conn, *, now)` (read-only) returns oldest `ready` age, oldest `blocked`
+task with all dependency parents terminal, and oldest `running` age measured from
+`last_heartbeat_at` (real schema cols); `evaluate(snap, thresholds)` flags age breaches + binary
+subsystem signals (dispatcher/notifier disabled, writer-daemon recovery-exhausted). CLI: `hermes
+kanban liveness [--json]` (read-only; zeroed snapshot on a board with no DB file yet). Gateway:
+pure `_maybe_emit_liveness_alert(breaches, *, board, state, emit)` dedup helper (one page per
+breach window, re-arms on clear, per-board), plus an async `_kanban_liveness_checker()` (per-minute,
+per-board readonly compute→evaluate, subsystem flags folded in from the notifier disabled-set +
+writer-daemon `health()`), gated on `kanban.liveness_alerts`; started alongside the writer watchdog.
+Flags documented in `cli-config.yaml.example`. Verified regression-free (`-k kanban` failing-set
+unchanged at 22). Tests: `test_kanban_liveness.py`, `test_kanban_liveness_cli.py`,
+`test_kanban_liveness_alert.py`.
+
+## PROGRAM COMPLETE
+All workstreams of kanban-autonomy-hardening are implemented + green:
+WS3 (review-lane removal), WS1 (single-writer daemon: protocol→daemon→client→guard→lifecycle→
+gateway dispatcher C1 + notifier/watchdog C2 + tool-handler migration & typed-error preservation
+T7 + worker spawn env T8 + kill-during-write proof T9), WS2 (corruption auto-recovery + flags),
+WS4 (scheduled-park auto-promote), WS5 (`kanban_reconcile` tool), WS6 (board-liveness SLO).
+Every behavioral change is flag-gated to today's behavior by default.
+
+Branch `feat/kanban-autonomy-hardening` carries 8 unreviewed commits on top of `0bc10f641`
+(C2, T7, T8, T9, WS4, WS5, WS6 — plus the earlier WS1/WS2/WS3 commits already noted above).
+
 ## REMAINING
-- **WS6** — board-liveness SLO + stall alerts. (Plan: `06-`.)
-- Cross-cutting: a full two-stage review of the WS1 + C2 + WS4 + WS5 work (none of these commits is reviewed yet).
+- Cross-cutting: a full two-stage review of all unreviewed commits before merge.
+- Manual smoke per workstream (e.g. start the gateway with each flag on, exercise the path) —
+  the suites cover units + integration but not a live end-to-end gateway run.
 
 ## Known non-issues
 - The broad kanban/gateway suite shows ~34 pre-existing cross-test contamination failures that are

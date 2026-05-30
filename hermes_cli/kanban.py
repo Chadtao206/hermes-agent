@@ -582,6 +582,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Override sidecar snapshot DB path for --write-snapshot",
     )
 
+    # --- liveness (read-only board-liveness signals) ---
+    p_liveness = sub.add_parser(
+        "liveness",
+        help="Report read-only board-liveness signals (oldest ready/blocked/stale-running ages)",
+    )
+    p_liveness.add_argument("--json", action="store_true", help="Emit structured JSON")
+
     # --- repair-db (guarded live DB replacement runbook) ---
     p_repair = sub.add_parser(
         "repair-db",
@@ -1361,6 +1368,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "doctor":   _cmd_doctor,
         "reconcile": _cmd_reconcile,
         "metrics":  _cmd_metrics,
+        "liveness": _cmd_liveness,
         "repair-db": _cmd_repair_db,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
@@ -1458,6 +1466,32 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
             result,
             max_examples=max(0, int(getattr(args, "examples", 5) or 0)),
         ))
+    return 0
+
+
+def _cmd_liveness(args: argparse.Namespace) -> int:
+    import dataclasses
+    from hermes_cli import kanban_liveness as kliv
+    board = getattr(args, "board", None)
+    # Read-only / observability: never create or mutate the board. A board with
+    # no DB file yet has nothing to report — emit a zeroed snapshot.
+    path = kb.kanban_db_path(board=board)
+    if path.exists():
+        conn = kb.connect(board=board, readonly=True)
+        try:
+            snap = kliv.compute_board_liveness(conn, now=int(time.time()))
+        finally:
+            conn.close()
+    else:
+        snap = kliv.Liveness()
+    data = dataclasses.asdict(snap)
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+    else:
+        for key, value in data.items():
+            if key == "extra":
+                continue
+            print(f"{key}: {value}")
     return 0
 
 

@@ -1880,6 +1880,36 @@ def _classify_board_write_error(
     return "disable"
 
 
+def _format_liveness_alert(board: str, breaches: list) -> str:
+    """One-line, high-signal alert text for a board-liveness breach set."""
+    parts = []
+    for b in breaches:
+        if getattr(b, "threshold", 0) == 0:
+            parts.append(b.dimension)  # binary subsystem signal
+        else:
+            parts.append(f"{b.dimension}={b.value}s>{b.threshold}s")
+    return f"⚠ kanban board '{board}' liveness breach: " + "; ".join(parts)
+
+
+def _maybe_emit_liveness_alert(breaches, *, board: str, state: dict, emit) -> None:
+    """Emit a liveness alert only on transition INTO a new breach signature for
+    ``board``, so a sustained breach pages once rather than every tick.
+
+    ``state`` maps board → last-emitted breach signature (the sorted set of
+    breached dimensions). An empty breach set clears the board's entry so a
+    later recurrence re-pages; a changed set (a dimension joins/leaves) re-pages.
+    Pure — all delivery goes through ``emit`` so it is trivially testable.
+    """
+    signature = tuple(sorted(b.dimension for b in breaches))
+    if not signature:
+        state.pop(board, None)
+        return
+    if state.get(board) == signature:
+        return
+    state[board] = signature
+    emit(_format_liveness_alert(board, breaches))
+
+
 def _board_db_header_looks_like_sqlite(path: Path) -> bool | None:
     try:
         with path.open("rb") as fh:
@@ -5026,6 +5056,11 @@ class GatewayRunner:
         # exhausts recovery. No-op when the single-writer flag is off.
         asyncio.create_task(self._kanban_writer_watchdog())
 
+        # Board-liveness checker: page on a stalled board (oldest ready/blocked/
+        # stale-running past threshold, or a disabled subsystem). No-op when
+        # kanban.liveness_alerts is off.
+        asyncio.create_task(self._kanban_liveness_checker())
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -5561,6 +5596,129 @@ class GatewayRunner:
                 await asyncio.to_thread(self._writer_watchdog_tick)
             except Exception as exc:
                 logger.debug("kanban writer watchdog tick failed: %s", exc)
+            for _ in range(int(max(1, interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
+    # ---- Board-liveness SLO + stall alerts (WS6) -------------------------
+
+    def _liveness_alerts_enabled(self) -> bool:
+        try:
+            from hermes_cli.config import load_config as _load_config
+            cfg = _load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception:
+            return False
+        return bool(kanban_cfg.get("liveness_alerts", False))
+
+    _DEFAULT_LIVENESS_THRESHOLDS = {
+        "oldest_ready_age_seconds": 900,
+        "oldest_blocked_done_parents_age_seconds": 1800,
+        "oldest_stale_running_age_seconds": 5400,
+    }
+
+    def _liveness_thresholds(self) -> dict:
+        try:
+            from hermes_cli.config import load_config as _load_config
+            cfg = _load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception:
+            kanban_cfg = {}
+        thresholds = kanban_cfg.get("liveness_thresholds")
+        if not isinstance(thresholds, dict):
+            return dict(self._DEFAULT_LIVENESS_THRESHOLDS)
+        out = {}
+        for k, v in thresholds.items():
+            try:
+                out[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out or dict(self._DEFAULT_LIVENESS_THRESHOLDS)
+
+    def _emit_liveness_alert(self, alert: str) -> None:
+        """Deliver a board-liveness alert. High-severity log line is the
+        always-on sink; a richer ops/home-channel delivery can hook here."""
+        logger.error("kanban liveness: %s", alert)
+
+    def _liveness_subsystem_flags(self, slug: str, resolved_db_path: str):
+        """Best-effort current subsystem state for a board, folded into the
+        liveness snapshot: dispatcher/notifier disabled sets + writer-daemon
+        recovery exhaustion. Each guarded so a missing attr never breaks a tick."""
+        notifier_disabled = False
+        try:
+            disabled = getattr(self, "_kanban_notifier_disabled_db_paths", {}) or {}
+            notifier_disabled = resolved_db_path in disabled
+        except Exception:
+            pass
+        writer_disabled = False
+        try:
+            import hermes_cli.kanban_db as _kb
+            from hermes_cli import kanban_writer_daemon as _wd
+            if _kb.single_writer_enabled():
+                daemon = _wd.lookup_daemon(_kb.kanban_db_path(board=slug))
+                if daemon is not None:
+                    writer_disabled = bool(daemon.health().get("disabled"))
+        except Exception:
+            pass
+        return notifier_disabled, writer_disabled
+
+    def _run_liveness_check_once(self, state: dict) -> None:
+        """One liveness pass over every board: compute → evaluate → dedup-alert.
+        Reads are read-only; never raises (a checker that crashes is worse)."""
+        import hermes_cli.kanban_db as _kb
+        from hermes_cli import kanban_liveness as _liv
+        thresholds = self._liveness_thresholds()
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [{"slug": _kb.DEFAULT_BOARD, "db_path": None}]
+        seen: set[str] = set()
+        for b in boards:
+            slug = (b.get("slug") if isinstance(b, dict) else None) or _kb.DEFAULT_BOARD
+            try:
+                path = _kb.kanban_db_path(board=slug)
+            except Exception:
+                continue
+            key = str(path.resolve()) if hasattr(path, "resolve") else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not path.exists():
+                continue
+            try:
+                conn = _kb.connect(board=slug, readonly=True)
+            except Exception as exc:
+                logger.debug("kanban liveness: cannot open board %s: %s", slug, exc)
+                continue
+            try:
+                snap = _liv.compute_board_liveness(conn, now=int(time.time()))
+            except Exception as exc:
+                logger.debug("kanban liveness: compute failed for %s: %s", slug, exc)
+                continue
+            finally:
+                conn.close()
+            notifier_disabled, writer_disabled = self._liveness_subsystem_flags(slug, key)
+            snap.notifier_enabled = not notifier_disabled
+            snap.writer_daemon_disabled = writer_disabled
+            breaches = _liv.evaluate(snap, thresholds=thresholds)
+            _maybe_emit_liveness_alert(
+                breaches, board=slug, state=state, emit=self._emit_liveness_alert,
+            )
+
+    async def _kanban_liveness_checker(self, interval: float = 60.0) -> None:
+        """Background loop: each minute evaluate board liveness and page on a
+        newly-breached threshold (deduped). Gated on kanban.liveness_alerts;
+        no-op body when the flag is off."""
+        if not self._liveness_alerts_enabled():
+            return
+        state: dict = {}
+        await asyncio.sleep(interval)
+        while self._running:
+            try:
+                await asyncio.to_thread(self._run_liveness_check_once, state)
+            except Exception as exc:
+                logger.debug("kanban liveness checker tick failed: %s", exc)
             for _ in range(int(max(1, interval))):
                 if not self._running:
                     return

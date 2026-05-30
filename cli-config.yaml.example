@@ -1210,3 +1210,14 @@ kanban:
     - unblock
     - keep_blocked
     - keep_parked
+
+  # Board-liveness stall alerts (WS6). When on, the gateway evaluates each
+  # board once a minute and pages (deduped — once per breach window, re-arming
+  # after it clears) when any signal exceeds its threshold, or when a subsystem
+  # is down (dispatcher/notifier disabled, writer daemon recovery-exhausted).
+  # Inspect signals any time with `hermes kanban liveness --json`. Default off.
+  liveness_alerts: false
+  liveness_thresholds:
+    oldest_ready_age_seconds: 900                  # ready, undispatched 15m → alert
+    oldest_blocked_done_parents_age_seconds: 1800  # blocked but unblockable 30m → alert
+    oldest_stale_running_age_seconds: 5400         # running, no heartbeat 90m → alert
