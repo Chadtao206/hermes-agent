@@ -25,6 +25,12 @@ OP_ALLOWLIST = frozenset({
     # kanban_list (orchestrator, a remote client) promotes ready tasks before
     # listing; the write must cross the wire since its conn is read-only.
     "recompute_ready",
+    # Dashboard write endpoints (a remote client under single-writer). These are
+    # legitimate kanban mutations invoked from the local, auth-gated dashboard;
+    # routing them through the daemon keeps the single-writer invariant intact.
+    "unlink_tasks", "reclaim_task", "reassign_task", "assign_task",
+    "schedule_task", "archive_task", "add_notify_sub", "remove_notify_sub",
+    "remove_profile_event_sub",
 })
 
 

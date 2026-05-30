@@ -109,20 +109,36 @@ def test_readonly_conn_uses_snapshot_not_live_mode_ro(monkeypatch, tmp_path):
     assert closed == [True]
 
 
-def test_create_task_uses_writable_conn(monkeypatch):
-    calls: list[bool] = []
+def test_create_task_routes_write_through_write_session(monkeypatch):
+    """Under single-writer the create must go through write_session (the daemon),
+    not a direct writable connect; the read-back uses a read-only conn."""
+    ops: list[tuple] = []
+
+    class _W:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def create_task(self, **kwargs):
+            ops.append(("create_task", kwargs))
+            return "t_new"
+
+    monkeypatch.setattr(plugin_api.kanban_db, "write_session", lambda *a, **k: _W())
 
     def _recording_conn(*args, **kwargs):
-        calls.append(bool(kwargs.get("readonly", False)))
-        raise RuntimeError("stop")
+        # Stop at the read-back so the test needs no real DB.
+        raise RuntimeError("stop:readonly=%s" % kwargs.get("readonly"))
 
     monkeypatch.setattr(plugin_api, "_conn", _recording_conn)
 
     payload = plugin_api.CreateTaskBody(title="demo task")
-    with pytest.raises(RuntimeError, match="stop"):
+    with pytest.raises(RuntimeError, match="stop:readonly=True"):
         plugin_api.create_task(payload, board=None)
 
-    assert calls == [False]
+    assert ops and ops[0][0] == "create_task"
+    assert ops[0][1]["title"] == "demo task"
 
 
 def test_board_counts_uses_snapshot_reader(monkeypatch, tmp_path):
