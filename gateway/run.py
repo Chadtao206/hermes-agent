@@ -1853,7 +1853,7 @@ def _writer_auto_recovery_enabled() -> bool:
     return bool(kanban_cfg.get("writer_auto_recovery", False))
 
 
-def _resolve_kanban_backend_for_export():
+def _resolve_kanban_backend_for_export() -> tuple[str, Optional[str]]:
     """Return (backend, dsn|None) from the gateway's (root) config without
     raising. dsn is None for non-postgres backends or if resolution fails."""
     try:
@@ -1878,11 +1878,15 @@ def _export_kanban_backend_env() -> None:
     backend, dsn = _resolve_kanban_backend_for_export()
     if backend != "postgres":
         return
-    os.environ["HERMES_KANBAN_BACKEND"] = "postgres"
+    if not os.environ.get("HERMES_KANBAN_BACKEND"):
+        os.environ["HERMES_KANBAN_BACKEND"] = "postgres"
     if dsn and not os.environ.get("HERMES_KANBAN_PG_DSN"):
         os.environ["HERMES_KANBAN_PG_DSN"] = dsn
-    logger.info("kanban backend propagated to worker env: postgres "
-                "(DSN %s)", "present" if dsn else "MISSING")
+    if dsn:
+        logger.info("kanban backend propagated to worker env: postgres (DSN present)")
+    else:
+        logger.warning("kanban backend propagated to worker env: postgres but "
+                       "DSN MISSING — spawned workers cannot reach Postgres")
 
 
 def _board_write_error_is_corruption(error_msg: str) -> bool:
