@@ -345,6 +345,100 @@ def test_complete_with_verified_cards(store):
     assert child in (payload.get("verified_cards") or [])
 
 
+def test_reviewer_completion_uses_newest_parent_pr_head_across_parents(store):
+    parent_a = store.create_task(title="implementation A", assignee="engineer")
+    assert store.complete_task(
+        parent_a,
+        summary="Opened PR A.",
+        metadata={"pull_request_head_sha": "aaaaaaaa11111111"},
+    ) is True
+    parent_b = store.create_task(title="implementation B", assignee="engineer")
+    assert store.complete_task(
+        parent_b,
+        summary="Opened PR B.",
+        metadata={"pull_request_head_sha": "bbbbbbbb22222222"},
+    ) is True
+
+    sha_by_parent = {
+        parent_a: "aaaaaaaa11111111",
+        parent_b: "bbbbbbbb22222222",
+    }
+    first_parent, last_parent = sorted([parent_a, parent_b])
+
+    backend = type(store).__name__
+    if backend == "PostgresKanbanStore":
+        with store._pool.connection() as c, c.cursor() as cc:
+            cc.execute(
+                "UPDATE task_runs SET ended_at=%s WHERE board=%s AND task_id=%s",
+                (1000, store.board, first_parent),
+            )
+            cc.execute(
+                "UPDATE task_runs SET ended_at=%s WHERE board=%s AND task_id=%s",
+                (2000, store.board, last_parent),
+            )
+    elif backend == "SqliteKanbanStore":
+        from hermes_cli import kanban_db as kb
+        with kb.connect(readonly=False) as c:
+            c.execute(
+                "UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                (1000, first_parent),
+            )
+            c.execute(
+                "UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                (2000, last_parent),
+            )
+            c.commit()
+    else:
+        raise AssertionError(f"unexpected backend {backend}")
+
+    review = store.create_task(
+        title="final review",
+        assignee="reviewer",
+        parents=[parent_a, parent_b],
+    )
+    claimed = store.claim_task(review, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    run_id = store.get_task(review).current_run_id
+    assert run_id is not None
+
+    newest_sha = sha_by_parent[last_parent]
+    stale_sha = sha_by_parent[first_parent]
+
+    blocked = False
+    try:
+        store.complete_task(
+            review,
+            summary="Approved stale parent head.",
+            metadata={"reviewed_pr_head_sha": stale_sha},
+            expected_run_id=run_id,
+        )
+    except ValueError as exc:
+        blocked = "current parent PR head" in str(exc)
+    assert blocked, "expected stale reviewed_pr_head_sha to be rejected"
+
+    assert store.complete_task(
+        review,
+        summary="Approved newest parent head.",
+        metadata={"reviewed_pr_head_sha": newest_sha},
+        expected_run_id=run_id,
+    ) is True
+
+    task_after = store.get_task(review)
+    events = store.list_events(review)
+    gate_events = [e for e in events if e.kind == "completion_blocked_pr_head_gate"]
+    assert task_after is not None
+    assert task_after.status == "done"
+    assert len(gate_events) == 1
+
+    payload = gate_events[0].payload
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert isinstance(payload, dict)
+    assert payload["expected_pr_head_sha"] == newest_sha
+    assert payload["parent_task_id"] == last_parent
+    assert payload["reviewed_pr_head_sha"] == stale_sha
+
+
 def test_complete_closeout_packet_present(store):
     tid = store.create_task(title="x", assignee="engineer")
     claimed = store.claim_task(tid, claimer="w1")

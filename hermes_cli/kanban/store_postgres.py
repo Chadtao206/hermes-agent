@@ -951,31 +951,37 @@ class PostgresKanbanStore:
         self, task_id: str,
     ) -> Optional[tuple[str, str, Optional[int]]]:
         """Return ``(sha, parent_task_id, parent_run_id)`` from done parents."""
-        for parent_id in self.parent_ids(
-                task_id, relation_type=LINK_RELATION_DEPENDENCY):
-            with self._pool.connection() as conn, \
-                    conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT id, metadata FROM task_runs "
-                    "WHERE board=%s AND task_id=%s AND outcome='completed' "
-                    "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC",
-                    (self.board, parent_id))
-                rows = cur.fetchall()
-                for row in rows:
-                    # task_runs.metadata is JSONB — already a dict, no json.loads.
-                    sha = _extract_pr_head_sha(row["metadata"])
-                    if sha:
-                        return sha, parent_id, int(row["id"])
+        parents = self.parent_ids(task_id, relation_type=LINK_RELATION_DEPENDENCY)
+        if not parents:
+            return None
+
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, task_id, metadata FROM task_runs "
+                "WHERE board=%s AND task_id = ANY(%s) AND outcome='completed' "
+                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC",
+                (self.board, parents))
+            rows = cur.fetchall()
+            for row in rows:
+                # task_runs.metadata is JSONB — already a dict, no json.loads.
+                sha = _extract_pr_head_sha(row["metadata"])
+                if sha:
+                    return sha, row["task_id"], int(row["id"])
+
+        # Legacy/manual fallback: only honor explicit SHA-looking text.
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            for parent_id in parents:
                 cur.execute(
                     "SELECT result FROM tasks "
                     "WHERE board=%s AND id=%s AND status='done'",
                     (self.board, parent_id))
                 task_row = cur.fetchone()
-            # Legacy/manual fallback: only honor explicit SHA-looking text.
-            if task_row:
-                sha = _extract_pr_head_sha(task_row["result"])
-                if sha:
-                    return sha, parent_id, None
+                if task_row:
+                    sha = _extract_pr_head_sha(task_row["result"])
+                    if sha:
+                        return sha, parent_id, None
         return None
 
     def _pg_enforce_review_pr_head_gate(
