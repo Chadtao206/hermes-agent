@@ -6,11 +6,16 @@ Reads the source READ-ONLY; never mutates a source board DB.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
+from typing import Optional
+
+import psycopg
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban import pg_pool
 
 # Parent-first load order (PG has no FK constraints, so order is cosmetic).
 MIGRATED_TABLES: tuple[str, ...] = (
@@ -100,6 +105,176 @@ def reseq(conn) -> None:
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), "
                 f"(SELECT COUNT(*) FROM {table}) > 0)")
             cur.fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Integrity checks — each entry is (label, SQL counting BAD rows for :board).
+# The PG schema has NO FK constraints, so these orphan/dangling checks matter.
+# ---------------------------------------------------------------------------
+_INTEGRITY_CHECKS: tuple[tuple[str, str], ...] = (
+    ("orphan task_links.parent",
+     "SELECT COUNT(*) FROM task_links l WHERE l.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=l.board AND t.id=l.parent_id)"),
+    ("orphan task_links.child",
+     "SELECT COUNT(*) FROM task_links l WHERE l.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=l.board AND t.id=l.child_id)"),
+    ("orphan task_comments.task_id",
+     "SELECT COUNT(*) FROM task_comments x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.task_id)"),
+    ("orphan task_events.task_id",
+     "SELECT COUNT(*) FROM task_events x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.task_id)"),
+    ("orphan task_runs.task_id",
+     "SELECT COUNT(*) FROM task_runs x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.task_id)"),
+    ("orphan kanban_notify_subs.task_id",
+     "SELECT COUNT(*) FROM kanban_notify_subs x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.task_id)"),
+    ("orphan kanban_profile_event_subs.task_id",
+     "SELECT COUNT(*) FROM kanban_profile_event_subs x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.task_id)"),
+    ("orphan kanban_profile_wake_events.task_id",
+     "SELECT COUNT(*) FROM kanban_profile_wake_events x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.task_id)"),
+    ("orphan kanban_profile_event_claims.root_task_id",
+     "SELECT COUNT(*) FROM kanban_profile_event_claims x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.board=x.board AND t.id=x.root_task_id)"),
+    ("dangling task_events.run_id",
+     "SELECT COUNT(*) FROM task_events x WHERE x.board=%(b)s AND x.run_id IS NOT NULL "
+     "AND NOT EXISTS (SELECT 1 FROM task_runs r WHERE r.board=x.board AND r.id=x.run_id)"),
+    ("dangling tasks.current_run_id",
+     "SELECT COUNT(*) FROM tasks x WHERE x.board=%(b)s AND x.current_run_id IS NOT NULL "
+     "AND NOT EXISTS (SELECT 1 FROM task_runs r WHERE r.board=x.board AND r.id=x.current_run_id)"),
+    ("dangling kanban_profile_event_claims.event_id",
+     "SELECT COUNT(*) FROM kanban_profile_event_claims x WHERE x.board=%(b)s AND NOT EXISTS "
+     "(SELECT 1 FROM task_events e WHERE e.board=x.board AND e.id=x.event_id)"),
+)
+
+
+@dataclasses.dataclass
+class VerifyReport:
+    counts: dict = dataclasses.field(default_factory=dict)        # table -> (src, tgt)
+    count_mismatches: list = dataclasses.field(default_factory=list)
+    integrity_failures: list = dataclasses.field(default_factory=list)
+    idseq_failures: list = dataclasses.field(default_factory=list)
+    parity_mismatches: list = dataclasses.field(default_factory=list)
+    source_doctor_criticals: list = dataclasses.field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not (self.count_mismatches or self.integrity_failures
+                    or self.idseq_failures or self.parity_mismatches
+                    or self.source_doctor_criticals)
+
+    def render(self) -> str:
+        lines = [f"verify: {'OK' if self.ok else 'FAILED'}"]
+        for t, (s, g) in sorted(self.counts.items()):
+            mark = "" if s == g else "  <-- MISMATCH"
+            lines.append(f"  count {t:32} src={s:<7} tgt={g:<7}{mark}")
+        for grp, items in (("integrity", self.integrity_failures),
+                           ("id/seq", self.idseq_failures),
+                           ("parity", self.parity_mismatches),
+                           ("source-doctor", self.source_doctor_criticals)):
+            for it in items:
+                lines.append(f"  [{grp}] {it}")
+        return "\n".join(lines)
+
+
+def _check_counts(data, cur, board, report):
+    for table in MIGRATED_TABLES:
+        src = len(data.get(table, ([], []))[1])
+        tgt = cur.execute(f"SELECT COUNT(*) FROM {table} WHERE board=%s",
+                          (board,)).fetchone()[0]
+        report.counts[table] = (src, tgt)
+        if src != tgt:
+            report.count_mismatches.append(f"{table}: src={src} tgt={tgt}")
+
+
+def _check_integrity(cur, board, report):
+    for label, sql in _INTEGRITY_CHECKS:
+        bad = cur.execute(sql, {"b": board}).fetchone()[0]
+        if bad:
+            report.integrity_failures.append(f"{label}: {bad} bad row(s)")
+
+
+def _check_idseq(data, cur, board, report):
+    for table in IDENTITY_TABLES:
+        rows = data.get(table, ([], []))[1]
+        src_max = max((int(r["id"]) for r in rows), default=0)
+        # Board-scoped: the migrated board's ids must be preserved 1:1.
+        tgt_max = cur.execute(
+            f"SELECT COALESCE(MAX(id),0) FROM {table} WHERE board=%s",
+            (board,)).fetchone()[0]
+        if tgt_max != src_max:
+            report.idseq_failures.append(
+                f"{table}: board max(id) src={src_max} tgt={tgt_max}")
+        # The IDENTITY sequence is GLOBAL across boards: it must sit at the
+        # global max(id) so the next insert never collides.
+        global_max = cur.execute(
+            f"SELECT COALESCE(MAX(id),0) FROM {table}").fetchone()[0]
+        seq = cur.execute("SELECT pg_get_serial_sequence(%s, 'id')",
+                          (table,)).fetchone()[0]
+        last_value, is_called = cur.execute(
+            f"SELECT last_value, is_called FROM {seq}").fetchone()
+        if global_max > 0:
+            if not (is_called and last_value == global_max):
+                report.idseq_failures.append(
+                    f"{table}: sequence last_value={last_value} "
+                    f"is_called={is_called}, expected {global_max}/True")
+        elif is_called:
+            report.idseq_failures.append(
+                f"{table}: sequence is_called=True on an empty table")
+
+
+def _check_parity(data, dsn, schema, board, report, sample=None):
+    """Read a sample of tasks via both stores; assert get_task() equality.
+    Assumes a single board (the migration guard enforces this), so the
+    unscoped list_tasks() on each store reflects only this board."""
+    from hermes_cli.kanban.store_sqlite import SqliteKanbanStore
+    from hermes_cli.kanban.store_postgres import PostgresKanbanStore
+    task_ids = [r["id"] for r in data.get("tasks", ([], []))[1]]
+    if sample is not None:
+        task_ids = task_ids[:sample]
+    sq = SqliteKanbanStore(board=board)
+    pool = pg_pool.make_pool(dsn, search_path=f"{schema},public")
+    try:
+        pg = PostgresKanbanStore(board=board, pool=pool)
+        sl = sq.list_tasks()
+        pl = pg.list_tasks()
+        if len(sl) != len(pl):
+            report.parity_mismatches.append(
+                f"list_tasks length src={len(sl)} tgt={len(pl)}")
+        for tid in task_ids:
+            a, b = sq.get_task(tid), pg.get_task(tid)
+            if a != b:
+                report.parity_mismatches.append(f"get_task({tid}) differs")
+    finally:
+        sq.close()
+        pool.close()
+
+
+def verify(data, dsn: str, schema: str, board: str, *,
+           sqlite_path: Optional[Path] = None, sample=None,
+           check_parity: bool = True) -> VerifyReport:
+    """Full verification stack. `data` is the read_source() snapshot of the
+    source; the target is `schema` in `dsn`. `check_parity` reads the source
+    board through SqliteKanbanStore; disable it for SQL-only unit tests that
+    have no matching on-disk source."""
+    report = VerifyReport()
+    if sqlite_path is not None:
+        from hermes_cli import kanban_board_doctor as kdoc
+        doc = kdoc.run_board_doctor(board=board)
+        report.source_doctor_criticals = [
+            i for i in doc.get("issues", []) if i.get("severity") == "critical"]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f'SET search_path TO "{schema}", public')
+        with c.cursor() as cur:
+            _check_counts(data, cur, board, report)
+            _check_integrity(cur, board, report)
+            _check_idseq(data, cur, board, report)
+    if check_parity:
+        _check_parity(data, dsn, schema, board, report, sample=sample)
+    return report
 
 
 def read_source(sqlite_path: Path) -> dict[str, tuple[list[str], list[dict]]]:
