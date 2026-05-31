@@ -104,7 +104,8 @@ class SqliteKanbanStore:
             conn.close()
 
     def dispatch_plan(self, *, resolve_workspace=None, profile_exists=None,
-                      terminate_fn=None, signal_fn=None, pid_alive_fn=None, **cfg):
+                      terminate_fn=None, signal_fn=None, pid_alive_fn=None,
+                      classify_exit_fn=None, **cfg):
         """One dispatcher tick: reclaim + ready-scan + claim + workspace-resolve,
         WITHOUT spawning. Reuses the UNTOUCHED ``kanban_db.dispatch_once`` via a
         capturing ``spawn_fn`` that records each claimed task instead of spawning.
@@ -124,9 +125,9 @@ class SqliteKanbanStore:
         .profile_exists`` it already imports. Tests monkeypatch those for the
         sqlite path; the injected callbacks are honored by the PG backend.
         """
-        # terminate_fn / signal_fn / pid_alive_fn: accepted for KanbanStore
-        # Protocol conformance but NOT forwarded — kanban_db.dispatch_once owns
-        # its own host-local kill ladder + reap internally.
+        # terminate_fn / signal_fn / pid_alive_fn / classify_exit_fn: accepted
+        # for KanbanStore Protocol conformance but NOT forwarded — kanban_db
+        # .dispatch_once owns its own host-local kill ladder + reap internally.
         from hermes_cli.kanban.store import DispatchPlan
 
         captured: list = []

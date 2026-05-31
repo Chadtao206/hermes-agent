@@ -43,3 +43,32 @@ def test_enforce_max_runtime_calls_terminate_fn(pg_store):
     assert calls == [(4242, "host-A:123")]
     assert pg_store.get_task(tid).status == "ready"
     assert "timed_out" in [e.kind for e in pg_store.list_events(tid)]
+
+
+def test_crash_clean_exit_is_protocol_violation(pg_store):
+    tid = _running_with_pid(pg_store)
+    pg_store._pg_detect_crashed_workers(
+        pid_alive_fn=lambda pid: False,
+        classify_exit_fn=lambda pid: ("clean_exit", 0))
+    t = pg_store.get_task(tid)
+    assert t.status == "blocked"   # rc=0 protocol violation caps the breaker
+    kinds = [e.kind for e in pg_store.list_events(tid)]
+    assert "protocol_violation" in kinds and "gave_up" in kinds
+    import json as _json
+    def _payload(ev):
+        return ev.payload if isinstance(ev.payload, dict) else _json.loads(ev.payload)
+    events = pg_store.list_events(tid)
+    pv = [e for e in events if e.kind == "protocol_violation"][-1]
+    assert _payload(pv).get("failure_class") == "protocol_violation_clean_exit"
+    gu = [e for e in events if e.kind == "gave_up"][-1]
+    assert _payload(gu).get("failure_class") == "protocol_violation_clean_exit"
+
+
+def test_crash_signaled_is_retryable(pg_store):
+    tid = _running_with_pid(pg_store)
+    pg_store._pg_detect_crashed_workers(
+        pid_alive_fn=lambda pid: False,
+        classify_exit_fn=lambda pid: ("signaled", 9))
+    t = pg_store.get_task(tid)
+    assert t.status == "ready"     # genuine crash -> retry
+    assert "crashed" in [e.kind for e in pg_store.list_events(tid)]

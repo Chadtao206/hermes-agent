@@ -120,6 +120,7 @@ class KanbanStore(Protocol):
         terminate_fn=None,
         signal_fn=None,
         pid_alive_fn=None,
+        classify_exit_fn=None,
     ) -> "DispatchPlan": ...
 
     def record_spawn_success(self, task_id: str, pid: int) -> None: ...

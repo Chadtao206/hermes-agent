@@ -94,6 +94,7 @@ def run_dispatch_tick(
     terminate_fn=None,
     signal_fn=None,
     pid_alive_fn=None,
+    classify_exit_fn=None,
 ) -> dict:
     """One backend-agnostic dispatch tick for ONE board's ``store``.
 
@@ -133,6 +134,10 @@ def run_dispatch_tick(
             ``pid_alive_fn``. The full SIGTERM->SIGKILL kill ladder is a tracked
             phase-3-tail on the PG store; SQLite's ``dispatch_once`` runs its own
             ladder internally.)
+        classify_exit_fn: ``classify_exit_fn(pid) -> (kind, code)`` injected
+            exit-classification callback forwarded to ``store.dispatch_plan``.
+            B1 wires the gateway's real ``_kb._classify_worker_exit``. When None
+            all dead workers are treated as genuine crashes (retry path).
         Remaining args are dispatch config forwarded to ``store.dispatch_plan``.
     """
     plan = store.dispatch_plan(
@@ -141,6 +146,7 @@ def run_dispatch_tick(
         terminate_fn=terminate_fn,
         signal_fn=signal_fn,
         pid_alive_fn=pid_alive_fn,
+        classify_exit_fn=classify_exit_fn,
         max_spawn=max_spawn,
         max_in_progress=max_in_progress,
         failure_limit=failure_limit,
