@@ -787,6 +787,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
+
+    Note: ``heartbeat_claim`` (claim-TTL extension) is the SQLITE path only;
+    under postgres, only ``last_heartbeat_at`` is refreshed here — claim
+    extension is handled dispatcher-side by ``_pg_release_stale_claims``'
+    live-pid extension logic.
     """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
@@ -800,6 +805,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         from hermes_cli.kanban.store import resolve_backend
+        ok = False
         if resolve_backend() == "postgres":
             # PG: refresh last_heartbeat_at via the store; claim-TTL extension
             # is dispatcher-side (live-pid extension in _pg_release_stale_claims).
