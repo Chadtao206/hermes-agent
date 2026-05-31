@@ -350,6 +350,36 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     }
 
 
+def _task_summary_dict_store(store, task) -> dict[str, Any]:
+    """Compact task shape for board-listing tools (backend-agnostic via store)."""
+    from hermes_cli.kanban_db import LINK_RELATION_ROLLUP
+    parents = store.parent_ids(task.id)
+    children = store.child_ids(task.id)
+    rollup_children = store.child_ids(task.id, relation_type=LINK_RELATION_ROLLUP)
+    return {
+        "id": task.id,
+        "title": task.title,
+        "assignee": task.assignee,
+        "status": task.status,
+        "priority": task.priority,
+        "tenant": task.tenant,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "created_by": task.created_by,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+        "current_run_id": task.current_run_id,
+        "model_override": task.model_override,
+        "parents": parents,
+        "children": children,
+        "rollup_children": rollup_children,
+        "parent_count": len(parents),
+        "child_count": len(children),
+        "rollup_child_count": len(rollup_children),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -364,46 +394,35 @@ def _handle_show(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        # Multi-read aggregation: one shared snapshot conn for consistency +
-        # to avoid N snapshot copies (the store opens a fresh conn per call).
-        _kb, conn = _connect(board=board)
-        try:
-            task = _kb.get_task(conn, tid)
-            if task is None:
-                return tool_error(f"task {tid} not found")
-            comments = _kb.list_comments(conn, tid)
-            events = _kb.list_events(conn, tid)
-            runs = _kb.list_runs(conn, tid)
-            parents = _kb.parent_ids(conn, tid)
-            children = _kb.child_ids(conn, tid)
-            rollup_parents = _kb.parent_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
-            rollup_children = _kb.child_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP)
-            worker_context = _kb.build_worker_context(conn, tid)
+        from hermes_cli.kanban.store import resolve_backend
+        from hermes_cli.kanban_db import LINK_RELATION_ROLLUP
 
-            def _task_dict(t):
-                return {
-                    "id": t.id, "title": t.title, "body": t.body,
-                    "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
-                    "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
-                    "created_by": t.created_by, "created_at": t.created_at,
-                    "started_at": t.started_at,
-                    "completed_at": t.completed_at,
-                    "result": t.result,
-                    "current_run_id": t.current_run_id,
-                    "model_override": t.model_override,
-                }
+        def _task_dict(t):
+            return {
+                "id": t.id, "title": t.title, "body": t.body,
+                "assignee": t.assignee, "status": t.status,
+                "tenant": t.tenant, "priority": t.priority,
+                "workspace_kind": t.workspace_kind,
+                "workspace_path": t.workspace_path,
+                "created_by": t.created_by, "created_at": t.created_at,
+                "started_at": t.started_at,
+                "completed_at": t.completed_at,
+                "result": t.result,
+                "current_run_id": t.current_run_id,
+                "model_override": t.model_override,
+            }
 
-            def _run_dict(r):
-                return {
-                    "id": r.id, "profile": r.profile,
-                    "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
-                    "started_at": r.started_at, "ended_at": r.ended_at,
-                }
+        def _run_dict(r):
+            return {
+                "id": r.id, "profile": r.profile,
+                "status": r.status, "outcome": r.outcome,
+                "summary": r.summary, "error": r.error,
+                "metadata": r.metadata,
+                "started_at": r.started_at, "ended_at": r.ended_at,
+            }
 
+        def _payload(task, comments, events, runs, parents, children,
+                     rollup_parents, rollup_children, worker_context):
             return json.dumps({
                 "task": _task_dict(task),
                 "parents": parents,
@@ -427,6 +446,46 @@ def _handle_show(args: dict, **kw) -> str:
                 # dispatcher at spawn time.
                 "worker_context": worker_context,
             })
+
+        if resolve_backend() == "postgres":
+            store = _store(board=board)
+            try:
+                task = store.get_task(tid)
+                if task is None:
+                    return tool_error(f"task {tid} not found")
+                return _payload(
+                    task,
+                    store.list_comments(tid),
+                    store.list_events(tid),
+                    store.list_runs(tid),
+                    store.parent_ids(tid),
+                    store.child_ids(tid),
+                    store.parent_ids(tid, relation_type=LINK_RELATION_ROLLUP),
+                    store.child_ids(tid, relation_type=LINK_RELATION_ROLLUP),
+                    store.build_worker_context(tid),
+                )
+            finally:
+                store.close()
+
+        # sqlite — Multi-read aggregation: one shared snapshot conn for
+        # consistency + to avoid N snapshot copies (the store opens a fresh
+        # conn per call). Byte-identical to the original implementation.
+        _kb, conn = _connect(board=board)
+        try:
+            task = _kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            return _payload(
+                task,
+                _kb.list_comments(conn, tid),
+                _kb.list_events(conn, tid),
+                _kb.list_runs(conn, tid),
+                _kb.parent_ids(conn, tid),
+                _kb.child_ids(conn, tid),
+                _kb.parent_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP),
+                _kb.child_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP),
+                _kb.build_worker_context(conn, tid),
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -462,6 +521,7 @@ def _handle_list(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban.store import resolve_backend
         rows = []
         store = _store(board=board)
         try:
@@ -479,12 +539,29 @@ def _handle_list(args: dict, **kw) -> str:
                 include_archived=include_archived,
                 limit=limit + 1,
             )
+            truncated = len(rows) > limit
+            tasks = rows[:limit]
+
+            if resolve_backend() == "postgres":
+                # Under postgres the store is already open — build summary
+                # dicts while the store connection is live, then close.
+                return json.dumps({
+                    "tasks": [_task_summary_dict_store(store, t) for t in tasks],
+                    "count": len(tasks),
+                    "limit": limit,
+                    "truncated": truncated,
+                    "next_limit": (
+                        min(limit * 2, KANBAN_LIST_MAX_LIMIT)
+                        if truncated and limit < KANBAN_LIST_MAX_LIMIT else None
+                    ),
+                    "promoted": promoted,
+                })
         finally:
             store.close()
-        truncated = len(rows) > limit
-        tasks = rows[:limit]
-        # _task_summary_dict uses relation_type (rollup), which is not a store
-        # method; open a short-lived read connection for the summary dicts only.
+
+        # sqlite — _task_summary_dict uses relation_type (rollup), which is
+        # not a store method; open a short-lived read connection for the
+        # summary dicts only. Byte-identical to the original implementation.
         _, conn = _connect(board=board)
         try:
             return json.dumps({
