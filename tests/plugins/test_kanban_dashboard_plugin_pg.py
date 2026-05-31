@@ -175,3 +175,46 @@ def test_get_task_pool_failure_503_no_dsn_leak(pg_client, monkeypatch):
     assert r.status_code == 503, r.text
     assert "SUPERSECRET" not in r.text
     assert fake_dsn not in r.text
+
+
+def test_writes_land_in_postgres(pg_client):
+    s = pg_client.pg_store
+    r = pg_client.post("/api/plugins/kanban/tasks", json={"title": "made in dashboard", "assignee": "engineer"})
+    assert r.status_code == 200
+    tid = r.json()["task"]["id"]
+    assert s.get_task(tid) is not None
+    r = pg_client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"title": "renamed", "priority": 5})
+    assert r.status_code == 200
+    assert s.get_task(tid).title == "renamed"
+    assert s.get_task(tid).priority == 5
+    r = pg_client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [tid], "archive": True})
+    assert r.status_code == 200
+    assert r.json()["results"][0]["ok"] is True
+    assert s.get_task(tid).status == "archived"
+
+
+def test_create_with_parents_links_in_pg(pg_client):
+    s = pg_client.pg_store
+    parent = s.create_task(title="P", assignee="engineer")
+    r = pg_client.post("/api/plugins/kanban/tasks",
+                       json={"title": "child", "assignee": "reviewer", "parents": [parent]})
+    assert r.status_code == 200
+    child = r.json()["task"]["id"]
+    # the link landed in PG
+    assert parent in s.parent_ids(child)
+
+
+def test_reconcile_graceful_noop_pg(pg_client):
+    r = pg_client.get("/api/plugins/kanban/reconcile")
+    assert r.status_code == 200
+    body = r.json()
+    assert (body.get("actions") in ([], None)) or (body.get("total_actions", 0) == 0)
+    assert "postgres" in (str(body.get("text_preview", "")) + str(body.get("note", ""))).lower()
+
+
+def test_boards_counts_pg(pg_client):
+    s = pg_client.pg_store
+    s.create_task(title="x", assignee="engineer")
+    body = pg_client.get("/api/plugins/kanban/boards").json()
+    default = next((b for b in body["boards"] if b["slug"] == "default"), None)
+    assert default is not None and default["total"] >= 1

@@ -746,6 +746,35 @@ def get_reconcile_health(
 ):
     """Return deterministic reconcile actions for dashboard/control-plane views."""
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        # Reconcile reads a sqlite snapshot directly (kanban_reconciler is not
+        # backend-aware). Under Postgres there is no on-disk board DB to snapshot,
+        # so serve a graceful no-op that mirrors run_reconciler's top-level keys
+        # (set to empty/zero) plus a note so the dashboard/CLI don't KeyError or
+        # show a stale/error preview.
+        note = "reconcile is not yet available on the postgres backend"
+        return {
+            "ok": True,
+            "board": _pg_reads().slug(board),
+            "db_path": None,
+            "actions": [],
+            "total_actions": 0,
+            "wake_triage": {
+                "mode": "auto_silent",
+                "wake_agent": False,
+                "reason": note,
+                "total_actions": 0,
+                "decision_packet_count": 0,
+                "decision_packets": [],
+                "summary": {},
+                "buckets": {},
+                "suppressed_decision_packet_count": 0,
+            },
+            "as_of": int(time.time()),
+            "mutation_applied": False,
+            "note": note,
+            "text_preview": note,
+        }
     result = kanban_reconciler.run_reconciler(
         board=board,
         ready_age_seconds=max(1, int(ready_age_seconds or 900)),
@@ -1285,6 +1314,41 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        pg = _pg_reads()
+        bslug = pg.slug(board)
+        store = None
+        try:
+            store = _store(board=bslug)
+            try:
+                task_id = store.create_task(
+                    title=payload.title, body=payload.body, assignee=payload.assignee,
+                    created_by="dashboard", workspace_kind=payload.workspace_kind,
+                    workspace_path=payload.workspace_path, tenant=payload.tenant,
+                    priority=payload.priority, parents=payload.parents,
+                    triage=payload.triage, idempotency_key=payload.idempotency_key,
+                    max_runtime_seconds=payload.max_runtime_seconds, skills=payload.skills,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            task = store.get_task(task_id)
+            body_out: dict[str, Any] = {"task": _task_dict(task) if task else None}
+            if task and task.status == "ready" and task.assignee:
+                try:
+                    from hermes_cli.kanban import _check_dispatcher_presence
+                    running, message = _check_dispatcher_presence()
+                    if not running and message:
+                        body_out["warning"] = message
+                except Exception:
+                    pass
+            return body_out
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
+        finally:
+            if store is not None:
+                store.close()
     # Single-writer: the mutation routes through the daemon; the read-back uses
     # a separate read-only (snapshot) connection.
     try:
@@ -1367,6 +1431,62 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         "done", "blocked", "scheduled", "ready", "archived", "todo", "triage",
     }:
         raise HTTPException(status_code=400, detail=f"unknown status: {payload.status}")
+
+    if _backend() == "postgres":
+        pg = _pg_reads()
+        bslug = pg.slug(board)
+        store = None
+        try:
+            store = _store(board=bslug)
+            if store.get_task(task_id) is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+            def _read_status_pg():
+                t = store.get_task(task_id)
+                return t.status if t else None
+
+            if payload.assignee is not None:
+                try:
+                    ok = store.assign_task(task_id=task_id, profile=payload.assignee or None)
+                except RuntimeError as e:
+                    raise HTTPException(status_code=409, detail=str(e))
+                if not ok:
+                    raise HTTPException(status_code=404, detail="task not found")
+            if payload.status is not None:
+                s = payload.status
+                if s == "done":
+                    ok = store.complete_task(task_id=task_id, result=payload.result, summary=payload.summary, metadata=payload.metadata)
+                elif s == "blocked":
+                    ok = store.block_task(task_id=task_id, reason=payload.block_reason)
+                elif s == "scheduled":
+                    ok = store.schedule_task(task_id=task_id, reason=payload.block_reason)
+                elif s == "ready":
+                    ok = (store.unblock_task(task_id=task_id) if _read_status_pg() in ("blocked", "scheduled")
+                          else store.set_status_direct(task_id=task_id, new_status="ready"))
+                elif s == "archived":
+                    ok = store.archive_task(task_id=task_id)
+                else:  # todo / triage
+                    ok = store.set_status_direct(task_id=task_id, new_status=s)
+                if not ok:
+                    if s == "ready":
+                        blockers = pg.parents_blocking_ready(bslug, task_id)
+                        if blockers:
+                            names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
+                            raise HTTPException(status_code=409, detail=f"Cannot move to 'ready': blocked by parent(s) not done — {names}")
+                    raise HTTPException(status_code=409, detail=f"status transition to {s!r} not valid from current state")
+            if payload.priority is not None:
+                store.set_task_priority(task_id=task_id, priority=int(payload.priority))
+            if payload.title is not None or payload.body is not None:
+                store.edit_task_fields(task_id=task_id, title=payload.title, body=payload.body)
+            updated = store.get_task(task_id)
+            return {"task": _task_dict(updated) if updated else None}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
+        finally:
+            if store is not None:
+                store.close()
 
     # Existence check on a read-only connection.
     rconn = _conn(board=board, readonly=True)
@@ -1603,6 +1723,71 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        pg = _pg_reads()
+        bslug = pg.slug(board)
+        store = None
+        try:
+            store = _store(board=bslug)
+            for tid in ids:
+                entry: dict[str, Any] = {"id": tid, "ok": True}
+                try:
+                    task = store.get_task(tid)
+                    if task is None:
+                        entry.update(ok=False, error="not found")
+                        results.append(entry)
+                        continue
+                    if payload.archive:
+                        if not store.archive_task(task_id=tid):
+                            entry.update(ok=False, error="archive refused")
+                    if payload.status is not None and not payload.archive:
+                        s = payload.status
+                        if s == "done":
+                            ok = store.complete_task(task_id=tid, result=payload.result, summary=payload.summary, metadata=payload.metadata)
+                        elif s == "blocked":
+                            ok = store.block_task(task_id=tid)
+                        elif s == "ready":
+                            cur = store.get_task(tid)
+                            ok = (store.unblock_task(task_id=tid) if cur and cur.status in ("blocked", "scheduled")
+                                  else store.set_status_direct(task_id=tid, new_status="ready"))
+                        elif s == "running":
+                            entry.update(ok=False, error=("Cannot set status to 'running' directly; use the dispatcher/claim path"))
+                            results.append(entry)
+                            continue
+                        elif s == "scheduled":
+                            ok = store.schedule_task(task_id=tid)
+                        elif s in {"todo", "triage"}:
+                            ok = store.set_status_direct(task_id=tid, new_status=s)
+                        else:
+                            entry.update(ok=False, error=f"unknown status {s!r}")
+                            results.append(entry)
+                            continue
+                        if not ok:
+                            entry.update(ok=False, error=f"transition to {s!r} refused")
+                    if payload.assignee is not None:
+                        try:
+                            ok = (store.reassign_task(task_id=tid, profile=payload.assignee or None, reclaim_first=True)
+                                  if payload.reclaim_first
+                                  else store.assign_task(task_id=tid, profile=payload.assignee or None))
+                            if not ok:
+                                entry.update(ok=False, error="assign refused")
+                        except RuntimeError as e:
+                            entry.update(ok=False, error=str(e))
+                    if payload.priority is not None:
+                        store.set_task_priority(task_id=tid, priority=int(payload.priority))
+                except Exception as e:  # defensive — one bad id shouldn't kill the batch
+                    entry.update(ok=False, error=str(e))
+                results.append(entry)
+            return {"results": results}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # Only a store-acquisition/catastrophic failure reaches here; per-id
+            # errors are captured into entry["error"] by the inner try above.
+            _raise_pg_read_unavailable(exc, board)
+        finally:
+            if store is not None:
+                store.close()
     # Reads off a read-only snapshot; every mutation through the single-writer
     # daemon. Distinct ids are independent, so reading each id's pre-batch state
     # from one snapshot is correct.
@@ -2819,6 +3004,17 @@ class RenameBoardBody(BaseModel):
 
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
+    if _backend() == "postgres":
+        # /boards enumerates on-disk board dirs (sqlite life-support); under PG,
+        # only the active/default board's counts are authoritative in Postgres.
+        # Other listed boards (if any) return empty rather than reading sqlite.
+        try:
+            pg = _pg_reads()
+            if slug == pg.slug(None):
+                return pg.board_counts(slug)
+            return {}
+        except Exception:
+            return {}
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
