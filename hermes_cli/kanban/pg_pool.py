@@ -42,13 +42,25 @@ def resolve_dsn() -> str:
     return dsn
 
 
-def make_pool(dsn: str, *, min_size: int = 1, max_size: int = 8) -> ConnectionPool:
+def make_pool(dsn: str, *, min_size: int = 1, max_size: int = 8,
+              search_path: Optional[str] = None) -> ConnectionPool:
     """Create a bounded psycopg ConnectionPool. autocommit=True: each store op
-    manages its own transaction explicitly via `with conn.transaction():`."""
+    manages its own transaction explicitly via `with conn.transaction():`.
+    `search_path`, when given, pins every connection's schema search path
+    (used by the migrator's dry-run parity read). Must not contain spaces
+    (libpq splits options on whitespace); use the "schema,public" form."""
+    kwargs: dict = {"autocommit": True}
+    if search_path is not None:
+        kwargs["options"] = f"-c search_path={search_path}"
     return ConnectionPool(
         conninfo=dsn, min_size=min_size, max_size=max_size,
-        kwargs={"autocommit": True}, open=True,
+        kwargs=kwargs, open=True,
     )
+
+
+def read_schema_ddl() -> str:
+    """Return the kanban Postgres DDL text (pg_schema.sql)."""
+    return _SCHEMA_PATH.read_text()
 
 
 def get_pool(dsn: Optional[str] = None) -> ConnectionPool:
