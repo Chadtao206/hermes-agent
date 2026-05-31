@@ -48,8 +48,14 @@ def make_pool(dsn: str, *, min_size: int = 1, max_size: int = 8,
     manages its own transaction explicitly via `with conn.transaction():`.
     `search_path`, when given, pins every connection's schema search path
     (used by the migrator's dry-run parity read). Must not contain spaces
-    (libpq splits options on whitespace); use the "schema,public" form."""
-    kwargs: dict = {"autocommit": True}
+    (libpq splits options on whitespace); use the "schema,public" form.
+
+    `prepare_threshold=None` disables psycopg's server-side prepared statements:
+    Supabase's transaction pooler (Supavisor) does not pin a backend across
+    transactions, so auto-prepared statements collide (`prepared statement
+    "_pg3_N" already exists`). Disabling them is the supported pattern for
+    transaction-mode pooling."""
+    kwargs: dict = {"autocommit": True, "prepare_threshold": None}
     if search_path is not None:
         kwargs["options"] = f"-c search_path={search_path}"
     return ConnectionPool(

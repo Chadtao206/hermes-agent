@@ -331,7 +331,7 @@ def verify(data, dsn: str, schema: str, board: str, *,
         doc = kdoc.run_board_doctor(board=board)
         report.source_doctor_criticals = [
             i for i in doc.get("issues", []) if i.get("severity") == "critical"]
-    with psycopg.connect(dsn, autocommit=True) as c:
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as c:
         c.execute(f'SET search_path TO "{schema}", public')
         with c.cursor() as cur:
             _check_counts(data, cur, board, report)
@@ -358,7 +358,7 @@ def dry_run(dsn: str, board: str, *, sqlite_path: Path):
     """Load into a throwaway schema, verify, then drop it. Returns (report, schema)."""
     data = read_source(sqlite_path)
     schema = _dryrun_schema_name(board, sqlite_path)
-    with psycopg.connect(dsn, autocommit=True) as c:
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as c:
         c.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         _apply_schema(c, schema)
         load(c, board, data)
@@ -366,7 +366,7 @@ def dry_run(dsn: str, board: str, *, sqlite_path: Path):
     try:
         report = verify(data, dsn, schema, board, sqlite_path=sqlite_path)
     finally:
-        with psycopg.connect(dsn, autocommit=True) as c:
+        with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as c:
             c.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
     return report, schema
 
@@ -376,7 +376,7 @@ def execute(dsn: str, board: str, *, sqlite_path: Path, force: bool = False,
     """Load into the target schema with an all-or-nothing transaction and a
     refuse-unless-force guard. Returns the VerifyReport."""
     data = read_source(sqlite_path)
-    with psycopg.connect(dsn, autocommit=True) as c:
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as c:
         _apply_schema(c, target_schema)
         existing = c.execute(
             "SELECT COUNT(*) FROM tasks WHERE board=%s", (board,)).fetchone()[0]
@@ -384,7 +384,7 @@ def execute(dsn: str, board: str, *, sqlite_path: Path, force: bool = False,
             raise MigrationError(
                 f"target schema {target_schema!r} already has {existing} task(s) "
                 f"for board {board!r}; pass force=True/--force to overwrite.")
-    with psycopg.connect(dsn, autocommit=False) as c:
+    with psycopg.connect(dsn, autocommit=False, prepare_threshold=None) as c:
         c.execute(f'SET search_path TO "{target_schema}"')
         if force:
             with c.cursor() as cur:
