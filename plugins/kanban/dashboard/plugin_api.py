@@ -247,6 +247,37 @@ def _store(board: Optional[str] = None):
     return kanban_store(board=board)
 
 
+def _pg_reads():
+    """Lazily load the sibling pg_reads.py by path.
+
+    plugin_api.py is loaded via spec_from_file_location (no package context)
+    and plugins/kanban/dashboard is not a package, so a normal package import
+    of pg_reads is unavailable. Load it the same way, cached in sys.modules.
+    """
+    import importlib.util
+    import os
+    import sys
+    name = "hermes_dashboard_plugin_kanban_pg_reads"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pg_reads.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _backend() -> str:
+    """resolve_backend() with a defensive sqlite fallback (never raises)."""
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        return resolve_backend()
+    except Exception:
+        return "sqlite"
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
