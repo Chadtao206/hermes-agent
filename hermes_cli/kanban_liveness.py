@@ -86,6 +86,44 @@ def compute_board_liveness(conn, *, now: int) -> Liveness:
     )
 
 
+def _scalar_pg(cur, sql: str, params) -> int:
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    if not row:
+        return 0
+    val = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+    return int(val) if val is not None else 0
+
+
+def compute_board_liveness_pg(cur, board: str, *, now: int) -> Liveness:
+    """Postgres equivalent of compute_board_liveness: same three invariants,
+    board-scoped, over a psycopg cursor. Mirrors the sqlite query logic."""
+    oldest_ready = _scalar_pg(
+        cur,
+        "SELECT MAX(%s - created_at) FROM tasks WHERE board=%s AND status='ready'",
+        (now, board))
+    oldest_blocked = _scalar_pg(
+        cur,
+        "SELECT MAX(%s - t.created_at) FROM tasks t "
+        "WHERE t.board=%s AND t.status='blocked' "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM task_links l JOIN tasks p "
+        "    ON p.board=l.board AND p.id=l.parent_id "
+        "  WHERE l.board=t.board AND l.child_id=t.id "
+        "    AND l.relation_type='dependency' "
+        "    AND p.status NOT IN ('done','archived'))",
+        (now, board))
+    oldest_stale_running = _scalar_pg(
+        cur,
+        "SELECT MAX(%s - COALESCE(last_heartbeat_at, started_at, created_at)) "
+        "FROM tasks WHERE board=%s AND status='running'",
+        (now, board))
+    return Liveness(
+        oldest_ready_age_seconds=max(0, oldest_ready),
+        oldest_blocked_done_parents_age_seconds=max(0, oldest_blocked),
+        oldest_stale_running_age_seconds=max(0, oldest_stale_running))
+
+
 def evaluate(snap: Liveness, *, thresholds: dict[str, int]) -> list[Breach]:
     """Return the threshold breaches in ``snap``.
 
