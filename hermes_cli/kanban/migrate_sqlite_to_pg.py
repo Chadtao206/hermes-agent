@@ -277,6 +277,61 @@ def verify(data, dsn: str, schema: str, board: str, *,
     return report
 
 
+def _dryrun_schema_name(board: str, sqlite_path: Path) -> str:
+    # Deterministic (no wall clock): board + source mtime -> stable across re-runs.
+    mtime = int(sqlite_path.stat().st_mtime)
+    return f"kanban_dryrun_{board}_{mtime}"[:60].replace("-", "_")
+
+
+def _apply_schema(conn, schema: str) -> None:
+    conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+    conn.execute(f'SET search_path TO "{schema}"')
+    conn.execute(pg_pool.read_schema_ddl())
+
+
+def dry_run(dsn: str, board: str, *, sqlite_path: Path):
+    """Load into a throwaway schema, verify, then drop it. Returns (report, schema)."""
+    data = read_source(sqlite_path)
+    schema = _dryrun_schema_name(board, sqlite_path)
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        _apply_schema(c, schema)
+        load(c, board, data)
+        reseq(c)
+    try:
+        report = verify(data, dsn, schema, board, sqlite_path=sqlite_path)
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    return report, schema
+
+
+def execute(dsn: str, board: str, *, sqlite_path: Path, force: bool = False,
+            target_schema: str = "public"):
+    """Load into the target schema with an all-or-nothing transaction and a
+    refuse-unless-force guard. Returns the VerifyReport."""
+    data = read_source(sqlite_path)
+    with psycopg.connect(dsn, autocommit=True) as c:
+        _apply_schema(c, target_schema)
+        existing = c.execute(
+            "SELECT COUNT(*) FROM tasks WHERE board=%s", (board,)).fetchone()[0]
+        if existing and not force:
+            raise MigrationError(
+                f"target schema {target_schema!r} already has {existing} task(s) "
+                f"for board {board!r}; pass force=True/--force to overwrite.")
+    with psycopg.connect(dsn, autocommit=False) as c:
+        c.execute(f'SET search_path TO "{target_schema}"')
+        if force:
+            with c.cursor() as cur:
+                for table in DELETE_ORDER:
+                    cur.execute(f"DELETE FROM {table} WHERE board=%s", (board,))
+        load(c, board, data)
+        reseq(c)
+        c.commit()
+    report = verify(data, dsn, target_schema, board, sqlite_path=sqlite_path)
+    return report
+
+
 def read_source(sqlite_path: Path) -> dict[str, tuple[list[str], list[dict]]]:
     """Read all 9 migrated tables READ-ONLY. Decode TEXT as strict UTF-8 and
     validate JSON columns; collect ALL offenders and raise (no partial output)."""
