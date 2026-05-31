@@ -7075,8 +7075,10 @@ class GatewayRunner:
                         spawn_fn=_kb._default_spawn,
                         resolve_workspace=_kb.resolve_workspace,
                         profile_exists=_profile_exists,
-                        signal_fn=os.kill,
+                        terminate_fn=lambda pid, lock: _kb._terminate_reclaimed_worker(
+                            pid, lock, signal_fn=os.kill),
                         pid_alive_fn=_kb._pid_alive,
+                        classify_exit_fn=_kb._classify_worker_exit,
                         max_spawn=max_spawn,
                         max_in_progress=max_in_progress,
                         failure_limit=failure_limit,
