@@ -1589,7 +1589,25 @@ class PostgresKanbanStore:
     # injected (``signal_fn`` / ``pid_alive_fn``) and defaults to no-op — the
     # glue (Part B) supplies host-local OS callbacks at the gateway call site.
 
-    def _pg_release_stale_claims(self, *, signal_fn=None) -> int:
+    @staticmethod
+    def _invoke_kill(terminate_fn, signal_fn, pid, claim_lock):
+        """Prefer the full host-guarded ladder (terminate_fn(pid, claim_lock));
+        fall back to a single best-effort SIGTERM (signal_fn(pid, SIGTERM))."""
+        if not pid:
+            return
+        if terminate_fn is not None:
+            try:
+                terminate_fn(int(pid), claim_lock)
+            except Exception:
+                pass
+        elif signal_fn is not None:
+            try:
+                import signal as _sig
+                signal_fn(int(pid), _sig.SIGTERM)
+            except Exception:
+                pass
+
+    def _pg_release_stale_claims(self, *, terminate_fn=None, signal_fn=None) -> int:
         """Mirror ``release_stale_claims``: TTL-expired running claims -> ready.
 
         Pure-DB form. Unlike the SQLite reference there is no host-local
@@ -1615,12 +1633,7 @@ class PostgresKanbanStore:
             stale = cur.fetchall()
         for row in stale:
             pid = row["worker_pid"]
-            if signal_fn is not None and pid:
-                try:
-                    import signal as _sig
-                    signal_fn(int(pid), _sig.SIGTERM)
-                except Exception:
-                    pass
+            self._invoke_kill(terminate_fn, signal_fn, pid, row["claim_lock"])
             with self._pool.connection() as conn, \
                     conn.cursor(row_factory=dict_row) as cur:
                 with conn.transaction():
@@ -1648,30 +1661,29 @@ class PostgresKanbanStore:
                     reclaimed += 1
         return reclaimed
 
-    def _pg_enforce_max_runtime(self, *, signal_fn=None) -> list:
+    def _pg_enforce_max_runtime(self, *, terminate_fn=None, signal_fn=None) -> list:
         """Mirror ``enforce_max_runtime``: running tasks past ``max_runtime_seconds``
         -> ready (+ timed_out event + failure counter).
 
         Identifies tasks past their per-attempt runtime budget (measured from
         the active run's ``started_at``, falling back to ``tasks.started_at``),
-        signals the worker via the injected ``signal_fn`` ONLY when provided (no
-        hardcoded ``os.kill``), flips the task back to ``ready``, closes the run
+        signals the worker via the injected ``terminate_fn`` (preferred, full
+        host-guarded ladder) or ``signal_fn`` (fallback, single best-effort
+        SIGTERM), flips the task back to ``ready``, closes the run
         ``timed_out``, and records a failure (``release_claim=False``,
         ``end_run=False``) so the breaker can trip.
 
         # phase-3-tail: the SQLite host_prefix (claim_lock) filter is NOT
         # applied — PG is multi-host-agnostic at the store layer; host-locality
-        # is a glue concern. SIGTERM/grace/SIGKILL escalation is delegated to
-        # ``signal_fn`` (the glue supplies the host-local kill ladder); the
-        # store sends a single best-effort SIGTERM when a signal_fn is given.
+        # is a glue concern. terminate_fn(pid, claim_lock) is PREFERRED;
+        # signal_fn stays as a single-shot fallback.
         """
-        import signal as _sig
         now = int(time.time())
         timed_out: list = []
         with self._pool.connection() as conn, \
                 conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT t.id, t.worker_pid, "
+                "SELECT t.id, t.worker_pid, t.claim_lock, "
                 "COALESCE(r.started_at, t.started_at) AS active_started_at, "
                 "t.max_runtime_seconds "
                 "FROM tasks t LEFT JOIN task_runs r "
@@ -1689,11 +1701,7 @@ class PostgresKanbanStore:
                 continue
             pid = int(row["worker_pid"])
             tid = row["id"]
-            if signal_fn is not None:
-                try:
-                    signal_fn(pid, _sig.SIGTERM)
-                except Exception:
-                    pass
+            self._invoke_kill(terminate_fn, signal_fn, pid, row["claim_lock"])
             tripped = False
             with self._pool.connection() as conn, \
                     conn.cursor(row_factory=dict_row) as cur:
@@ -1728,7 +1736,7 @@ class PostgresKanbanStore:
         return timed_out
 
     def _pg_detect_stale_running(self, *, stale_timeout_seconds=0,
-                                 signal_fn=None) -> list:
+                                 terminate_fn=None, signal_fn=None) -> list:
         """Mirror ``detect_stale_running``: heartbeat-stale running tasks -> ready.
 
         A task is stale when it has been running longer than
@@ -1740,17 +1748,17 @@ class PostgresKanbanStore:
         counting it would let two legitimately long runs trip the breaker).
 
         # phase-3-tail: the SQLite host_prefix filter is not applied (store is
-        # host-agnostic); the kill is delegated to the injected ``signal_fn``.
+        # host-agnostic); terminate_fn(pid, claim_lock) is PREFERRED;
+        # signal_fn stays as a single-shot fallback.
         """
         if stale_timeout_seconds <= 0:
             return []
-        import signal as _sig
         now = int(time.time())
         reclaimed: list = []
         with self._pool.connection() as conn, \
                 conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT t.id, t.worker_pid, t.last_heartbeat_at, "
+                "SELECT t.id, t.worker_pid, t.claim_lock, t.last_heartbeat_at, "
                 "COALESCE(r.started_at, t.started_at) AS active_started_at "
                 "FROM tasks t LEFT JOIN task_runs r "
                 "ON r.board=t.board AND r.id=t.current_run_id "
@@ -1769,11 +1777,7 @@ class PostgresKanbanStore:
                 continue
             pid = row["worker_pid"]
             tid = row["id"]
-            if signal_fn is not None and pid:
-                try:
-                    signal_fn(int(pid), _sig.SIGTERM)
-                except Exception:
-                    pass
+            self._invoke_kill(terminate_fn, signal_fn, pid, row["claim_lock"])
             with self._pool.connection() as conn, \
                     conn.cursor(row_factory=dict_row) as cur:
                 with conn.transaction():
@@ -1971,7 +1975,7 @@ class PostgresKanbanStore:
                       stale_timeout_seconds=0, default_assignee=None,
                       max_in_progress_per_profile=None, ttl_seconds=None,
                       resolve_workspace=None, profile_exists=None,
-                      signal_fn=None, pid_alive_fn=None):
+                      terminate_fn=None, signal_fn=None, pid_alive_fn=None):
         """One dispatcher tick reimplemented for PG: reclaim + ready-scan +
         claim + workspace-resolve, WITHOUT zombie-reap and WITHOUT the real
         spawn (the glue spawns; this returns the claimed tasks in
@@ -1992,10 +1996,13 @@ class PostgresKanbanStore:
 
         # --- reclaim phase (mirror dispatch_once ordering) ---------------
         result.crashed = self._pg_detect_crashed_workers(pid_alive_fn=pid_alive_fn)
-        result.reclaimed = self._pg_release_stale_claims(signal_fn=signal_fn)
+        result.reclaimed = self._pg_release_stale_claims(
+            terminate_fn=terminate_fn, signal_fn=signal_fn)
         result.stale = self._pg_detect_stale_running(
-            stale_timeout_seconds=stale_timeout_seconds, signal_fn=signal_fn)
-        result.timed_out = self._pg_enforce_max_runtime(signal_fn=signal_fn)
+            stale_timeout_seconds=stale_timeout_seconds,
+            terminate_fn=terminate_fn, signal_fn=signal_fn)
+        result.timed_out = self._pg_enforce_max_runtime(
+            terminate_fn=terminate_fn, signal_fn=signal_fn)
         if kanban_db._promote_scheduled_enabled():
             self._pg_promote_cleared_scheduled()
         result.promoted = self.recompute_ready()

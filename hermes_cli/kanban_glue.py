@@ -91,6 +91,7 @@ def run_dispatch_tick(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     ttl_seconds: Optional[int] = None,
+    terminate_fn=None,
     signal_fn=None,
     pid_alive_fn=None,
 ) -> dict:
@@ -121,6 +122,10 @@ def run_dispatch_tick(
             ``store.dispatch_plan`` (the PG store uses them directly; the SQLite
             store relies on the module-level ``kanban_db`` functions, which
             tests monkeypatch).
+        terminate_fn: injected full host-guarded SIGTERM->grace->SIGKILL ladder
+            callback ``terminate_fn(pid, claim_lock)``, forwarded to
+            ``store.dispatch_plan``; preferred over the single-shot ``signal_fn``
+            fallback. (B1 wires the gateway's real ladder.)
         signal_fn / pid_alive_fn: injected OS callbacks forwarded straight to
             ``store.dispatch_plan`` for its DB-side reclaim. B1 passes the
             caller-provided callbacks through unchanged. (B3 wires the gateway's
@@ -133,6 +138,7 @@ def run_dispatch_tick(
     plan = store.dispatch_plan(
         resolve_workspace=resolve_workspace,
         profile_exists=profile_exists,
+        terminate_fn=terminate_fn,
         signal_fn=signal_fn,
         pid_alive_fn=pid_alive_fn,
         max_spawn=max_spawn,

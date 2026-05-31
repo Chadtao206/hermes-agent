@@ -117,6 +117,7 @@ class KanbanStore(Protocol):
         ttl_seconds: Optional[int] = None,
         resolve_workspace=None,
         profile_exists=None,
+        terminate_fn=None,
         signal_fn=None,
         pid_alive_fn=None,
     ) -> "DispatchPlan": ...
