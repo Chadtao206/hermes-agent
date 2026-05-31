@@ -785,7 +785,7 @@ def get_board(
     if _backend() == "postgres":
         pg = _pg_reads()
         bslug = pg.slug(board)
-        store = _store(board=board)
+        store = _store(board=bslug)
         try:
             tasks = store.list_tasks(
                 tenant=tenant, include_archived=include_archived,
