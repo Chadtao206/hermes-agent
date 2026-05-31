@@ -85,11 +85,16 @@ is deferred until a second board actually exists. `t_…` TEXT task ids and epoc
   server so it surfaces real permission/type/constraint/JSON issues.
 - **`--execute`** → guard: if the board already has rows in the target (`public`)
   schema, **abort** unless `--force` is given (which `DELETE`s that board's rows in
-  FK order first). Then load + `reseq` + **in-transaction** structural verify, and
-  only then **COMMIT** (all-or-nothing). Post-commit, run the store-parity read.
-- The migrator uses its **own** psycopg connection (autocommit off) for load+verify
-  so a failed/garbage load never partially commits. The store-parity read uses a
-  `PostgresKanbanStore`.
+  FK order first). Then load + `reseq` in a single transaction that **COMMITs**
+  (the data load is all-or-nothing). The full verification stack then runs
+  **post-commit** and is reported — a verify failure here means data *was* loaded
+  but a discrepancy was found, so investigate before flipping config. (As shipped,
+  verification is post-commit rather than in-transaction; the Phase-4 code review
+  judged this acceptable for a one-shot tool, and the cutover runbook gates on a
+  green `--dry-run` rehearsal first.)
+- The migrator uses its **own** psycopg connection (autocommit off) for the load
+  transaction so a failed/garbage load never partially commits. The store-parity
+  read uses a `PostgresKanbanStore`.
 - **Load order** (parent-first; PG has **no** FK constraints, so order is cosmetic
   but kept for clarity): `tasks → task_runs → task_events → task_comments →
   task_links → kanban_notify_subs → kanban_profile_event_subs →
