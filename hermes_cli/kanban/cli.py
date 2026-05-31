@@ -49,6 +49,11 @@ def _make_store():
     Looks up ``kanban_store`` on the ``hermes_cli.kanban`` package object at
     call time so that test monkeypatching of ``hermes_cli.kanban.kanban_store``
     takes effect inside every handler that calls ``_make_store()``.
+
+    Note: under backend=postgres the store resolves to board "default"
+    (PostgresKanbanStore ignores HERMES_KANBAN_BOARD); correct for the
+    single-board live deployment, but --board / multi-board is not honored on
+    the PG path (cf. _cmd_liveness which uses kb.get_current_board()).
     """
     import sys as _sys
     _pkg = _sys.modules.get("hermes_cli.kanban")

@@ -154,6 +154,13 @@ byte-identical:
   function during implementation.
 - **Worker writes were also sqlite-bound** → Layer 1 fixes reads *and* writes
   (same `resolve_backend`); the worker write smoke asserts a completion lands in PG.
+  **KNOWN FOLLOW-UP (out of read-path scope):** worker heartbeat writes
+  (`kanban_tools` `heartbeat_current_worker_from_env` + `_handle_heartbeat`) still
+  call `kb.write_session()` (sqlite-only); under PG they land in frozen sqlite while
+  the PG dispatcher reads `last_heartbeat_at` from PG. Only bites workers exceeding
+  `dispatch_stale_timeout_seconds` (~4 h). Route both through `store.heartbeat_worker()`
+  in a follow-up. The "Layer 1 fixes reads and writes" claim holds for store-routed
+  writes (`complete`/`block`) but **NOT** the heartbeat path.
 - **Live `gateway/run.py` touch** → a single idempotent env-export block behind the
   postgres check, sequenced last; activated on the next gateway restart.
 - **Secret leakage via env export** → the DSN is set into `os.environ` only and
