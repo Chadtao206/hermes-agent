@@ -3868,30 +3868,36 @@ def _expected_parent_pr_head_sha(
     task_id: str,
 ) -> Optional[tuple[str, str, Optional[int]]]:
     """Return ``(sha, parent_task_id, parent_run_id)`` from done parents."""
-    for parent_id in parent_ids(conn, task_id, relation_type=LINK_RELATION_DEPENDENCY):
-        rows = conn.execute(
-            """
-            SELECT id, metadata
-              FROM task_runs
-             WHERE task_id = ?
-               AND outcome = 'completed'
-             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
-            """,
-            (parent_id,),
-        ).fetchall()
-        for row in rows:
-            try:
-                parent_metadata = json.loads(row["metadata"]) if row["metadata"] else None
-            except Exception:
-                parent_metadata = None
-            sha = _extract_pr_head_sha(parent_metadata)
-            if sha:
-                return sha, parent_id, int(row["id"])
+    parents = parent_ids(conn, task_id, relation_type=LINK_RELATION_DEPENDENCY)
+    if not parents:
+        return None
+
+    placeholders = ",".join("?" * len(parents))
+    rows = conn.execute(
+        f"""
+        SELECT id, task_id, metadata
+          FROM task_runs
+         WHERE task_id IN ({placeholders})
+           AND outcome = 'completed'
+         ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+        """,
+        tuple(parents),
+    ).fetchall()
+    for row in rows:
+        try:
+            parent_metadata = json.loads(row["metadata"]) if row["metadata"] else None
+        except Exception:
+            parent_metadata = None
+        sha = _extract_pr_head_sha(parent_metadata)
+        if sha:
+            return sha, row["task_id"], int(row["id"])
+
+    # Legacy/manual fallback: only honor explicit SHA-looking result text.
+    for parent_id in parents:
         task_row = conn.execute(
             "SELECT result FROM tasks WHERE id = ? AND status = 'done'",
             (parent_id,),
         ).fetchone()
-        # Legacy/manual fallback: only honor explicit SHA-looking result text.
         if task_row:
             sha = _extract_pr_head_sha(task_row["result"])
             if sha:
