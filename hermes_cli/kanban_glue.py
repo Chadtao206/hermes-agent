@@ -410,9 +410,16 @@ async def run_notifier_tick(
     # Read side (ported from _collect). One sync collection, off-thread so
     # the loop never blocks on the store's IO — the gateway does the same.
     # ------------------------------------------------------------------
+    # Stash for a fatal-classified claim fault. We do NOT re-raise immediately
+    # out of ``_collect`` (that would discard the chat deliveries already
+    # claimed — whose cursors have advanced — so their terminal notifications
+    # would be permanently lost). Instead we stop collecting, RETURN what was
+    # collected so far, deliver it in the async body, and only THEN re-raise so
+    # the gateway's per-board quarantine still fires (Bug 1 fix).
     def _collect():
         chat_deliveries: list[dict] = []
         profile_deliveries: list[dict] = []
+        fatal_error: Optional[BaseException] = None
 
         # Chat subscriptions only matter when an adapter is connected.
         subs = store.list_notify_subs() if active else []
@@ -463,11 +470,16 @@ async def run_notifier_tick(
             except Exception as exc:
                 # A fatal claim fault (corruption / disk-io, as classified by
                 # the caller) must PROPAGATE so the gateway can quarantine the
-                # board rather than spin on it every tick. Without a classifier
-                # (default) keep the historical swallow+continue per-sub
-                # isolation for a genuinely-malformed sub.
+                # board rather than spin on it every tick. But we must NOT
+                # discard the chat deliveries already collected (their cursors
+                # advanced at claim time — re-raising here would lose those
+                # terminal notifications). Stash the error, STOP collecting, and
+                # let the async body deliver what we have and THEN re-raise.
+                # Without a classifier (default) keep the historical
+                # swallow+continue per-sub isolation for a malformed sub.
                 if claim_error_is_fatal is not None and claim_error_is_fatal(exc):
-                    raise
+                    fatal_error = exc
+                    break
                 logger.warning(
                     "kanban notifier: chat claim failed for %s/%s on board %s: %s",
                     _sub_field(sub, "task_id"), _sub_field(sub, "platform"),
@@ -484,11 +496,15 @@ async def run_notifier_tick(
                 "board": board,
             })
 
-        # Profile-level event subs (adapter-independent) — always processed.
-        try:
-            pro_subs = store.list_profile_event_subs(enabled_only=True)
-        except Exception:
-            pro_subs = []
+        # Profile-level event subs (adapter-independent) — always processed,
+        # UNLESS a fatal chat-claim fault already stashed (we've stopped
+        # collecting; deliver what we have, then re-raise).
+        pro_subs = []
+        if fatal_error is None:
+            try:
+                pro_subs = store.list_profile_event_subs(enabled_only=True)
+            except Exception:
+                pro_subs = []
         for psub in pro_subs:
             # Per-sub isolation: one malformed/raising profile sub must be
             # SKIPPED, not abort the whole _collect (which would discard the
@@ -518,11 +534,13 @@ async def run_notifier_tick(
                             except Exception:
                                 p_event_tasks[ev.task_id] = None
             except Exception as exc:
-                # See the chat-sub loop above: a fatal claim fault propagates
-                # to the caller's quarantine; otherwise the malformed sub is
-                # skipped so the tick proceeds.
+                # See the chat-sub loop above: a fatal claim fault is stashed
+                # (deliver-then-raise) so the caller's quarantine still fires
+                # without discarding already-claimed deliveries; otherwise the
+                # malformed sub is skipped so the tick proceeds.
                 if claim_error_is_fatal is not None and claim_error_is_fatal(exc):
-                    raise
+                    fatal_error = exc
+                    break
                 logger.warning(
                     "kanban notifier: profile-event claim failed for %s/%s on "
                     "board %s: %s",
@@ -539,9 +557,9 @@ async def run_notifier_tick(
                 "event_tasks": p_event_tasks,
                 "board": board,
             })
-        return chat_deliveries, profile_deliveries
+        return chat_deliveries, profile_deliveries, fatal_error
 
-    deliveries, profile_deliveries = await asyncio.to_thread(_collect)
+    deliveries, profile_deliveries, fatal_error = await asyncio.to_thread(_collect)
 
     delivered = 0
     send_failures = 0
@@ -628,12 +646,22 @@ async def run_notifier_tick(
                     last_success_cursor, int(getattr(ev, "id", 0) or 0),
                 )
                 sub_fail_counts.pop(sub_key, None)
-            except Exception:
+            except Exception as send_exc:
                 all_delivered = False
                 fails = sub_fail_counts.get(sub_key, 0) + 1
                 sub_fail_counts[sub_key] = fails
                 send_failures += 1
+                logger.warning(
+                    "kanban notifier: send failed for %s on %s (attempt %d/%d): %s",
+                    _sub_field(sub, "task_id"), platform_str, fails,
+                    max_send_failures, send_exc,
+                )
                 if fails >= max_send_failures:
+                    logger.warning(
+                        "kanban notifier: dropping subscription %s on %s after "
+                        "%d consecutive send failures",
+                        _sub_field(sub, "task_id"), platform_str, fails,
+                    )
                     await asyncio.to_thread(
                         store.remove_notify_sub,
                         task_id=_sub_field(sub, "task_id"),
@@ -740,6 +768,11 @@ async def run_notifier_tick(
             woke += 1
             woke_profiles.append(_sub_field(psub, "task_id"))
         else:
+            logger.warning(
+                "kanban notifier: profile wake raised for %s/%s: %s",
+                _sub_field(psub, "task_id"), _sub_field(psub, "profile"),
+                wake_error,
+            )
             await asyncio.to_thread(
                 store.record_profile_wake_failure,
                 task_id=_sub_field(psub, "task_id"),
@@ -750,6 +783,15 @@ async def run_notifier_tick(
                 error=wake_error,
             )
             profile_failed += 1
+
+    # Bug 1: a fatal-classified claim fault (corruption / disk-io) was stashed
+    # during collection. We have now delivered every already-claimed chat event
+    # and run every already-collected profile wake, so no terminal notification
+    # is lost. Re-raise so the gateway's per-board quarantine fires (streak /
+    # hard-disable for a durable corruption, durable-vs-transient confirmation
+    # for an IOERR) rather than spinning on a corrupt board every tick.
+    if fatal_error is not None:
+        raise fatal_error
 
     return {
         "delivered": delivered,

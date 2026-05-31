@@ -6066,7 +6066,7 @@ class GatewayRunner:
                     try:
                         store = _kanban_store(board=slug)
                         try:
-                            await kanban_glue.run_notifier_tick(
+                            summary = await kanban_glue.run_notifier_tick(
                                 store, self.adapters,
                                 notifier_profile=notifier_profile,
                                 active_platforms=active_platforms,
@@ -6085,7 +6085,10 @@ class GatewayRunner:
                                 # isolation would swallow them and a corrupt board
                                 # would spin every tick. Genuinely-malformed subs
                                 # (not classified fatal) are still skipped inside
-                                # the glue.
+                                # the glue. A fatal fault is now raised only AFTER
+                                # the glue delivers any already-claimed chat events
+                                # (so terminal notifications aren't lost), then the
+                                # quarantine below still fires.
                                 claim_error_is_fatal=lambda exc: (
                                     _is_disk_io_board_db_error(exc)
                                     or _notifier_db_error_is_corrupt(exc)
@@ -6096,6 +6099,23 @@ class GatewayRunner:
                                 store.close()
                             except Exception:
                                 pass
+                        # B4 (Bug 2): surface the tick summary the old notifier
+                        # logged. Flapping chats (send failures / terminal
+                        # unsubs) get a WARN so a silently-dropped chat leaves a
+                        # trace; the full summary stays at DEBUG.
+                        logger.debug(
+                            "kanban notifier: board %s tick summary=%s",
+                            slug, summary,
+                        )
+                        if summary.get("send_failures") or summary.get("unsubbed"):
+                            logger.warning(
+                                "kanban notifier: board %s had send failures=%s "
+                                "unsubbed=%s this tick (summary=%s)",
+                                slug,
+                                summary.get("send_failures"),
+                                summary.get("unsubbed"),
+                                summary,
+                            )
                         # A clean tick clears any pending corruption streak for
                         # this DB (mirrors the old ``not confirmed_corruption_this_tick``
                         # reset at the tail of ``_collect``).

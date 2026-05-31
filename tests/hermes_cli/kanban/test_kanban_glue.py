@@ -573,3 +573,92 @@ def test_notifier_tick_nonfatal_claim_error_is_swallowed(classifier):
     # Tick completed (no raise); the raising sub was skipped so nothing was
     # delivered.
     assert summary["delivered"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 regression: a fatal claim fault on a LATER (profile) sub must NOT
+# discard the chat deliveries already claimed earlier in the tick. The glue
+# delivers those terminal notifications FIRST, then re-raises so the gateway
+# can still quarantine the board.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """Minimal event row: the glue reads ``task_id`` / ``kind`` / ``id`` /
+    ``payload``."""
+
+    def __init__(self, ev_id, task_id, kind):
+        self.id = ev_id
+        self.task_id = task_id
+        self.kind = kind
+        self.payload = None
+
+
+class _ChatDeliveredThenFatalProfileStore:
+    """One deliverable chat sub (its claim advances the cursor) plus one
+    profile sub whose claim raises a fatal-classified fault. Pure-glue logic;
+    no real DB needed."""
+
+    board = "test"
+
+    def __init__(self):
+        self.advanced = []
+
+    def list_notify_subs(self, *args, **kwargs):
+        return [{
+            "task_id": "t1",
+            "platform": "telegram",
+            "chat_id": "c1",
+            "thread_id": "",
+            "event_kinds": None,
+            "include_children": 0,
+            "notifier_profile": None,
+        }]
+
+    def claim_unseen_events_for_sub(self, *args, **kwargs):
+        # (old_cursor, new_cursor, events) — the claim already advanced the
+        # cursor 0 -> 5, mirroring the real store committing at claim time.
+        return 0, 5, [_FakeEvent(5, "t1", "completed")]
+
+    def get_task(self, task_id):
+        return {"status": "done"}
+
+    def advance_notify_cursor(self, *args, **kwargs):
+        self.advanced.append(kwargs)
+
+    def remove_notify_sub(self, *args, **kwargs):
+        # The done task triggers should_unsub; harmless no-op here.
+        return None
+
+    def list_profile_event_subs(self, *args, **kwargs):
+        return [{"task_id": "t_profile", "profile": "default", "name": ""}]
+
+    def claim_unseen_events_for_profile_sub(self, *args, **kwargs):
+        raise _FatalClaimError("database disk image is malformed")
+
+
+def test_notifier_tick_fatal_profile_claim_still_delivers_chat():
+    """A fatal profile-sub claim fault must deliver the already-claimed chat
+    event FIRST, then re-raise so the gateway can quarantine the board."""
+    store = _ChatDeliveredThenFatalProfileStore()
+    adapter = _FakeAdapter()
+
+    with pytest.raises(_FatalClaimError):
+        asyncio.run(run_notifier_tick(
+            store,
+            {"telegram": adapter},
+            notifier_profile=None,
+            active_platforms={"telegram"},
+            terminal_kinds=_TERMINAL_KINDS,
+            render_chat_event=_render,
+            wake_profile_fn=_wake_noop,
+            platform_enum=None,
+            claim_error_is_fatal=lambda exc: True,
+        ))
+
+    # (a) The chat event WAS delivered before the raise — the terminal
+    # notification is NOT lost despite the later fatal profile-claim fault.
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "c1"
+    # The cursor advanced for the delivered chat sub (claim committed).
+    assert store.advanced, "chat cursor should have advanced before the raise"
