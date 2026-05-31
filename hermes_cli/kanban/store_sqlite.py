@@ -72,6 +72,15 @@ class SqliteKanbanStore:
     def reclaim_task(self, task_id: str, **kwargs: Any) -> bool:
         return self._write("reclaim_task", task_id=task_id, **kwargs)
 
+    def record_task_failure(self, task_id, error, *, outcome, failure_limit=None,
+                            failure_limit_is_cap=False, release_claim=True,
+                            end_run=True, event_payload_extra=None) -> bool:
+        return self._write("record_task_failure", task_id=task_id, error=error,
+                           outcome=outcome, failure_limit=failure_limit,
+                           failure_limit_is_cap=failure_limit_is_cap,
+                           release_claim=release_claim, end_run=end_run,
+                           event_payload_extra=event_payload_extra)
+
     def set_status_direct(self, task_id: str, new_status: str) -> bool:
         return self._write("set_status_direct", task_id=task_id, new_status=new_status)
 

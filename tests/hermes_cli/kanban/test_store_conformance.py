@@ -138,6 +138,33 @@ def test_claim_task_atomic(store):
     assert store.claim_task(tid, claimer="w2") is None
 
 
+def test_record_failure_breaker_trips(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    # failure_limit=1: the very first failure trips the breaker.
+    blocked = store.record_task_failure(
+        tid, "boom", outcome="spawn_failed", failure_limit=1)
+    assert blocked is True
+    assert store.get_task(tid).status == "blocked"
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "gave_up" in kinds
+
+
+def test_record_failure_retry(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    # failure_limit=3: a single failure stays under threshold -> retry (ready).
+    blocked = store.record_task_failure(
+        tid, "boom", outcome="spawn_failed", failure_limit=3)
+    assert blocked is False
+    assert store.get_task(tid).status == "ready"
+    # end_run=True emits the outcome-named event on the retry path.
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "spawn_failed" in kinds
+
+
 def test_heartbeat_worker(store):
     tid = store.create_task(title="x", assignee="engineer")
     claimed = store.claim_task(tid, claimer="w1")

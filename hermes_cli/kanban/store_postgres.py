@@ -13,6 +13,7 @@ from hermes_cli import kanban_db
 from hermes_cli.kanban_db import (  # reuse dataclasses
     Task, Run, Event, Comment, DEFAULT_HEARTBEAT_EVENT_MIN_INTERVAL_SECONDS,
     DEFAULT_PROFILE_WAKE_FAILURE_EVENT_MIN_INTERVAL_SECONDS,
+    DEFAULT_FAILURE_LIMIT,
 )
 from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across backends
     HallucinatedCardsError, PRHeadGateError, ExternalHandoffGateError,
@@ -1318,6 +1319,128 @@ class PostgresKanbanStore:
                     (claimer, now + ttl, now, run_id, self.board, task_id))
                 self._emit(cur, task_id, "claimed", {"claimer": claimer}, run_id=run_id)
         return self.get_task(task_id)
+
+    # --- record_task_failure (circuit breaker / gave_up) ------------------
+
+    def record_task_failure(self, task_id, error, *, outcome, failure_limit=None,
+                            failure_limit_is_cap=False, release_claim=True,
+                            end_run=True, event_payload_extra=None) -> bool:
+        """Mirror kanban_db._record_task_failure board-scoped.
+
+        Returns True when the breaker tripped (task auto-blocked + gave_up),
+        False when the task was just updated in place (retry -> ready, or a
+        counter-only bookkeep on the timeout/crash path).
+        """
+        blocked = False
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT consecutive_failures, status, max_retries "
+                    "FROM tasks WHERE board=%s AND id=%s",
+                    (self.board, task_id))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                failures = int(row["consecutive_failures"]) + 1
+
+                # Per-task override remains authoritative for ordinary failures.
+                # Deterministic/systemic failure paths can opt into cap semantics
+                # with ``failure_limit_is_cap=True``.
+                task_override = row["max_retries"]
+                if (
+                    task_override is not None
+                    and failure_limit is not None
+                    and failure_limit_is_cap
+                ):
+                    task_limit = int(task_override)
+                    caller_limit = int(failure_limit)
+                    effective_limit = min(task_limit, caller_limit)
+                    limit_source = ("task" if effective_limit == task_limit
+                                    else "dispatcher")
+                elif task_override is not None:
+                    effective_limit = int(task_override)
+                    limit_source = "task"
+                else:
+                    effective_limit = int(
+                        failure_limit if failure_limit is not None
+                        else DEFAULT_FAILURE_LIMIT)
+                    limit_source = "dispatcher"
+
+                if failures >= effective_limit:
+                    # Trip the breaker.
+                    if release_claim:
+                        # Spawn path: still running, also clear claim state.
+                        cur.execute(
+                            "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                            "claim_expires=NULL, worker_pid=NULL, "
+                            "consecutive_failures=%s, last_failure_error=%s "
+                            "WHERE board=%s AND id=%s "
+                            "AND status IN ('running','ready')",
+                            (failures, error[:500], self.board, task_id))
+                    else:
+                        # Timeout/crash path: task already at ``ready`` with
+                        # claim cleared; just flip to blocked + update counter.
+                        cur.execute(
+                            "UPDATE tasks SET status='blocked', "
+                            "consecutive_failures=%s, last_failure_error=%s "
+                            "WHERE board=%s AND id=%s "
+                            "AND status IN ('ready','running')",
+                            (failures, error[:500], self.board, task_id))
+                    run_id = None
+                    if end_run:
+                        # Only the spawn path has an open run to close.
+                        run_id = self._pg_end_run(
+                            cur, task_id,
+                            outcome="gave_up", status="gave_up",
+                            error=error[:500],
+                            metadata={
+                                "failures": failures,
+                                "trigger_outcome": outcome,
+                                "effective_limit": effective_limit,
+                                "limit_source": limit_source,
+                            })
+                    payload = {
+                        "failures": failures,
+                        "effective_limit": effective_limit,
+                        "limit_source": limit_source,
+                        "error": error[:500],
+                        "trigger_outcome": outcome,
+                    }
+                    if event_payload_extra:
+                        payload.update(event_payload_extra)
+                    self._emit(cur, task_id, "gave_up", payload, run_id=run_id)
+                    blocked = True
+                else:
+                    # Below threshold.
+                    if release_claim:
+                        # Spawn path: transition running -> ready + clear claim.
+                        cur.execute(
+                            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                            "claim_expires=NULL, worker_pid=NULL, "
+                            "consecutive_failures=%s, last_failure_error=%s "
+                            "WHERE board=%s AND id=%s AND status='running'",
+                            (failures, error[:500], self.board, task_id))
+                    else:
+                        # Timeout/crash path: task already at ``ready`` via its
+                        # own UPDATE. Just bookkeep the counter + last error.
+                        cur.execute(
+                            "UPDATE tasks SET consecutive_failures=%s, "
+                            "last_failure_error=%s WHERE board=%s AND id=%s",
+                            (failures, error[:500], self.board, task_id))
+                    if end_run:
+                        # Spawn path: close the open run with outcome.
+                        run_id = self._pg_end_run(
+                            cur, task_id,
+                            outcome=outcome, status=outcome,
+                            error=error[:500],
+                            metadata={"failures": failures})
+                        self._emit(
+                            cur, task_id, outcome,
+                            {"error": error[:500], "failures": failures},
+                            run_id=run_id)
+                    # Timeout/crash path's caller already emitted its own event.
+        return blocked
 
     # --- runs -------------------------------------------------------------
 

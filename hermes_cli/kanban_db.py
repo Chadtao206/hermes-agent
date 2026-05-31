@@ -7190,6 +7190,26 @@ def _record_task_failure(
     return blocked
 
 
+def record_task_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    outcome: str,
+    failure_limit: int = None,
+    failure_limit_is_cap: bool = False,
+    release_claim: bool = False,
+    end_run: bool = False,
+    event_payload_extra: Optional[dict] = None,
+) -> bool:
+    """Public alias for the circuit-breaker failure recorder (store seam)."""
+    return _record_task_failure(
+        conn, task_id, error, outcome=outcome, failure_limit=failure_limit,
+        failure_limit_is_cap=failure_limit_is_cap, release_claim=release_claim,
+        end_run=end_run, event_payload_extra=event_payload_extra,
+    )
+
+
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
 def _record_spawn_failure(

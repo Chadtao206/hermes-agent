@@ -51,6 +51,9 @@ OP_ALLOWLIST = frozenset({
     "gc_events",
     # Dispatcher atomic ready->running claim (SKIP LOCKED on pg).
     "claim_task",
+    # Circuit-breaker failure recorder: increments consecutive_failures and
+    # blocks (gave_up) or releases back to ready depending on the threshold.
+    "record_task_failure",
     # Notifier post-delivery cursor mutations + profile-wake recording.
     "advance_notify_cursor", "rewind_notify_cursor",
     "advance_profile_event_cursor", "rewind_profile_event_cursor",

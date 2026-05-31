@@ -69,6 +69,19 @@ class KanbanStore(Protocol):
 
     def reclaim_task(self, task_id: str, *, reason=None) -> bool: ...
 
+    def record_task_failure(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        outcome: str,
+        failure_limit=None,
+        failure_limit_is_cap: bool = False,
+        release_claim: bool = True,
+        end_run: bool = True,
+        event_payload_extra=None,
+    ) -> bool: ...
+
     def set_status_direct(self, task_id: str, new_status: str) -> bool: ...
 
     def set_task_priority(self, task_id: str, priority: int) -> bool: ...
