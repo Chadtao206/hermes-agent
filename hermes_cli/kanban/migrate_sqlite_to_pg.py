@@ -72,6 +72,36 @@ def _decode_and_validate(table: str, row: dict, errors: list[str]) -> dict:
     return out
 
 
+def load(conn, board: str, data: dict[str, tuple[list[str], list[dict]]]) -> None:
+    """Insert every migrated table's rows, stamping `board`, casting JSON->JSONB.
+    Assumes conn's search_path already points at the target schema."""
+    with conn.cursor() as cur:
+        for table in MIGRATED_TABLES:
+            cols, rows = data.get(table, ([], []))
+            if not rows:
+                continue
+            jcols = JSON_COLUMNS.get(table, frozenset())
+            placeholders = ["%s"] + [
+                "%s::jsonb" if c in jcols else "%s" for c in cols]
+            sql = (f"INSERT INTO {table} (board, {', '.join(cols)}) "
+                   f"VALUES ({', '.join(placeholders)})")
+            params = [[board] + [r.get(c) for c in cols] for r in rows]
+            cur.executemany(sql, params)
+
+
+def reseq(conn) -> None:
+    """Set each IDENTITY sequence to max(id) so the next insert is max+1
+    (or to 1/uncalled when the table is empty). Assumes conn's search_path
+    already points at the target schema."""
+    with conn.cursor() as cur:
+        for table in IDENTITY_TABLES:
+            cur.execute(
+                f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                f"COALESCE((SELECT MAX(id) FROM {table}), 1), "
+                f"(SELECT COUNT(*) FROM {table}) > 0)")
+            cur.fetchone()
+
+
 def read_source(sqlite_path: Path) -> dict[str, tuple[list[str], list[dict]]]:
     """Read all 9 migrated tables READ-ONLY. Decode TEXT as strict UTF-8 and
     validate JSON columns; collect ALL offenders and raise (no partial output)."""
