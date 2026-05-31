@@ -169,10 +169,10 @@ class SqliteKanbanStore:
     def unlink_tasks(self, parent_id: str, child_id: str, **kwargs: Any) -> bool:
         return self._write("unlink_tasks", parent_id=parent_id, child_id=child_id, **kwargs)
 
-    def parent_ids(self, task_id: str, *, relation_type: str = "dependency") -> list[str]:
+    def parent_ids(self, task_id: str, *, relation_type: Optional[str] = "dependency") -> list[str]:
         return self._read(lambda c: kb.parent_ids(c, task_id, relation_type=relation_type))
 
-    def child_ids(self, task_id: str, *, relation_type: str = "dependency") -> list[str]:
+    def child_ids(self, task_id: str, *, relation_type: Optional[str] = "dependency") -> list[str]:
         return self._read(lambda c: kb.child_ids(c, task_id, relation_type=relation_type))
 
     # --- comments --------------------------------------------------------
