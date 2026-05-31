@@ -6,9 +6,11 @@ Reads the source READ-ONLY; never mutates a source board DB.
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -75,6 +77,37 @@ def _decode_and_validate(table: str, row: dict, errors: list[str]) -> dict:
         except (ValueError, TypeError) as e:
             errors.append(f"{table}(id={rid!r}).{jc}: invalid JSON ({e})")
     return out
+
+
+def read_source(sqlite_path: Path) -> dict[str, tuple[list[str], list[dict]]]:
+    """Read all 9 migrated tables READ-ONLY. Decode TEXT as strict UTF-8 and
+    validate JSON columns; collect ALL offenders and raise (no partial output)."""
+    con = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    con.text_factory = bytes  # surface non-UTF-8 so we can detect it
+    con.row_factory = sqlite3.Row
+    errors: list[str] = []
+    data: dict[str, tuple[list[str], list[dict]]] = {}
+    try:
+        for table in MIGRATED_TABLES:
+            info = con.execute(f"PRAGMA table_info({table})").fetchall()
+            if not info:
+                raise MigrationError(
+                    f"source DB is missing table {table!r}; run the kanban DB "
+                    "migrations on the source before migrating.")
+            cols = [r["name"].decode() if isinstance(r["name"], bytes) else r["name"]
+                    for r in info]
+            rows = [
+                _decode_and_validate(table, {c: r[c] for c in cols}, errors)
+                for r in con.execute(f"SELECT {', '.join(cols)} FROM {table}")
+            ]
+            data[table] = (cols, rows)
+    finally:
+        con.close()
+    if errors:
+        raise MigrationError(
+            "source contains data Postgres cannot store; scrub the source and "
+            "re-run. Offenders:\n  " + "\n  ".join(errors))
+    return data
 
 
 def load(conn, board: str, data: dict[str, tuple[list[str], list[dict]]]) -> None:
@@ -332,32 +365,64 @@ def execute(dsn: str, board: str, *, sqlite_path: Path, force: bool = False,
     return report
 
 
-def read_source(sqlite_path: Path) -> dict[str, tuple[list[str], list[dict]]]:
-    """Read all 9 migrated tables READ-ONLY. Decode TEXT as strict UTF-8 and
-    validate JSON columns; collect ALL offenders and raise (no partial output)."""
-    con = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
-    con.text_factory = bytes  # surface non-UTF-8 so we can detect it
-    con.row_factory = sqlite3.Row
-    errors: list[str] = []
-    data: dict[str, tuple[list[str], list[dict]]] = {}
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="migrate_sqlite_to_pg",
+        description="Read-only SQLite -> Postgres kanban migrator (Phase 4).")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true",
+                      help="Load into a throwaway schema, verify, drop it.")
+    mode.add_argument("--execute", action="store_true",
+                      help="Load into the target (public) schema.")
+    ap.add_argument("--force", action="store_true",
+                    help="With --execute: delete the board's rows first.")
+    ap.add_argument("--dsn", default=None, help="Postgres DSN (else resolve_dsn()).")
+    ap.add_argument("--board", default=None, help="Board slug (else single-board guard).")
+    ap.add_argument("--json", action="store_true", help="Emit a JSON report.")
+    ap.add_argument("--report", default=None, help="Write the JSON report to PATH.")
     try:
-        for table in MIGRATED_TABLES:
-            info = con.execute(f"PRAGMA table_info({table})").fetchall()
-            if not info:
-                raise MigrationError(
-                    f"source DB is missing table {table!r}; run the kanban DB "
-                    "migrations on the source before migrating.")
-            cols = [r["name"].decode() if isinstance(r["name"], bytes) else r["name"]
-                    for r in info]
-            rows = [
-                _decode_and_validate(table, {c: r[c] for c in cols}, errors)
-                for r in con.execute(f"SELECT {', '.join(cols)} FROM {table}")
-            ]
-            data[table] = (cols, rows)
-    finally:
-        con.close()
-    if errors:
-        raise MigrationError(
-            "source contains data Postgres cannot store; scrub the source and "
-            "re-run. Offenders:\n  " + "\n  ".join(errors))
-    return data
+        args = ap.parse_args(argv)
+    except SystemExit:
+        return 2
+
+    if args.force and not args.execute:
+        print("error: --force only applies to --execute", file=sys.stderr)
+        return 2
+
+    try:
+        dsn = args.dsn or pg_pool.resolve_dsn()
+        board = args.board or enumerate_board()
+        sqlite_path = Path(kb.kanban_db_path(board))
+        if args.dry_run:
+            report, _schema = dry_run(dsn, board, sqlite_path=sqlite_path)
+        else:
+            report = execute(dsn, board, sqlite_path=sqlite_path, force=args.force)
+    except (MigrationError, RuntimeError, psycopg.OperationalError) as e:
+        print(f"migration aborted: {e}", file=sys.stderr)
+        return 2
+
+    payload = {
+        "ok": report.ok,
+        "board": board,
+        "counts": {t: {"src": s, "tgt": g} for t, (s, g) in report.counts.items()},
+        "count_mismatches": report.count_mismatches,
+        "integrity_failures": report.integrity_failures,
+        "idseq_failures": report.idseq_failures,
+        "parity_mismatches": report.parity_mismatches,
+        "source_doctor_criticals": report.source_doctor_criticals,
+    }
+    if args.report:
+        try:
+            Path(args.report).write_text(json.dumps(payload, indent=2, default=str))
+        except OSError as e:
+            print(f"warning: could not write report to {args.report!r}: {e}",
+                  file=sys.stderr)
+    if args.json:
+        print(json.dumps(payload, default=str))
+    else:
+        print(report.render())
+    return 0 if report.ok else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
