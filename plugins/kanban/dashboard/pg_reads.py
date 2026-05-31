@@ -146,3 +146,128 @@ def parents_blocking_ready(board: str, task_id: str) -> list[dict]:
         (board, task_id),
     )
     return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
+
+
+def diagnostics_rows(
+    board: str, task_ids: Optional[list[str]] = None,
+) -> tuple[list[dict], dict[str, list], dict[str, list]]:
+    """Fetch task/event/run dict rows for the diagnostics engine (which is
+    backend-agnostic and reads rows by column name). Mirrors the sqlite
+    _compute_task_diagnostics 3-query structure. JSONB payload/metadata arrive
+    as dicts — the engine handles dict payloads."""
+    from psycopg.rows import dict_row
+    with _pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        if task_ids is not None:
+            if not task_ids:
+                return [], {}, {}
+            cur.execute(
+                "SELECT * FROM tasks WHERE board=%s AND id = ANY(%s)", (board, list(task_ids)),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM tasks WHERE board=%s AND status != 'archived'", (board,),
+            )
+        task_rows = cur.fetchall()
+        if not task_rows:
+            return [], {}, {}
+        ids = [r["id"] for r in task_rows]
+        events_by: dict[str, list] = {tid: [] for tid in ids}
+        runs_by: dict[str, list] = {tid: [] for tid in ids}
+        cur.execute(
+            "SELECT * FROM task_events WHERE board=%s AND task_id = ANY(%s) ORDER BY id",
+            (board, ids),
+        )
+        for ev in cur.fetchall():
+            events_by.setdefault(ev["task_id"], []).append(ev)
+        cur.execute(
+            "SELECT * FROM task_runs WHERE board=%s AND task_id = ANY(%s) ORDER BY id",
+            (board, ids),
+        )
+        for rn in cur.fetchall():
+            runs_by.setdefault(rn["task_id"], []).append(rn)
+    return task_rows, events_by, runs_by
+
+
+def wake_health(board: str, task_ids: list[str]) -> dict:
+    """Board-level profile wake-health aggregate (mirrors _compute_wake_health)."""
+    import time
+    out = {
+        "subscription_count": 0, "failing_count": 0, "stale_count": 0,
+        "severity": "none", "as_of": int(time.time()),
+    }
+    if not task_ids:
+        return out
+    rows = _query(
+        "SELECT "
+        "  COUNT(*) AS subscription_count, "
+        "  SUM(CASE WHEN (last_wake_error_at IS NOT NULL OR COALESCE(wake_failure_count,0) > 0) "
+        "      THEN 1 ELSE 0 END) AS failing_count, "
+        "  SUM(CASE WHEN (last_wake_error_at IS NULL AND COALESCE(wake_failure_count,0) = 0 "
+        "      AND COALESCE(last_wake_at,0) = 0) THEN 1 ELSE 0 END) AS stale_count "
+        "FROM kanban_profile_event_subs "
+        "WHERE board=%s AND enabled = 1 AND wake_agent = 1 AND task_id = ANY(%s)",
+        (board, list(task_ids)),
+    )
+    row = rows[0] if rows else {}
+    subscription_count = int(row.get("subscription_count") or 0)
+    failing_count = int(row.get("failing_count") or 0)
+    stale_count = int(row.get("stale_count") or 0)
+    if subscription_count == 0:
+        severity = "none"
+    elif failing_count > 0:
+        severity = "failing"
+    elif stale_count > 0:
+        severity = "stale"
+    else:
+        severity = "healthy"
+    out.update({
+        "subscription_count": subscription_count, "failing_count": failing_count,
+        "stale_count": stale_count, "severity": severity,
+    })
+    return out
+
+
+def wake_health_rows(
+    board: str, task_ids: list[str], tasks_by_id: dict, limit: int,
+) -> tuple[list[dict], int]:
+    """Ordered failing+stale rows + overflow (mirrors _collect_wake_health_rows)."""
+    if not task_ids:
+        return [], 0
+    failing: list[dict] = []
+    stale: list[dict] = []
+    rows = _query(
+        "SELECT task_id, profile, name, last_wake_at, last_wake_error_at, "
+        "       last_wake_error, wake_failure_count FROM kanban_profile_event_subs "
+        "WHERE board=%s AND enabled = 1 AND wake_agent = 1 AND task_id = ANY(%s)",
+        (board, list(task_ids)),
+    )
+    for row in rows:
+        tid = row["task_id"]
+        failure_count = int(row["wake_failure_count"] or 0)
+        error_at = row["last_wake_error_at"]
+        last_wake_at = row["last_wake_at"]
+        is_failing = error_at is not None or failure_count > 0
+        is_stale = (not is_failing) and (last_wake_at is None or last_wake_at == 0)
+        if not is_failing and not is_stale:
+            continue
+        task = tasks_by_id.get(tid)
+        base = {
+            "task_id": tid, "task_title": task.title if task else tid,
+            "task_status": task.status if task else None,
+            "profile": row["profile"], "name": row["name"] or "",
+            "last_wake_at": last_wake_at, "last_wake_error_at": error_at,
+            "wake_failure_count": failure_count,
+        }
+        if is_failing:
+            base["kind"] = "failing"
+            base["message"] = row["last_wake_error"] or "Last wake errored"
+            failing.append(base)
+        else:
+            base["kind"] = "stale"
+            base["message"] = "No successful wake yet"
+            stale.append(base)
+    failing.sort(key=lambda r: (-(r["last_wake_error_at"] or 0), r["task_id"], r["profile"], r["name"]))
+    stale.sort(key=lambda r: (r["task_id"], r["profile"], r["name"]))
+    combined = failing + stale
+    overflow = max(0, len(combined) - limit)
+    return combined[:limit], overflow

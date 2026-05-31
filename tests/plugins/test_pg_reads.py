@@ -72,3 +72,28 @@ def test_events_since_active_workers_blocking(pg_board):
     assert blockers[0]["status"] != "done"
 
     assert pg.active_workers("default") == []  # nothing running/claimed
+
+
+def test_diagnostics_rows_and_wake_health(pg_board):
+    from hermes_cli import kanban_diagnostics as kd
+    from hermes_cli.config import load_config
+    pg = _load_pg_reads()
+    s = pg_board
+    t = s.create_task(title="t", assignee="engineer")
+    s.add_profile_event_sub(task_id=t, profile="engineer", name="", wake_agent=True)
+
+    task_rows, events_by, runs_by = pg.diagnostics_rows("default")
+    assert any(r["id"] == t for r in task_rows)
+    # rows are dict-shaped with the keys the engine reads
+    row = next(r for r in task_rows if r["id"] == t)
+    for k in ("id", "status", "assignee", "consecutive_failures", "last_failure_error", "created_at"):
+        assert k in row
+    # engine consumes them without error
+    cfg = kd.config_from_runtime_config(load_config())
+    diags = kd.compute_task_diagnostics(row, events_by.get(t, []), runs_by.get(t, []), config=cfg)
+    assert isinstance(diags, list)
+
+    wh = pg.wake_health("default", [t])
+    assert wh["subscription_count"] == 1
+    rows, overflow = pg.wake_health_rows("default", [t], {t: s.get_task(t)}, 50)
+    assert isinstance(rows, list) and overflow == 0
