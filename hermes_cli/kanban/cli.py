@@ -1502,17 +1502,24 @@ def _cmd_liveness(args: argparse.Namespace) -> int:
     import dataclasses
     from hermes_cli import kanban_liveness as kliv
     board = getattr(args, "board", None)
-    # Read-only / observability: never create or mutate the board. A board with
-    # no DB file yet has nothing to report — emit a zeroed snapshot.
-    path = kb.kanban_db_path(board=board)
-    if path.exists():
-        conn = kb.connect(board=board, readonly=True)
-        try:
-            snap = kliv.compute_board_liveness(conn, now=int(time.time()))
-        finally:
-            conn.close()
+    if resolve_backend() == "postgres":
+        from hermes_cli.kanban import pg_pool
+        from psycopg.rows import dict_row
+        slug = board or kb.get_current_board()
+        with pg_pool.get_pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            snap = kliv.compute_board_liveness_pg(cur, slug, now=int(time.time()))
     else:
-        snap = kliv.Liveness()
+        # Read-only / observability: never create or mutate the board. A board
+        # with no DB file yet has nothing to report — emit a zeroed snapshot.
+        path = kb.kanban_db_path(board=board)
+        if path.exists():
+            conn = kb.connect(board=board, readonly=True)
+            try:
+                snap = kliv.compute_board_liveness(conn, now=int(time.time()))
+            finally:
+                conn.close()
+        else:
+            snap = kliv.Liveness()
     data = dataclasses.asdict(snap)
     if getattr(args, "json", False):
         print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
@@ -3554,8 +3561,15 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 
 def _cmd_context(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        text = kb.build_worker_context(conn, args.task_id)
+    if resolve_backend() == "postgres":
+        store = _make_store()
+        try:
+            text = store.build_worker_context(args.task_id)
+        finally:
+            store.close()
+    else:
+        with kb.connect_closing() as conn:
+            text = kb.build_worker_context(conn, args.task_id)
     print(text)
     return 0
 
