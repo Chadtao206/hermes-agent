@@ -30,12 +30,12 @@
 
 **Files:**
 - Modify: `hermes_cli/kanban_liveness.py`
-- Test: `tests/hermes_cli/test_kanban_liveness_pg.py`
+- Test: `tests/hermes_cli/kanban/test_kanban_liveness_pg.py`
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/hermes_cli/test_kanban_liveness_pg.py
+# tests/hermes_cli/kanban/test_kanban_liveness_pg.py
 import os, shutil, uuid
 import pytest
 
@@ -86,7 +86,7 @@ def test_compute_board_liveness_pg(pg):
 
 - [ ] **Step 2: Run, verify it FAILS**
 
-Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/test_kanban_liveness_pg.py -v`
+Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/kanban/test_kanban_liveness_pg.py -v`
 Expected: FAIL — `module 'hermes_cli.kanban_liveness' has no attribute 'compute_board_liveness_pg'`.
 
 - [ ] **Step 3: Implement** — add to `hermes_cli/kanban_liveness.py` (after `compute_board_liveness`):
@@ -134,13 +134,13 @@ Note the cursor may be a `dict_row` cursor (as in the test) — `_scalar_pg` han
 
 - [ ] **Step 4: Run, verify it PASSES**
 
-Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/test_kanban_liveness_pg.py -v`
+Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/kanban/test_kanban_liveness_pg.py -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add hermes_cli/kanban_liveness.py tests/hermes_cli/test_kanban_liveness_pg.py
+git add hermes_cli/kanban_liveness.py tests/hermes_cli/kanban/test_kanban_liveness_pg.py
 git commit -m "feat(kanban-pg): compute_board_liveness_pg (board-scoped PG liveness metrics)"
 ```
 
@@ -150,12 +150,12 @@ git commit -m "feat(kanban-pg): compute_board_liveness_pg (board-scoped PG liven
 
 **Files:**
 - Modify: `hermes_cli/kanban_board_doctor.py`
-- Test: `tests/hermes_cli/test_kanban_board_doctor_pg.py`
+- Test: `tests/hermes_cli/kanban/test_kanban_board_doctor_pg.py`
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/hermes_cli/test_kanban_board_doctor_pg.py
+# tests/hermes_cli/kanban/test_kanban_board_doctor_pg.py
 import os, shutil, uuid
 import pytest
 
@@ -217,7 +217,7 @@ def test_doctor_pg_unreachable_is_critical(pg):
 
 - [ ] **Step 2: Run, verify it FAILS**
 
-Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/test_kanban_board_doctor_pg.py -v`
+Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/kanban/test_kanban_board_doctor_pg.py -v`
 Expected: FAIL — `_run_board_doctor_pg` not defined.
 
 - [ ] **Step 3: Implement.**
@@ -375,7 +375,7 @@ def _run_board_doctor_pg(*, board: str | None, ready_age_seconds: int, pool=None
 
 - [ ] **Step 4: Run, verify it PASSES**
 
-Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/test_kanban_board_doctor_pg.py -v`
+Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/kanban/test_kanban_board_doctor_pg.py -v`
 Expected: PASS (both tests).
 
 - [ ] **Step 5: Run the sqlite doctor tests to confirm the byte-identical path is intact**
@@ -386,7 +386,7 @@ Expected: PASS (unchanged sqlite behavior; `resolve_backend()` defaults to sqlit
 - [ ] **Step 6: Commit**
 
 ```bash
-git add hermes_cli/kanban_board_doctor.py tests/hermes_cli/test_kanban_board_doctor_pg.py
+git add hermes_cli/kanban_board_doctor.py tests/hermes_cli/kanban/test_kanban_board_doctor_pg.py
 git commit -m "feat(kanban-pg): run_board_doctor postgres path (connectivity + logical checks, redacted dsn)"
 ```
 
@@ -466,7 +466,7 @@ git commit -m "feat(kanban-pg): gateway liveness loop computes via PG on the pos
 
 - [ ] **Step 1: Full kanban + diagnostics suites, both backends**
 
-Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/kanban/ tests/hermes_cli/test_kanban_board_doctor.py tests/hermes_cli/test_kanban_board_doctor_pg.py tests/hermes_cli/test_kanban_liveness.py tests/hermes_cli/test_kanban_liveness_pg.py -q`
+Run: `cd <worktree> && /Users/ctao/.hermes/hermes-agent/venv/bin/python -m pytest tests/hermes_cli/kanban/ tests/hermes_cli/test_kanban_board_doctor.py tests/hermes_cli/kanban/test_kanban_board_doctor_pg.py tests/hermes_cli/test_kanban_liveness.py tests/hermes_cli/kanban/test_kanban_liveness_pg.py -q`
 Expected: PASS (sqlite paths unchanged; new PG paths green against docker PG).
 
 - [ ] **Step 2: Confirm `kanban_db.py` is unedited**
