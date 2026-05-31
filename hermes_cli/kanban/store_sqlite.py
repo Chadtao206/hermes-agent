@@ -81,6 +81,54 @@ class SqliteKanbanStore:
                            release_claim=release_claim, end_run=end_run,
                            event_payload_extra=event_payload_extra)
 
+    def record_spawn_success(self, task_id: str, pid: int) -> None:
+        return self._write("record_spawn_success", task_id=task_id, pid=int(pid))
+
+    def record_spawn_failure(self, task_id, error, *, failure_limit=None) -> bool:
+        # Thin wrapper over the A4 record_task_failure spawn_failed path. The
+        # systemic-failure-signature grouping from dispatch_once lives in the
+        # Part-B glue, NOT here.
+        return self.record_task_failure(task_id, error, outcome="spawn_failed",
+                                        failure_limit=failure_limit,
+                                        release_claim=True, end_run=True)
+
+    def dispatch_plan(self, *, resolve_workspace=None, profile_exists=None,
+                      signal_fn=None, pid_alive_fn=None, **cfg):
+        """One dispatcher tick: reclaim + ready-scan + claim + workspace-resolve,
+        WITHOUT spawning. Reuses the UNTOUCHED ``kanban_db.dispatch_once`` via a
+        capturing ``spawn_fn`` that records each claimed task instead of spawning.
+
+        NOTE (single-writer caveat): ``spawn_fn`` is a closure, so it CANNOT
+        cross the writer-daemon socket (RemoteWriter serializes its args over
+        the wire). We therefore run ``dispatch_once`` on a LOCAL writable
+        connection (``kb.connect(..., _bootstrap=True)`` bypasses the
+        single-writer guard) rather than routing it through ``write_session``.
+        This is acceptable for A5/conformance; Part B (B3) addresses
+        single-writer routing at the gateway call site, where the dispatcher
+        runs in-process and can hold the writer directly.
+
+        The injected ``resolve_workspace`` / ``profile_exists`` callbacks are
+        part of the cross-backend contract; for sqlite, ``dispatch_once`` uses
+        the module-level ``kb.resolve_workspace`` / ``hermes_cli.profiles
+        .profile_exists`` it already imports. Tests monkeypatch those for the
+        sqlite path; the injected callbacks are honored by the PG backend.
+        """
+        from hermes_cli.kanban.store import DispatchPlan
+
+        captured: list = []
+
+        def _capture_spawn(task, workspace, board=None):
+            captured.append((task, str(workspace)))
+            return None  # no pid yet; the glue spawns later -> record_spawn_success
+
+        conn = kb.connect(board=self.board, readonly=False, _bootstrap=True)
+        try:
+            result = kb.dispatch_once(
+                conn, spawn_fn=_capture_spawn, board=self.board, **cfg)
+        finally:
+            conn.close()
+        return DispatchPlan(to_spawn=captured, result=result)
+
     def set_status_direct(self, task_id: str, new_status: str) -> bool:
         return self._write("set_status_direct", task_id=task_id, new_status=new_status)
 

@@ -485,3 +485,73 @@ def test_profile_event_cursor_advance_rewind(store):
     subs = store.list_profile_event_subs(
         task_id=tid, profile="engineer", enabled_only=False)
     assert int(_field(subs[0], "last_event_id")) == 2
+
+
+# --- dispatch core (A5) ----------------------------------------------------
+
+def test_dispatch_plan_claims_ready(store, monkeypatch, tmp_path):
+    import pathlib
+
+    # Backend-agnostic injected callbacks so the DB ready-scan path runs.
+    profile_exists = lambda a: True  # noqa: E731
+    resolve_workspace = lambda task, board=None: str(tmp_path)  # noqa: E731
+
+    # For the SQLITE path, dispatch_once uses the module-level functions, not
+    # the injected callbacks; monkeypatch those so the spawnable check + the
+    # workspace resolution + the respawn guard all pass for a fresh ready task.
+    # Harmless for PG (which uses the injected callbacks above).
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda a: True,
+                        raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.resolve_workspace",
+        lambda task, board=None: pathlib.Path(str(tmp_path)))
+    monkeypatch.setattr("hermes_cli.kanban_db.check_respawn_guard",
+                        lambda conn, task_id: None)
+
+    tid = store.create_task(title="dispatch me", assignee="engineer")
+    assert store.get_task(tid).status == "ready"
+
+    plan = store.dispatch_plan(
+        resolve_workspace=resolve_workspace, profile_exists=profile_exists,
+        max_spawn=5)
+    # The task was claimed + captured (not yet spawned).
+    claimed_ids = [t.id for t, ws in plan.to_spawn]
+    assert tid in claimed_ids
+    # The claim flipped it to running.
+    assert store.get_task(tid).status == "running"
+    # The workspace resolved to tmp_path on both backends.
+    by_id = {t.id: ws for t, ws in plan.to_spawn}
+    assert by_id[tid] == str(tmp_path)
+
+    # Second pass: the now-running task is no longer ready, so it must NOT
+    # reappear in the new plan.
+    plan2 = store.dispatch_plan(
+        resolve_workspace=resolve_workspace, profile_exists=profile_exists,
+        max_spawn=5)
+    assert tid not in [t.id for t, ws in plan2.to_spawn]
+
+
+def test_record_spawn_failure_breaker(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    # failure_limit=1: the first spawn failure trips the breaker -> blocked.
+    blocked = store.record_spawn_failure(tid, "spawn boom", failure_limit=1)
+    assert blocked is True
+    assert store.get_task(tid).status == "blocked"
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "gave_up" in kinds
+
+
+def test_record_spawn_success_sets_pid(store):
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    store.record_spawn_success(tid, 4242)
+    assert store.get_task(tid).worker_pid == 4242
+    spawned = [e for e in store.list_events(tid) if e.kind == "spawned"]
+    assert spawned, "expected a spawned event"
+    payload = spawned[-1].payload
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload.get("pid") == 4242

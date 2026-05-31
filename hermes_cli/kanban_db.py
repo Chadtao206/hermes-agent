@@ -7466,6 +7466,16 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
+def record_spawn_success(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Public alias for the spawn-success recorder (store seam, A5).
+
+    Records the spawned child's pid + emits a ``spawned`` event. The glue
+    (Part B) calls this after a successful spawn of a task that
+    ``dispatch_plan`` already claimed + workspace-resolved.
+    """
+    return _set_worker_pid(conn, task_id, pid)
+
+
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 

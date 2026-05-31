@@ -1,13 +1,32 @@
 from __future__ import annotations
+from dataclasses import dataclass, field
 from typing import Any, Optional
 try:
     from typing import Protocol, runtime_checkable
 except ImportError:  # Python 3.7
     from typing_extensions import Protocol, runtime_checkable  # type: ignore
 
-from hermes_cli.kanban_db import Task
+from hermes_cli.kanban_db import Task, DispatchResult
 
 _VALID_BACKENDS = {"sqlite", "postgres"}
+
+
+@dataclass
+class DispatchPlan:
+    """Output of one ``dispatch_plan()`` pass: tasks CLAIMED and
+    workspace-resolved but NOT yet spawned (the glue spawns them), plus the
+    :class:`DispatchResult` diagnostics for telemetry/logging.
+
+    ``to_spawn`` is a list of ``(claimed_task, workspace_path)`` tuples where
+    ``claimed_task`` is a full :class:`Task` (status already flipped to
+    ``running`` by the claim) and ``workspace_path`` is the resolved string
+    path the worker should ``cd`` into. After spawning each, the glue calls
+    :meth:`KanbanStore.record_spawn_success` to stamp the worker pid, or
+    :meth:`KanbanStore.record_spawn_failure` on spawn error.
+    """
+
+    to_spawn: list = field(default_factory=list)  # list[tuple[Task, str]]
+    result: "DispatchResult" = field(default_factory=DispatchResult)
 
 
 @runtime_checkable
@@ -80,6 +99,32 @@ class KanbanStore(Protocol):
         release_claim: bool = True,
         end_run: bool = True,
         event_payload_extra=None,
+    ) -> bool: ...
+
+    # ------------------------------------------------------------------
+    # Dispatch core (one dispatcher tick: reclaim + ready-scan + claim)
+    # ------------------------------------------------------------------
+
+    def dispatch_plan(
+        self,
+        *,
+        max_spawn: Optional[int] = None,
+        max_in_progress: Optional[int] = None,
+        failure_limit: int = 2,
+        stale_timeout_seconds: int = 0,
+        default_assignee: Optional[str] = None,
+        max_in_progress_per_profile: Optional[int] = None,
+        ttl_seconds: Optional[int] = None,
+        resolve_workspace=None,
+        profile_exists=None,
+        signal_fn=None,
+        pid_alive_fn=None,
+    ) -> "DispatchPlan": ...
+
+    def record_spawn_success(self, task_id: str, pid: int) -> None: ...
+
+    def record_spawn_failure(
+        self, task_id: str, error: str, *, failure_limit=None
     ) -> bool: ...
 
     def set_status_direct(self, task_id: str, new_status: str) -> bool: ...

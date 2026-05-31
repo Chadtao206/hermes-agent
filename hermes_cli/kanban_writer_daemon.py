@@ -54,6 +54,9 @@ OP_ALLOWLIST = frozenset({
     # Circuit-breaker failure recorder: increments consecutive_failures and
     # blocks (gave_up) or releases back to ready depending on the threshold.
     "record_task_failure",
+    # Spawn-success recorder: stamps worker_pid + emits a `spawned` event after
+    # the glue (Part B) spawns a task that dispatch_plan already claimed.
+    "record_spawn_success",
     # Notifier post-delivery cursor mutations + profile-wake recording.
     "advance_notify_cursor", "rewind_notify_cursor",
     "advance_profile_event_cursor", "rewind_profile_event_cursor",

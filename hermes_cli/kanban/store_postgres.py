@@ -26,7 +26,14 @@ from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across bac
     _extract_pr_head_sha,
     _TASK_ID_PROSE_RE,
     _EXTERNAL_HANDOFF_METADATA_KEYS,
+    _pre_spawn_validation_errors,
+    _RESPAWN_BLOCKER_RE,
+    _RESPAWN_GUARD_PR_URL_RE,
+    _RESPAWN_GUARD_SUCCESS_WINDOW,
+    _RESPAWN_GUARD_PR_WINDOW,
+    _STALE_HEARTBEAT_GAP_SECONDS,
 )
+from hermes_cli.kanban_db import DispatchResult
 from hermes_cli.kanban import pg_pool
 
 _VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
@@ -1441,6 +1448,646 @@ class PostgresKanbanStore:
                             run_id=run_id)
                     # Timeout/crash path's caller already emitted its own event.
         return blocked
+
+    # --- spawn result recording (A5) -------------------------------------
+
+    def record_spawn_success(self, task_id: str, pid: int) -> None:
+        """Stamp ``worker_pid`` + emit a ``spawned`` event.
+
+        Mirrors ``kanban_db._set_worker_pid``: updates ``tasks.worker_pid`` and
+        the current run's ``task_runs.worker_pid``, then emits a ``spawned``
+        event carrying the pid. Called by the glue (Part B) after a successful
+        spawn of a task that ``dispatch_plan`` already claimed.
+        """
+        pid = int(pid)
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "UPDATE tasks SET worker_pid=%s WHERE board=%s AND id=%s",
+                    (pid, self.board, task_id))
+                cur.execute(
+                    "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+                    (self.board, task_id))
+                row = cur.fetchone()
+                run_id = row["current_run_id"] if row else None
+                if run_id is not None:
+                    cur.execute(
+                        "UPDATE task_runs SET worker_pid=%s WHERE board=%s AND id=%s",
+                        (pid, self.board, int(run_id)))
+                self._emit(cur, task_id, "spawned", {"pid": pid}, run_id=run_id)
+
+    def record_spawn_failure(self, task_id, error, *, failure_limit=None) -> bool:
+        # Thin wrapper over the A4 record_task_failure spawn_failed path. The
+        # systemic-failure-signature grouping from dispatch_once lives in the
+        # Part-B glue, NOT here.
+        return self.record_task_failure(task_id, error, outcome="spawn_failed",
+                                        failure_limit=failure_limit,
+                                        release_claim=True, end_run=True)
+
+    # --- dispatch reclaim primitives (A5) --------------------------------
+    #
+    # Each mirrors a kanban_db reclaim primitive board-scoped, reusing
+    # ``_pg_end_run`` + ``record_task_failure`` where the reference uses
+    # ``_end_run`` / ``_record_task_failure``. OS-level liveness/kill is
+    # injected (``signal_fn`` / ``pid_alive_fn``) and defaults to no-op — the
+    # glue (Part B) supplies host-local OS callbacks at the gateway call site.
+
+    def _pg_release_stale_claims(self, *, signal_fn=None) -> int:
+        """Mirror ``release_stale_claims``: TTL-expired running claims -> ready.
+
+        Pure-DB form. Unlike the SQLite reference there is no host-local
+        claim_lock prefix filter and no live-pid claim *extension* — those are
+        host-local OS behaviors. PG reclaims any claim whose ``claim_expires``
+        has passed and closes the run with ``outcome='reclaimed'``.
+
+        # phase-3-tail: live-pid claim-extension (release_stale_claims keeps a
+        # claim alive when its host-local worker pid is still running) is NOT
+        # reimplemented here — it requires OS liveness that PG cannot do
+        # server-side. The glue can pre-filter via ``pid_alive_fn`` later.
+        """
+        now = int(time.time())
+        reclaimed = 0
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, claim_lock, worker_pid, claim_expires, "
+                "last_heartbeat_at FROM tasks "
+                "WHERE board=%s AND status='running' AND claim_expires IS NOT NULL "
+                "AND claim_expires < %s",
+                (self.board, now))
+            stale = cur.fetchall()
+        for row in stale:
+            pid = row["worker_pid"]
+            if signal_fn is not None and pid:
+                try:
+                    import signal as _sig
+                    signal_fn(int(pid), _sig.SIGTERM)
+                except Exception:
+                    pass
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                with conn.transaction():
+                    cur.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL "
+                        "WHERE board=%s AND id=%s AND status='running' "
+                        "AND claim_expires IS NOT NULL AND claim_expires < %s",
+                        (self.board, row["id"], now))
+                    if cur.rowcount != 1:
+                        continue
+                    run_id = self._pg_end_run(
+                        cur, row["id"], outcome="reclaimed", status="reclaimed",
+                        error=f"stale_lock={row['claim_lock']}")
+                    payload = {
+                        "stale_lock": row["claim_lock"],
+                        "worker_pid": int(pid) if pid is not None else None,
+                        "claim_expires": int(row["claim_expires"]),
+                        "last_heartbeat_at": (
+                            int(row["last_heartbeat_at"])
+                            if row["last_heartbeat_at"] is not None else None),
+                        "now": now,
+                    }
+                    self._emit(cur, row["id"], "reclaimed", payload, run_id=run_id)
+                    reclaimed += 1
+        return reclaimed
+
+    def _pg_enforce_max_runtime(self, *, signal_fn=None) -> list:
+        """Mirror ``enforce_max_runtime``: running tasks past ``max_runtime_seconds``
+        -> ready (+ timed_out event + failure counter).
+
+        Identifies tasks past their per-attempt runtime budget (measured from
+        the active run's ``started_at``, falling back to ``tasks.started_at``),
+        signals the worker via the injected ``signal_fn`` ONLY when provided (no
+        hardcoded ``os.kill``), flips the task back to ``ready``, closes the run
+        ``timed_out``, and records a failure (``release_claim=False``,
+        ``end_run=False``) so the breaker can trip.
+
+        # phase-3-tail: the SQLite host_prefix (claim_lock) filter is NOT
+        # applied — PG is multi-host-agnostic at the store layer; host-locality
+        # is a glue concern. SIGTERM/grace/SIGKILL escalation is delegated to
+        # ``signal_fn`` (the glue supplies the host-local kill ladder); the
+        # store sends a single best-effort SIGTERM when a signal_fn is given.
+        """
+        import signal as _sig
+        now = int(time.time())
+        timed_out: list = []
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT t.id, t.worker_pid, "
+                "COALESCE(r.started_at, t.started_at) AS active_started_at, "
+                "t.max_runtime_seconds "
+                "FROM tasks t LEFT JOIN task_runs r "
+                "ON r.board=t.board AND r.id=t.current_run_id "
+                "WHERE t.board=%s AND t.status='running' "
+                "AND t.max_runtime_seconds IS NOT NULL "
+                "AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
+                "AND t.worker_pid IS NOT NULL",
+                (self.board,))
+            rows = cur.fetchall()
+        for row in rows:
+            elapsed = now - int(row["active_started_at"])
+            limit = int(row["max_runtime_seconds"])
+            if elapsed < limit:
+                continue
+            pid = int(row["worker_pid"])
+            tid = row["id"]
+            if signal_fn is not None:
+                try:
+                    signal_fn(pid, _sig.SIGTERM)
+                except Exception:
+                    pass
+            tripped = False
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                with conn.transaction():
+                    cur.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL, "
+                        "last_heartbeat_at=NULL "
+                        "WHERE board=%s AND id=%s AND status='running'",
+                        (self.board, tid))
+                    if cur.rowcount != 1:
+                        continue
+                    payload = {
+                        "pid": pid,
+                        "elapsed_seconds": int(elapsed),
+                        "limit_seconds": limit,
+                    }
+                    run_id = self._pg_end_run(
+                        cur, tid, outcome="timed_out", status="timed_out",
+                        error=f"elapsed {int(elapsed)}s > limit {limit}s",
+                        metadata=payload)
+                    self._emit(cur, tid, "timed_out", payload, run_id=run_id)
+                    timed_out.append(tid)
+                    tripped = True
+            if tripped:
+                # Counter-only failure bookkeep (task already at ready, run
+                # already closed). May flip ready -> blocked if the breaker trips.
+                self.record_task_failure(
+                    tid, f"elapsed {int(elapsed)}s > limit {limit}s",
+                    outcome="timed_out", release_claim=False, end_run=False,
+                    event_payload_extra={"pid": pid})
+        return timed_out
+
+    def _pg_detect_stale_running(self, *, stale_timeout_seconds=0,
+                                 signal_fn=None) -> list:
+        """Mirror ``detect_stale_running``: heartbeat-stale running tasks -> ready.
+
+        A task is stale when it has been running longer than
+        ``stale_timeout_seconds`` AND its ``last_heartbeat_at`` is older than
+        ``_STALE_HEARTBEAT_GAP_SECONDS`` (or never sent). On reclaim it goes
+        back to ``ready`` and the run closes ``outcome='stale'``. Deliberately
+        does NOT call ``record_task_failure`` (matches the reference: stale
+        reclaim is detection of an absent heartbeat, not a worker failure —
+        counting it would let two legitimately long runs trip the breaker).
+
+        # phase-3-tail: the SQLite host_prefix filter is not applied (store is
+        # host-agnostic); the kill is delegated to the injected ``signal_fn``.
+        """
+        if stale_timeout_seconds <= 0:
+            return []
+        import signal as _sig
+        now = int(time.time())
+        reclaimed: list = []
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT t.id, t.worker_pid, t.last_heartbeat_at, "
+                "COALESCE(r.started_at, t.started_at) AS active_started_at "
+                "FROM tasks t LEFT JOIN task_runs r "
+                "ON r.board=t.board AND r.id=t.current_run_id "
+                "WHERE t.board=%s AND t.status='running'",
+                (self.board,))
+            rows = cur.fetchall()
+        for row in rows:
+            if row["active_started_at"] is None:
+                continue
+            elapsed = now - int(row["active_started_at"])
+            if elapsed < stale_timeout_seconds:
+                continue
+            last_hb = row["last_heartbeat_at"]
+            hb_age = (now - int(last_hb)) if last_hb is not None else None
+            if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+                continue
+            pid = row["worker_pid"]
+            tid = row["id"]
+            if signal_fn is not None and pid:
+                try:
+                    signal_fn(int(pid), _sig.SIGTERM)
+                except Exception:
+                    pass
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                with conn.transaction():
+                    cur.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL, "
+                        "last_heartbeat_at=NULL "
+                        "WHERE board=%s AND id=%s AND status='running'",
+                        (self.board, tid))
+                    if cur.rowcount != 1:
+                        continue
+                    payload = {
+                        "elapsed_seconds": int(elapsed),
+                        "last_heartbeat_at": (
+                            int(last_hb) if last_hb is not None else None),
+                        "heartbeat_age_seconds": (
+                            int(hb_age) if hb_age is not None else None),
+                        "timeout_seconds": stale_timeout_seconds,
+                        "pid": int(pid) if pid else None,
+                    }
+                    run_id = self._pg_end_run(
+                        cur, tid, outcome="stale", status="stale",
+                        error=(
+                            f"no heartbeat for {int(hb_age)}s "
+                            if hb_age is not None else "no heartbeat ever")
+                        + f"after {int(elapsed)}s running",
+                        metadata=payload)
+                    self._emit(cur, tid, "stale", payload, run_id=run_id)
+                    reclaimed.append(tid)
+        return reclaimed
+
+    def _pg_detect_crashed_workers(self, *, pid_alive_fn=None) -> list:
+        """SIMPLIFIED PG crash detection.
+
+        Without OS liveness there is no way to tell a dead worker from a live
+        one, so when ``pid_alive_fn`` is None this returns ``[]``. When provided,
+        for each running task with a ``worker_pid`` whose pid is NOT alive, the
+        task flips back to ``ready``, a ``crashed`` event is emitted, and a
+        failure is recorded (``release_claim=False``, ``end_run=False``).
+
+        # phase-3-tail: the reap-registry clean-exit (rc=0 -> protocol_violation
+        # -> immediate breaker trip) classification from ``detect_crashed_workers``
+        # is GLUE-side and NOT reimplemented here. The PG store only does the
+        # liveness-based crash reclaim; clean-exit protocol-violation detection
+        # needs the gateway's worker-exit reap registry, which lives in Part B.
+        """
+        if pid_alive_fn is None:
+            return []
+        now = int(time.time())
+        crashed: list = []
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, worker_pid, claim_lock FROM tasks "
+                "WHERE board=%s AND status='running' AND worker_pid IS NOT NULL",
+                (self.board,))
+            rows = cur.fetchall()
+        for row in rows:
+            pid = int(row["worker_pid"])
+            try:
+                alive = bool(pid_alive_fn(pid))
+            except Exception:
+                alive = True  # be conservative: don't reclaim on probe error
+            if alive:
+                continue
+            tid = row["id"]
+            lock = row["claim_lock"] or ""
+            error_text = f"pid {pid} not alive"
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                with conn.transaction():
+                    cur.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL "
+                        "WHERE board=%s AND id=%s AND status='running' "
+                        "AND worker_pid=%s",
+                        (self.board, tid, pid))
+                    if cur.rowcount != 1:
+                        continue
+                    payload = {"pid": pid, "claimer": lock}
+                    run_id = self._pg_end_run(
+                        cur, tid, outcome="crashed", status="crashed",
+                        error=error_text, metadata=payload)
+                    self._emit(cur, tid, "crashed", payload, run_id=run_id)
+                    crashed.append(tid)
+            self.record_task_failure(
+                tid, error_text, outcome="crashed",
+                release_claim=False, end_run=False)
+        return crashed
+
+    def _pg_promote_cleared_scheduled(self) -> int:
+        """Mirror ``promote_cleared_scheduled``: un-park ``active_pr`` scheduled
+        tasks whose PR guard has cleared, back to ``ready``. Pure DB.
+
+        Targets ONLY parks marked ``respawn_guard='active_pr'`` on the most
+        recent ``scheduled`` event; re-evaluates the same active-PR predicate.
+        """
+        promoted = 0
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, assignee FROM tasks WHERE board=%s AND status='scheduled'",
+                (self.board,))
+            rows = cur.fetchall()
+        for row in rows:
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE board=%s AND task_id=%s AND kind='scheduled' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (self.board, row["id"]))
+                ev = cur.fetchone()
+            if not ev or not ev["payload"]:
+                continue
+            payload = ev["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    continue
+            if not isinstance(payload, dict) or \
+                    payload.get("respawn_guard") != "active_pr":
+                continue  # time-based / operator park — leave alone
+            if self._pg_active_pr_guard_holds(row["id"], row["assignee"]):
+                continue  # PR still recent — stay parked
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                with conn.transaction():
+                    cur.execute(
+                        "UPDATE tasks SET status='ready' "
+                        "WHERE board=%s AND id=%s AND status='scheduled'",
+                        (self.board, row["id"]))
+                    if cur.rowcount != 1:
+                        continue
+                    self._emit(
+                        cur, row["id"], "ready",
+                        {"reason": "active_pr respawn guard cleared; "
+                                   "auto-promoted to ready"})
+                    promoted += 1
+        return promoted
+
+    # --- respawn guard (A5, board-scoped reimplementation of check_respawn_guard) ---
+
+    def _pg_active_pr_guard_holds(self, task_id: str,
+                                  assignee: Optional[str]) -> bool:
+        """Mirror ``active_pr_guard_holds`` board-scoped: True iff a non-reviewer
+        task has a GitHub PR URL in a comment newer than the PR guard window."""
+        if (assignee or "").casefold() == "reviewer":
+            return False
+        pr_cutoff = int(time.time()) - _RESPAWN_GUARD_PR_WINDOW
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT body FROM task_comments "
+                "WHERE board=%s AND task_id=%s AND created_at >= %s",
+                (self.board, task_id, pr_cutoff))
+            for c in cur.fetchall():
+                if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                    return True
+        return False
+
+    def _pg_check_respawn_guard(self, task_id: str) -> Optional[str]:
+        """Mirror ``check_respawn_guard`` board-scoped. Returns a guard reason
+        (``blocker_auth`` / ``recent_success`` / ``active_pr``) or None."""
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT assignee, last_failure_error FROM tasks "
+                "WHERE board=%s AND id=%s",
+                (self.board, task_id))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            err = row["last_failure_error"]
+            if err and _RESPAWN_BLOCKER_RE.search(err):
+                return "blocker_auth"
+            cutoff = int(time.time()) - _RESPAWN_GUARD_SUCCESS_WINDOW
+            cur.execute(
+                "SELECT id FROM task_runs "
+                "WHERE board=%s AND task_id=%s AND outcome='completed' "
+                "AND ended_at >= %s LIMIT 1",
+                (self.board, task_id, cutoff))
+            if cur.fetchone():
+                return "recent_success"
+            assignee = row["assignee"]
+        if self._pg_active_pr_guard_holds(task_id, assignee):
+            return "active_pr"
+        return None
+
+    # --- dispatch_plan (A5 dispatch core) --------------------------------
+
+    def dispatch_plan(self, *, max_spawn=None, max_in_progress=None,
+                      failure_limit=DEFAULT_FAILURE_LIMIT,
+                      stale_timeout_seconds=0, default_assignee=None,
+                      max_in_progress_per_profile=None, ttl_seconds=None,
+                      resolve_workspace=None, profile_exists=None,
+                      signal_fn=None, pid_alive_fn=None):
+        """One dispatcher tick reimplemented for PG: reclaim + ready-scan +
+        claim + workspace-resolve, WITHOUT zombie-reap and WITHOUT the real
+        spawn (the glue spawns; this returns the claimed tasks in
+        ``DispatchPlan.to_spawn``).
+
+        Mirrors ``kanban_db.dispatch_once`` MINUS the os.waitpid zombie reap
+        (OS, host-local) and MINUS spawn_fn invocation. Reclaim OS callbacks
+        (``signal_fn`` / ``pid_alive_fn``) are injected and default to no-op.
+        ``resolve_workspace`` / ``profile_exists`` are injected callbacks:
+        ``resolve_workspace(task, board=...) -> path``; ``profile_exists(name)
+        -> bool``. When ``profile_exists`` is None every assignee is treated as
+        spawnable. When ``resolve_workspace`` is None the workspace is left as
+        the task's existing path (may be None).
+        """
+        from hermes_cli.kanban.store import DispatchPlan
+
+        result = DispatchResult()
+
+        # --- reclaim phase (mirror dispatch_once ordering) ---------------
+        result.crashed = self._pg_detect_crashed_workers(pid_alive_fn=pid_alive_fn)
+        result.reclaimed = self._pg_release_stale_claims(signal_fn=signal_fn)
+        result.stale = self._pg_detect_stale_running(
+            stale_timeout_seconds=stale_timeout_seconds, signal_fn=signal_fn)
+        result.timed_out = self._pg_enforce_max_runtime(signal_fn=signal_fn)
+        if kanban_db._promote_scheduled_enabled():
+            self._pg_promote_cleared_scheduled()
+        result.promoted = self.recompute_ready()
+
+        # --- concurrency caps --------------------------------------------
+        running_count = 0
+        if max_spawn is not None or max_in_progress is not None:
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT count(*) AS n FROM tasks "
+                    "WHERE board=%s AND status='running'", (self.board,))
+                running_count = int(cur.fetchone()["n"])
+
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, assignee FROM tasks "
+                "WHERE board=%s AND status='ready' AND claim_lock IS NULL "
+                "ORDER BY priority DESC, created_at ASC",
+                (self.board,))
+            ready_rows = cur.fetchall()
+        result.ready_count = len(ready_rows)
+
+        if max_in_progress is not None:
+            if max_spawn is None or max_spawn > max_in_progress:
+                max_spawn = max_in_progress
+            if ready_rows and max_spawn is not None and running_count >= max_spawn:
+                result.max_in_progress_blocked = True
+                return DispatchPlan(to_spawn=[], result=result)
+
+        # --- per-profile cap (count currently-running per assignee) ------
+        per_profile_cap = (
+            max_in_progress_per_profile
+            if isinstance(max_in_progress_per_profile, int)
+            and max_in_progress_per_profile > 0 else None)
+        per_profile_running: dict = {}
+        if per_profile_cap is not None:
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT assignee, count(*) AS n FROM tasks "
+                    "WHERE board=%s AND status='running' AND assignee IS NOT NULL "
+                    "GROUP BY assignee", (self.board,))
+                for prow in cur.fetchall():
+                    per_profile_running[str(prow["assignee"])] = int(prow["n"])
+
+        # --- default-assignee resolution ---------------------------------
+        default_assignee = (default_assignee or "").strip() or None
+        default_assignee_resolved = False
+        if default_assignee:
+            if profile_exists is None:
+                default_assignee_resolved = True
+            else:
+                try:
+                    default_assignee_resolved = bool(profile_exists(default_assignee))
+                except Exception:
+                    default_assignee_resolved = True
+
+        def _profile_ok(name) -> bool:
+            if profile_exists is None:
+                return True
+            try:
+                return bool(profile_exists(name))
+            except Exception:
+                return True
+
+        to_spawn: list = []
+        spawned = 0
+
+        for row in ready_rows:
+            if max_spawn is not None and running_count + spawned >= max_spawn:
+                break
+            tid = row["id"]
+            row_assignee = row["assignee"]
+            if not row_assignee:
+                if default_assignee and default_assignee_resolved:
+                    with self._pool.connection() as conn, \
+                            conn.cursor(row_factory=dict_row) as cur:
+                        with conn.transaction():
+                            cur.execute(
+                                "UPDATE tasks SET assignee=%s WHERE board=%s "
+                                "AND id=%s AND (assignee IS NULL OR assignee='')",
+                                (default_assignee, self.board, tid))
+                            if cur.rowcount == 1:
+                                self._emit(cur, tid, "assigned", {
+                                    "assignee": default_assignee,
+                                    "source": "kanban.default_assignee"})
+                    row_assignee = default_assignee
+                    result.auto_assigned_default.append(tid)
+                else:
+                    result.skipped_unassigned.append(tid)
+                    continue
+            # Skip ready tasks whose assignee is not a real spawnable profile.
+            if not _profile_ok(row_assignee):
+                result.skipped_nonspawnable.append(tid)
+                continue
+            if per_profile_cap is not None:
+                current = per_profile_running.get(str(row_assignee), 0)
+                if current >= per_profile_cap:
+                    result.skipped_per_profile_capped.append(
+                        (tid, str(row_assignee), current))
+                    continue
+            result.spawnable_ready += 1
+
+            task_for_validation = self.get_task(tid)
+            if task_for_validation is None:
+                continue
+            validation_errors = _pre_spawn_validation_errors(task_for_validation)
+            if validation_errors:
+                reason = "; ".join(validation_errors)
+                result.pre_spawn_blocked.append((tid, reason))
+                # phase-3-tail: the SQLite pre-spawn auto-block emit
+                # (_record_pre_spawn_validation_failure: flip ready->blocked +
+                # synth run + gave_up event) is NOT mirrored here. PG defers the
+                # task this tick without auto-blocking; the breaker still trips
+                # later via record_task_failure on repeated failures.
+                continue
+
+            guard_reason = self._pg_check_respawn_guard(tid)
+            if guard_reason is not None:
+                result.respawn_guarded.append((tid, guard_reason))
+                with self._pool.connection() as conn, \
+                        conn.cursor(row_factory=dict_row) as cur:
+                    with conn.transaction():
+                        self._emit(cur, tid, "respawn_guarded",
+                                   {"reason": guard_reason})
+                        if guard_reason == "blocker_auth":
+                            reason = ("respawn guard: auth/quota blocker "
+                                      "detected; operator action is required "
+                                      "before retry")
+                            cur.execute(
+                                "UPDATE tasks SET status='blocked', "
+                                "claim_lock=NULL, claim_expires=NULL, "
+                                "worker_pid=NULL WHERE board=%s AND id=%s "
+                                "AND status='ready'", (self.board, tid))
+                            run_id = self._pg_end_run(
+                                cur, tid, outcome="blocked", status="blocked",
+                                summary=reason,
+                                metadata={"respawn_guard": guard_reason})
+                            self._emit(cur, tid, "blocked", {"reason": reason},
+                                       run_id=run_id)
+                        elif guard_reason == "active_pr":
+                            reason = ("respawn guard: recent PR URL detected; "
+                                      "task parked to prevent duplicate PR "
+                                      "creation")
+                            cur.execute(
+                                "UPDATE tasks SET status='scheduled', "
+                                "claim_lock=NULL, claim_expires=NULL, "
+                                "worker_pid=NULL WHERE board=%s AND id=%s "
+                                "AND status='ready'", (self.board, tid))
+                            run_id = self._pg_end_run(
+                                cur, tid, outcome="scheduled", status="scheduled",
+                                summary=reason,
+                                metadata={"respawn_guard": guard_reason})
+                            self._emit(
+                                cur, tid, "scheduled",
+                                {"reason": reason, "respawn_guard": guard_reason},
+                                run_id=run_id)
+                continue
+
+            claimed = self.claim_task(tid, ttl_seconds=ttl_seconds)
+            if claimed is None:
+                continue
+            result.spawn_attempts += 1
+            workspace = None
+            if resolve_workspace is not None:
+                try:
+                    workspace = resolve_workspace(claimed, board=self.board)
+                except Exception as exc:
+                    self.record_spawn_failure(claimed.id, f"workspace: {exc}",
+                                              failure_limit=failure_limit)
+                    result.spawn_failures += 1
+                    continue
+                self.set_workspace_path(claimed.id, str(workspace))
+            else:
+                workspace = claimed.workspace_path
+            to_spawn.append(
+                (claimed, str(workspace) if workspace is not None else None))
+            result.spawned.append(
+                (claimed.id, claimed.assignee or "",
+                 str(workspace) if workspace is not None else ""))
+            spawned += 1
+            if per_profile_cap is not None and claimed.assignee:
+                key = str(claimed.assignee)
+                per_profile_running[key] = per_profile_running.get(key, 0) + 1
+
+        return DispatchPlan(to_spawn=to_spawn, result=result)
 
     # --- runs -------------------------------------------------------------
 
