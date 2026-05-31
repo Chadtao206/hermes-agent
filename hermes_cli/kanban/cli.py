@@ -40,6 +40,7 @@ from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_p
 # sub-module of that package.
 # ---------------------------------------------------------------------------
 from hermes_cli.kanban.store import kanban_store  # noqa: F401 (re-exported)
+from hermes_cli.kanban.store import resolve_backend  # noqa: F401 (used in preamble guard + tests)
 
 
 def _make_store():
@@ -1370,7 +1371,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     observational_actions = {"doctor", "reconcile", "metrics", "repair-db"}
-    if action not in observational_actions:
+    # Postgres ensures its schema via the store (pg_pool.ensure_schema); the
+    # sqlite init_db() opens a writable sqlite connection and would trip the
+    # single-writer guard under backend=postgres.  Skip it for Postgres.
+    if action not in observational_actions and resolve_backend() != "postgres":
         try:
             kb.init_db()
         except Exception as exc:
