@@ -6078,6 +6078,18 @@ class GatewayRunner:
                                 max_send_failures=MAX_SEND_FAILURES,
                                 platform_enum=_Platform,
                                 board=slug,
+                                # Per-sub claim faults that are corruption/disk-io
+                                # must PROPAGATE out of the glue so the per-board
+                                # except below quarantines the board (streak /
+                                # hard-disable). Without this the glue's per-sub
+                                # isolation would swallow them and a corrupt board
+                                # would spin every tick. Genuinely-malformed subs
+                                # (not classified fatal) are still skipped inside
+                                # the glue.
+                                claim_error_is_fatal=lambda exc: (
+                                    _is_disk_io_board_db_error(exc)
+                                    or _notifier_db_error_is_corrupt(exc)
+                                ),
                             )
                         finally:
                             try:

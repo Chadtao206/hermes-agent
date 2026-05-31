@@ -14,6 +14,8 @@ import asyncio
 import enum
 import pathlib
 
+import pytest
+
 from hermes_cli.kanban_glue import run_dispatch_tick, run_notifier_tick
 
 _TERMINAL_KINDS = (
@@ -492,3 +494,82 @@ def test_notifier_tick_profile_wake_failure_rewinds(store):
     assert "failed" in statuses
     failed_row = [e for e in wake_events if _field(e, "status") == "failed"][-1]
     assert "spawn boom" in str(_field(failed_row, "error"))
+
+
+# ---------------------------------------------------------------------------
+# claim_error_is_fatal classifier (B4 regression)
+#
+# Pure glue logic: a tiny fake store whose chat-claim raises a sentinel. With a
+# fatal classifier the exception PROPAGATES out of run_notifier_tick (the
+# gateway then quarantines the board); without one (or with a non-fatal
+# classifier) the sub is skipped and the tick completes. Backend-agnostic — the
+# branch under test never touches a real DB, so a fake store suffices.
+# ---------------------------------------------------------------------------
+
+
+class _FatalClaimError(Exception):
+    """Sentinel raised by the fake store's claim to stand in for a corrupt/
+    disk-io DB fault."""
+
+
+class _RaisingClaimStore:
+    """Minimal store: one chat sub, whose claim raises the sentinel. Everything
+    else is a no-op so the tick reaches the chat-claim try/except and nothing
+    after it matters for the assertion."""
+
+    board = "test"
+
+    def list_notify_subs(self, *args, **kwargs):
+        return [{
+            "task_id": "t1",
+            "platform": "telegram",
+            "chat_id": "c1",
+            "thread_id": "",
+            "event_kinds": None,
+            "include_children": 0,
+            "notifier_profile": None,
+        }]
+
+    def claim_unseen_events_for_sub(self, *args, **kwargs):
+        raise _FatalClaimError("database disk image is malformed")
+
+    def list_profile_event_subs(self, *args, **kwargs):
+        return []
+
+
+def test_notifier_tick_fatal_claim_error_propagates():
+    """A fatal-classified claim fault RE-RAISES out of run_notifier_tick."""
+    store = _RaisingClaimStore()
+    with pytest.raises(_FatalClaimError):
+        asyncio.run(run_notifier_tick(
+            store,
+            {"telegram": _FakeAdapter()},
+            notifier_profile=None,
+            active_platforms={"telegram"},
+            terminal_kinds=_TERMINAL_KINDS,
+            render_chat_event=_render,
+            wake_profile_fn=_wake_noop,
+            platform_enum=None,
+            claim_error_is_fatal=lambda exc: True,
+        ))
+
+
+@pytest.mark.parametrize("classifier", [None, lambda exc: False])
+def test_notifier_tick_nonfatal_claim_error_is_swallowed(classifier):
+    """No classifier (default) or a non-fatal classifier swallows the claim
+    fault: the sub is skipped and the tick completes without raising."""
+    store = _RaisingClaimStore()
+    summary = asyncio.run(run_notifier_tick(
+        store,
+        {"telegram": _FakeAdapter()},
+        notifier_profile=None,
+        active_platforms={"telegram"},
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=_wake_noop,
+        platform_enum=None,
+        claim_error_is_fatal=classifier,
+    ))
+    # Tick completed (no raise); the raising sub was skipped so nothing was
+    # delivered.
+    assert summary["delivered"] == 0

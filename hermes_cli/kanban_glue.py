@@ -322,6 +322,7 @@ async def run_notifier_tick(
     max_send_failures=3,
     platform_enum=None,
     board=None,
+    claim_error_is_fatal=None,
 ) -> dict:
     """One backend-agnostic notifier tick for ONE board's ``store``.
 
@@ -380,6 +381,19 @@ async def run_notifier_tick(
             string match against ``adapters`` keys.
         board: board slug pinned for this tick; forwarded to the injected
             ``render_chat_event`` / ``wake_profile_fn`` callbacks for context.
+        claim_error_is_fatal: optional ``(exc) -> bool`` classifier consulted
+            when a per-sub CLAIM raises (the chat-sub
+            ``claim_unseen_events_for_sub`` block and the profile-sub
+            ``claim_unseen_events_for_profile_sub`` block). When it returns
+            truthy for a raised exception the exception is RE-RAISED out of
+            ``run_notifier_tick`` instead of being swallowed, so the caller can
+            handle it (e.g. the gateway's corruption/disk-io quarantine
+            hard-disables a faulted board rather than spinning on it every
+            tick). When it returns falsy — or ``None`` (the default) — the
+            historical behaviour is preserved: the offending sub is logged and
+            SKIPPED so the rest of the tick proceeds (per-sub isolation for a
+            genuinely-malformed sub). The default keeps the glue backend-agnostic
+            (no classifier ⇒ swallow+continue as before).
 
     Returns a plain summary dict:
         ``delivered`` (chat events sent), ``woke`` (profile wakes spawned),
@@ -447,6 +461,13 @@ async def run_notifier_tick(
                             except Exception:
                                 event_tasks[ev.task_id] = None
             except Exception as exc:
+                # A fatal claim fault (corruption / disk-io, as classified by
+                # the caller) must PROPAGATE so the gateway can quarantine the
+                # board rather than spin on it every tick. Without a classifier
+                # (default) keep the historical swallow+continue per-sub
+                # isolation for a genuinely-malformed sub.
+                if claim_error_is_fatal is not None and claim_error_is_fatal(exc):
+                    raise
                 logger.warning(
                     "kanban notifier: chat claim failed for %s/%s on board %s: %s",
                     _sub_field(sub, "task_id"), _sub_field(sub, "platform"),
@@ -497,6 +518,11 @@ async def run_notifier_tick(
                             except Exception:
                                 p_event_tasks[ev.task_id] = None
             except Exception as exc:
+                # See the chat-sub loop above: a fatal claim fault propagates
+                # to the caller's quarantine; otherwise the malformed sub is
+                # skipped so the tick proceeds.
+                if claim_error_is_fatal is not None and claim_error_is_fatal(exc):
+                    raise
                 logger.warning(
                     "kanban notifier: profile-event claim failed for %s/%s on "
                     "board %s: %s",
