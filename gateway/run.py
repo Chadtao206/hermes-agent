@@ -7447,6 +7447,57 @@ class GatewayRunner:
             if tick_recorded_db_paths is None:
                 tick_recorded_db_paths = set()
             conn = None
+
+            # Postgres backend: the sqlite-specific fingerprint / connect /
+            # corruption+disk-io quarantine machinery below is meaningless for
+            # a remote PG store (no on-disk board file to stat or hot-swap), so
+            # SKIP it entirely and route the tick through the backend-agnostic
+            # glue. Guarded on resolve_backend() so it never runs for sqlite —
+            # the default deployment is wholly unaffected. (This branch is
+            # validated by the conformance suite + the Phase-5 cutover plan; it
+            # is intentionally not exercised by a pg gateway test in B3.)
+            try:
+                from hermes_cli.kanban.store import (
+                    kanban_store as _kanban_store,
+                    resolve_backend as _resolve_backend,
+                )
+                from hermes_cli import kanban_glue as _glue
+            except Exception:
+                _resolve_backend = None  # type: ignore[assignment]
+            if _resolve_backend is not None and _resolve_backend() == "postgres":
+                try:
+                    from hermes_cli.profiles import profile_exists as _profile_exists
+                except Exception:
+                    _profile_exists = None  # type: ignore[assignment]
+                store = _kanban_store(board=slug)
+                try:
+                    return _glue.run_dispatch_tick(
+                        store,
+                        board=slug,
+                        spawn_fn=_kb._default_spawn,
+                        resolve_workspace=_kb.resolve_workspace,
+                        profile_exists=_profile_exists,
+                        signal_fn=os.kill,
+                        pid_alive_fn=_kb._pid_alive,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: tick failed on board %s (postgres)",
+                        slug,
+                    )
+                    return None
+                finally:
+                    try:
+                        store.close()
+                    except Exception:
+                        pass
+
             fingerprint = _board_db_fingerprint(slug, db_path=db_path)
             if slug in disabled_boards:
                 return None
@@ -7501,16 +7552,31 @@ class GatewayRunner:
                     )
                     corruption_confirm_streaks.pop(fingerprint[0], None)
                     return result
-                conn = _kb.connect(board=slug)
-                # `connect()` runs the schema + idempotent migration on
-                # first open per process; the previous explicit
-                # `init_db()` call here busted the per-process cache and
-                # re-ran the migration on a second connection, racing
-                # the first. See the matching comment in
-                # `_kanban_notifier_watcher` and issue #21378.
-                result = _kb.dispatch_once(
-                    conn,
+                # Non-single-writer SQLite path: route through the
+                # backend-agnostic glue. The SqliteKanbanStore opens its own
+                # local writable connection (dispatch_once-with-capture cannot
+                # cross a writer socket), so we no longer open `conn` here —
+                # `conn` stays None and the `finally` close is a no-op. The
+                # store-internal reclaim/kill/crash-detection runs inside
+                # dispatch_once's capturing path, so signal_fn / pid_alive_fn /
+                # resolve_workspace / profile_exists are accepted-but-ignored by
+                # the sqlite store; we pass None to make that explicit. The
+                # fingerprint stat above + the disk-io/corruption try/except
+                # below still wrap this call so DB faults are quarantined the
+                # same as the legacy direct branch. Returns a SUMMARY DICT whose
+                # int keys match DispatchResult.summary() (drop-in for the
+                # consumer, which normalizes dict-or-DispatchResult).
+                from hermes_cli.kanban.store_sqlite import SqliteKanbanStore
+                from hermes_cli import kanban_glue as _glue
+                store = SqliteKanbanStore(board=slug)
+                result = _glue.run_dispatch_tick(
+                    store,
                     board=slug,
+                    spawn_fn=_kb._default_spawn,
+                    resolve_workspace=None,
+                    profile_exists=None,
+                    signal_fn=None,
+                    pid_alive_fn=None,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
@@ -7859,7 +7925,16 @@ class GatewayRunner:
                     if res is None:
                         continue
                     dispatch_res = cast(Any, res)
-                    summary = dispatch_res.summary()
+                    # `_tick_once_for_board` returns EITHER a DispatchResult
+                    # (single-writer daemon path — unchanged) OR a summary dict
+                    # (the glue path). The glue's dict already carries the same
+                    # int keys as DispatchResult.summary(), so normalize to a
+                    # dict and the downstream `.get(...)` reads work unchanged.
+                    summary = (
+                        dispatch_res.summary()
+                        if hasattr(dispatch_res, "summary")
+                        else dict(dispatch_res)
+                    )
                     summaries_by_board[slug] = summary
                     if summary.get("spawned", 0):
                         any_spawned = True
