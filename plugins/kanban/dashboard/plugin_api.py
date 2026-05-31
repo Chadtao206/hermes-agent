@@ -3076,6 +3076,35 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         def _fetch_new(cursor_val: int, wake_cursor_val: int) -> tuple[int, list[dict], int, list[dict]]:
+            if _backend() == "postgres":
+                pg = _pg_reads()
+                # Resolve the board slug ONCE and pass the same slug to both the
+                # events tail and the wake-event store, so they never read
+                # different boards (Task 5 split-brain lesson).
+                bslug = pg.slug(ws_board)
+                new_cursor, out = pg.events_since(bslug, cursor_val, 200)
+                store = _store(board=bslug)
+                try:
+                    wake_rows = store.list_profile_wake_events(
+                        since_id=wake_cursor_val, limit=200,
+                    )
+                finally:
+                    store.close()
+                wake_out: list[dict] = []
+                new_wake_cursor = wake_cursor_val
+                for wr in wake_rows:
+                    wake_out.append({
+                        "id": wr.get("id"),
+                        "task_id": wr.get("task_id"),
+                        "profile": wr.get("profile"),
+                        "name": wr.get("name") or "",
+                        "status": wr.get("status"),
+                        "error": wr.get("error"),
+                        "claimed_event_cursor": wr.get("claimed_event_cursor"),
+                        "created_at": wr.get("created_at"),
+                    })
+                    new_wake_cursor = int(wr.get("id") or new_wake_cursor)
+                return new_cursor, out, new_wake_cursor, wake_out
             conn = _readonly_snapshot_conn(board=ws_board)
             try:
                 rows = conn.execute(

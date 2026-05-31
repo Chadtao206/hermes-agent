@@ -42,6 +42,25 @@ def test_board_running_column_from_postgres(pg_client):
     assert t in {x["id"] for x in running}
 
 
+def test_events_stream_tails_postgres(pg_client, monkeypatch):
+    # _check_ws_token rejects a missing token even in the test harness
+    # (it only fails-open for a *non-empty* token when web_server isn't
+    # importable). The pg_client router is loaded by path under a synthetic
+    # module name, so monkeypatch _check_ws_token on that exact instance.
+    import sys
+    plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    monkeypatch.setattr(plugin_mod, "_check_ws_token", lambda _token: True)
+
+    s = pg_client.pg_store
+    t = s.create_task(title="evt", assignee="engineer")  # emits task_events rows
+    with pg_client.websocket_connect("/api/plugins/kanban/events?since=0") as ws:
+        msg = ws.receive_json()
+        assert "events" in msg and msg["cursor"] > 0
+        assert any(e["task_id"] == t for e in msg["events"])
+        # payloads are objects/None, never raw JSON strings
+        assert all(not isinstance(e["payload"], str) for e in msg["events"])
+
+
 def test_board_resolves_current_board_consistently(monkeypatch, _pg_dsn, tmp_path):
     """When ?board= is omitted and the current-board pointer != 'default',
     the store AND the aggregates must read the SAME board (regression for the
