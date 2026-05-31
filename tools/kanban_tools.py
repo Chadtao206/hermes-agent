@@ -252,23 +252,38 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
     _auto_heartbeat_last_attempt = now
     try:
-        from hermes_cli import kanban_db as kb
-        with kb.write_session() as w:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+        run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+        run_id: Optional[int]
+        try:
+            run_id = int(run_id_raw) if run_id_raw else None
+        except (TypeError, ValueError):
+            run_id = None
+        from hermes_cli.kanban.store import resolve_backend
+        if resolve_backend() == "postgres":
+            # PG: only refresh last_heartbeat_at via the store. Claim-TTL
+            # extension for a live worker is handled dispatcher-side by
+            # _pg_release_stale_claims' live-pid extension, so the worker
+            # does not self-extend the claim (no heartbeat_claim on PG).
+            _board = os.environ.get("HERMES_KANBAN_BOARD") or None
+            store = _store(board=_board)
             try:
-                w.heartbeat_claim(task_id=tid, claimer=claim_lock)
+                store.heartbeat_worker(task_id=tid, note=None, expected_run_id=run_id)
             except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                w.heartbeat_worker(task_id=tid, note=None, expected_run_id=run_id)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+                logger.debug("auto-heartbeat: store heartbeat_worker failed", exc_info=True)
+            finally:
+                store.close()
+        else:
+            from hermes_cli import kanban_db as kb
+            with kb.write_session() as w:
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                try:
+                    w.heartbeat_claim(task_id=tid, claimer=claim_lock)
+                except Exception:
+                    logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+                try:
+                    w.heartbeat_worker(task_id=tid, note=None, expected_run_id=run_id)
+                except Exception:
+                    logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
@@ -784,21 +799,32 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     note = args.get("note")
     board = args.get("board")
     try:
-        from hermes_cli import kanban_db as kb
-        with kb.write_session(board=board) as w:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            w.heartbeat_claim(task_id=tid, claimer=claim_lock)
+        from hermes_cli.kanban.store import resolve_backend
+        if resolve_backend() == "postgres":
+            # PG: refresh last_heartbeat_at via the store; claim-TTL extension
+            # is dispatcher-side (live-pid extension in _pg_release_stale_claims).
+            store = _store(board=board)
+            try:
+                ok = store.heartbeat_worker(
+                    task_id=tid, note=note, expected_run_id=_worker_run_id(tid))
+            finally:
+                store.close()
+        else:
+            from hermes_cli import kanban_db as kb
+            with kb.write_session(board=board) as w:
+                # Extend the claim TTL first. The dispatcher pins
+                # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
+                # (see _default_spawn in kanban_db.py); falling back to the
+                # default _claimer_id() covers locally-driven workers that
+                # never went through the dispatcher path.
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                w.heartbeat_claim(task_id=tid, claimer=claim_lock)
 
-            ok = w.heartbeat_worker(
-                task_id=tid,
-                note=note,
-                expected_run_id=_worker_run_id(tid),
-            )
+                ok = w.heartbeat_worker(
+                    task_id=tid,
+                    note=note,
+                    expected_run_id=_worker_run_id(tid),
+                )
         if not ok:
             return tool_error(
                 f"could not heartbeat {tid} (unknown id or not running)"
