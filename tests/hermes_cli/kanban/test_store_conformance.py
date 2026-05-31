@@ -555,3 +555,24 @@ def test_record_spawn_success_sets_pid(store):
     if isinstance(payload, str):
         payload = json.loads(payload)
     assert payload.get("pid") == 4242
+
+
+def test_pre_spawn_validation_auto_blocks(store, monkeypatch):
+    # A ready task whose forced skill cannot be resolved fails pre-spawn
+    # validation; both backends must auto-block it (not silently defer).
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda a: True,
+                        raising=False)
+    tid = store.create_task(title="bad skill", assignee="engineer",
+                            skills=["__phase45_missing_skill__"])
+    assert store.get_task(tid).status == "ready"
+    store.dispatch_plan(profile_exists=lambda a: True, max_spawn=5)
+    assert store.get_task(tid).status == "blocked"
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "pre_spawn_validation_failed" in kinds
+    assert "gave_up" in kinds
+    assert "blocked" in kinds
+    task = store.get_task(tid)
+    assert task.consecutive_failures == 1
+    runs = store.list_runs(tid)
+    assert len(runs) == 1
+    assert _field(runs[0], "outcome") == "spawn_failed"

@@ -1089,6 +1089,50 @@ class PostgresKanbanStore:
              Jsonb(metadata) if metadata else None, now, now))
         return int(cur.fetchone()["id"])
 
+    def _pg_record_pre_spawn_validation_failure(self, task_id: str,
+                                                errors: list[str]) -> bool:
+        """Mirror kanban_db._record_pre_spawn_validation_failure: flip a ready
+        task to blocked, synth an ended run, emit the failure/gave_up/blocked
+        events. Returns True if it blocked the task."""
+        reason = "pre-spawn validation failed: " + "; ".join(errors)
+        with self._pool.connection() as conn, \
+                conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT consecutive_failures, status FROM tasks "
+                    "WHERE board=%s AND id=%s", (self.board, task_id))
+                row = cur.fetchone()
+                if row is None or row["status"] != "ready":
+                    return False
+                failures = int(row["consecutive_failures"] or 0) + 1
+                cur.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL, "
+                    "consecutive_failures=%s, last_failure_error=%s "
+                    "WHERE board=%s AND id=%s AND status='ready' "
+                    "AND claim_lock IS NULL",
+                    (failures, reason[:500], self.board, task_id))
+                if cur.rowcount != 1:
+                    return False
+                metadata = {
+                    "failure_class": "pre_spawn_validation",
+                    "validation_errors": list(errors),
+                    "failures": failures,
+                    "effective_limit": 1,
+                    "limit_source": "pre_spawn_validation",
+                }
+                run_id = self._pg_synthesize_ended_run(
+                    cur, task_id, outcome="spawn_failed", summary=reason,
+                    error=reason[:500], metadata=metadata)
+                payload = dict(metadata)
+                payload["error"] = reason[:500]
+                self._emit(cur, task_id, "pre_spawn_validation_failed",
+                           payload, run_id=run_id)
+                self._emit(cur, task_id, "gave_up", payload, run_id=run_id)
+                self._emit(cur, task_id, "blocked", {"reason": reason},
+                           run_id=run_id)
+                return True
+
     def _pg_clear_failure_counter(self, task_id: str) -> None:
         with self._pool.connection() as conn, \
                 conn.cursor(row_factory=dict_row) as cur:
@@ -2012,11 +2056,8 @@ class PostgresKanbanStore:
             if validation_errors:
                 reason = "; ".join(validation_errors)
                 result.pre_spawn_blocked.append((tid, reason))
-                # phase-3-tail: the SQLite pre-spawn auto-block emit
-                # (_record_pre_spawn_validation_failure: flip ready->blocked +
-                # synth run + gave_up event) is NOT mirrored here. PG defers the
-                # task this tick without auto-blocking; the breaker still trips
-                # later via record_task_failure on repeated failures.
+                if self._pg_record_pre_spawn_validation_failure(tid, validation_errors):
+                    result.auto_blocked.append(tid)
                 continue
 
             guard_reason = self._pg_check_respawn_guard(tid)
