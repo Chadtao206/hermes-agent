@@ -104,13 +104,28 @@ def test_cmd_liveness_pg(monkeypatch, capsys):
 def test_cmd_context_pg(monkeypatch, capsys):
     dsn = os.environ["HERMES_PG_TEST_DSN"]
     import hermes_cli.kanban.cli as cli
+    import hermes_cli.kanban.store_postgres as pg_store_mod
 
     store, pool, board = _pg_setup(monkeypatch, dsn)
+
+    # Install a spy on PostgresKanbanStore.build_worker_context to prove the PG
+    # branch was actually taken (not the sqlite fallback).
+    calls = {"n": 0}
+    _orig_bwc = pg_store_mod.PostgresKanbanStore.build_worker_context
+
+    def _spy(self, task_id):
+        calls["n"] += 1
+        return _orig_bwc(self, task_id)
+
+    monkeypatch.setattr(pg_store_mod.PostgresKanbanStore, "build_worker_context", _spy)
+
     try:
         tid = store.create_task(title="ctx", assignee="engineer", body="b")
         rc = cli.kanban_command(_context_args(tid))
         assert rc == 0
         assert f"# Kanban task {tid}" in capsys.readouterr().out
+        # Confirm the PG store's build_worker_context was called, not the sqlite path.
+        assert calls["n"] >= 1, "expected PostgresKanbanStore.build_worker_context to be called under backend=postgres"
     finally:
         store.close()
         pool.close()
