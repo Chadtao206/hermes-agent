@@ -169,11 +169,11 @@ class SqliteKanbanStore:
     def unlink_tasks(self, parent_id: str, child_id: str, **kwargs: Any) -> bool:
         return self._write("unlink_tasks", parent_id=parent_id, child_id=child_id, **kwargs)
 
-    def parent_ids(self, task_id: str) -> list[str]:
-        return self._read(lambda c: kb.parent_ids(c, task_id))
+    def parent_ids(self, task_id: str, *, relation_type: str = "dependency") -> list[str]:
+        return self._read(lambda c: kb.parent_ids(c, task_id, relation_type=relation_type))
 
-    def child_ids(self, task_id: str) -> list[str]:
-        return self._read(lambda c: kb.child_ids(c, task_id))
+    def child_ids(self, task_id: str, *, relation_type: str = "dependency") -> list[str]:
+        return self._read(lambda c: kb.child_ids(c, task_id, relation_type=relation_type))
 
     # --- comments --------------------------------------------------------
     def add_comment(self, task_id: str, *, author: str, body: str) -> int:
@@ -201,6 +201,12 @@ class SqliteKanbanStore:
 
     def latest_summary(self, task_id: str):
         return self._read(lambda c: kb.latest_summary(c, task_id))
+
+    def build_worker_context(self, task_id: str) -> str:
+        # Byte-identical to the upstream worker-context builder. The sqlite
+        # store reads through the same snapshot/connect lifecycle as every
+        # other read here.
+        return self._read(lambda c: kb.build_worker_context(c, task_id))
 
     def latest_summaries(self, task_ids):
         return self._read(lambda c: kb.latest_summaries(c, task_ids))

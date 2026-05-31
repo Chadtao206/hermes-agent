@@ -594,3 +594,28 @@ def test_block_systemic_spawn_failure_signature(store):
         kinds = [e.kind for e in store.list_events(t)]
         assert "systemic_failure_signature" in kinds and "gave_up" in kinds \
             and "blocked" in kinds
+
+
+def test_build_worker_context_basic(store):
+    tid = store.create_task(title="ctx task", assignee="engineer",
+                            body="do the thing")
+    text = store.build_worker_context(tid)
+    assert f"# Kanban task {tid}: ctx task" in text
+    assert "## Closeout requirement (do not skip)" in text
+    assert "## Body" in text and "do the thing" in text
+    assert text.endswith("\n")
+
+
+def test_build_worker_context_unknown_raises(store):
+    import pytest
+    with pytest.raises(ValueError):
+        store.build_worker_context("t_nope")
+
+
+def test_parent_ids_rollup_relation(store):
+    from hermes_cli.kanban_db import LINK_RELATION_ROLLUP
+    p = store.create_task(title="p", assignee="engineer")
+    c = store.create_task(title="c", assignee="engineer")
+    store.link_tasks(p, c, relation_type=LINK_RELATION_ROLLUP)
+    assert store.parent_ids(c, relation_type=LINK_RELATION_ROLLUP) == [p]
+    assert store.parent_ids(c) == []  # default dependency relation only
