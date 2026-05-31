@@ -1,4 +1,17 @@
-"""Backend-agnostic dispatch glue for the kanban dispatcher (Phase 3, Part B).
+"""Backend-agnostic dispatch + notifier glue for the kanban (Phase 3, Part B).
+
+This module exposes two public tick functions plus a pair of shared helpers:
+
+  * ``run_dispatch_tick`` — one dispatcher tick (claim ready tasks + spawn
+    workers + record spawn success/failure) against ONE board's store.
+  * ``run_notifier_tick`` — one notifier tick (claim unseen events + send chat
+    deliveries via the injected adapters + orchestrate profile wakes) against
+    ONE board's store. It is the board-agnostic delivery core extracted from
+    the gateway's ``_kanban_notifier_watcher``; the gateway keeps board
+    enumeration, heartbeats, and the corruption/disk-io quarantine.
+  * ``_resolve_adapter`` — map a subscription ``platform`` string to a chat
+    adapter (by ``platform_enum`` member or lowercased string key).
+  * ``_sub_field`` — dict-or-attr accessor for a subscription row.
 
 ``run_dispatch_tick`` runs ONE dispatcher tick against ONE board's
 :class:`~hermes_cli.kanban.store.KanbanStore`:
@@ -35,10 +48,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as _kb
+
+logger = logging.getLogger(__name__)
 
 
 def _spawn_accepts_board(spawn_fn) -> bool:
@@ -267,9 +283,12 @@ def _resolve_adapter(platform_str: str, adapters, platform_enum):
       * ``"missing"``— a valid platform but no connected adapter; the gateway
         rewinds the claim so a later tick can retry once it reconnects.
 
-    With ``platform_enum=None`` we resolve by lowercased string match against
-    the ``adapters`` dict keys (also lowercased), so callers/tests can key the
-    dict by ``"telegram"`` etc.
+    With ``platform_enum=None`` we resolve against the ``adapters`` dict in two
+    steps: first a direct ``platform_str in adapters`` lookup (the key is NOT
+    lowercased — a dict keyed by the already-lowercased ``"telegram"`` hits
+    here), then a fallback loop that compares each adapter key's value
+    *lowercased* against ``platform_str``, so callers/tests can key the dict by
+    ``"telegram"`` or by an enum-ish object whose ``.value`` lowercases to it.
     """
     if platform_enum is not None:
         try:
@@ -339,7 +358,14 @@ async def run_notifier_tick(
         wake_profile_fn: ``wake_profile_fn(psub, events, task, event_tasks,
             board) -> Any`` INJECTED profile-wake. May return ``bool`` (legacy)
             or ``(bool, error)``; on a falsy/exception result the glue records a
-            wake failure via the store, otherwise a wake success.
+            wake failure via the store, otherwise a wake success. The callback
+            is invoked DIRECTLY on the event loop (the glue awaits the result
+            only if it is awaitable), so B4 MUST pass either a coroutine
+            function or a callable that internally wraps blocking work (e.g.
+            ``subprocess.Popen``) in ``asyncio.to_thread`` — otherwise it blocks
+            the loop. (The gateway calls its blocking ``_kanban_profile_wake``
+            via ``await asyncio.to_thread(...)``; B4's injected wrapper must
+            preserve that.)
         deliver_artifacts_fn: optional async
             ``deliver_artifacts_fn(adapter, chat_id, metadata, event_payload,
             task)`` called once per ``completed`` event after the text send.
@@ -377,42 +403,56 @@ async def run_notifier_tick(
         # Chat subscriptions only matter when an adapter is connected.
         subs = store.list_notify_subs() if active else []
         for sub in subs:
-            owner_profile = _sub_field(sub, "notifier_profile") or None
-            if owner_profile and owner_profile != notifier_profile:
+            # Per-sub isolation (symmetry with the profile loop below): one
+            # malformed/raising chat sub is SKIPPED so the rest of the tick
+            # proceeds. The gateway's outer board try/except covered this, but
+            # per-sub isolation is strictly more robust and matches intent.
+            try:
+                owner_profile = _sub_field(sub, "notifier_profile") or None
+                if owner_profile and owner_profile != notifier_profile:
+                    continue
+                platform = (_sub_field(sub, "platform") or "").lower()
+                if platform not in active:
+                    continue
+                # Per-sub event_kinds override the default terminal-only list;
+                # NULL/empty falls back to the injected terminal kinds.
+                sub_kinds = _kb._parse_event_kinds_column(
+                    _sub_field(sub, "event_kinds")
+                )
+                effective_kinds = (
+                    tuple(sub_kinds) if sub_kinds else tuple(terminal_kinds)
+                )
+                include_children = bool(_sub_field(sub, "include_children"))
+                old_cursor, cursor, events = store.claim_unseen_events_for_sub(
+                    task_id=_sub_field(sub, "task_id"),
+                    platform=_sub_field(sub, "platform"),
+                    chat_id=_sub_field(sub, "chat_id"),
+                    thread_id=_sub_field(sub, "thread_id") or "",
+                    kinds=effective_kinds,
+                    include_children=include_children,
+                )
+                if not events:
+                    continue
+                task = store.get_task(_sub_field(sub, "task_id"))
+                event_tasks: dict[str, Any] = {}
+                if include_children:
+                    for ev in events:
+                        if ev.task_id in event_tasks:
+                            continue
+                        if ev.task_id == _sub_field(sub, "task_id"):
+                            event_tasks[ev.task_id] = task
+                        else:
+                            try:
+                                event_tasks[ev.task_id] = store.get_task(ev.task_id)
+                            except Exception:
+                                event_tasks[ev.task_id] = None
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: chat claim failed for %s/%s on board %s: %s",
+                    _sub_field(sub, "task_id"), _sub_field(sub, "platform"),
+                    board, exc,
+                )
                 continue
-            platform = (_sub_field(sub, "platform") or "").lower()
-            if platform not in active:
-                continue
-            # Per-sub event_kinds override the default terminal-only list;
-            # NULL/empty falls back to the injected terminal kinds.
-            sub_kinds = _kb._parse_event_kinds_column(
-                _sub_field(sub, "event_kinds")
-            )
-            effective_kinds = tuple(sub_kinds) if sub_kinds else tuple(terminal_kinds)
-            include_children = bool(_sub_field(sub, "include_children"))
-            old_cursor, cursor, events = store.claim_unseen_events_for_sub(
-                task_id=_sub_field(sub, "task_id"),
-                platform=_sub_field(sub, "platform"),
-                chat_id=_sub_field(sub, "chat_id"),
-                thread_id=_sub_field(sub, "thread_id") or "",
-                kinds=effective_kinds,
-                include_children=include_children,
-            )
-            if not events:
-                continue
-            task = store.get_task(_sub_field(sub, "task_id"))
-            event_tasks: dict[str, Any] = {}
-            if include_children:
-                for ev in events:
-                    if ev.task_id in event_tasks:
-                        continue
-                    if ev.task_id == _sub_field(sub, "task_id"):
-                        event_tasks[ev.task_id] = task
-                    else:
-                        try:
-                            event_tasks[ev.task_id] = store.get_task(ev.task_id)
-                        except Exception:
-                            event_tasks[ev.task_id] = None
             chat_deliveries.append({
                 "sub": sub,
                 "old_cursor": old_cursor,
@@ -429,26 +469,41 @@ async def run_notifier_tick(
         except Exception:
             pro_subs = []
         for psub in pro_subs:
-            old_pc, pc, p_events = store.claim_unseen_events_for_profile_sub(
-                task_id=_sub_field(psub, "task_id"),
-                profile=_sub_field(psub, "profile"),
-                name=_sub_field(psub, "name") or "",
-            )
-            if not p_events:
+            # Per-sub isolation: one malformed/raising profile sub must be
+            # SKIPPED, not abort the whole _collect (which would discard the
+            # already-collected chat deliveries too). Mirrors the gateway's
+            # generic per-sub ``try/except: logger.warning; continue``
+            # (gateway/run.py:6207, 6291-6297). The corruption/disk-io
+            # quarantine stays in the gateway — this is just the generic skip.
+            try:
+                old_pc, pc, p_events = store.claim_unseen_events_for_profile_sub(
+                    task_id=_sub_field(psub, "task_id"),
+                    profile=_sub_field(psub, "profile"),
+                    name=_sub_field(psub, "name") or "",
+                )
+                if not p_events:
+                    continue
+                p_task = store.get_task(_sub_field(psub, "task_id"))
+                p_event_tasks: dict[str, Any] = {}
+                if bool(_sub_field(psub, "include_children")):
+                    for ev in p_events:
+                        if ev.task_id in p_event_tasks:
+                            continue
+                        if ev.task_id == _sub_field(psub, "task_id"):
+                            p_event_tasks[ev.task_id] = p_task
+                        else:
+                            try:
+                                p_event_tasks[ev.task_id] = store.get_task(ev.task_id)
+                            except Exception:
+                                p_event_tasks[ev.task_id] = None
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: profile-event claim failed for %s/%s on "
+                    "board %s: %s",
+                    _sub_field(psub, "task_id"), _sub_field(psub, "profile"),
+                    board, exc,
+                )
                 continue
-            p_task = store.get_task(_sub_field(psub, "task_id"))
-            p_event_tasks: dict[str, Any] = {}
-            if bool(_sub_field(psub, "include_children")):
-                for ev in p_events:
-                    if ev.task_id in p_event_tasks:
-                        continue
-                    if ev.task_id == _sub_field(psub, "task_id"):
-                        p_event_tasks[ev.task_id] = p_task
-                    else:
-                        try:
-                            p_event_tasks[ev.task_id] = store.get_task(ev.task_id)
-                        except Exception:
-                            p_event_tasks[ev.task_id] = None
             profile_deliveries.append({
                 "sub": psub,
                 "old_cursor": old_pc,
@@ -534,10 +589,14 @@ async def run_notifier_tick(
                             event_payload=getattr(ev, "payload", None),
                             task=ev_task,
                         )
-                    except Exception:
+                    except Exception as art_exc:
                         # Artifact delivery is best-effort; never fail the
                         # send / rewind the cursor over an upload error.
-                        pass
+                        # Matches the gateway's logger.debug (run.py:6554).
+                        logger.debug(
+                            "kanban notifier: artifact delivery for %s failed: %s",
+                            _sub_field(sub, "task_id"), art_exc,
+                        )
                 delivered += 1
                 last_success_cursor = max(
                     last_success_cursor, int(getattr(ev, "id", 0) or 0),

@@ -11,6 +11,7 @@ the A5 ``test_dispatch_plan_claims_ready`` test). For the PG path the injected
 ``resolve_workspace`` / ``profile_exists`` callbacks are honored directly.
 """
 import asyncio
+import enum
 import pathlib
 
 from hermes_cli.kanban_glue import run_dispatch_tick, run_notifier_tick
@@ -358,3 +359,136 @@ def test_notifier_tick_profile_wake_advances(store):
     ))
     assert woke == []
     assert summary2["woke"] == 0
+
+
+def test_notifier_tick_platform_enum_resolution(store):
+    """Exercise the ``platform_enum``-based adapter resolution — the path B4
+    actually wires (the gateway keys ``self.adapters`` by its ``Platform``
+    enum). Prefer the real ``gateway.config.Platform`` when it imports cleanly,
+    else fall back to a tiny enum-like."""
+    try:
+        from gateway.config import Platform as _Platform  # real gateway type
+        tg_key = _Platform.TELEGRAM
+        platform_enum = _Platform
+    except Exception:
+        _Platform = enum.Enum("P", {"TELEGRAM": "telegram"})
+        tg_key = _Platform.TELEGRAM
+        platform_enum = _Platform
+
+    tid = store.create_task(title="enum notify", assignee="engineer")
+    store.add_notify_sub(task_id=tid, platform="telegram", chat_id="c1")
+    store.complete_task(tid, summary="done")
+
+    adapter = _FakeAdapter()
+    summary = asyncio.run(run_notifier_tick(
+        store,
+        {tg_key: adapter},  # adapters keyed by the enum member (gateway style)
+        notifier_profile=None,
+        active_platforms={"telegram"},
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=_wake_noop,
+        platform_enum=platform_enum,
+    ))
+
+    # The enum-keyed adapter was resolved and the event delivered.
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "c1"
+    assert summary["delivered"] == 1
+    assert tid in summary["delivered_subs"]
+
+
+def test_notifier_tick_async_wake_profile_fn(store):
+    """An ``async def`` wake_profile_fn returning True must take the
+    ``inspect.isawaitable`` path: wake recorded as success, cursor advanced."""
+    tid = store.create_task(title="async wake", assignee="engineer")
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+    store.complete_task(tid, summary="done")
+
+    calls = []
+
+    async def async_wake(psub, events, task, event_tasks, board):
+        calls.append(_field(psub, "task_id"))
+        return True
+
+    summary = asyncio.run(run_notifier_tick(
+        store,
+        {},
+        notifier_profile=None,
+        active_platforms=set(),
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=async_wake,
+        platform_enum=None,
+    ))
+
+    assert calls == [tid]
+    assert summary["woke"] == 1
+    assert tid in summary["woke_profiles"]
+
+    statuses = [_field(e, "status")
+                for e in store.list_profile_wake_events(task_id=tid)]
+    assert "success" in statuses
+
+    # The cursor advanced past the claimed event — a second tick wakes nothing.
+    calls.clear()
+    summary2 = asyncio.run(run_notifier_tick(
+        store,
+        {},
+        notifier_profile=None,
+        active_platforms=set(),
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=async_wake,
+        platform_enum=None,
+    ))
+    assert calls == []
+    assert summary2["woke"] == 0
+
+
+def test_notifier_tick_profile_wake_failure_rewinds(store):
+    """A wake_profile_fn that returns ``(False, "spawn boom")`` must trigger
+    record_profile_wake_failure: the sub's cursor is rewound to the old value,
+    a 'failed' wake-event row appears, and wake_failure_count bumps."""
+    tid = store.create_task(title="wake fail", assignee="engineer")
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+
+    # Capture the cursor + failure count BEFORE the failing event is emitted.
+    before = store.list_profile_event_subs(task_id=tid, enabled_only=True)
+    assert len(before) == 1
+    old_cursor = int(_field(before[0], "last_event_id"))
+    old_fail_count = int(_field(before[0], "wake_failure_count"))
+
+    store.complete_task(tid, summary="done")  # emits a terminal event to claim
+
+    def failing_wake(psub, events, task, event_tasks, board):
+        return (False, "spawn boom")
+
+    summary = asyncio.run(run_notifier_tick(
+        store,
+        {},
+        notifier_profile=None,
+        active_platforms=set(),
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=failing_wake,
+        platform_enum=None,
+    ))
+
+    assert summary["woke"] == 0
+    assert summary["profile_failed"] == 1
+    assert tid not in summary["woke_profiles"]
+
+    # The failure rewound the cursor back to its old value (so a later tick can
+    # retry the same event) and bumped the failure counter.
+    after = store.list_profile_event_subs(task_id=tid, enabled_only=True)
+    assert len(after) == 1
+    assert int(_field(after[0], "last_event_id")) == old_cursor
+    assert int(_field(after[0], "wake_failure_count")) == old_fail_count + 1
+
+    # A 'failed' wake-event row was appended carrying the error.
+    wake_events = store.list_profile_wake_events(task_id=tid)
+    statuses = [_field(e, "status") for e in wake_events]
+    assert "failed" in statuses
+    failed_row = [e for e in wake_events if _field(e, "status") == "failed"][-1]
+    assert "spawn boom" in str(_field(failed_row, "error"))
