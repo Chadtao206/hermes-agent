@@ -2339,6 +2339,10 @@ class PostgresKanbanStore:
     def build_worker_context(self, task_id: str) -> str:
         """Return the full text a worker should read to understand its task.
 
+        Mirror of kanban_db.build_worker_context (hermes_cli/kanban_db.py);
+        byte-parity pinned by tests/hermes_cli/kanban/test_build_worker_context_parity.py
+        — keep in sync.
+
         Byte-identical to ``kanban_db.build_worker_context`` for identical
         logical data. Reproduces the upstream section order and per-field
         caps so PG workers see the same context sqlite workers do (closes the
