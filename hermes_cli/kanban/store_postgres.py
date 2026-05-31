@@ -1607,18 +1607,22 @@ class PostgresKanbanStore:
             except Exception:
                 pass
 
-    def _pg_release_stale_claims(self, *, terminate_fn=None, signal_fn=None) -> int:
+    def _pg_release_stale_claims(self, *, terminate_fn=None, signal_fn=None,
+                                  pid_alive_fn=None) -> int:
         """Mirror ``release_stale_claims``: TTL-expired running claims -> ready.
 
-        Pure-DB form. Unlike the SQLite reference there is no host-local
-        claim_lock prefix filter and no live-pid claim *extension* — those are
-        host-local OS behaviors. PG reclaims any claim whose ``claim_expires``
+        When ``pid_alive_fn`` is supplied, a stale claim whose ``worker_pid``
+        is still alive is EXTENDED (new claim_expires + ``claim_extended``
+        event) instead of being reclaimed — preventing a duplicate spawn of a
+        slow-but-alive worker (mirrors the SQLite reference behaviour).
+
+        Pure-DB form otherwise. PG reclaims any claim whose ``claim_expires``
         has passed and closes the run with ``outcome='reclaimed'``.
 
-        # phase-3-tail: live-pid claim-extension (release_stale_claims keeps a
-        # claim alive when its host-local worker pid is still running) is NOT
-        # reimplemented here — it requires OS liveness that PG cannot do
-        # server-side. The glue can pre-filter via ``pid_alive_fn`` later.
+        Note: the SQLite host_prefix (claim_lock) filter is NOT applied here —
+        host-locality is a glue/single-host concern, not a store concern. This
+        is a deliberate divergence from the SQLite reference; the glue layer
+        supplies host-local OS callbacks (pid_alive_fn / terminate_fn) instead.
         """
         now = int(time.time())
         reclaimed = 0
@@ -1633,6 +1637,47 @@ class PostgresKanbanStore:
             stale = cur.fetchall()
         for row in stale:
             pid = row["worker_pid"]
+            if pid_alive_fn is not None and pid:
+                try:
+                    alive = bool(pid_alive_fn(int(pid)))
+                except Exception:
+                    alive = False
+                if alive:
+                    new_expires = now + kanban_db._resolve_claim_ttl_seconds()
+                    with self._pool.connection() as conn, \
+                            conn.cursor(row_factory=dict_row) as cur:
+                        with conn.transaction():
+                            cur.execute(
+                                "UPDATE tasks SET claim_expires=%s "
+                                "WHERE board=%s AND id=%s AND status='running' "
+                                "AND claim_expires IS NOT NULL AND claim_expires < %s",
+                                (new_expires, self.board, row["id"], now))
+                            if cur.rowcount != 1:
+                                continue
+                            cur.execute(
+                                "SELECT current_run_id FROM tasks "
+                                "WHERE board=%s AND id=%s",
+                                (self.board, row["id"]))
+                            rr = cur.fetchone()
+                            run_id = rr["current_run_id"] if rr else None
+                            if run_id is not None:
+                                cur.execute(
+                                    "UPDATE task_runs SET claim_expires=%s "
+                                    "WHERE board=%s AND id=%s",
+                                    (new_expires, self.board, run_id))
+                            self._emit(cur, row["id"], "claim_extended", {
+                                "reason": "pid_alive",
+                                "worker_pid": int(pid),
+                                "claim_lock": row["claim_lock"],
+                                "claim_expires_was": int(row["claim_expires"]),
+                                "claim_expires_now": new_expires,
+                                "last_heartbeat_at": (
+                                    int(row["last_heartbeat_at"])
+                                    if row["last_heartbeat_at"] is not None
+                                    else None),
+                            }, run_id=run_id)
+                    continue
+            # --- existing kill + reclaim path ---
             self._invoke_kill(terminate_fn, signal_fn, pid, row["claim_lock"])
             with self._pool.connection() as conn, \
                     conn.cursor(row_factory=dict_row) as cur:
@@ -2022,7 +2067,8 @@ class PostgresKanbanStore:
         result.crashed = self._pg_detect_crashed_workers(
             pid_alive_fn=pid_alive_fn, classify_exit_fn=classify_exit_fn)
         result.reclaimed = self._pg_release_stale_claims(
-            terminate_fn=terminate_fn, signal_fn=signal_fn)
+            terminate_fn=terminate_fn, signal_fn=signal_fn,
+            pid_alive_fn=pid_alive_fn)
         result.stale = self._pg_detect_stale_running(
             stale_timeout_seconds=stale_timeout_seconds,
             terminate_fn=terminate_fn, signal_fn=signal_fn)

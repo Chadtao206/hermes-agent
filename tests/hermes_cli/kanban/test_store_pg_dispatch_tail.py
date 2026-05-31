@@ -72,3 +72,33 @@ def test_crash_signaled_is_retryable(pg_store):
     t = pg_store.get_task(tid)
     assert t.status == "ready"     # genuine crash -> retry
     assert "crashed" in [e.kind for e in pg_store.list_events(tid)]
+
+
+def test_stale_claim_extends_when_pid_alive(pg_store):
+    import time as _t
+    tid = _running_with_pid(pg_store)
+    # Expire the claim in the past.
+    with pg_store._pool.connection() as c, c.cursor() as cc:
+        cc.execute("UPDATE tasks SET claim_expires=%s WHERE board=%s AND id=%s",
+                   (int(_t.time()) - 5, pg_store.board, tid))
+    n = pg_store._pg_release_stale_claims(pid_alive_fn=lambda pid: True)
+    assert n == 0                                   # extended, not reclaimed
+    assert pg_store.get_task(tid).status == "running"
+    assert "claim_extended" in [e.kind for e in pg_store.list_events(tid)]
+    import time as _t2
+    with pg_store._pool.connection() as c, c.cursor() as cc:
+        cc.execute("SELECT claim_expires FROM tasks WHERE board=%s AND id=%s",
+                   (pg_store.board, tid))
+        assert cc.fetchone()[0] > int(_t2.time())
+
+
+def test_stale_claim_reclaims_when_pid_dead(pg_store):
+    import time as _t
+    tid = _running_with_pid(pg_store)
+    with pg_store._pool.connection() as c, c.cursor() as cc:
+        cc.execute("UPDATE tasks SET claim_expires=%s WHERE board=%s AND id=%s",
+                   (int(_t.time()) - 5, pg_store.board, tid))
+    n = pg_store._pg_release_stale_claims(pid_alive_fn=lambda pid: False)
+    assert n == 1
+    assert pg_store.get_task(tid).status == "ready"
+    assert "reclaimed" in [e.kind for e in pg_store.list_events(tid)]
