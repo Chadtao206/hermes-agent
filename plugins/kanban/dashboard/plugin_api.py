@@ -141,6 +141,23 @@ def _raise_kanban_db_unavailable(exc: BaseException, board: Optional[str]) -> No
     ) from exc
 
 
+def _raise_pg_read_unavailable(exc: BaseException, board: Optional[str]) -> None:
+    """Convert a Postgres read failure into a controlled 503 without leaking the DSN.
+
+    Only the exception *type* is logged (psycopg connection/pool errors can carry
+    connection info in their message/args; the DSN/password must never be logged)."""
+    try:
+        slug = _pg_reads().slug(board)
+    except Exception:
+        slug = board or "default"
+    log.error("kanban dashboard: postgres read failed for board %s (%s)",
+              slug, type(exc).__name__)
+    raise HTTPException(
+        status_code=503,
+        detail="Kanban Postgres backend is temporarily unavailable; please retry.",
+    )
+
+
 def _lenient_text_factory(value: bytes) -> str:
     """Decode SQLite TEXT columns tolerantly for the read-only dashboard.
 
@@ -437,6 +454,29 @@ def _compute_task_diagnostics(
             events_by_task.get(tid, []),
             runs_by_task.get(tid, []),
             config=diag_config,
+        )
+        if diags:
+            out[tid] = [d.to_dict() for d in diags]
+    return out
+
+
+def _compute_task_diagnostics_pg(
+    board_slug: str, task_ids: Optional[list[str]] = None,
+) -> dict[str, list[dict]]:
+    """Postgres counterpart to _compute_task_diagnostics: fetch dict rows via
+    pg_reads and run the (backend-agnostic) diagnostics engine."""
+    from hermes_cli import kanban_diagnostics as kd
+    from hermes_cli.config import load_config
+    pg = _pg_reads()
+    diag_config = kd.config_from_runtime_config(load_config())
+    task_rows, events_by, runs_by = pg.diagnostics_rows(board_slug, task_ids=task_ids)
+    if not task_rows:
+        return {}
+    out: dict[str, list[dict]] = {}
+    for r in task_rows:
+        tid = r["id"]
+        diags = kd.compute_task_diagnostics(
+            r, events_by.get(tid, []), runs_by.get(tid, []), config=diag_config,
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
@@ -742,6 +782,60 @@ def get_board(
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        pg = _pg_reads()
+        bslug = pg.slug(board)
+        store = _store(board=board)
+        try:
+            tasks = store.list_tasks(
+                tenant=tenant, include_archived=include_archived,
+                workflow_template_id=workflow_template_id,
+                current_step_key=current_step_key,
+            )
+            task_ids = [t.id for t in tasks]
+            wake_health = pg.wake_health(bslug, task_ids)
+            notifier_health = _compute_notifier_health(
+                None, board=board, wake_health=wake_health,
+            )
+            link_counts = pg.link_counts(bslug)
+            comment_counts = pg.comment_counts(bslug)
+            progress = pg.child_progress(bslug)
+            diagnostics_per_task = _compute_task_diagnostics_pg(bslug, task_ids=None)
+            latest_event_id = pg.latest_event_id(bslug)
+            summary_map = store.latest_summaries(task_ids)
+
+            columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+            if include_archived:
+                columns["archived"] = []
+            for t in tasks:
+                full = summary_map.get(t.id)
+                preview = full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
+                d = _task_dict(t, latest_summary=preview)
+                d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+                d["comment_count"] = comment_counts.get(t.id, 0)
+                d["progress"] = progress.get(t.id)
+                diags = diagnostics_per_task.get(t.id)
+                if diags:
+                    d["diagnostics"] = diags
+                    d["warnings"] = _warnings_summary_from_diagnostics(diags)
+                col = t.status if t.status in columns else "todo"
+                columns[col].append(d)
+
+            return {
+                "columns": [{"name": name, "tasks": columns[name]} for name in columns.keys()],
+                "tenants": pg.distinct_tenants(bslug),
+                "assignees": pg.distinct_assignees(bslug),
+                "wake_health": wake_health,
+                "notifier_health": notifier_health,
+                "latest_event_id": int(latest_event_id),
+                "now": int(time.time()),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
+        finally:
+            store.close()
     conn = _conn(board=board, readonly=True)
     try:
         tasks = kanban_db.list_tasks(
