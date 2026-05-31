@@ -1166,28 +1166,34 @@ def get_task(
 ):
     board = _resolve_board(board)
     if _backend() == "postgres":
+        # EVERYTHING (run-state validation, pool/store acquisition, assembly)
+        # runs inside the guarded try so a transient pooler outage in _store()/
+        # _pg_reads() maps to a controlled 503 (no DSN leak) instead of escaping
+        # as an unguarded 500 the way the other read endpoints already do.
+        #
         # Run-state validation runs for the PG branch too so a bad combination
         # 400s on both backends (the sqlite body below applies the identical
         # checks). PG list_runs does not support these filters.
-        if (run_state_type is None) ^ (run_state_name is None):
-            raise HTTPException(
-                status_code=400,
-                detail="run_state_type and run_state_name must be passed together or omitted",
-            )
-        if run_state_type is not None and run_state_type not in ("status", "outcome"):
-            raise HTTPException(
-                status_code=400,
-                detail="run_state_type must be 'status' or 'outcome'",
-            )
-        if run_state_type is not None or run_state_name is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="run state filtering is not yet supported on the postgres backend",
-            )
-        pg = _pg_reads()
-        bslug = pg.slug(board)
-        store = _store(board=bslug)
+        store = None
         try:
+            if (run_state_type is None) ^ (run_state_name is None):
+                raise HTTPException(
+                    status_code=400,
+                    detail="run_state_type and run_state_name must be passed together or omitted",
+                )
+            if run_state_type is not None and run_state_type not in ("status", "outcome"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="run_state_type must be 'status' or 'outcome'",
+                )
+            if run_state_type is not None or run_state_name is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="run state filtering is not yet supported on the postgres backend",
+                )
+            pg = _pg_reads()
+            bslug = pg.slug(board)
+            store = _store(board=bslug)
             task = store.get_task(task_id)
             if task is None:
                 raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1209,7 +1215,8 @@ def get_task(
         except Exception as exc:
             _raise_pg_read_unavailable(exc, board)
         finally:
-            store.close()
+            if store is not None:
+                store.close()
     conn = _conn(board=board, readonly=True)
     try:
         if (run_state_type is None) ^ (run_state_name is None):
@@ -2587,11 +2594,19 @@ def get_task_log(
     """
     board = _resolve_board(board)
     if _backend() == "postgres":
-        store = _store(board=_pg_reads().slug(board))
+        # Guard pool/store acquisition + the existence check so a transient
+        # pooler outage maps to 503 (no DSN leak) rather than an unguarded 500.
+        store = None
         try:
+            store = _store(board=_pg_reads().slug(board))
             task = store.get_task(task_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
         finally:
-            store.close()
+            if store is not None:
+                store.close()
     else:
         conn = _conn(board=board, readonly=True)
         try:

@@ -141,3 +141,37 @@ def test_task_detail_workers_diagnostics_pg(pg_client):
 
     lg = pg_client.get(f"/api/plugins/kanban/tasks/{c}/log")
     assert lg.status_code == 200  # exists check via store; log file absent -> content ""
+
+
+def test_get_task_pool_failure_503_no_dsn_leak(pg_client, monkeypatch):
+    """If the pool/store acquisition raises on a transient pooler outage, the
+    /tasks/{id} PG branch must map it to a controlled 503 — never an unguarded
+    500 — and the DSN-bearing exception message must not leak in the response.
+
+    Regression for the bug where _store()/_pg_reads() ran OUTSIDE the guarded
+    try, so a pool failure escaped as a 500 with a DSN-bearing traceback.
+    """
+    import sys
+    from fastapi.testclient import TestClient
+
+    s = pg_client.pg_store
+    c = s.create_task(title="leaky", assignee="engineer")
+
+    plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    fake_dsn = "postgresql://postgres:SUPERSECRET@db.example.invalid:6543/kanban"
+
+    def _boom(*_a, **_k):
+        raise RuntimeError(f"connection to pooler failed using {fake_dsn}")
+
+    # _store is what acquires pg_pool.get_pool() under the PG branch; making it
+    # raise simulates a transient pooler outage at store-open time.
+    monkeypatch.setattr(plugin_mod, "_store", _boom)
+
+    # raise_server_exceptions=False so an UNGUARDED 500 would surface as a 500
+    # status (pre-fix) rather than re-raising inside the test client; post-fix
+    # the guarded try maps it to 503.
+    client = TestClient(pg_client.app, raise_server_exceptions=False)
+    r = client.get(f"/api/plugins/kanban/tasks/{c}")
+    assert r.status_code == 503, r.text
+    assert "SUPERSECRET" not in r.text
+    assert fake_dsn not in r.text

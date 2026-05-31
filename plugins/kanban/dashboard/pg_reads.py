@@ -122,7 +122,7 @@ def active_workers(board: str) -> list[dict]:
         "       r.claim_lock, r.claim_expires, r.last_heartbeat_at, r.max_runtime_seconds "
         "FROM task_runs r JOIN tasks t ON t.board = r.board AND t.id = r.task_id "
         "WHERE r.board=%s AND r.ended_at IS NULL AND r.worker_pid IS NOT NULL "
-        "  AND t.status = 'running' ORDER BY r.started_at ASC",
+        "  AND t.status = 'running' ORDER BY r.started_at ASC, r.id ASC",
         (board,),
     )
     return [
