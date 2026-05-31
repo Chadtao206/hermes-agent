@@ -40,9 +40,38 @@ class MigrationError(Exception):
     """Fatal precondition failure (multi-board, bad source data, target guard)."""
 
 
+def _norm_record(rec):
+    """Normalize a store record (dataclass or dict) to a dict with any
+    JSON-string fields parsed, so SQLite's JSON-as-text compares equal to
+    Postgres's JSONB-as-object on CONTENT (not representation)."""
+    if dataclasses.is_dataclass(rec) and not isinstance(rec, type):
+        d = dataclasses.asdict(rec)
+    elif isinstance(rec, dict):
+        d = dict(rec)
+    else:
+        d = dict(getattr(rec, "__dict__", {}))
+    for k, v in list(d.items()):
+        if isinstance(v, str):
+            s = v.strip()
+            if s[:1] in ("[", "{"):
+                try:
+                    d[k] = json.loads(v)
+                except (ValueError, TypeError):
+                    pass
+    return d
+
+
+def _norm_list(recs):
+    """Normalize + order-stabilize a list of records for parity comparison."""
+    return sorted((_norm_record(r) for r in recs),
+                  key=lambda d: d.get("id") or 0)
+
+
 def enumerate_board() -> str:
     """Return the single board slug to migrate, or raise if >1 board exists."""
     boards = kb.list_boards()
+    # Defensive: list_boards() always includes the default board, so this
+    # cannot fire today; kept as belt-and-suspenders.
     if not boards:
         raise MigrationError("refusing to migrate: no boards found on disk.")
     if len(boards) > 1:
@@ -281,6 +310,9 @@ def _check_parity(data, dsn, schema, board, report, sample=None):
             a, b = sq.get_task(tid), pg.get_task(tid)
             if a != b:
                 report.parity_mismatches.append(f"get_task({tid}) differs")
+            for label in ("list_comments", "list_runs", "list_events"):
+                if _norm_list(getattr(sq, label)(tid)) != _norm_list(getattr(pg, label)(tid)):
+                    report.parity_mismatches.append(f"{label}({tid}) differs")
     finally:
         sq.close()
         pool.close()
@@ -313,7 +345,7 @@ def verify(data, dsn: str, schema: str, board: str, *,
 def _dryrun_schema_name(board: str, sqlite_path: Path) -> str:
     # Deterministic (no wall clock): board + source mtime -> stable across re-runs.
     mtime = int(sqlite_path.stat().st_mtime)
-    return f"kanban_dryrun_{board}_{mtime}"[:60].replace("-", "_")
+    return f"kanban_dryrun_{board}_{mtime}".replace("-", "_")[:63]
 
 
 def _apply_schema(conn, schema: str) -> None:
@@ -397,7 +429,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             report, _schema = dry_run(dsn, board, sqlite_path=sqlite_path)
         else:
             report = execute(dsn, board, sqlite_path=sqlite_path, force=args.force)
-    except (MigrationError, RuntimeError, psycopg.OperationalError) as e:
+    except (MigrationError, RuntimeError, psycopg.Error) as e:
         print(f"migration aborted: {e}", file=sys.stderr)
         return 2
 
