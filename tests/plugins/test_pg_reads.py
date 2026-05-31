@@ -95,5 +95,11 @@ def test_diagnostics_rows_and_wake_health(pg_board):
 
     wh = pg.wake_health("default", [t])
     assert wh["subscription_count"] == 1
+    assert wh["stale_count"] == 1
+    assert wh["failing_count"] == 0
+    assert wh["severity"] == "stale"
     rows, overflow = pg.wake_health_rows("default", [t], {t: s.get_task(t)}, 50)
-    assert isinstance(rows, list) and overflow == 0
+    assert overflow == 0
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "stale"
+    assert rows[0]["task_id"] == t

@@ -8,6 +8,7 @@ untouched. The DSN is never logged.
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from hermes_cli import kanban_db
@@ -190,7 +191,6 @@ def diagnostics_rows(
 
 def wake_health(board: str, task_ids: list[str]) -> dict:
     """Board-level profile wake-health aggregate (mirrors _compute_wake_health)."""
-    import time
     out = {
         "subscription_count": 0, "failing_count": 0, "stale_count": 0,
         "severity": "none", "as_of": int(time.time()),
