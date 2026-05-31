@@ -2,6 +2,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import migrate_sqlite_to_pg as m
@@ -45,6 +46,6 @@ def test_module_runs_as_main_subprocess(seeded_home, _pg_dsn):
     proc = subprocess.run(
         [sys.executable, "-m", "hermes_cli.kanban.migrate_sqlite_to_pg",
          "--dry-run", "--dsn", _pg_dsn],
-        cwd="/Users/ctao/.hermes/hermes-agent/.worktrees/kanban-pg-phase4-migrate",
+        cwd=str(Path(__file__).resolve().parents[3]),
         env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
