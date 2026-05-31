@@ -33,7 +33,9 @@ The glue runs IN the gateway process (host-local), so it MAY import host-local
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
+import time
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as _kb
@@ -235,3 +237,443 @@ def run_dispatch_tick(
     summary["spawned_ids"] = spawned_ids
     summary["auto_blocked_ids"] = list(plan.result.auto_blocked) + glue_auto_blocked
     return summary
+
+
+def _sub_field(sub, key, default=None):
+    """Accessor for a subscription row (dict-or-attr, backend-agnostic).
+
+    Both stores return notify/profile subs as plain dicts today, but mirror
+    ``run_dispatch_tick``'s tolerance for attr-style rows so the glue does not
+    care which backend produced the row.
+    """
+    if isinstance(sub, dict):
+        return sub.get(key, default)
+    return getattr(sub, key, default)
+
+
+def _resolve_adapter(platform_str: str, adapters, platform_enum):
+    """Resolve a subscription ``platform`` string to an adapter.
+
+    The gateway keys ``self.adapters`` by its ``Platform`` enum, so when the
+    caller passes ``platform_enum`` (B4 wires the gateway's ``Platform``) we
+    coerce the string to that enum and look it up — matching the gateway's
+    ``adapter = self.adapters.get(_Platform(platform_str))`` exactly, including
+    the ``ValueError`` (unknown platform string) escape hatch.
+
+    Returns ``(status, adapter)`` where ``status`` is one of:
+      * ``"ok"``     — adapter resolved (``adapter`` is the adapter).
+      * ``"unknown"``— the platform string isn't a valid enum member; the
+        gateway advances the cursor so a bad sub doesn't replay forever.
+      * ``"missing"``— a valid platform but no connected adapter; the gateway
+        rewinds the claim so a later tick can retry once it reconnects.
+
+    With ``platform_enum=None`` we resolve by lowercased string match against
+    the ``adapters`` dict keys (also lowercased), so callers/tests can key the
+    dict by ``"telegram"`` etc.
+    """
+    if platform_enum is not None:
+        try:
+            key = platform_enum(platform_str)
+        except ValueError:
+            return "unknown", None
+        adapter = adapters.get(key)
+        return ("ok", adapter) if adapter is not None else ("missing", None)
+    # String-key resolution: lowercased platform vs lowercased adapter keys.
+    if platform_str in adapters:
+        return "ok", adapters[platform_str]
+    for k, v in adapters.items():
+        if str(getattr(k, "value", k)).lower() == platform_str:
+            return "ok", v
+    # No matching key at all — treat as a disconnected/missing adapter so the
+    # claim rewinds (a later tick can retry) rather than being dropped.
+    return "missing", None
+
+
+async def run_notifier_tick(
+    store,
+    adapters,
+    *,
+    notifier_profile,
+    active_platforms,
+    terminal_kinds,
+    render_chat_event,
+    wake_profile_fn,
+    deliver_artifacts_fn=None,
+    sub_fail_counts=None,
+    max_send_failures=3,
+    platform_enum=None,
+    board=None,
+) -> dict:
+    """One backend-agnostic notifier tick for ONE board's ``store``.
+
+    Reads subs + claims unseen events via the store, sends chat deliveries via
+    ``adapters`` (rendered by ``render_chat_event``), advances/rewinds cursors
+    via the store, orchestrates profile wakes via ``wake_profile_fn``, and
+    records wake success/failure via the store. NO asyncio loop, NO board
+    enumeration, NO heartbeat/quarantine — those stay in the gateway watcher.
+
+    This is the board-agnostic delivery core extracted from the gateway's
+    ``_kanban_notifier_watcher._collect`` (the read side) + its chat-delivery
+    and profile-wake loops. The gateway KEEPS board enumeration, heartbeats,
+    daemon lookup, identity/config, the corruption/disk-io quarantine maps, and
+    the asyncio while-loop. The ``store`` routes daemon-vs-direct internally, so
+    there is NO ``board_daemon.execute(...)`` branching and NO ``conn`` handling
+    here — only ``store.<method>`` calls.
+
+    Args:
+        store: a :class:`~hermes_cli.kanban.store.KanbanStore` for ONE board.
+        adapters: chat adapters. When ``platform_enum`` is given, this is keyed
+            by ``platform_enum`` members (the gateway's ``self.adapters``);
+            otherwise keyed by lowercased platform string.
+        notifier_profile: this notifier's owning profile. Subs whose
+            ``notifier_profile`` is set and differs are skipped (another
+            notifier owns them).
+        active_platforms: set of lowercased connected-platform strings. Chat
+            subs on a platform not in this set are skipped. Profile-event subs
+            are independent of connected adapters and always processed.
+        terminal_kinds: default kinds claimed for a sub that does not pin its
+            own ``event_kinds`` (the gateway's ``TERMINAL_KINDS``).
+        render_chat_event: ``render_chat_event(ev, ev_task, sub, board) -> str``
+            INJECTED message formatter (the gateway keeps its per-kind
+            formatter and passes it in). The glue does NOT format messages.
+        wake_profile_fn: ``wake_profile_fn(psub, events, task, event_tasks,
+            board) -> Any`` INJECTED profile-wake. May return ``bool`` (legacy)
+            or ``(bool, error)``; on a falsy/exception result the glue records a
+            wake failure via the store, otherwise a wake success.
+        deliver_artifacts_fn: optional async
+            ``deliver_artifacts_fn(adapter, chat_id, metadata, event_payload,
+            task)`` called once per ``completed`` event after the text send.
+            ``None`` (default) skips artifact delivery.
+        sub_fail_counts: caller-owned ``{sub_key: int}`` dict so the per-sub
+            consecutive-send-failure counter persists across ticks. A fresh
+            dict is used when ``None`` (failures won't accumulate across ticks).
+        max_send_failures: drop a chat sub after this many consecutive send
+            failures (the gateway's ``MAX_SEND_FAILURES``).
+        platform_enum: the gateway's ``Platform`` enum used to resolve a
+            platform string → adapter key. ``None`` → resolve by lowercased
+            string match against ``adapters`` keys.
+        board: board slug pinned for this tick; forwarded to the injected
+            ``render_chat_event`` / ``wake_profile_fn`` callbacks for context.
+
+    Returns a plain summary dict:
+        ``delivered`` (chat events sent), ``woke`` (profile wakes spawned),
+        ``unsubbed`` (chat subs removed), ``send_failures`` (failed sends),
+        ``profile_advanced`` (wake-disabled profile subs acked),
+        ``profile_failed`` (profile wakes that failed), plus the id lists
+        ``delivered_subs`` / ``woke_profiles`` / ``unsubbed_subs``.
+    """
+    if sub_fail_counts is None:
+        sub_fail_counts = {}
+    active = {str(p).lower() for p in (active_platforms or set())}
+
+    # ------------------------------------------------------------------
+    # Read side (ported from _collect). One sync collection, off-thread so
+    # the loop never blocks on the store's IO — the gateway does the same.
+    # ------------------------------------------------------------------
+    def _collect():
+        chat_deliveries: list[dict] = []
+        profile_deliveries: list[dict] = []
+
+        # Chat subscriptions only matter when an adapter is connected.
+        subs = store.list_notify_subs() if active else []
+        for sub in subs:
+            owner_profile = _sub_field(sub, "notifier_profile") or None
+            if owner_profile and owner_profile != notifier_profile:
+                continue
+            platform = (_sub_field(sub, "platform") or "").lower()
+            if platform not in active:
+                continue
+            # Per-sub event_kinds override the default terminal-only list;
+            # NULL/empty falls back to the injected terminal kinds.
+            sub_kinds = _kb._parse_event_kinds_column(
+                _sub_field(sub, "event_kinds")
+            )
+            effective_kinds = tuple(sub_kinds) if sub_kinds else tuple(terminal_kinds)
+            include_children = bool(_sub_field(sub, "include_children"))
+            old_cursor, cursor, events = store.claim_unseen_events_for_sub(
+                task_id=_sub_field(sub, "task_id"),
+                platform=_sub_field(sub, "platform"),
+                chat_id=_sub_field(sub, "chat_id"),
+                thread_id=_sub_field(sub, "thread_id") or "",
+                kinds=effective_kinds,
+                include_children=include_children,
+            )
+            if not events:
+                continue
+            task = store.get_task(_sub_field(sub, "task_id"))
+            event_tasks: dict[str, Any] = {}
+            if include_children:
+                for ev in events:
+                    if ev.task_id in event_tasks:
+                        continue
+                    if ev.task_id == _sub_field(sub, "task_id"):
+                        event_tasks[ev.task_id] = task
+                    else:
+                        try:
+                            event_tasks[ev.task_id] = store.get_task(ev.task_id)
+                        except Exception:
+                            event_tasks[ev.task_id] = None
+            chat_deliveries.append({
+                "sub": sub,
+                "old_cursor": old_cursor,
+                "cursor": cursor,
+                "events": events,
+                "task": task,
+                "event_tasks": event_tasks,
+                "board": board,
+            })
+
+        # Profile-level event subs (adapter-independent) — always processed.
+        try:
+            pro_subs = store.list_profile_event_subs(enabled_only=True)
+        except Exception:
+            pro_subs = []
+        for psub in pro_subs:
+            old_pc, pc, p_events = store.claim_unseen_events_for_profile_sub(
+                task_id=_sub_field(psub, "task_id"),
+                profile=_sub_field(psub, "profile"),
+                name=_sub_field(psub, "name") or "",
+            )
+            if not p_events:
+                continue
+            p_task = store.get_task(_sub_field(psub, "task_id"))
+            p_event_tasks: dict[str, Any] = {}
+            if bool(_sub_field(psub, "include_children")):
+                for ev in p_events:
+                    if ev.task_id in p_event_tasks:
+                        continue
+                    if ev.task_id == _sub_field(psub, "task_id"):
+                        p_event_tasks[ev.task_id] = p_task
+                    else:
+                        try:
+                            p_event_tasks[ev.task_id] = store.get_task(ev.task_id)
+                        except Exception:
+                            p_event_tasks[ev.task_id] = None
+            profile_deliveries.append({
+                "sub": psub,
+                "old_cursor": old_pc,
+                "cursor": pc,
+                "events": p_events,
+                "task": p_task,
+                "event_tasks": p_event_tasks,
+                "board": board,
+            })
+        return chat_deliveries, profile_deliveries
+
+    deliveries, profile_deliveries = await asyncio.to_thread(_collect)
+
+    delivered = 0
+    send_failures = 0
+    unsubbed_subs: list[str] = []
+    delivered_subs: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Chat delivery loop (ported from gateway:6399-6624).
+    # ------------------------------------------------------------------
+    for d in deliveries:
+        sub = d["sub"]
+        task = d["task"]
+        platform_str = (_sub_field(sub, "platform") or "").lower()
+        status, adapter = _resolve_adapter(platform_str, adapters, platform_enum)
+        if status == "unknown":
+            # Unknown platform string; advance so we don't replay forever.
+            await asyncio.to_thread(
+                store.advance_notify_cursor,
+                task_id=_sub_field(sub, "task_id"),
+                platform=_sub_field(sub, "platform"),
+                chat_id=_sub_field(sub, "chat_id"),
+                thread_id=_sub_field(sub, "thread_id") or "",
+                new_cursor=d["cursor"],
+            )
+            continue
+        if status == "missing":
+            # Valid platform but adapter disconnected before delivery; rewind
+            # the claim so a later tick retries once it reconnects.
+            await asyncio.to_thread(
+                store.rewind_notify_cursor,
+                task_id=_sub_field(sub, "task_id"),
+                platform=_sub_field(sub, "platform"),
+                chat_id=_sub_field(sub, "chat_id"),
+                thread_id=_sub_field(sub, "thread_id") or "",
+                claimed_cursor=d["cursor"],
+                old_cursor=int(d.get("old_cursor", 0) or 0),
+            )
+            continue
+
+        event_tasks = d.get("event_tasks") or {}
+        # The claim advanced the cursor to the batch max before delivery,
+        # giving this tick exclusive ownership of the range. If a later send
+        # fails after earlier sends succeeded, rewind only to the last
+        # successfully delivered event id so retry doesn't duplicate pings.
+        last_success_cursor = int(d.get("old_cursor", 0) or 0)
+        sub_key = (
+            _sub_field(sub, "task_id"),
+            _sub_field(sub, "platform"),
+            _sub_field(sub, "chat_id"),
+            _sub_field(sub, "thread_id") or "",
+        )
+        all_delivered = True
+        for ev in d["events"]:
+            ev_task = event_tasks.get(ev.task_id) or task
+            msg = render_chat_event(ev, ev_task, sub, d.get("board"))
+            metadata: dict[str, Any] = {}
+            if _sub_field(sub, "thread_id"):
+                metadata["thread_id"] = _sub_field(sub, "thread_id")
+            try:
+                await adapter.send(
+                    _sub_field(sub, "chat_id"), msg, metadata=metadata,
+                )
+                # Surface artifacts on the completed event only (never on
+                # retries) when the caller injected a delivery callback.
+                if ev.kind == "completed" and deliver_artifacts_fn is not None:
+                    try:
+                        await deliver_artifacts_fn(
+                            adapter=adapter,
+                            chat_id=_sub_field(sub, "chat_id"),
+                            metadata=metadata,
+                            event_payload=getattr(ev, "payload", None),
+                            task=ev_task,
+                        )
+                    except Exception:
+                        # Artifact delivery is best-effort; never fail the
+                        # send / rewind the cursor over an upload error.
+                        pass
+                delivered += 1
+                last_success_cursor = max(
+                    last_success_cursor, int(getattr(ev, "id", 0) or 0),
+                )
+                sub_fail_counts.pop(sub_key, None)
+            except Exception:
+                all_delivered = False
+                fails = sub_fail_counts.get(sub_key, 0) + 1
+                sub_fail_counts[sub_key] = fails
+                send_failures += 1
+                if fails >= max_send_failures:
+                    await asyncio.to_thread(
+                        store.remove_notify_sub,
+                        task_id=_sub_field(sub, "task_id"),
+                        platform=_sub_field(sub, "platform"),
+                        chat_id=_sub_field(sub, "chat_id"),
+                        thread_id=_sub_field(sub, "thread_id") or "",
+                    )
+                    sub_fail_counts.pop(sub_key, None)
+                    unsubbed_subs.append(_sub_field(sub, "task_id"))
+                else:
+                    await asyncio.to_thread(
+                        store.rewind_notify_cursor,
+                        task_id=_sub_field(sub, "task_id"),
+                        platform=_sub_field(sub, "platform"),
+                        chat_id=_sub_field(sub, "chat_id"),
+                        thread_id=_sub_field(sub, "thread_id") or "",
+                        claimed_cursor=d["cursor"],
+                        old_cursor=last_success_cursor,
+                    )
+                # Transient or terminal, stop processing this batch.
+                break
+
+        if all_delivered:
+            # All events delivered; advance cursor (the dedup mechanism).
+            await asyncio.to_thread(
+                store.advance_notify_cursor,
+                task_id=_sub_field(sub, "task_id"),
+                platform=_sub_field(sub, "platform"),
+                chat_id=_sub_field(sub, "chat_id"),
+                thread_id=_sub_field(sub, "thread_id") or "",
+                new_cursor=d["cursor"],
+            )
+            delivered_subs.append(_sub_field(sub, "task_id"))
+            # Unsub only when the task reached a truly final status
+            # (done / archived). Subtree subs stay alive after the root
+            # completes (downstream lane events still matter); archive is the
+            # explicit terminal cleanup. Mirrors gateway:6614-6623.
+            include_children = bool(_sub_field(sub, "include_children"))
+            task_status = _sub_field(task, "status") if task is not None else None
+            task_terminal = task is not None and task_status in {"done", "archived"}
+            should_unsub = bool(
+                task_terminal
+                and (not include_children or task_status == "archived")
+            )
+            if should_unsub:
+                await asyncio.to_thread(
+                    store.remove_notify_sub,
+                    task_id=_sub_field(sub, "task_id"),
+                    platform=_sub_field(sub, "platform"),
+                    chat_id=_sub_field(sub, "chat_id"),
+                    thread_id=_sub_field(sub, "thread_id") or "",
+                )
+                unsubbed_subs.append(_sub_field(sub, "task_id"))
+
+    # ------------------------------------------------------------------
+    # Profile wake loop (ported from gateway:6625-6686).
+    # ------------------------------------------------------------------
+    woke = 0
+    profile_advanced = 0
+    profile_failed = 0
+    woke_profiles: list[str] = []
+    for pd in profile_deliveries:
+        psub = pd["sub"]
+        if not int(_sub_field(psub, "wake_agent") or 0):
+            # Sub recorded events but is configured not to wake an agent —
+            # just advance the cursor to ack the range. No wake happened, so
+            # we do NOT record a wake-events row.
+            await asyncio.to_thread(
+                store.advance_profile_event_cursor,
+                task_id=_sub_field(psub, "task_id"),
+                profile=_sub_field(psub, "profile"),
+                name=_sub_field(psub, "name") or "",
+                new_cursor=pd["cursor"],
+                last_wake_at=None,
+            )
+            profile_advanced += 1
+            continue
+        wake_error: Any = None
+        try:
+            result = wake_profile_fn(
+                psub, pd["events"], pd["task"], pd["event_tasks"], pd.get("board"),
+            )
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            result = False
+            wake_error = exc
+        # wake_profile_fn returns bool (legacy) or (bool, error).
+        if isinstance(result, tuple) and len(result) == 2:
+            ok = bool(result[0])
+            if not ok and wake_error is None:
+                wake_error = result[1]
+        else:
+            ok = bool(result)
+        if ok:
+            await asyncio.to_thread(
+                store.record_profile_wake_success,
+                task_id=_sub_field(psub, "task_id"),
+                profile=_sub_field(psub, "profile"),
+                name=_sub_field(psub, "name") or "",
+                new_cursor=pd["cursor"],
+                last_wake_at=int(time.time()),
+            )
+            woke += 1
+            woke_profiles.append(_sub_field(psub, "task_id"))
+        else:
+            await asyncio.to_thread(
+                store.record_profile_wake_failure,
+                task_id=_sub_field(psub, "task_id"),
+                profile=_sub_field(psub, "profile"),
+                name=_sub_field(psub, "name") or "",
+                claimed_cursor=pd["cursor"],
+                old_cursor=int(pd.get("old_cursor", 0) or 0),
+                error=wake_error,
+            )
+            profile_failed += 1
+
+    return {
+        "delivered": delivered,
+        "woke": woke,
+        "unsubbed": len(unsubbed_subs),
+        "send_failures": send_failures,
+        "profile_advanced": profile_advanced,
+        "profile_failed": profile_failed,
+        "delivered_subs": delivered_subs,
+        "woke_profiles": woke_profiles,
+        "unsubbed_subs": unsubbed_subs,
+    }

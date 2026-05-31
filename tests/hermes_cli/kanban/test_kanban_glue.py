@@ -10,9 +10,14 @@ rather than the injected callbacks — so we monkeypatch those (same pattern as
 the A5 ``test_dispatch_plan_claims_ready`` test). For the PG path the injected
 ``resolve_workspace`` / ``profile_exists`` callbacks are honored directly.
 """
+import asyncio
 import pathlib
 
-from hermes_cli.kanban_glue import run_dispatch_tick
+from hermes_cli.kanban_glue import run_dispatch_tick, run_notifier_tick
+
+_TERMINAL_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "archived",
+)
 
 
 def _field(row, key):
@@ -180,3 +185,176 @@ def test_dispatch_tick_returns_diagnostics(store, monkeypatch, tmp_path):
     # spawned count is an int (gateway does arithmetic on it); ids is a list.
     assert isinstance(summary["spawned"], int)
     assert isinstance(summary["spawned_ids"], list)
+
+
+# ---------------------------------------------------------------------------
+# run_notifier_tick (B2)
+#
+# Backend-agnostic: the store routes daemon-vs-direct internally, so these
+# tests never monkeypatch profile/workspace (the notifier path doesn't spawn
+# workers). The fake adapter is keyed by the lowercased platform string because
+# we drive the glue with ``platform_enum=None`` (string-match resolution).
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdapter:
+    """Records send() calls; an async send like the real chat adapters."""
+
+    def __init__(self, raise_on_send=False):
+        self.sent = []
+        self._raise = raise_on_send
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text,
+                          "metadata": metadata or {}})
+        if self._raise:
+            raise RuntimeError("send boom")
+
+
+def _render(ev, ev_task, sub, board):
+    return f"msg:{ev.kind}"
+
+
+def _wake_noop(psub, events, task, event_tasks, board):
+    return True
+
+
+def test_notifier_tick_delivers_and_advances(store):
+    tid = store.create_task(title="notify me", assignee="engineer")
+    store.add_notify_sub(task_id=tid, platform="telegram", chat_id="c1")
+    # Terminal event: completing the task emits a ``completed`` event.
+    store.complete_task(tid, summary="done")
+
+    adapter = _FakeAdapter()
+    summary = asyncio.run(run_notifier_tick(
+        store,
+        {"telegram": adapter},
+        notifier_profile=None,
+        active_platforms={"telegram"},
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=_wake_noop,
+        platform_enum=None,
+    ))
+
+    # Delivered exactly once, to the subscribed chat.
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "c1"
+    assert summary["delivered"] == 1
+    assert tid in summary["delivered_subs"]
+
+    # The sub completing on a done task is removed (should_unsub).
+    assert not store.list_notify_subs(tid)
+
+    # A second tick delivers nothing (cursor advanced + sub gone).
+    adapter2 = _FakeAdapter()
+    summary2 = asyncio.run(run_notifier_tick(
+        store,
+        {"telegram": adapter2},
+        notifier_profile=None,
+        active_platforms={"telegram"},
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=_wake_noop,
+        platform_enum=None,
+    ))
+    assert adapter2.sent == []
+    assert summary2["delivered"] == 0
+
+
+def test_notifier_tick_send_failure_rewinds_then_unsubs(store):
+    """max_send_failures=2: first tick rewinds (cursor restored, sub stays),
+    second tick removes the sub after the failure counter trips."""
+    tid = store.create_task(title="dead chat", assignee="engineer")
+    store.add_notify_sub(task_id=tid, platform="telegram", chat_id="c1")
+    # Use a non-terminal task state so should_unsub never fires on its own —
+    # blocking keeps the task alive while still emitting a terminal event kind.
+    store.block_task(tid, reason="halt")
+
+    adapter = _FakeAdapter(raise_on_send=True)
+    fail_counts: dict = {}
+
+    # Tick 1: send raises -> rewind (below the limit). Sub survives.
+    summary1 = asyncio.run(run_notifier_tick(
+        store,
+        {"telegram": adapter},
+        notifier_profile=None,
+        active_platforms={"telegram"},
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=_wake_noop,
+        sub_fail_counts=fail_counts,
+        max_send_failures=2,
+        platform_enum=None,
+    ))
+    assert summary1["send_failures"] == 1
+    assert summary1["unsubbed"] == 0
+    assert store.list_notify_subs(tid), "sub should survive the first failure"
+
+    # Tick 2: the rewind let the same event be re-claimed; the second failure
+    # trips max_send_failures -> the sub is removed.
+    summary2 = asyncio.run(run_notifier_tick(
+        store,
+        {"telegram": adapter},
+        notifier_profile=None,
+        active_platforms={"telegram"},
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=_wake_noop,
+        sub_fail_counts=fail_counts,
+        max_send_failures=2,
+        platform_enum=None,
+    ))
+    assert summary2["send_failures"] == 1
+    assert summary2["unsubbed"] == 1
+    assert not store.list_notify_subs(tid), "sub removed after the 2nd failure"
+
+
+def test_notifier_tick_profile_wake_advances(store):
+    tid = store.create_task(title="wake me", assignee="engineer")
+    # wake_agent defaults on.
+    store.add_profile_event_sub(task_id=tid, profile="engineer")
+    store.complete_task(tid, summary="done")
+
+    woke = []
+
+    def wake_fn(psub, events, task, event_tasks, board):
+        woke.append((_field(psub, "task_id"), _field(psub, "profile")))
+        return True
+
+    summary = asyncio.run(run_notifier_tick(
+        store,
+        {},  # no chat adapters needed for a profile wake
+        notifier_profile=None,
+        active_platforms=set(),
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=wake_fn,
+        platform_enum=None,
+    ))
+
+    # The wake callback fired for our sub, and the tick recorded the wake.
+    assert woke == [(tid, "engineer")]
+    assert summary["woke"] == 1
+    assert tid in summary["woke_profiles"]
+
+    # record_profile_wake_success appended a 'success' wake-event row + advanced
+    # the cursor.
+    wake_events = store.list_profile_wake_events(task_id=tid)
+    statuses = [_field(e, "status") for e in wake_events]
+    assert "success" in statuses
+
+    # A second tick wakes nothing (cursor advanced past the claimed event).
+    woke.clear()
+    summary2 = asyncio.run(run_notifier_tick(
+        store,
+        {},
+        notifier_profile=None,
+        active_platforms=set(),
+        terminal_kinds=_TERMINAL_KINDS,
+        render_chat_event=_render,
+        wake_profile_fn=wake_fn,
+        platform_enum=None,
+    ))
+    assert woke == []
+    assert summary2["woke"] == 0
