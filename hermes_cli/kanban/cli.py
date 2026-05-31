@@ -2057,10 +2057,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
             rollup_children = store.child_ids(
                 args.task_id, relation_type=kb.LINK_RELATION_ROLLUP
             )
-            # store.list_runs accepts state_type/state_name but raises
-            # NotImplementedError if they are non-None (phase-2-tail item).
-            # Pass **rsk so filtering works once it is implemented; for the
-            # common path rsk == {} and this is a no-op.
+            # rsk is {} on the common path. Non-empty rsk (--state-type/
+            # --state-name) raises NotImplementedError on the PG store
+            # (phase-2-tail deferral); it propagates as an unhandled exception
+            # rather than a graceful error. Acceptable for now: the
+            # single-board live deployment never passes run-state filters to
+            # 'show'.
             runs = store.list_runs(args.task_id, **rsk)
         finally:
             store.close()
