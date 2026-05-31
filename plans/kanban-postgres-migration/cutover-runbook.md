@@ -31,25 +31,45 @@ writes. The one-way door is called out explicitly at §8.
 
 Work through this checklist in order. **Do not proceed past any unchecked item.**
 
-### 2a. Every phase-3-tail item is CLOSED
+### 2a. Every phase-3-tail item is CLOSED ✓ (Phase 4.5)
 
-These are tracked by marker comments `# phase-3-tail:` in
+These items were originally tracked by `# phase-3-tail:` marker comments in
 `hermes_cli/kanban/store_postgres.py` and `hermes_cli/kanban_glue.py`, and
-recorded in the `kanban-pg-phase3-glue` memory note. They are runtime
-correctness gaps in the Postgres backend that are orthogonal to moving data but
-must be resolved before the backend is trusted in production.
+recorded in the `kanban-pg-phase3-glue` memory note. They are now **fully
+implemented and tested** on branch `feat/kanban-pg-phase45-tail` (Phase 4.5),
+conformance-green on both backends. The marker comments have been removed.
+Design notes: `plans/kanban-postgres-migration/phase-3-tail-closeout-design.md`.
 
-| # | Item | Status required |
-|---|------|----------------|
-| 1 | PG `detect_crashed_workers`: reap-registry clean-exit (rc=0) must be classified as a protocol violation, not a normal exit | CLOSED |
-| 2 | PG pre-spawn validation: auto-block emit when validation fails (matching SQLite behavior) | CLOSED |
-| 3 | PG host-local `SIGTERM → grace → SIGKILL` kill-ladder: currently delegated to an injected `signal_fn`; reconcile `store_postgres.signal_fn(pid, sig)` vs `kanban_glue.enforce_runtime_kill` ladder so the full escalation runs on PG | CLOSED |
-| 4 | Systemic-spawn-failure sibling pre-emptive block in the glue (currently missing for PG path) | CLOSED |
-| 5 | (Cleanup) Dead gateway helpers `_kanban_advance` / `_rewind` / `_unsub` / `_profile_*` are now unreachable from the notifier; remove to prevent confusion | CLOSED |
-| 6 | Confirm whether non-single-writer SQLite is a supported production config; this determines which of items 1–4 are truly blocking vs. nice-to-have | RESOLVED |
+| # | Item | Status |
+|---|------|--------|
+| 1 | PG `detect_crashed_workers`: reap-registry clean-exit (rc=0) must be classified as a protocol violation, not a normal exit | **CLOSED (Phase 4.5 — A4 + B1)** |
+| 2 | PG pre-spawn validation: auto-block emit when validation fails (matching SQLite behavior) | **CLOSED (Phase 4.5 — A1)** |
+| 3 | PG host-local `SIGTERM → grace → SIGKILL` kill-ladder: full escalation via injected `terminate_fn(pid, claim_lock)`; gateway wires the real ladder | **CLOSED (Phase 4.5 — A3 + B1)** |
+| 4 | Systemic-spawn-failure sibling pre-emptive block in the glue (previously missing for PG path) | **CLOSED (Phase 4.5 — A2)** |
+| 5 | (Cleanup) Dead gateway helpers `_kanban_advance` / `_rewind` / `_unsub` / `_profile_*` unreachable from notifier; removed | **CLOSED (Phase 4.5 — B2)** |
+| 6 | Live-PID claim-extension: running workers extend their claim each heartbeat so reclaim skips genuinely live workers | **CLOSED (Phase 4.5 — A5)** |
 
-**GO / NO-GO:** if any item above is still open, stop here. Raise a ticket, close
-it, and re-run this checklist from the top.
+**GO / NO-GO:** all items above are CLOSED as of Phase 4.5. This gate is
+satisfied — proceed to 2b.
+
+### 2a-note. Known PG-dispatch characteristics (operator awareness at cutover)
+
+These are **not blocking** — they are parity or pre-existing behaviours the
+operator should know before going live:
+
+- **Kill-ladder blocks dispatcher tick (~5 s per reclaimed worker).** The PG
+  reclaim kill-ladder (`terminate_fn`) blocks the dispatcher tick for up to
+  ~5 s per genuinely-dying host-local worker while it waits for the SIGTERM
+  grace period before escalating to SIGKILL. This is **parity with the SQLite
+  backend** (`enforce_max_runtime` blocks identically). The ladder runs on a
+  worker thread — not the event loop — so it does not stall async I/O; however,
+  gateway shutdown can lag by up to one ladder window if a reclaim is in flight.
+
+- **`reap_worker_zombies()` uses a global `waitpid(-1)` (pre-existing on all
+  backends).** Called once per dispatcher tick, this can race asyncio's child
+  watcher for non-kanban subprocesses (e.g. ffprobe, quick-commands), producing
+  a spurious rc=255 for those processes. Severity is low and the behaviour is
+  pre-existing — it was not introduced by Phase 4.5.
 
 ### 2b. Supabase Postgres provisioned and reachable
 

@@ -1718,10 +1718,13 @@ class PostgresKanbanStore:
         ``timed_out``, and records a failure (``release_claim=False``,
         ``end_run=False``) so the breaker can trip.
 
-        # phase-3-tail: the SQLite host_prefix (claim_lock) filter is NOT
-        # applied — PG is multi-host-agnostic at the store layer; host-locality
-        # is a glue concern. terminate_fn(pid, claim_lock) is PREFERRED;
-        # signal_fn stays as a single-shot fallback.
+        # The PG store is host-agnostic by design (no host_prefix filter at this
+        # layer; host-locality is enforced inside the injected callback).  Kill
+        # is delegated to ``terminate_fn(pid, claim_lock)`` (preferred), which
+        # runs the full host-guarded SIGTERM→grace→SIGKILL ladder — the
+        # host-prefix guard lives inside that callback.  ``signal_fn`` is the
+        # single-shot SIGTERM fallback used when ``terminate_fn`` is not
+        # injected.
         """
         now = int(time.time())
         timed_out: list = []
@@ -1792,9 +1795,11 @@ class PostgresKanbanStore:
         reclaim is detection of an absent heartbeat, not a worker failure —
         counting it would let two legitimately long runs trip the breaker).
 
-        # phase-3-tail: the SQLite host_prefix filter is not applied (store is
-        # host-agnostic); terminate_fn(pid, claim_lock) is PREFERRED;
-        # signal_fn stays as a single-shot fallback.
+        # The PG store is host-agnostic by design (no host_prefix filter at this
+        # layer).  Kill is delegated to ``terminate_fn(pid, claim_lock)``
+        # (preferred), which runs the full host-guarded SIGTERM→grace→SIGKILL
+        # ladder; ``signal_fn`` is the single-shot SIGTERM fallback used when
+        # ``terminate_fn`` is not injected.
         """
         if stale_timeout_seconds <= 0:
             return []

@@ -129,11 +129,12 @@ def run_dispatch_tick(
             fallback. (B1 wires the gateway's real ladder.)
         signal_fn / pid_alive_fn: injected OS callbacks forwarded straight to
             ``store.dispatch_plan`` for its DB-side reclaim. B1 passes the
-            caller-provided callbacks through unchanged. (B3 wires the gateway's
+            caller-provided callbacks through unchanged. (The gateway wires its
             real ``os.kill``-based ``signal_fn`` / ``os.kill(pid, 0)``-style
-            ``pid_alive_fn``. The full SIGTERM->SIGKILL kill ladder is a tracked
-            phase-3-tail on the PG store; SQLite's ``dispatch_once`` runs its own
-            ladder internally.)
+            ``pid_alive_fn``.) ``signal_fn`` is the single-shot SIGTERM fallback;
+            the full host-guarded SIGTERM→grace→SIGKILL ladder runs via
+            ``terminate_fn`` (implemented in the gateway and wired through B1).
+            SQLite's ``dispatch_once`` runs its own equivalent ladder internally.
         classify_exit_fn: ``classify_exit_fn(pid) -> (kind, code)`` injected
             exit-classification callback forwarded to ``store.dispatch_plan``.
             B1 wires the gateway's real ``_kb._classify_worker_exit``. When None
@@ -157,9 +158,11 @@ def run_dispatch_tick(
     )
 
     # NOTE: zombie reaping is NOT done here. On the SQLite path
-    # ``dispatch_once`` reaps internally (preserved, runs inside dispatch_plan);
-    # on the PG path crash-detection-via-reap is a tracked phase-3-tail. The
-    # glue never owns a reap loop because it must stay backend-agnostic.
+    # ``dispatch_once`` reaps internally (preserved, runs inside dispatch_plan).
+    # The glue never owns a reap loop because it must stay backend-agnostic.
+    # On the PG path, the gateway dispatcher loop calls ``reap_worker_zombies``
+    # each tick and injects ``classify_exit_fn`` so the store classifies rc=0
+    # clean exits as protocol violations rather than genuine crashes.
 
     spawned_ids: list[str] = []
     glue_spawn_failures = 0
