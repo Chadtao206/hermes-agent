@@ -55,3 +55,18 @@ def test_doctor_pg_unreachable_is_critical(pg):
                for i in res["issues"])
     # connectivity failure short-circuits: no logical-check issues mixed in
     assert all(i["kind"] == "pg_unreachable" for i in res["issues"])
+
+
+def test_doctor_pg_unresolvable_dsn_degrades(pg, monkeypatch):
+    from hermes_cli import kanban_board_doctor as kdoc
+    from hermes_cli.kanban import pg_pool
+    s, pool, board = pg
+    def _boom(*a, **k):
+        raise RuntimeError("kanban backend=postgres but no DSN configured")
+    monkeypatch.setattr(pg_pool, "get_pool", _boom)
+    # no pool arg -> _run_board_doctor_pg falls back to pg_pool.get_pool(), which raises
+    res = kdoc._run_board_doctor_pg(board=board, ready_age_seconds=900)
+    assert res["ok"] is False
+    assert any(i["kind"] == "pg_unreachable" and i["severity"] == "critical"
+               for i in res["issues"])
+    assert "reconcile_summary" in res  # shape uniformity

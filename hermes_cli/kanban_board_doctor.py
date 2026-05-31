@@ -149,10 +149,12 @@ def _run_board_doctor_pg(*, board: str | None, ready_age_seconds: int, pool=None
     now = int(time.time())
     issues: list[Issue] = []
     db_path = _redacted_pg_dsn()
-    pool = pool or pg_pool.get_pool()
     # 1. connectivity in place of sqlite file-integrity (bounded so an
-    #    unreachable backend fails fast instead of hanging the doctor)
+    #    unreachable/misconfigured backend fails fast as a critical issue
+    #    rather than hanging or crashing the doctor). Pool acquisition is inside
+    #    the try so an unresolvable DSN (resolve_dsn RuntimeError) degrades too.
     try:
+        pool = pool or pg_pool.get_pool()
         with pool.connection(timeout=5) as conn:
             conn.execute("SELECT 1").fetchone()
     except Exception as exc:
@@ -160,7 +162,9 @@ def _run_board_doctor_pg(*, board: str | None, ready_age_seconds: int, pool=None
             "critical", "pg_unreachable",
             f"Postgres kanban backend is unreachable: {type(exc).__name__}: {exc}",
             action="check the Supabase pooler DSN/credentials/network before relying on the board"))
-        return {"ok": False, "board": slug, "db_path": db_path, "issues": issues, "as_of": now}
+        return {"ok": False, "board": slug, "db_path": db_path, "issues": issues,
+                "reconcile_summary": {"ok": False, "backend": "postgres", "note": "unreachable"},
+                "as_of": now}
     # 2. logical invariant checks (board-scoped PG SQL; same issue kinds as sqlite)
     with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         # orphan dependency/rollup links
