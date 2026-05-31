@@ -1,3 +1,4 @@
+import json
 import time
 from uuid import uuid4
 
@@ -163,6 +164,46 @@ def test_record_failure_retry(store):
     # end_run=True emits the outcome-named event on the retry path.
     kinds = [e.kind for e in store.list_events(tid)]
     assert "spawn_failed" in kinds
+
+
+def test_record_failure_timeout_crash_trip(store):
+    # Timeout/crash path: release_claim=False, end_run=False. The breaker
+    # tripping here uses the SECOND UPDATE variant (status IN ('ready','running'))
+    # and closes NO run; the caller is responsible for its own outcome event.
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    blocked = store.record_task_failure(
+        tid, "stuck", outcome="timed_out", failure_limit=1,
+        release_claim=False, end_run=False)
+    assert blocked is True
+    assert store.get_task(tid).status == "blocked"
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "gave_up" in kinds
+    # end_run=False: this call must NOT emit the outcome-named event;
+    # the real flow's caller emits its own timed_out event.
+    assert "timed_out" not in kinds
+
+
+def test_record_failure_event_payload_extra(store):
+    # event_payload_extra merges into the gave_up event payload when the
+    # breaker trips (spawn-path defaults release_claim/end_run=True).
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    blocked = store.record_task_failure(
+        tid, "boom", outcome="crashed", failure_limit=1,
+        event_payload_extra={"pid": 4242})
+    assert blocked is True
+    assert store.get_task(tid).status == "blocked"
+    gave_up = [e for e in store.list_events(tid) if e.kind == "gave_up"]
+    assert gave_up, "expected a gave_up event"
+    payload = gave_up[-1].payload
+    # Tolerate either backend exposing payload as a dict or a JSON string.
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert isinstance(payload, dict)
+    assert payload.get("pid") == 4242
 
 
 def test_heartbeat_worker(store):
