@@ -5736,7 +5736,20 @@ class GatewayRunner:
             # filled from a read-only open when one is possible, else left zeroed.
             notifier_disabled, writer_disabled = self._liveness_subsystem_flags(slug, key)
             snap = None
-            if path.exists():
+            try:
+                from hermes_cli.kanban.store import resolve_backend as _rb
+                _backend = _rb()
+            except Exception:
+                _backend = "sqlite"
+            if _backend == "postgres":
+                try:
+                    from hermes_cli.kanban import pg_pool as _pg
+                    from psycopg.rows import dict_row as _dr
+                    with _pg.get_pool().connection(timeout=5) as _c, _c.cursor(row_factory=_dr) as _cur:
+                        snap = _liv.compute_board_liveness_pg(_cur, slug, now=int(time.time()))
+                except Exception as exc:
+                    logger.debug("kanban liveness: cannot read board %s (postgres): %s", slug, exc)
+            elif path.exists():
                 try:
                     conn = _kb.connect(board=slug, readonly=True)
                     try:
