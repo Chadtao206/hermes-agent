@@ -1853,6 +1853,38 @@ def _writer_auto_recovery_enabled() -> bool:
     return bool(kanban_cfg.get("writer_auto_recovery", False))
 
 
+def _resolve_kanban_backend_for_export():
+    """Return (backend, dsn|None) from the gateway's (root) config without
+    raising. dsn is None for non-postgres backends or if resolution fails."""
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        backend = resolve_backend()
+    except Exception:
+        return ("sqlite", None)
+    if backend != "postgres":
+        return (backend, None)
+    try:
+        from hermes_cli.kanban.pg_pool import resolve_dsn
+        return ("postgres", resolve_dsn())
+    except Exception:
+        return ("postgres", None)
+
+
+def _export_kanban_backend_env() -> None:
+    """Propagate the live kanban backend + DSN into os.environ so dispatcher-
+    spawned workers (which run under a profile-scoped HERMES_HOME whose config
+    may not carry the backend) inherit it via `env = dict(os.environ)`. The DSN
+    value is never logged."""
+    backend, dsn = _resolve_kanban_backend_for_export()
+    if backend != "postgres":
+        return
+    os.environ["HERMES_KANBAN_BACKEND"] = "postgres"
+    if dsn and not os.environ.get("HERMES_KANBAN_PG_DSN"):
+        os.environ["HERMES_KANBAN_PG_DSN"] = dsn
+    logger.info("kanban backend propagated to worker env: postgres "
+                "(DSN %s)", "present" if dsn else "MISSING")
+
+
 def _board_write_error_is_corruption(error_msg: str) -> bool:
     """True when a board-write error string looks like durable DB corruption.
 
@@ -5082,6 +5114,11 @@ class GatewayRunner:
         task = asyncio.create_task(self._control_center_command_watcher())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+        # Propagate the live kanban backend + DSN to spawned workers BEFORE any
+        # writer/dispatcher starts, so worker in-agent kanban tools resolve the
+        # same backend the gateway uses (not the profile-config default).
+        _export_kanban_backend_env()
 
         # Start the single-writer daemon(s) BEFORE the dispatcher tick runs so
         # the writer thread exists + is registered for in-process routing.
