@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 try:
@@ -273,7 +274,6 @@ def resolve_backend() -> str:
     workers whose profile-scoped config does not carry it. Otherwise read
     config defensively; any failure falls back to 'sqlite' so default
     deployments and upstream are unaffected."""
-    import os
     env_backend = (os.environ.get("HERMES_KANBAN_BACKEND") or "").strip().lower()
     if env_backend in _VALID_BACKENDS:
         return env_backend
