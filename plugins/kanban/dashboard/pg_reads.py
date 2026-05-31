@@ -8,7 +8,7 @@ untouched. The DSN is never logged.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 from hermes_cli import kanban_db
 

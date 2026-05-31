@@ -13,7 +13,7 @@ def _load_pg_reads():
     return m
 
 
-def test_board_aggregates(pg_board, monkeypatch):
+def test_board_aggregates(pg_board):
     pg = _load_pg_reads()
     s = pg_board
     p = s.create_task(title="parent", assignee="engineer", body="b", tenant="acme")
