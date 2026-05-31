@@ -352,6 +352,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 def _task_summary_dict_store(store, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools (backend-agnostic via store)."""
+    # Keep the returned key set in sync with _task_summary_dict (sqlite path).
     from hermes_cli.kanban_db import LINK_RELATION_ROLLUP
     parents = store.parent_ids(task.id)
     children = store.child_ids(task.id)
