@@ -1090,6 +1090,40 @@ class PostgresKanbanStore:
                     "last_failure_error=NULL WHERE board=%s AND id=%s",
                     (self.board, task_id))
 
+    def _pg_end_run(self, cur, task_id, *, outcome, summary=None, error=None,
+                    metadata=None, status=None):
+        """Mirror kanban_db._end_run: close the active run + clear the pointer.
+
+        Runs inside the caller's open transaction (takes the open ``cur``).
+        Returns the closed run_id, or None if no active run existed. If the
+        active run was already ended by a racing reclaim/crash path
+        (rowcount==0), emit a ``double_close_attempt`` event but STILL clear
+        ``tasks.current_run_id`` and return the run_id (backward-compatible
+        with the reference, avoiding a dangling pointer + spurious synth run).
+        """
+        cur.execute(
+            "SELECT current_run_id FROM tasks WHERE board=%s AND id=%s",
+            (self.board, task_id))
+        row = cur.fetchone()
+        if not row or not row["current_run_id"]:
+            return None
+        run_id = int(row["current_run_id"])
+        cur.execute(
+            "UPDATE task_runs SET status=%s, outcome=%s, summary=%s, error=%s, "
+            "metadata=%s, ended_at=%s, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE board=%s AND id=%s AND ended_at IS NULL",
+            (status or outcome, outcome, summary, error,
+             Jsonb(metadata) if metadata else None, int(time.time()),
+             self.board, run_id))
+        if cur.rowcount == 0:
+            self._emit(cur, task_id, "double_close_attempt",
+                       {"run_id": run_id, "caller_outcome": outcome},
+                       run_id=run_id)
+        cur.execute(
+            "UPDATE tasks SET current_run_id=NULL WHERE board=%s AND id=%s",
+            (self.board, task_id))
+        return run_id
+
     def complete_task(self, task_id: str, *, result=None, summary=None,
                       metadata=None, created_cards=None,
                       expected_run_id=None,
@@ -1166,25 +1200,19 @@ class PostgresKanbanStore:
                 if cur.rowcount != 1:
                     return False
                 active_run_id = current_run_id
+                # Build the closeout packet with the active run id BEFORE
+                # ending the run (same order as the reference _end_run flow).
                 closeout_metadata = self._pg_metadata_with_closeout_packet(
                     cur, task_id, metadata,
                     run_id=active_run_id, outcome="completed",
                     summary=handoff_summary)
-                # End the current run (inline _end_run, enriched w/ packet).
-                if active_run_id is not None:
-                    cur.execute(
-                        "UPDATE task_runs SET status='done', outcome='completed', "
-                        "summary=%s, metadata=%s, ended_at=%s, "
-                        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
-                        "WHERE board=%s AND id=%s AND ended_at IS NULL",
-                        (handoff_summary, Jsonb(closeout_metadata), now,
-                         self.board, active_run_id))
-                    if cur.rowcount == 1:
-                        run_id = active_run_id
-                        cur.execute(
-                            "UPDATE tasks SET current_run_id=NULL "
-                            "WHERE board=%s AND id=%s",
-                            (self.board, task_id))
+                # End the current run via the shared _end_run mirror. It
+                # re-reads current_run_id itself and handles the defensive
+                # double-close branch (already-ended run): emits the event,
+                # clears the pointer unconditionally, and returns the run_id.
+                run_id = self._pg_end_run(
+                    cur, task_id, outcome="completed", status="done",
+                    summary=handoff_summary, metadata=closeout_metadata)
                 # No active run + handoff data: synthesize a zero-duration run
                 # so the handoff isn't lost, re-resolving the packet w/ run_id.
                 if run_id is None and (summary or metadata or result):

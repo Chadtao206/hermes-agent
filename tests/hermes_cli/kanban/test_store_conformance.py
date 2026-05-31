@@ -317,6 +317,83 @@ def test_complete_on_cleanup_hook(store):
         raise AssertionError(f"unexpected backend {backend}")
 
 
+def test_complete_dangling_ended_run(store):
+    """complete_task on a task whose current_run_id points at an
+    ALREADY-ENDED run must NOT synthesize a spurious run nor leave the
+    pointer dangling: it must close the run defensively (double_close_attempt
+    event), clear current_run_id, and return True — mirroring _end_run.
+
+    The public API maintains the invariant, so we force the corrupt
+    precondition white-box (branch on backend for SETUP only), then assert
+    identically on both backends.
+    """
+    tid = store.create_task(title="x", assignee="engineer")
+    claimed = store.claim_task(tid, claimer="w1")
+    assert claimed is not None and claimed.status == "running"
+    # Active run R for the task.
+    runs = store.list_runs(tid)
+    assert len(runs) == 1
+    rid = _field(runs[0], "id")
+    assert store.get_task(tid).current_run_id == rid
+
+    # Force R ended WITHOUT clearing tasks.current_run_id (the corruption).
+    backend = type(store).__name__
+    if backend == "PostgresKanbanStore":
+        with store._pool.connection() as c, c.cursor() as cc:
+            cc.execute(
+                "UPDATE task_runs SET ended_at=%s WHERE board=%s AND id=%s",
+                (int(time.time()), store.board, rid))
+    elif backend == "SqliteKanbanStore":
+        # The conformance fixture set HERMES_KANBAN_DB, so kb.connect()
+        # targets the test DB.
+        from hermes_cli import kanban_db as kb
+        with kb.connect(readonly=False) as c:
+            c.execute(
+                "UPDATE task_runs SET ended_at=? WHERE id=?",
+                (int(time.time()), rid))
+            c.commit()
+    else:
+        raise AssertionError(f"unexpected backend {backend}")
+
+    # Sanity: pointer still dangles at the now-ended run.
+    assert store.get_task(tid).current_run_id == rid
+
+    assert store.complete_task(tid, summary="done") is True
+    assert store.get_task(tid).status == "done"
+
+    # No spurious synthetic run — still exactly the one run R.
+    after = store.list_runs(tid)
+    assert len(after) == 1, [(_field(r, "id"), _field(r, "ended_at")) for r in after]
+    assert _field(after[0], "id") == rid
+    # Pointer cleared (no dangle).
+    assert store.get_task(tid).current_run_id is None
+    # Defensive double-close telemetry emitted.
+    kinds = [e.kind for e in store.list_events(tid)]
+    assert "double_close_attempt" in kinds
+
+
+def test_complete_never_claimed_synthesizes_run(store):
+    """complete_task on a never-claimed task (no active run) synthesizes one
+    zero-duration run and re-resolves the closeout packet's run_id to that
+    synthesized run (not None)."""
+    tid = store.create_task(title="x", assignee="engineer")
+    assert store.get_task(tid).status == "ready"
+    assert store.complete_task(
+        tid, summary="manual close", metadata={"k": "v"}) is True
+    assert store.get_task(tid).status == "done"
+
+    runs = store.list_runs(tid)
+    assert len(runs) == 1, "expected exactly one synthesized run"
+    synth_id = _field(runs[0], "id")
+    assert _field(runs[0], "outcome") == "completed"
+
+    completed = [e for e in store.list_events(tid) if e.kind == "completed"]
+    assert completed, "expected a completed event"
+    packet = completed[-1].payload.get("closeout_packet")
+    assert isinstance(packet, dict)
+    assert packet.get("run_id") == synth_id
+
+
 def test_profile_event_cursor_advance_rewind(store):
     tid = store.create_task(title="x", assignee="engineer")
     store.add_profile_event_sub(task_id=tid, profile="engineer")
