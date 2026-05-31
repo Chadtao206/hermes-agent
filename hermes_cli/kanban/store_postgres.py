@@ -1529,6 +1529,58 @@ class PostgresKanbanStore:
                                         failure_limit=failure_limit,
                                         release_claim=True, end_run=True)
 
+    def block_systemic_spawn_failure_signature(self, task_ids, *,
+                                               failure_signature, error,
+                                               signature_count):
+        """Mirror kanban_db._block_systemic_spawn_failure_signature: block ready
+        siblings sharing a spawn-failure signature WITHOUT re-incrementing their
+        counters. Returns the ids actually blocked.
+
+        Unlike the SQLite reference (single write_txn over all ids), this
+        blocks each id in its own transaction — intentional, since the
+        siblings are independent and the PG store uses per-op connections.
+        """
+        reason = ("systemic spawn failure: multiple tasks failed with the same "
+                  "spawn error signature; platform/profile fix required before retry")
+        blocked = []
+        seen = list(dict.fromkeys(task_ids))
+        for task_id in seen:
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                with conn.transaction():
+                    cur.execute(
+                        "SELECT status, consecutive_failures FROM tasks "
+                        "WHERE board=%s AND id=%s", (self.board, task_id))
+                    row = cur.fetchone()
+                    if row is None or row["status"] != "ready":
+                        continue
+                    cur.execute(
+                        "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL, last_failure_error=%s "
+                        "WHERE board=%s AND id=%s AND status='ready' "
+                        "AND claim_lock IS NULL",
+                        (error[:500], self.board, task_id))
+                    if cur.rowcount != 1:
+                        continue
+                    payload = {
+                        "failure_class": kanban_db.FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE,
+                        "failure_signature": failure_signature,
+                        "signature_count": int(signature_count),
+                        "signature_threshold":
+                            kanban_db.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD,
+                        "failures": int(row["consecutive_failures"] or 0),
+                        "effective_limit": 1,
+                        "limit_source": "systemic_failure_signature",
+                        "trigger_outcome": "spawn_failed",
+                        "error": error[:500],
+                        "guidance": kanban_db._SYSTEMIC_SPAWN_FAILURE_GUIDANCE,
+                    }
+                    self._emit(cur, task_id, "systemic_failure_signature", payload)
+                    self._emit(cur, task_id, "gave_up", payload)
+                    self._emit(cur, task_id, "blocked", {"reason": reason})
+                    blocked.append(task_id)
+        return blocked
+
     # --- dispatch reclaim primitives (A5) --------------------------------
     #
     # Each mirrors a kanban_db reclaim primitive board-scoped, reusing

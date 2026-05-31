@@ -576,3 +576,21 @@ def test_pre_spawn_validation_auto_blocks(store, monkeypatch):
     runs = store.list_runs(tid)
     assert len(runs) == 1
     assert _field(runs[0], "outcome") == "spawn_failed"
+
+
+def test_block_systemic_spawn_failure_signature(store):
+    a = store.create_task(title="a", assignee="engineer")
+    b = store.create_task(title="b", assignee="engineer")
+    c = store.create_task(title="c", assignee="engineer")
+    assert all(store.get_task(t).status == "ready" for t in (a, b, c))
+    blocked = store.block_systemic_spawn_failure_signature(
+        [a, b, c], failure_signature="boom", error="spawn boom",
+        signature_count=3)
+    assert set(blocked) == {a, b, c}
+    for t in (a, b, c):
+        assert store.get_task(t).status == "blocked"
+        # sibling block must NOT bump the per-task failure counter
+        assert store.get_task(t).consecutive_failures == 0
+        kinds = [e.kind for e in store.list_events(t)]
+        assert "systemic_failure_signature" in kinds and "gave_up" in kinds \
+            and "blocked" in kinds

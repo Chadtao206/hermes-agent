@@ -109,6 +109,40 @@ def test_dispatch_tick_spawn_failure_breaker(store, monkeypatch, tmp_path):
     assert "gave_up" in kinds
 
 
+def test_dispatch_tick_systemic_sibling_block(store, monkeypatch, tmp_path):
+    """Three tasks whose spawn_fn raises the SAME error cross
+    SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD (=3) within one tick; the glue
+    must block all three via block_systemic_spawn_failure_signature."""
+    _patch_sqlite_dispatch_path(monkeypatch, tmp_path)
+
+    tid1 = store.create_task(title="systemic A", assignee="engineer")
+    tid2 = store.create_task(title="systemic B", assignee="engineer")
+    tid3 = store.create_task(title="systemic C", assignee="engineer")
+
+    def identical_boom(task, workspace, board=None):
+        raise RuntimeError("identical spawn boom")
+
+    summary = run_dispatch_tick(
+        store,
+        board=store.board,
+        spawn_fn=identical_boom,
+        resolve_workspace=lambda t, board=None: str(tmp_path),
+        profile_exists=lambda a: True,
+        max_spawn=5,
+        failure_limit=3,  # high enough that individual breaker won't trip first
+    )
+
+    # All three tasks must be blocked by the systemic-signature path.
+    for tid in (tid1, tid2, tid3):
+        assert _field(store.get_task(tid), "status") == "blocked", \
+            f"task {tid} was not blocked"
+
+    # The summary's auto_blocked_ids must contain all three task ids.
+    for tid in (tid1, tid2, tid3):
+        assert tid in summary["auto_blocked_ids"], \
+            f"task {tid} not in auto_blocked_ids"
+
+
 def test_dispatch_tick_spawn_failure_retries_below_limit(store, monkeypatch, tmp_path):
     """With failure_limit > 1, a single spawn failure must NOT block the task;
     it returns to ready for a later tick (per-task breaker not yet tripped)."""

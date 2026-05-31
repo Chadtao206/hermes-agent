@@ -199,18 +199,12 @@ def run_dispatch_tick(
                 end_run=True,
                 event_payload_extra=event_extra,
             )
-            # phase-3-tail: the systemic-SIBLING pre-emptive block
-            # (kanban_db._block_systemic_spawn_failure_signature) — which blocks
-            # the OTHER already-failed tasks in the same signature group without
-            # re-incrementing their counters — is NOT replicated here. Doing so
-            # cross-backend needs a new store method (block a set of ids by
-            # shared signature) that does not exist yet; adding store surface is
-            # out of scope for B1. The PRIMARY systemic behavior — escalating the
-            # current task via failure_limit_is_cap — IS preserved above, so a
-            # systemic spawn failure still trips the breaker on the offending
-            # task at the threshold. Siblings will block via their own next
-            # spawn failure rather than pre-emptively. Tracked for the
-            # phase-3-tail (B-series follow-up).
+            newly = store.block_systemic_spawn_failure_signature(
+                group, failure_signature=signature, error=error,
+                signature_count=len(group))
+            for bid in newly:
+                if bid not in glue_auto_blocked:
+                    glue_auto_blocked.append(bid)
         else:
             auto = store.record_spawn_failure(
                 task_id, error, failure_limit=failure_limit

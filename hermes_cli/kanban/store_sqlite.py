@@ -92,6 +92,17 @@ class SqliteKanbanStore:
                                         failure_limit=failure_limit,
                                         release_claim=True, end_run=True)
 
+    def block_systemic_spawn_failure_signature(self, task_ids, *,
+                                               failure_signature, error,
+                                               signature_count):
+        conn = kb.connect(board=self.board, readonly=False)
+        try:
+            return kb._block_systemic_spawn_failure_signature(
+                conn, list(task_ids), failure_signature=failure_signature,
+                error=error, signature_count=signature_count)
+        finally:
+            conn.close()
+
     def dispatch_plan(self, *, resolve_workspace=None, profile_exists=None,
                       signal_fn=None, pid_alive_fn=None, **cfg):
         """One dispatcher tick: reclaim + ready-scan + claim + workspace-resolve,
