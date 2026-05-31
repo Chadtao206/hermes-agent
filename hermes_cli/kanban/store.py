@@ -266,9 +266,17 @@ def kanban_store(board: Optional[str] = None) -> "KanbanStore":
 
 
 def resolve_backend() -> str:
-    """Return the configured kanban backend ('sqlite' default). Reads config
-    defensively; any failure falls back to 'sqlite' so default deployments and
-    upstream are unaffected."""
+    """Return the configured kanban backend ('sqlite' default).
+
+    Precedence: the ``HERMES_KANBAN_BACKEND`` env override (if it names a valid
+    backend) wins, so the gateway can propagate the live backend to spawned
+    workers whose profile-scoped config does not carry it. Otherwise read
+    config defensively; any failure falls back to 'sqlite' so default
+    deployments and upstream are unaffected."""
+    import os
+    env_backend = (os.environ.get("HERMES_KANBAN_BACKEND") or "").strip().lower()
+    if env_backend in _VALID_BACKENDS:
+        return env_backend
     try:
         from hermes_cli.config import load_config
         cfg = load_config()

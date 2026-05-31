@@ -35,3 +35,24 @@ def test_factory_returns_postgres_store(monkeypatch):
     s = kanban_store(board=None)
     assert isinstance(s, PostgresKanbanStore)
     s.close()
+
+
+def test_resolve_backend_env_override_wins(monkeypatch):
+    from hermes_cli.kanban import store as store_mod
+    # Config says sqlite (default), env says postgres → env wins.
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "postgres")
+    assert store_mod.resolve_backend() == "postgres"
+
+
+def test_resolve_backend_env_invalid_falls_through(monkeypatch):
+    from hermes_cli.kanban import store as store_mod
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "mariadb")
+    # Invalid env value is ignored → falls through to config (sqlite default).
+    assert store_mod.resolve_backend() == "sqlite"
+
+
+def test_resolve_backend_no_env_unchanged(monkeypatch):
+    from hermes_cli.kanban import store as store_mod
+    monkeypatch.delenv("HERMES_KANBAN_BACKEND", raising=False)
+    # No env → existing config behavior (sqlite default in test env).
+    assert store_mod.resolve_backend() == "sqlite"
