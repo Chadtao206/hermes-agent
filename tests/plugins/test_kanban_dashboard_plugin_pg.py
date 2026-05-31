@@ -111,3 +111,33 @@ def test_board_resolves_current_board_consistently(monkeypatch, _pg_dsn, tmp_pat
                         "kanban_profile_wake_events", "kanban_profile_event_subs", "tasks"):
                 cur.execute(f"DELETE FROM {tbl} WHERE board=%s", (board,))
         s.close(); pool.close()
+
+
+def test_task_detail_workers_diagnostics_pg(pg_client):
+    s = pg_client.pg_store
+    p = s.create_task(title="parent", assignee="engineer", body="pbody")
+    c = s.create_task(title="child", assignee="reviewer", body="cbody")
+    s.link_tasks(p, c)
+    s.add_comment(c, author="ops", body="please review")
+
+    r = pg_client.get(f"/api/plugins/kanban/tasks/{c}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"]["id"] == c and body["task"]["body"] == "cbody"
+    assert [cm["body"] for cm in body["comments"]] == ["please review"]
+    assert body["links"]["parents"] == [p]
+
+    r2 = pg_client.get(f"/api/plugins/kanban/tasks/{c}?run_state_type=status&run_state_name=running")
+    assert r2.status_code == 400
+
+    aw = pg_client.get("/api/plugins/kanban/workers/active").json()
+    assert aw["count"] == 0 and aw["workers"] == []
+
+    dg = pg_client.get("/api/plugins/kanban/diagnostics").json()
+    assert "diagnostics" in dg and "count" in dg
+
+    wh = pg_client.get("/api/plugins/kanban/wake-health/details").json()
+    assert "wake_health" in wh and "rows" in wh
+
+    lg = pg_client.get(f"/api/plugins/kanban/tasks/{c}/log")
+    assert lg.status_code == 200  # exists check via store; log file absent -> content ""

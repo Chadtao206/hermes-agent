@@ -708,6 +708,22 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _links_for_pg(board_slug: str, task_id: str) -> dict[str, list[str]]:
+    """Postgres counterpart to _links_for: parents/children from task_links."""
+    pg = _pg_reads()
+    rows = pg._query(
+        "SELECT parent_id FROM task_links WHERE board=%s AND child_id=%s ORDER BY parent_id",
+        (board_slug, task_id),
+    )
+    parents = [r["parent_id"] for r in rows]
+    rows = pg._query(
+        "SELECT child_id FROM task_links WHERE board=%s AND parent_id=%s ORDER BY child_id",
+        (board_slug, task_id),
+    )
+    children = [r["child_id"] for r in rows]
+    return {"parents": parents, "children": children}
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -1075,6 +1091,32 @@ def get_wake_health_details(
     first. ``overflow_count`` reports rows beyond ``limit``.
     """
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        store = None
+        try:
+            pg = _pg_reads()
+            bslug = pg.slug(board)
+            store = _store(board=bslug)
+            tasks = store.list_tasks(
+                tenant=tenant, include_archived=include_archived,
+                workflow_template_id=workflow_template_id, current_step_key=current_step_key,
+            )
+            task_ids = [t.id for t in tasks]
+            tasks_by_id = {t.id: t for t in tasks}
+            wake_health = pg.wake_health(bslug, task_ids)
+            notifier_health = _compute_notifier_health(None, board=board, wake_health=wake_health)
+            rows, overflow = pg.wake_health_rows(bslug, task_ids, tasks_by_id, limit)
+            return {
+                "wake_health": wake_health, "notifier_health": notifier_health,
+                "rows": rows, "overflow_count": overflow, "as_of": int(time.time()),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
+        finally:
+            if store is not None:
+                store.close()
     conn = _conn(board=board, readonly=True)
     try:
         tasks = kanban_db.list_tasks(
@@ -1123,6 +1165,51 @@ def get_task(
     ),
 ):
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        # Run-state validation runs for the PG branch too so a bad combination
+        # 400s on both backends (the sqlite body below applies the identical
+        # checks). PG list_runs does not support these filters.
+        if (run_state_type is None) ^ (run_state_name is None):
+            raise HTTPException(
+                status_code=400,
+                detail="run_state_type and run_state_name must be passed together or omitted",
+            )
+        if run_state_type is not None and run_state_type not in ("status", "outcome"):
+            raise HTTPException(
+                status_code=400,
+                detail="run_state_type must be 'status' or 'outcome'",
+            )
+        if run_state_type is not None or run_state_name is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="run state filtering is not yet supported on the postgres backend",
+            )
+        pg = _pg_reads()
+        bslug = pg.slug(board)
+        store = _store(board=bslug)
+        try:
+            task = store.get_task(task_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            full_summary = store.latest_summary(task_id)
+            task_d = _task_dict(task, latest_summary=full_summary)
+            diag_list = _compute_task_diagnostics_pg(bslug, task_ids=[task_id]).get(task_id) or []
+            if diag_list:
+                task_d["diagnostics"] = diag_list
+                task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+            return {
+                "task": task_d,
+                "comments": [_comment_dict(c) for c in store.list_comments(task_id)],
+                "events": [_event_dict(e) for e in store.list_events(task_id)],
+                "links": _links_for_pg(bslug, task_id),
+                "runs": [_run_dict(r) for r in store.list_runs(task_id)],
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
+        finally:
+            store.close()
     conn = _conn(board=board, readonly=True)
     try:
         if (run_state_type is None) ^ (run_state_name is None):
@@ -1621,6 +1708,48 @@ def list_diagnostics(
     directly when it isn't.
     """
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        try:
+            pg = _pg_reads()
+            bslug = pg.slug(board)
+            diags_by_task = _compute_task_diagnostics_pg(bslug, task_ids=None)
+            if not diags_by_task:
+                return {"diagnostics": [], "count": 0}
+            if severity:
+                filtered: dict[str, list[dict]] = {}
+                for tid, dl in diags_by_task.items():
+                    keep = [d for d in dl if kd.severity_at_or_above(d.get("severity"), severity)]
+                    if keep:
+                        filtered[tid] = keep
+                diags_by_task = filtered
+                if not diags_by_task:
+                    return {"diagnostics": [], "count": 0}
+            store = _store(board=bslug)
+            try:
+                tasks_by_id = {t.id: t for t in store.list_tasks(include_archived=True)}
+            finally:
+                store.close()
+            out = []
+            for tid, dl in diags_by_task.items():
+                t = tasks_by_id.get(tid)
+                out.append({
+                    "task_id": tid,
+                    "task_title": t.title if t else None,
+                    "task_status": t.status if t else None,
+                    "task_assignee": t.assignee if t else None,
+                    "diagnostics": dl,
+                })
+            from hermes_cli.kanban_diagnostics import SEVERITY_ORDER
+            sev_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
+            def _sort_key(row):
+                top = row["diagnostics"][0]
+                return (-sev_idx.get(top.get("severity"), -1), -(top.get("last_seen_at") or 0))
+            out.sort(key=_sort_key)
+            return {"diagnostics": out, "count": sum(len(d["diagnostics"]) for d in out)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
     conn = _conn(board=board, readonly=True)
     try:
         diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
@@ -1703,6 +1832,13 @@ def list_active_workers(
     its task without a second round-trip.
     """
     board = _resolve_board(board)
+    if _backend() == "postgres":
+        try:
+            pg = _pg_reads()
+            workers = pg.active_workers(pg.slug(board))
+            return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+        except Exception as exc:
+            _raise_pg_read_unavailable(exc, board)
     conn = _conn(board=board, readonly=True)
     try:
         rows = conn.execute(
@@ -2450,11 +2586,18 @@ def get_task_log(
     generations, so disk usage per task is bounded at ~4 MiB.
     """
     board = _resolve_board(board)
-    conn = _conn(board=board, readonly=True)
-    try:
-        task = kanban_db.get_task(conn, task_id)
-    finally:
-        conn.close()
+    if _backend() == "postgres":
+        store = _store(board=_pg_reads().slug(board))
+        try:
+            task = store.get_task(task_id)
+        finally:
+            store.close()
+    else:
+        conn = _conn(board=board, readonly=True)
+        try:
+            task = kanban_db.get_task(conn, task_id)
+        finally:
+            conn.close()
     if task is None:
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     content = kanban_db.read_worker_log(task_id, tail_bytes=tail, board=board)
@@ -2508,11 +2651,18 @@ async def stream_task_log(ws: WebSocket, task_id: str):
     except ValueError:
         offset = 0
 
-    conn = _conn(board=board, readonly=True)
-    try:
-        task = kanban_db.get_task(conn, task_id)
-    finally:
-        conn.close()
+    if _backend() == "postgres":
+        store = _store(board=_pg_reads().slug(board))
+        try:
+            task = store.get_task(task_id)
+        finally:
+            store.close()
+    else:
+        conn = _conn(board=board, readonly=True)
+        try:
+            task = kanban_db.get_task(conn, task_id)
+        finally:
+            conn.close()
     if task is None:
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
