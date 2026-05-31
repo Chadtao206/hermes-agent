@@ -2,15 +2,18 @@
 
 Read-only by default. Intended for operators, cron watchdogs, and dashboard
 health surfaces that need machine-readable stall/corruption signals without
-mutating the hot Kanban SQLite DB.
+mutating the hot Kanban board (SQLite or Postgres).
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_health
@@ -128,7 +131,147 @@ def _quick_check(path: Path) -> Issue | None:
     return None
 
 
+def _redacted_pg_dsn() -> str:
+    try:
+        from hermes_cli.kanban import pg_pool
+        import psycopg.conninfo as _ci
+        d = _ci.conninfo_to_dict(pg_pool.resolve_dsn())
+        return f"postgres://{d.get('host')}:{d.get('port')}/{d.get('dbname')}"
+    except Exception:
+        logger.debug("kanban doctor: could not resolve/redact PG DSN", exc_info=True)
+        return "postgres://<unknown>"
+
+
+def _run_board_doctor_pg(*, board: str | None, ready_age_seconds: int, pool=None) -> dict[str, Any]:
+    from hermes_cli.kanban import pg_pool
+    from psycopg.rows import dict_row
+    slug = board or kb.get_current_board()
+    now = int(time.time())
+    issues: list[Issue] = []
+    db_path = _redacted_pg_dsn()
+    pool = pool or pg_pool.get_pool()
+    # 1. connectivity in place of sqlite file-integrity (bounded so an
+    #    unreachable backend fails fast instead of hanging the doctor)
+    try:
+        with pool.connection(timeout=5) as conn:
+            conn.execute("SELECT 1").fetchone()
+    except Exception as exc:
+        issues.append(_issue(
+            "critical", "pg_unreachable",
+            f"Postgres kanban backend is unreachable: {type(exc).__name__}: {exc}",
+            action="check the Supabase pooler DSN/credentials/network before relying on the board"))
+        return {"ok": False, "board": slug, "db_path": db_path, "issues": issues, "as_of": now}
+    # 2. logical invariant checks (board-scoped PG SQL; same issue kinds as sqlite)
+    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        # orphan dependency/rollup links
+        cur.execute(
+            "SELECT l.parent_id, l.child_id, l.relation_type, "
+            "       p.id AS parent_exists, c.id AS child_exists "
+            "FROM task_links l "
+            "LEFT JOIN tasks p ON p.board=l.board AND p.id=l.parent_id "
+            "LEFT JOIN tasks c ON c.board=l.board AND c.id=l.child_id "
+            "WHERE l.board=%s AND (p.id IS NULL OR c.id IS NULL) "
+            "ORDER BY l.parent_id, l.child_id", (slug,))
+        for row in cur.fetchall():
+            missing = []
+            if row["parent_exists"] is None: missing.append("parent")
+            if row["child_exists"] is None: missing.append("child")
+            issues.append(_issue(
+                "error", "orphan_task_link",
+                f"task_links references missing {'/'.join(missing)} row",
+                parent_id=row["parent_id"], child_id=row["child_id"],
+                relation_type=row["relation_type"],
+                action="remove/recreate the orphan link before relying on dependency promotion"))
+        # profile event subscriptions pointing at missing tasks
+        cur.execute(
+            "SELECT s.task_id, s.profile, s.name FROM kanban_profile_event_subs s "
+            "LEFT JOIN tasks t ON t.board=s.board AND t.id=s.task_id "
+            "WHERE s.board=%s AND t.id IS NULL ORDER BY s.task_id, s.profile, s.name", (slug,))
+        for row in cur.fetchall():
+            issues.append(_issue(
+                "error", "orphan_profile_event_subscription",
+                "profile wake subscription references a missing task",
+                task_id=row["task_id"], profile=row["profile"], name=row["name"],
+                action="remove the subscription or recreate the task before enabling notifier wakes"))
+        # running tasks with expired claim / dead worker / stale heartbeat
+        cur.execute(
+            "SELECT id, title, assignee, worker_pid, claim_expires, last_heartbeat_at, current_run_id "
+            "FROM tasks WHERE board=%s AND status='running' ORDER BY started_at, created_at", (slug,))
+        for row in cur.fetchall():
+            pid_alive = _alive(row["worker_pid"])
+            expired = bool(row["claim_expires"] and int(row["claim_expires"]) < now)
+            stale_hb = bool(row["last_heartbeat_at"] and now - int(row["last_heartbeat_at"]) > 15 * 60)
+            if not pid_alive or expired or stale_hb:
+                issues.append(_issue(
+                    "critical" if expired or not pid_alive else "warning",
+                    "stale_running_task",
+                    "running task has dead/missing worker, expired claim, or stale heartbeat",
+                    task_id=row["id"], assignee=row["assignee"], worker_pid=row["worker_pid"],
+                    pid_alive=pid_alive, claim_expired=expired,
+                    heartbeat_age_seconds=(now - int(row["last_heartbeat_at"])) if row["last_heartbeat_at"] else None,
+                    action="reclaim or inspect worker logs before retrying"))
+        # stale run rows left marked running
+        cur.execute(
+            "SELECT r.id AS run_id, r.task_id, r.profile, r.worker_pid, r.started_at, "
+            "       t.status AS task_status, t.current_run_id "
+            "FROM task_runs r JOIN tasks t ON t.board=r.board AND t.id=r.task_id "
+            "WHERE r.board=%s AND r.status='running' "
+            "  AND (t.status != 'running' OR t.current_run_id IS NULL OR t.current_run_id != r.id) "
+            "ORDER BY r.started_at DESC", (slug,))
+        for row in cur.fetchall():
+            issues.append(_issue(
+                "warning", "stale_running_run",
+                "task_run is still marked running but is not the task current running run",
+                task_id=row["task_id"], run_id=row["run_id"], profile=row["profile"],
+                task_status=row["task_status"], worker_pid=row["worker_pid"],
+                pid_alive=_alive(row["worker_pid"]),
+                action="mark/reconcile stale run metadata; do not treat it as an active worker"))
+        # blocked tasks whose dependency parents are all terminal
+        cur.execute(
+            "SELECT c.id, c.title, c.assignee, COUNT(l.parent_id) AS parents, "
+            "  SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) AS terminal_parents, "
+            "  string_agg(p.id || ':' || p.status, ', ') AS parent_state "
+            "FROM tasks c "
+            "JOIN task_links l ON l.board=c.board AND l.child_id=c.id "
+            "JOIN tasks p ON p.board=l.board AND p.id=l.parent_id "
+            "WHERE c.board=%s AND c.status='blocked' "
+            "  AND COALESCE(l.relation_type,'dependency')='dependency' "
+            "GROUP BY c.id, c.title, c.assignee, c.created_at "
+            "HAVING COUNT(l.parent_id) > 0 "
+            "   AND COUNT(l.parent_id) = SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) "
+            "ORDER BY c.created_at", (slug,))
+        for row in cur.fetchall():
+            issues.append(_issue(
+                "warning", "blocked_with_completed_parents",
+                "blocked task has all dependency parents completed; likely needs an explicit unblock/re-review decision",
+                task_id=row["id"], assignee=row["assignee"], parents=row["parent_state"],
+                action="if remediation evidence is sufficient, run `hermes kanban unblock <task>`; otherwise park with a fresh blocker comment"))
+        # ready tasks older than threshold
+        cur.execute(
+            "SELECT id, title, assignee, created_at FROM tasks "
+            "WHERE board=%s AND status='ready' ORDER BY created_at", (slug,))
+        for row in cur.fetchall():
+            age = now - int(row["created_at"])
+            if age >= ready_age_seconds:
+                issues.append(_issue(
+                    "warning", "old_ready_task",
+                    "ready task has not been claimed within the threshold",
+                    task_id=row["id"], assignee=row["assignee"], age_seconds=age,
+                    action="check gateway dispatcher health and whether assignee profile exists"))
+    return {"ok": not issues, "board": slug, "db_path": db_path, "issues": issues,
+            "reconcile_summary": {"ok": True, "backend": "postgres",
+                                  "note": "reconciler embed not run on postgres"},
+            "as_of": now}
+
+
 def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 60) -> dict[str, Any]:
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        _backend = resolve_backend()
+    except Exception:
+        _backend = "sqlite"
+    if _backend == "postgres":
+        return _run_board_doctor_pg(board=board, ready_age_seconds=ready_age_seconds)
     path = kb.kanban_db_path(board=board)
     now = int(time.time())
     issues: list[Issue] = []
