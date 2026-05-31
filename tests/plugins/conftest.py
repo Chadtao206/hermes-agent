@@ -66,6 +66,7 @@ def _load_plugin_router():
     spec = importlib.util.spec_from_file_location(
         "hermes_dashboard_plugin_kanban_test", plugin_file,
     )
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
@@ -90,6 +91,7 @@ def pg_board(monkeypatch, _pg_dsn):
             cur.execute(f"DELETE FROM {tbl} WHERE board=%s", ("default",))
     monkeypatch.setenv("HERMES_KANBAN_BACKEND", "postgres")
     monkeypatch.setenv("HERMES_KANBAN_PG_DSN", _pg_dsn)
+    monkeypatch.setattr(pg_pool, "get_pool", lambda *a, **k: pool)
     store = PostgresKanbanStore(board="default", pool=pool)
     try:
         yield store

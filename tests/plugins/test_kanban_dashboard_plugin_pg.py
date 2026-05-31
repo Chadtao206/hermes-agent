@@ -1,5 +1,4 @@
 """Dashboard plugin API on the Postgres backend."""
-import json
 
 
 def test_pg_client_stats_resolves_postgres(pg_client):
