@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 from typing import Any, Callable, Iterable, Optional
@@ -2332,6 +2333,226 @@ class PostgresKanbanStore:
                 ") t WHERE rn=1",
                 (self.board, list(task_ids)))
             return {r["task_id"]: r["summary"] for r in cur.fetchall()}
+
+    # --- worker context --------------------------------------------------
+
+    def build_worker_context(self, task_id: str) -> str:
+        """Return the full text a worker should read to understand its task.
+
+        Byte-identical to ``kanban_db.build_worker_context`` for identical
+        logical data. Reproduces the upstream section order and per-field
+        caps so PG workers see the same context sqlite workers do (closes the
+        worker split-brain). See the upstream docstring for the full ordering
+        contract; do not let this drift from it.
+        """
+        task = self.get_task(task_id)
+        if not task:
+            raise ValueError(f"unknown task {task_id}")
+
+        # Per-field truncation helper — reproduced verbatim from upstream.
+        def _cap(s: Optional[str],
+                 limit: int = kanban_db._CTX_MAX_FIELD_BYTES) -> str:
+            if not s:
+                return ""
+            s = s.strip()
+            if len(s) <= limit:
+                return s
+            return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+        lines: list[str] = []
+        lines.append(f"# Kanban task {task.id}: {task.title}")
+        lines.append("")
+        lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+        lines.append(f"Status:   {task.status}")
+        if task.tenant:
+            lines.append(f"Tenant:   {task.tenant}")
+        lines.append(
+            f"Workspace: {task.workspace_kind} @ "
+            f"{task.workspace_path or '(unresolved)'}")
+        if task.max_runtime_seconds is not None:
+            terminal_timeout = kanban_db._worker_terminal_timeout_env(
+                task.max_runtime_seconds,
+                os.environ.get("TERMINAL_TIMEOUT"),
+            )
+            effective_terminal_timeout = (
+                terminal_timeout or os.environ.get("TERMINAL_TIMEOUT"))
+            lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+            if effective_terminal_timeout:
+                lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+        if task.branch_name:
+            lines.append(f"Branch:   {task.branch_name}")
+        lines.append("")
+
+        lines.append("## Closeout requirement (do not skip)")
+        lines.append(
+            "Before you exit, you MUST call exactly one terminal kanban tool: "
+            "`kanban_complete(summary=..., metadata=...)` on success, or "
+            "`kanban_block(reason=...)` if you cannot continue. Exiting "
+            "cleanly without one of these is a protocol violation "
+            "(`failure_class=protocol_violation_clean_exit`) and will auto-"
+            "block this task on the first occurrence."
+        )
+        lines.append("")
+
+        expected_review_head = None
+        lane_type = _lane_type_for_assignee(task.assignee)
+        if lane_type == "implementation":
+            lines.append("## Implementation PR evidence")
+            lines.append(
+                "If this task opens or updates a PR, include structured PR "
+                "evidence in `kanban_complete(..., metadata=...)`: `pr_url`, "
+                "`pull_request_head_sha`, and `branch_name`. Downstream "
+                "final-review tasks use that SHA to prevent stale approvals. "
+                "If no PR exists yet, say so explicitly in the summary/metadata."
+            )
+            lines.append("")
+        if lane_type == "review":
+            expected_review_head = self._pg_expected_parent_pr_head_sha(task_id)
+        if expected_review_head is not None:
+            expected_sha, parent_task_id, parent_run_id = expected_review_head
+            lines.append("## Final-review PR-head gate")
+            lines.append(
+                "This review has a parent implementation closeout with current "
+                f"PR head `{expected_sha}` (parent `{parent_task_id}`"
+                + (f", run `{parent_run_id}`" if parent_run_id is not None else "")
+                + "). To complete this task, your `kanban_complete` metadata "
+                f"MUST include `reviewed_pr_head_sha: {expected_sha}`. If the "
+                "PR head has changed or you cannot verify it, call "
+                "`kanban_block` instead of approving stale evidence."
+            )
+            lines.append("")
+
+        if task.body and task.body.strip():
+            lines.append("## Body")
+            lines.append(_cap(task.body, kanban_db._CTX_MAX_BODY_BYTES))
+            lines.append("")
+
+        # Prior attempts — closed runs only (skip the active worker's run).
+        all_prior = [r for r in self.list_runs(task_id) if r.ended_at is not None]
+        if len(all_prior) > kanban_db._CTX_MAX_PRIOR_ATTEMPTS:
+            omitted = len(all_prior) - kanban_db._CTX_MAX_PRIOR_ATTEMPTS
+            shown = all_prior[-kanban_db._CTX_MAX_PRIOR_ATTEMPTS:]
+            first_shown_idx = omitted + 1
+        else:
+            omitted = 0
+            shown = all_prior
+            first_shown_idx = 1
+        if shown:
+            lines.append("## Prior attempts on this task")
+            if omitted:
+                lines.append(
+                    f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
+                    f"omitted; showing most recent {len(shown)})_"
+                )
+            for offset, run in enumerate(shown):
+                idx = first_shown_idx + offset
+                ts = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(run.started_at))
+                profile = run.profile or "(unknown)"
+                outcome = run.outcome or run.status
+                lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts})")
+                if run.summary and run.summary.strip():
+                    lines.append(_cap(run.summary))
+                if run.error and run.error.strip():
+                    lines.append(f"_error_: {_cap(run.error)}")
+                if run.metadata:
+                    try:
+                        meta_str = json.dumps(
+                            run.metadata, ensure_ascii=False, sort_keys=True)
+                        lines.append(f"_metadata_: `{_cap(meta_str)}`")
+                    except Exception:
+                        pass
+                lines.append("")
+
+        # Parents: prefer the most-recent 'completed' run's summary + metadata,
+        # fall back to ``task.result`` when no run rows exist.
+        dependency_parent_ids = self.parent_ids(
+            task_id, relation_type=LINK_RELATION_DEPENDENCY)
+
+        if dependency_parent_ids:
+            wrote_header = False
+            for pid in dependency_parent_ids:
+                pt = self.get_task(pid)
+                if not pt or pt.status != "done":
+                    continue
+                runs = [r for r in self.list_runs(pid)
+                        if r.outcome == "completed"]
+                runs.sort(key=lambda r: r.started_at, reverse=True)
+                run = runs[0] if runs else None
+
+                if not wrote_header:
+                    lines.append("## Parent task results")
+                    wrote_header = True
+                lines.append(f"### {pid}")
+
+                body_lines: list[str] = []
+                if run is not None and run.summary and run.summary.strip():
+                    body_lines.append(_cap(run.summary))
+                elif pt.result:
+                    body_lines.append(_cap(pt.result))
+                else:
+                    body_lines.append("(no result recorded)")
+
+                if run is not None and run.metadata:
+                    try:
+                        meta_str = json.dumps(
+                            run.metadata, ensure_ascii=False, sort_keys=True)
+                        body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
+                    except Exception:
+                        pass
+                lines.extend(body_lines)
+                lines.append("")
+
+        # Cross-task role history: most recent 5 completed runs on OTHER tasks
+        # by this assignee. Board-scoped (the one query not behind a store
+        # method). Safe on assignee=None (skipped).
+        if task.assignee:
+            with self._pool.connection() as conn, \
+                    conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT t.id, t.title, r.summary, r.ended_at "
+                    "FROM task_runs r "
+                    "JOIN tasks t ON r.board = t.board AND r.task_id = t.id "
+                    "WHERE r.board = %s AND r.profile = %s AND r.task_id <> %s "
+                    "  AND r.outcome = 'completed' "
+                    "ORDER BY r.ended_at DESC LIMIT 5",
+                    (self.board, task.assignee, task_id))
+                role_rows = cur.fetchall()
+            if role_rows:
+                lines.append(f"## Recent work by @{task.assignee}")
+                for row in role_rows:
+                    ts = time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"])))
+                    s = (row["summary"] or "").strip().splitlines()
+                    first = s[0][:200] if s else "(no summary)"
+                    lines.append(f"- {row['id']} — {row['title']} ({ts}): {first}")
+                lines.append("")
+
+        # Comments: cap at the most-recent _CTX_MAX_COMMENTS.
+        all_comments = self.list_comments(task_id)
+        if len(all_comments) > kanban_db._CTX_MAX_COMMENTS:
+            omitted_c = len(all_comments) - kanban_db._CTX_MAX_COMMENTS
+            shown_c = all_comments[-kanban_db._CTX_MAX_COMMENTS:]
+        else:
+            omitted_c = 0
+            shown_c = all_comments
+        if shown_c:
+            lines.append("## Comment thread")
+            if omitted_c:
+                lines.append(
+                    f"_({omitted_c} earlier comment"
+                    f"{'s' if omitted_c != 1 else ''} "
+                    f"omitted; showing most recent {len(shown_c)})_"
+                )
+            for c in shown_c:
+                ts = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(c.created_at))
+                safe_author = (c.author or "").replace("`", "")
+                lines.append(f"comment from worker `{safe_author}` at {ts}:")
+                lines.append(_cap(c.body, kanban_db._CTX_MAX_COMMENT_BYTES))
+                lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
 
     # --- event claiming (notify subs) ------------------------------------
 
