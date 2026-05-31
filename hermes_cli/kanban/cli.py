@@ -40,7 +40,7 @@ from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_p
 # sub-module of that package.
 # ---------------------------------------------------------------------------
 from hermes_cli.kanban.store import kanban_store  # noqa: F401 (re-exported)
-from hermes_cli.kanban.store import resolve_backend  # noqa: F401 (used in preamble guard + tests)
+from hermes_cli.kanban.store import resolve_backend
 
 
 def _make_store():
