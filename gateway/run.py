@@ -5799,6 +5799,18 @@ class GatewayRunner:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        # Backend-agnostic notifier tick (B4). The store (resolved per board
+        # below) owns conn/daemon routing; the glue does the board-agnostic
+        # read+deliver. Imported lazily like ``kanban_db`` so a missing module
+        # disables the notifier rather than crashing the gateway.
+        try:
+            from hermes_cli import kanban_glue
+            from hermes_cli.kanban.store import kanban_store as _kanban_store
+        except Exception:
+            logger.warning(
+                "kanban notifier: kanban_glue/store not importable; notifier disabled"
+            )
+            return
 
         # Default kinds for subscriptions that don't pin their own list.
         # Mirrors ``kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS``; imported here
@@ -5939,9 +5951,14 @@ class GatewayRunner:
 
         while self._running:
             try:
-                def _collect():
-                    chat_deliveries: list[dict] = []
-                    profile_deliveries: list[dict] = []
+                def _collect_boards():
+                    # B4: enumerate the boards to tick (dedup by resolved db
+                    # path) + record each board's heartbeat + apply the
+                    # disabled-board skip. The actual read+deliver moved into
+                    # ``kanban_glue.run_notifier_tick`` (driven per board in the
+                    # async loop below); this stays in a thread because
+                    # ``list_boards`` / the heartbeat write touch disk.
+                    boards_to_tick: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
@@ -6007,683 +6024,142 @@ class GatewayRunner:
                                 "kanban notifier: heartbeat record failed for board %s: %s",
                                 slug, exc,
                             )
-                        confirmed_corruption_this_tick = False
-                        # Single-writer: the board's writer daemon owns the only
-                        # writable connection. The notifier reads through a
-                        # read-only conn and routes its read-modify-write event
-                        # claims through the daemon's writer thread (a direct
-                        # writable open here would trip DirectWriteForbidden).
-                        # Flag off (or no local daemon) → today's writable conn.
-                        board_daemon = None
-                        if _kb.single_writer_enabled():
-                            try:
-                                from hermes_cli import kanban_writer_daemon as _wd
-                                board_daemon = _wd.lookup_daemon(
-                                    _kb.kanban_db_path(board=slug)
-                                )
-                            except Exception:
-                                board_daemon = None
-                        try:
-                            conn = (
-                                _kb.connect(board=slug, readonly=True)
-                                if board_daemon is not None
-                                else _kb.connect(board=slug)
-                            )
-                        except Exception as exc:
-                            if _is_disk_io_board_db_error(exc):
-                                confirmed, confirmation = _board_db_io_error_is_durable(
-                                    resolved_db_path
-                                )
-                                if confirmed:
-                                    notifier_disabled_db_paths[resolved_db_path] = {
-                                        "reason": "disk_io_error",
-                                        "board": slug,
-                                        "error": str(exc),
-                                        "confirmation": confirmation,
-                                    }
-                                    logger.error(
-                                        _DISK_IO_BOARD_DB_GUIDANCE,
-                                        slug,
-                                        resolved_db_path,
-                                        exc,
-                                        confirmation,
-                                    )
-                                else:
-                                    logger.warning(
-                                        _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
-                                        "notifier",
-                                        slug,
-                                        resolved_db_path,
-                                        confirmation,
-                                        exc,
-                                    )
-                            elif _notifier_db_error_is_corrupt(exc):
-                                confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
-                                if confirmed:
-                                    if _record_notifier_corruption_confirmation(
-                                        resolved_db_path=resolved_db_path,
-                                        slug=slug,
-                                        exc=exc,
-                                        confirmation=confirmation,
-                                        reason="corrupt_db",
-                                        tick_recorded_db_paths=tick_recorded_db_paths,
-                                    ):
-                                        logger.error(
-                                            "kanban notifier: board %s database %s is corrupt/unhealthy; "
-                                            "disabling notifier reads/writes for this DB until gateway restart "
-                                            "after quiesced repair: %s (confirmation: %s)",
-                                            slug,
-                                            resolved_db_path,
-                                            exc,
-                                            confirmation,
-                                        )
-                                else:
-                                    notifier_corruption_streaks.pop(resolved_db_path, None)
-                                    logger.warning(
-                                        "kanban notifier: board %s database %s reported corruption/open failure "
-                                        "but confirmation did not find durable corruption (%s); treating as transient: %s",
-                                        slug,
-                                        resolved_db_path,
-                                        confirmation,
-                                        exc,
-                                    )
-                            else:
-                                logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
-                            continue
-                        try:
-                            # `connect()` runs the schema + idempotent migration
-                            # on first open per process, so an explicit
-                            # `init_db()` here would be redundant. Worse:
-                            # `init_db()` deliberately busts the per-process
-                            # cache and re-runs the migration on a *second*
-                            # connection, which races the first and used to
-                            # log a benign but noisy `duplicate column name`
-                            # traceback (and intermittent "database is locked"
-                            # — issue #21378) on every gateway start against
-                            # a legacy DB. `_add_column_if_missing` now
-                            # tolerates that race, but we still skip the
-                            # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(conn) if active_platforms else []
-                            if active_platforms and not subs:
-                                logger.debug("kanban notifier: board %s has no subscriptions", slug)
-                            for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s owned by profile %s; current profile %s skipping",
-                                        sub.get("task_id"), owner_profile, notifier_profile,
-                                    )
-                                    continue
-                                platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform or "<missing>",
-                                    )
-                                    continue
-                                # Per-sub event_kinds (custom subscriptions like
-                                # lifecycle tailers) override the default
-                                # terminal-only list. NULL/empty in the DB
-                                # falls back to the legacy terminal kinds so
-                                # pre-existing subscriptions keep their old
-                                # behavior. include_children opts into subtree
-                                # fan-out for parent subscriptions.
-                                sub_kinds = _kb._parse_event_kinds_column(
-                                    sub.get("event_kinds")
-                                )
-                                effective_kinds = (
-                                    tuple(sub_kinds) if sub_kinds else TERMINAL_KINDS
-                                )
-                                include_children = bool(sub.get("include_children"))
-                                claim_kwargs = dict(
-                                    task_id=sub["task_id"],
-                                    platform=sub["platform"],
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id") or "",
-                                    kinds=effective_kinds,
-                                    include_children=include_children,
-                                )
-                                if board_daemon is not None:
-                                    old_cursor, cursor, events = board_daemon.execute(
-                                        "claim_unseen_events_for_sub", **claim_kwargs,
-                                    )
-                                else:
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                        conn, **claim_kwargs,
-                                    )
-                                if not events:
-                                    continue
-                                task = _kb.get_task(conn, sub["task_id"])
-                                # For include_children subscriptions, events
-                                # may reference descendant tasks; resolve each
-                                # one inside the open conn so the renderer
-                                # gets the right title/assignee per event.
-                                event_tasks: dict[str, Any] = {}
-                                if include_children:
-                                    for ev in events:
-                                        if ev.task_id in event_tasks:
-                                            continue
-                                        if ev.task_id == sub["task_id"]:
-                                            event_tasks[ev.task_id] = task
-                                        else:
-                                            try:
-                                                event_tasks[ev.task_id] = _kb.get_task(
-                                                    conn, ev.task_id,
-                                                )
-                                            except Exception:
-                                                event_tasks[ev.task_id] = None
-                                logger.debug(
-                                    "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                    len(events), sub["task_id"], slug, old_cursor, cursor,
-                                )
-                                chat_deliveries.append({
-                                    "sub": sub,
-                                    "old_cursor": old_cursor,
-                                    "cursor": cursor,
-                                    "events": events,
-                                    "task": task,
-                                    "event_tasks": event_tasks,
-                                    "board": slug,
-                                })
+                        # B4: the store owns conn/daemon routing for the tick.
+                        # The gateway no longer opens a per-board conn here or
+                        # branches on ``board_daemon`` for the claims — all of
+                        # that lives inside the store (which routes per-op
+                        # through the single-writer daemon under the flag). We
+                        # only enumerate the board (slug + resolved db path) so
+                        # the async loop can run ``kanban_glue.run_notifier_tick``
+                        # per board and reuse the quarantine helpers on failure.
+                        boards_to_tick.append({
+                            "slug": slug,
+                            "resolved_db_path": resolved_db_path,
+                        })
+                    return boards_to_tick, active_platforms, tick_recorded_db_paths
 
-                            # ---- Profile-level event subscriptions (Phase 2) ----
-                            # Adapter-independent. Helper not present on a legacy
-                            # build (extremely defensive — the import alias above
-                            # already resolved kanban_db) -> skip the block.
-                            list_pro = getattr(_kb, "list_profile_event_subs", None)
-                            claim_pro = getattr(
-                                _kb, "claim_unseen_events_for_profile_sub", None,
+                boards_to_tick, active_platforms, tick_recorded_db_paths = (
+                    await asyncio.to_thread(_collect_boards)
+                )
+
+                # Async wake wrapper: the glue invokes ``wake_profile_fn``
+                # DIRECTLY on the event loop, but ``self._kanban_profile_wake``
+                # is BLOCKING (subprocess.Popen). Wrap it in ``asyncio.to_thread``
+                # to preserve the old ``await asyncio.to_thread(...)`` behavior
+                # (run.py pre-B4 :6647) so the loop never blocks. The blocking
+                # call returns ``(bool, error)`` (or a bare ``bool`` from tests
+                # monkeypatching the class) — the glue handles both shapes.
+                async def _wake_profile_async(psub, events, task, event_tasks, board):
+                    return await asyncio.to_thread(
+                        self._kanban_profile_wake,
+                        psub, events, task, event_tasks, board,
+                    )
+
+                for board_ctx in boards_to_tick:
+                    slug = board_ctx["slug"]
+                    resolved_db_path = board_ctx["resolved_db_path"]
+                    # Re-check the disabled set: a prior board iteration sharing
+                    # the same resolved DB path could have just quarantined it.
+                    if resolved_db_path in notifier_disabled_db_paths:
+                        continue
+                    confirmed_corruption_this_tick = False
+                    try:
+                        store = _kanban_store(board=slug)
+                        try:
+                            await kanban_glue.run_notifier_tick(
+                                store, self.adapters,
+                                notifier_profile=notifier_profile,
+                                active_platforms=active_platforms,
+                                terminal_kinds=TERMINAL_KINDS,
+                                render_chat_event=self._render_kanban_chat_event,
+                                wake_profile_fn=_wake_profile_async,
+                                deliver_artifacts_fn=self._deliver_kanban_artifacts,
+                                sub_fail_counts=sub_fail_counts,
+                                max_send_failures=MAX_SEND_FAILURES,
+                                platform_enum=_Platform,
+                                board=slug,
                             )
-                            if list_pro and claim_pro:
-                                try:
-                                    pro_subs = list_pro(conn, enabled_only=True)
-                                except Exception as exc:
-                                    logger.debug(
-                                        "kanban notifier: profile-event sub listing "
-                                        "failed for board %s: %s", slug, exc,
-                                    )
-                                    pro_subs = []
-                                for psub in pro_subs:
-                                    try:
-                                        pclaim_kwargs = dict(
-                                            task_id=psub["task_id"],
-                                            profile=psub["profile"],
-                                            name=psub.get("name") or "",
-                                        )
-                                        if board_daemon is not None:
-                                            old_pc, pc, p_events = board_daemon.execute(
-                                                "claim_unseen_events_for_profile_sub",
-                                                **pclaim_kwargs,
-                                            )
-                                        else:
-                                            old_pc, pc, p_events = claim_pro(
-                                                conn, **pclaim_kwargs,
-                                            )
-                                    except Exception as exc:
-                                        if _is_disk_io_board_db_error(exc):
-                                            confirmed, confirmation = _board_db_io_error_is_durable(
-                                                resolved_db_path
-                                            )
-                                            if confirmed:
-                                                notifier_disabled_db_paths[resolved_db_path] = {
-                                                    "reason": "disk_io_error",
-                                                    "board": slug,
-                                                    "task_id": psub.get("task_id"),
-                                                    "profile": psub.get("profile"),
-                                                    "error": str(exc),
-                                                    "confirmation": confirmation,
-                                                }
-                                                logger.error(
-                                                    _DISK_IO_BOARD_DB_GUIDANCE,
-                                                    slug,
-                                                    resolved_db_path,
-                                                    exc,
-                                                    confirmation,
-                                                )
-                                                break
-                                            logger.warning(
-                                                _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
-                                                "notifier profile-event claim",
-                                                slug,
-                                                resolved_db_path,
-                                                confirmation,
-                                                exc,
-                                            )
-                                            continue
-                                        if _notifier_db_error_is_corrupt(exc):
-                                            confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
-                                            if confirmed:
-                                                confirmed_corruption_this_tick = True
-                                                if _record_notifier_corruption_confirmation(
-                                                    resolved_db_path=resolved_db_path,
-                                                    slug=slug,
-                                                    exc=exc,
-                                                    confirmation=confirmation,
-                                                    reason="profile_event_corruption",
-                                                    tick_recorded_db_paths=tick_recorded_db_paths,
-                                                    extra={
-                                                        "task_id": psub.get("task_id"),
-                                                        "profile": psub.get("profile"),
-                                                    },
-                                                ):
-                                                    logger.error(
-                                                        "kanban notifier: profile-event claim detected corrupt/unhealthy DB "
-                                                        "for board %s path %s; disabling notifier for this DB until "
-                                                        "gateway restart after quiesced repair: %s (confirmation: %s)",
-                                                        slug,
-                                                        resolved_db_path,
-                                                        exc,
-                                                        confirmation,
-                                                    )
-                                                    break
-                                                continue
-                                            notifier_corruption_streaks.pop(resolved_db_path, None)
-                                            logger.warning(
-                                                "kanban notifier: profile-event claim for board %s path %s "
-                                                "reported corruption/open failure but confirmation did not find "
-                                                "durable corruption (%s); treating as transient: %s",
-                                                slug,
-                                                resolved_db_path,
-                                                confirmation,
-                                                exc,
-                                            )
-                                            continue
-                                        logger.warning(
-                                            "kanban notifier: profile-event claim "
-                                            "failed for %s/%s on board %s: %s",
-                                            psub.get("task_id"), psub.get("profile"),
-                                            slug, exc,
-                                        )
-                                        continue
-                                    if not p_events:
-                                        continue
-                                    p_task = _kb.get_task(conn, psub["task_id"])
-                                    p_event_tasks: dict[str, Any] = {}
-                                    if bool(psub.get("include_children")):
-                                        for ev in p_events:
-                                            if ev.task_id in p_event_tasks:
-                                                continue
-                                            if ev.task_id == psub["task_id"]:
-                                                p_event_tasks[ev.task_id] = p_task
-                                            else:
-                                                try:
-                                                    p_event_tasks[ev.task_id] = _kb.get_task(
-                                                        conn, ev.task_id,
-                                                    )
-                                                except Exception:
-                                                    p_event_tasks[ev.task_id] = None
-                                    logger.debug(
-                                        "kanban notifier: claimed %d profile event(s) "
-                                        "for %s on board %s cursor %s→%s",
-                                        len(p_events), psub["task_id"], slug, old_pc, pc,
-                                    )
-                                    profile_deliveries.append({
-                                        "sub": psub,
-                                        "old_cursor": old_pc,
-                                        "cursor": pc,
-                                        "events": p_events,
-                                        "task": p_task,
-                                        "event_tasks": p_event_tasks,
-                                        "board": slug,
-                                    })
-                            if not confirmed_corruption_this_tick:
-                                notifier_corruption_streaks.pop(resolved_db_path, None)
-                        except Exception as exc:
-                            if _is_disk_io_board_db_error(exc):
-                                confirmed, confirmation = _board_db_io_error_is_durable(
-                                    resolved_db_path
+                        finally:
+                            try:
+                                store.close()
+                            except Exception:
+                                pass
+                        # A clean tick clears any pending corruption streak for
+                        # this DB (mirrors the old ``not confirmed_corruption_this_tick``
+                        # reset at the tail of ``_collect``).
+                        notifier_corruption_streaks.pop(resolved_db_path, None)
+                    except Exception as exc:
+                        # REUSE the corruption/disk-io quarantine logic verbatim
+                        # from the old _collect except blocks (pre-B4
+                        # run.py:6044-6104 / 6343-6406). The store re-raises the
+                        # same sqlite errors on read/claim, so the classification
+                        # is unchanged.
+                        if _is_disk_io_board_db_error(exc):
+                            confirmed, confirmation = _board_db_io_error_is_durable(
+                                resolved_db_path
+                            )
+                            if confirmed:
+                                notifier_disabled_db_paths[resolved_db_path] = {
+                                    "reason": "disk_io_error",
+                                    "board": slug,
+                                    "error": str(exc),
+                                    "confirmation": confirmation,
+                                }
+                                logger.error(
+                                    _DISK_IO_BOARD_DB_GUIDANCE,
+                                    slug,
+                                    resolved_db_path,
+                                    exc,
+                                    confirmation,
                                 )
-                                if confirmed:
-                                    notifier_disabled_db_paths[resolved_db_path] = {
-                                        "reason": "disk_io_error",
-                                        "board": slug,
-                                        "error": str(exc),
-                                        "confirmation": confirmation,
-                                    }
-                                    logger.error(
-                                        _DISK_IO_BOARD_DB_GUIDANCE,
-                                        slug,
-                                        resolved_db_path,
-                                        exc,
-                                        confirmation,
-                                    )
-                                else:
-                                    logger.warning(
-                                        _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
-                                        "notifier",
-                                        slug,
-                                        resolved_db_path,
-                                        confirmation,
-                                        exc,
-                                    )
-                            elif _notifier_db_error_is_corrupt(exc):
-                                confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
-                                if confirmed:
-                                    if _record_notifier_corruption_confirmation(
-                                        resolved_db_path=resolved_db_path,
-                                        slug=slug,
-                                        exc=exc,
-                                        confirmation=confirmation,
-                                        reason="corrupt_db",
-                                        tick_recorded_db_paths=tick_recorded_db_paths,
-                                    ):
-                                        logger.error(
-                                            "kanban notifier: board %s database %s is corrupt/unhealthy during read; "
-                                            "disabling notifier reads/writes for this DB until gateway restart "
-                                            "after quiesced repair: %s (confirmation: %s)",
-                                            slug,
-                                            resolved_db_path,
-                                            exc,
-                                            confirmation,
-                                        )
-                                else:
-                                    notifier_corruption_streaks.pop(resolved_db_path, None)
-                                    logger.warning(
-                                        "kanban notifier: board %s database %s read reported corruption/open failure "
-                                        "but confirmation did not find durable corruption (%s); treating as transient: %s",
-                                        slug,
-                                        resolved_db_path,
-                                        confirmation,
-                                        exc,
-                                    )
                             else:
                                 logger.warning(
-                                    "kanban notifier: board %s tick failed: %s",
+                                    _DISK_IO_BOARD_DB_TRANSIENT_GUIDANCE,
+                                    "notifier",
                                     slug,
+                                    resolved_db_path,
+                                    confirmation,
                                     exc,
                                 )
-                        finally:
-                            conn.close()
-                    return chat_deliveries, profile_deliveries
-
-                deliveries, profile_deliveries = await asyncio.to_thread(_collect)
-                for d in deliveries:
-                    sub = d["sub"]
-                    task = d["task"]
-                    board_slug = d.get("board")
-                    platform_str = (sub["platform"] or "").lower()
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        continue
-                    adapter = self.adapters.get(plat)
-                    if adapter is None:
-                        logger.debug(
-                            "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
-                            platform_str, sub["task_id"],
-                        )
-                        await asyncio.to_thread(
-                            self._kanban_rewind,
-                            sub,
-                            d["cursor"],
-                            d.get("old_cursor", 0),
-                            board_slug,
-                        )
-                        continue
-                    event_tasks = d.get("event_tasks") or {}
-                    # The DB claim advances the subscription cursor to the
-                    # batch max before delivery, giving this watcher exclusive
-                    # ownership of the event range. If a later send in the
-                    # batch fails after earlier sends succeeded, rewind only
-                    # to the last successfully delivered event id; otherwise
-                    # retry would duplicate already-sent lifecycle pings.
-                    last_success_cursor = int(d.get("old_cursor", 0) or 0)
-                    for ev in d["events"]:
-                        kind = ev.kind
-                        # Resolve per-event task so subtree subscriptions
-                        # render the descendant's title/assignee, not the
-                        # parent's. Falls back to the subscription task when
-                        # the event isn't from a descendant (the common
-                        # single-task case).
-                        ev_task = event_tasks.get(ev.task_id) or task
-                        ev_title = (
-                            ev_task.title if ev_task and ev_task.title
-                            else ev.task_id
-                        )[:120]
-                        ev_id = ev.task_id or sub["task_id"]
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (ev_task.assignee if ev_task and ev_task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                h = payload_summary.strip().splitlines()[0][:200]
-                                handoff = f"\n{h}"
-                            elif ev_task and ev_task.result:
-                                r = ev_task.result.strip().splitlines()[0][:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {tag}Kanban {ev_id} done"
-                                f" — {ev_title}{handoff}"
-                            )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {ev_id} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {tag}Kanban {ev_id} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {tag}Kanban {ev_id} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {tag}Kanban {ev_id} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        elif kind == "archived":
-                            msg = f"🗄 {tag}Kanban {ev_id} archived — {ev_title}"
-                        elif kind == "created":
-                            msg = f"➕ {tag}Kanban {ev_id} created — {ev_title}"
-                        elif kind == "claimed":
-                            msg = f"▶ {tag}Kanban {ev_id} claimed — {ev_title}"
-                        elif kind == "unblocked":
-                            msg = f"▶ {tag}Kanban {ev_id} unblocked — {ev_title}"
-                        elif kind == "promoted":
-                            msg = f"⤴ {tag}Kanban {ev_id} promoted to ready — {ev_title}"
-                        elif kind == "review_requested":
-                            msg = f"👀 {tag}Kanban {ev_id} review requested — {ev_title}"
-                        else:
-                            # Unknown kind, but the subscription explicitly
-                            # asked for it (or a future event kind landed
-                            # in the DB before the renderer learned it).
-                            # Surface a generic event line instead of
-                            # silently dropping so users still see the
-                            # signal they asked for.
-                            msg = f"• {tag}Kanban {ev_id} {kind} — {ev_title}"
-                        metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
-                            metadata["thread_id"] = sub["thread_id"]
-                        sub_key = (
-                            sub["task_id"], sub["platform"],
-                            sub["chat_id"], sub.get("thread_id") or "",
-                        )
-                        try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
-                            )
-                            # After delivering the text notification, surface
-                            # any artifact paths the worker referenced in
-                            # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
-                                try:
-                                    await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
-                                        metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=ev_task,
+                        elif _notifier_db_error_is_corrupt(exc):
+                            confirmed, confirmation = _confirm_board_db_corruption(resolved_db_path)
+                            if confirmed:
+                                confirmed_corruption_this_tick = True
+                                if _record_notifier_corruption_confirmation(
+                                    resolved_db_path=resolved_db_path,
+                                    slug=slug,
+                                    exc=exc,
+                                    confirmation=confirmation,
+                                    reason="corrupt_db",
+                                    tick_recorded_db_paths=tick_recorded_db_paths,
+                                ):
+                                    logger.error(
+                                        "kanban notifier: board %s database %s is corrupt/unhealthy; "
+                                        "disabling notifier reads/writes for this DB until gateway restart "
+                                        "after quiesced repair: %s (confirmation: %s)",
+                                        slug,
+                                        resolved_db_path,
+                                        exc,
+                                        confirmation,
                                     )
-                                except Exception as art_exc:
-                                    logger.debug(
-                                        "kanban notifier: artifact delivery for %s failed: %s",
-                                        sub["task_id"], art_exc,
-                                    )
-                            last_success_cursor = max(
-                                last_success_cursor, int(getattr(ev, "id", 0) or 0),
-                            )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
-                        except Exception as exc:
-                            fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
-                                sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
-                            )
-                            if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
-                                    sub["task_id"], platform_str, fails,
-                                )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
                             else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    last_success_cursor,
-                                    board_slug,
+                                notifier_corruption_streaks.pop(resolved_db_path, None)
+                                logger.warning(
+                                    "kanban notifier: board %s database %s reported corruption/open failure "
+                                    "but confirmation did not find durable corruption (%s); treating as transient: %s",
+                                    slug,
+                                    resolved_db_path,
+                                    confirmation,
+                                    exc,
                                 )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
-                            break
-                    else:
-                        # All events delivered; advance cursor. The cursor
-                        # is the dedup mechanism — it prevents re-delivery
-                        # of the same event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
-                        # gave_up / crashed / timed_out the subscription is
-                        # kept alive so the user gets notified again if the
-                        # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
-                        # above for the failure mode this prevents.
-                        # Single-task legacy subscriptions can unsubscribe
-                        # when that task is done/archived. Subtree
-                        # subscriptions intentionally stay alive after the
-                        # root completes: dependency children often start
-                        # after their parent finishes, and the whole point of
-                        # include_children is to keep the orchestrator
-                        # subscribed to those downstream lane events.
-                        # Archive remains an explicit terminal cleanup.
-                        include_children = bool(sub.get("include_children"))
-                        task_terminal = task and task.status in {"done", "archived"}
-                        should_unsub = bool(
-                            task_terminal
-                            and (not include_children or task.status == "archived")
-                        )
-                        if should_unsub:
-                            await asyncio.to_thread(
-                                self._kanban_unsub, sub, board_slug,
+                        else:
+                            logger.warning(
+                                "kanban notifier: board %s tick failed: %s",
+                                slug,
+                                exc,
                             )
-
-                # ---- Profile-level event subscription wakes (Phase 2) ----
-                # Each profile delivery is a single fire-and-forget
-                # ``hermes -p <profile> chat -q <prompt>`` spawn covering the
-                # entire claimed batch. On spawn success, advance the cursor
-                # (already at ``new`` from the claim) and stamp
-                # ``last_wake_at``. On failure, rewind to ``old`` so the next
-                # tick retries.
-                for pd in profile_deliveries:
-                    psub = pd["sub"]
-                    p_board = pd.get("board")
-                    if not int(psub.get("wake_agent") or 0):
-                        # Subscription recorded events but is configured not to
-                        # wake an agent — just advance the cursor to ack the
-                        # range and continue. No wake actually happened, so we
-                        # do NOT append a wake_events row.
-                        await asyncio.to_thread(
-                            self._kanban_profile_advance,
-                            psub, pd["cursor"], p_board, None,
-                        )
-                        continue
-                    wake_error: Any = None
-                    try:
-                        result = await asyncio.to_thread(
-                            self._kanban_profile_wake,
-                            psub,
-                            pd["events"],
-                            pd["task"],
-                            pd["event_tasks"],
-                            p_board,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "kanban notifier: profile wake spawn raised for "
-                            "%s/%s on board %s: %s",
-                            psub.get("task_id"), psub.get("profile"),
-                            p_board, exc,
-                        )
-                        result = False
-                        wake_error = exc
-                    # ``_kanban_profile_wake`` returns ``bool`` (legacy) or
-                    # ``(bool, error)``; tests monkeypatch the bool form, real
-                    # code now passes the Popen error in the tuple form.
-                    if isinstance(result, tuple) and len(result) == 2:
-                        ok = bool(result[0])
-                        if not ok and wake_error is None:
-                            wake_error = result[1]
-                    else:
-                        ok = bool(result)
-                    if ok:
-                        await asyncio.to_thread(
-                            self._kanban_profile_record_success,
-                            psub, pd["cursor"], p_board, int(time.time()),
-                        )
-                    else:
-                        await asyncio.to_thread(
-                            self._kanban_profile_record_failure,
-                            psub,
-                            pd["cursor"],
-                            pd.get("old_cursor", 0),
-                            p_board,
-                            wake_error,
-                        )
+                    if not confirmed_corruption_this_tick:
+                        notifier_corruption_streaks.pop(resolved_db_path, None)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
@@ -6691,6 +6167,96 @@ class GatewayRunner:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _render_kanban_chat_event(self, ev, ev_task, sub, board=None) -> str:
+        """Render one notifier chat message for ``ev`` (B4 formatter seam).
+
+        Extracted VERBATIM from the per-kind formatter that used to live inline
+        in ``_kanban_notifier_watcher``'s delivery loop so the rendered messages
+        are byte-identical to before B4. Injected into
+        ``kanban_glue.run_notifier_tick`` via ``render_chat_event`` — the glue
+        does NOT format messages itself.
+
+        PURE function: no DB reads. The completed summary comes from
+        ``ev.payload`` (with a fallback to ``ev_task.result`` for legacy rows
+        written before runs shipped). ``ev_task`` is the per-event task already
+        resolved by the glue (the descendant for subtree subs, else the sub's
+        task). ``board`` is for signature compat with the glue and is unused.
+        """
+        kind = ev.kind
+        ev_title = (
+            ev_task.title if ev_task and ev_task.title
+            else ev.task_id
+        )[:120]
+        ev_id = ev.task_id or sub["task_id"]
+        # Identity prefix: attribute terminal pings to the worker that did the
+        # work. Makes fleets (where one chat subscribes to many tasks) legible
+        # at a glance.
+        who = (ev_task.assignee if ev_task and ev_task.assignee else None)
+        tag = f"@{who} " if who else ""
+        if kind == "completed":
+            # Prefer the run's summary (the worker's intentional human-facing
+            # handoff, carried in the event payload), then fall back to
+            # task.result for legacy rows written before runs shipped.
+            handoff = ""
+            payload_summary = None
+            if ev.payload and ev.payload.get("summary"):
+                payload_summary = str(ev.payload["summary"])
+            if payload_summary:
+                h = payload_summary.strip().splitlines()[0][:200]
+                handoff = f"\n{h}"
+            elif ev_task and ev_task.result:
+                r = ev_task.result.strip().splitlines()[0][:160]
+                handoff = f"\n{r}"
+            msg = (
+                f"✔ {tag}Kanban {ev_id} done"
+                f" — {ev_title}{handoff}"
+            )
+        elif kind == "blocked":
+            reason = ""
+            if ev.payload and ev.payload.get("reason"):
+                reason = f": {str(ev.payload['reason'])[:160]}"
+            msg = f"⏸ {tag}Kanban {ev_id} blocked{reason}"
+        elif kind == "gave_up":
+            err = ""
+            if ev.payload and ev.payload.get("error"):
+                err = f"\n{str(ev.payload['error'])[:200]}"
+            msg = (
+                f"✖ {tag}Kanban {ev_id} gave up "
+                f"after repeated spawn failures{err}"
+            )
+        elif kind == "crashed":
+            msg = (
+                f"✖ {tag}Kanban {ev_id} worker crashed "
+                f"(pid gone); dispatcher will retry"
+            )
+        elif kind == "timed_out":
+            limit = 0
+            if ev.payload and ev.payload.get("limit_seconds"):
+                limit = int(ev.payload["limit_seconds"])
+            msg = (
+                f"⏱ {tag}Kanban {ev_id} timed out "
+                f"(max_runtime={limit}s); will retry"
+            )
+        elif kind == "archived":
+            msg = f"🗄 {tag}Kanban {ev_id} archived — {ev_title}"
+        elif kind == "created":
+            msg = f"➕ {tag}Kanban {ev_id} created — {ev_title}"
+        elif kind == "claimed":
+            msg = f"▶ {tag}Kanban {ev_id} claimed — {ev_title}"
+        elif kind == "unblocked":
+            msg = f"▶ {tag}Kanban {ev_id} unblocked — {ev_title}"
+        elif kind == "promoted":
+            msg = f"⤴ {tag}Kanban {ev_id} promoted to ready — {ev_title}"
+        elif kind == "review_requested":
+            msg = f"👀 {tag}Kanban {ev_id} review requested — {ev_title}"
+        else:
+            # Unknown kind, but the subscription explicitly asked for it (or a
+            # future event kind landed in the DB before the renderer learned
+            # it). Surface a generic event line instead of silently dropping so
+            # users still see the signal they asked for.
+            msg = f"• {tag}Kanban {ev_id} {kind} — {ev_title}"
+        return msg
 
     def _board_write(self, board: Optional[str], op: str, **kwargs):
         """Perform a single board mutation, routing through the single-writer
