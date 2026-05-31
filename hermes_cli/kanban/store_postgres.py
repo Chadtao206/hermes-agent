@@ -1585,9 +1585,12 @@ class PostgresKanbanStore:
     #
     # Each mirrors a kanban_db reclaim primitive board-scoped, reusing
     # ``_pg_end_run`` + ``record_task_failure`` where the reference uses
-    # ``_end_run`` / ``_record_task_failure``. OS-level liveness/kill is
-    # injected (``signal_fn`` / ``pid_alive_fn``) and defaults to no-op — the
-    # glue (Part B) supplies host-local OS callbacks at the gateway call site.
+    # ``_end_run`` / ``_record_task_failure``. OS-level liveness/kill/exit are
+    # injected and default to no-op: ``terminate_fn(pid, claim_lock)`` runs the
+    # full host-guarded SIGTERM->grace->SIGKILL ladder (``signal_fn`` is the
+    # single-shot fallback), ``pid_alive_fn`` probes liveness, and
+    # ``classify_exit_fn`` classifies a dead pid's exit (rc=0 => protocol
+    # violation). The gateway (Part B) wires the real host-local callbacks.
 
     @staticmethod
     def _invoke_kill(terminate_fn, signal_fn, pid, claim_lock):
