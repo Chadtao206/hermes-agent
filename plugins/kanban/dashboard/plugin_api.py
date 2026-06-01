@@ -746,35 +746,6 @@ def get_reconcile_health(
 ):
     """Return deterministic reconcile actions for dashboard/control-plane views."""
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        # Reconcile reads a sqlite snapshot directly (kanban_reconciler is not
-        # backend-aware). Under Postgres there is no on-disk board DB to snapshot,
-        # so serve a graceful no-op that mirrors run_reconciler's top-level keys
-        # (set to empty/zero) plus a note so the dashboard/CLI don't KeyError or
-        # show a stale/error preview.
-        note = "reconcile is not yet available on the postgres backend"
-        return {
-            "ok": True,
-            "board": _pg_reads().slug(board),
-            "db_path": None,
-            "actions": [],
-            "total_actions": 0,
-            "wake_triage": {
-                "mode": "auto_silent",
-                "wake_agent": False,
-                "reason": note,
-                "total_actions": 0,
-                "decision_packet_count": 0,
-                "decision_packets": [],
-                "summary": {},
-                "buckets": {},
-                "suppressed_decision_packet_count": 0,
-            },
-            "as_of": int(time.time()),
-            "mutation_applied": False,
-            "note": note,
-            "text_preview": note,
-        }
     result = kanban_reconciler.run_reconciler(
         board=board,
         ready_age_seconds=max(1, int(ready_age_seconds or 900)),

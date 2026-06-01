@@ -229,12 +229,33 @@ def test_create_with_parents_links_in_pg(pg_client):
     assert parent in s.parent_ids(child)
 
 
-def test_reconcile_graceful_noop_pg(pg_client):
+def test_reconcile_clean_board_pg(pg_client):
+    """Clean board → run_reconciler returns empty actions + partial note; no old no-op."""
     r = pg_client.get("/api/plugins/kanban/reconcile")
     assert r.status_code == 200
     body = r.json()
-    assert (body.get("actions") in ([], None)) or (body.get("total_actions", 0) == 0)
-    assert "postgres" in (str(body.get("text_preview", "")) + str(body.get("note", ""))).lower()
+    assert body.get("actions") == []
+    assert "partial" in body                        # backend-aware run_reconciler result
+    assert "text_preview" in body                   # format_reconcile_text ran
+    assert "not yet available" not in (body.get("note") or "")  # old no-op note gone
+
+
+def test_reconcile_returns_real_actions_under_postgres(pg_client):
+    import time
+    from hermes_cli.kanban import pg_pool
+    s = pg_client.pg_store
+    t = s.create_task(title="stuck ready", assignee=None)
+    with pg_pool.get_pool().connection() as conn:
+        conn.execute("UPDATE tasks SET created_at=%s WHERE board=%s AND id=%s",
+                     (int(time.time()) - 10_000, s.board, t)); conn.commit()
+    r = pg_client.get("/api/plugins/kanban/reconcile?ready_age_seconds=900")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mutation_applied"] is False
+    assert any(a["kind"].startswith("old_ready_") for a in body["actions"])  # real, not no-op
+    assert "partial" in body                       # deferred-kinds note present
+    assert "text_preview" in body                  # format_reconcile_text ran
+    assert "not yet available" not in (body.get("note") or "")  # old no-op note gone
 
 
 def test_boards_counts_pg(pg_client):
