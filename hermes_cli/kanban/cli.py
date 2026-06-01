@@ -1974,9 +1974,10 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
-    with kb.connect_closing() as conn:
+    store = _make_store()
+    try:
         created = ks.create_swarm(
-            conn,
+            store,
             goal=args.goal,
             workers=workers,
             verifier_assignee=args.verifier,
@@ -1986,6 +1987,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
+    finally:
+        store.close()
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
     else:
