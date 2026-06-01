@@ -50,7 +50,10 @@ def _resolve_backend() -> str:
 
 
 def _pg_store():
-    """Construct a PG store bound to the current board (resolve slug once)."""
+    # NOTE: single-board ('default') only on Postgres. kb.get_current_board()/
+    # board_exists() are sqlite-filesystem-coupled, so a non-default PG-only board
+    # would mis-resolve to 'default' (Phase-6 multi-board blocker). Safe for the
+    # live single-'default' board.
     from hermes_cli.kanban.store_postgres import PostgresKanbanStore
     return PostgresKanbanStore(board=kb.get_current_board())
 
@@ -166,9 +169,16 @@ def specify_task(
     ``--all`` sweep can continue past individual failures.
     """
     backend = _resolve_backend()
-    _pg = _pg_store() if backend == "postgres" else None
+    _pg = None
     if backend == "postgres":
-        task = _pg.get_task(task_id)
+        try:
+            _pg = _pg_store()
+            task = _pg.get_task(task_id)
+        except Exception as exc:
+            logger.info("specify: postgres read failed for %s (%s)",
+                        task_id, type(exc).__name__)
+            return SpecifyOutcome(
+                task_id, False, f"kanban store error: {type(exc).__name__}")
     else:
         with kb.connect_closing() as conn:          # EXISTING verbatim
             task = kb.get_task(conn, task_id)
@@ -260,9 +270,15 @@ def specify_task(
             )
 
     if backend == "postgres":
-        ok = _pg.specify_triage_task(
-            task_id, title=new_title, body=new_body,
-            author=author or _profile_author())
+        try:
+            ok = _pg.specify_triage_task(
+                task_id, title=new_title, body=new_body,
+                author=author or _profile_author())
+        except Exception as exc:
+            logger.info("specify: postgres write failed for %s (%s)",
+                        task_id, type(exc).__name__)
+            return SpecifyOutcome(
+                task_id, False, f"kanban store error: {type(exc).__name__}")
     else:
         with kb.connect_closing() as conn:          # EXISTING verbatim
             ok = kb.specify_triage_task(

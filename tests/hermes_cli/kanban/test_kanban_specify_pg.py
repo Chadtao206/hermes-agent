@@ -55,3 +55,19 @@ def test_list_triage_ids_reads_postgres(pg_store, monkeypatch):
     pg_store.create_task(title="live")  # ready, excluded
     ids = kanban_specify.list_triage_ids()
     assert a in ids
+
+
+def test_specify_task_degrades_on_store_error(monkeypatch):
+    """A Postgres connectivity error must degrade to ok=False, not raise,
+    and must not leak a DSN/host into the reason."""
+    monkeypatch.setattr("hermes_cli.kanban.store.resolve_backend", lambda: "postgres")
+
+    class _BoomStore:
+        def get_task(self, _):
+            raise RuntimeError("connection to host=secret-host port=5432 failed")
+
+    monkeypatch.setattr(kanban_specify, "_pg_store", lambda: _BoomStore())
+    outcome = kanban_specify.specify_task("t_whatever", author="alice")
+    assert outcome.ok is False
+    assert "RuntimeError" in outcome.reason          # type name only
+    assert "secret-host" not in outcome.reason        # no raw exception text / DSN
