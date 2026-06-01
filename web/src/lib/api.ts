@@ -194,6 +194,7 @@ export async function buildWsAuthParam(): Promise<[string, string]> {
 
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getQuotaStatus: () => fetchJSON<QuotaStatusResponse>("/api/quota/status"),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *
@@ -691,6 +692,37 @@ export interface StatusResponse {
   latest_config_version: number;
   release_date: string;
   version: string;
+}
+
+export interface QuotaWindow {
+  key: string;
+  label: string;
+  used_percent: number | string | null;
+  window_minutes: number | string | null;
+  resets_at: number | string | null;
+  resets_at_iso: string | null;
+}
+
+export interface QuotaProviderStatus {
+  provider: "codex" | "claude" | string;
+  label: string;
+  available: boolean;
+  windows: Record<string, QuotaWindow>;
+  plan_type?: string | null;
+  credits?: Record<string, unknown> | null;
+  rate_limit_reached_type?: string | null;
+  source: string;
+  updated_at: string | null;
+  error: string | null;
+}
+
+export interface QuotaStatusResponse {
+  generated_at: string;
+  providers: {
+    codex: QuotaProviderStatus;
+    claude: QuotaProviderStatus;
+    [provider: string]: QuotaProviderStatus;
+  };
 }
 
 export interface SessionInfo {

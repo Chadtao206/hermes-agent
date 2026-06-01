@@ -4,6 +4,7 @@ import { PageHeaderContext } from "./page-header-context";
 import { resolvePageTitle } from "@/lib/resolve-page-title";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
+import { QuotaHeaderWidget } from "@/components/QuotaHeaderWidget";
 
 export function PageHeaderProvider({
   children,
@@ -92,6 +93,7 @@ export function PageHeaderProvider({
               >
                 {displayTitle}
               </h1>
+              <QuotaHeaderWidget />
               {afterTitle ? (
                 <div
                   className={cn(

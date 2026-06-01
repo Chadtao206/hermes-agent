@@ -570,6 +570,15 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     return False, None
 
 
+@app.get("/api/quota/status")
+async def get_quota_status_endpoint():
+    """Return local Codex / Claude Code quota telemetry for dashboard header chips."""
+    from hermes_cli.quota_status import get_quota_status
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, get_quota_status)
+
+
 @app.get("/api/status")
 async def get_status():
     current_ver, latest_ver = check_config_version()
