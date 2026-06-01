@@ -234,3 +234,27 @@ def test_read_only_no_mutation(pg):
     before = _counts()
     _kinds(pool, board, s)
     assert _counts() == before
+
+
+def test_blocked_parents_string_is_p_id_ordered_and_stable(pg):
+    """string_agg ORDER BY p.id makes the parents string deterministic across runs."""
+    s, pool, board = pg
+    parents = [s.create_task(title=f"p{i}") for i in range(3)]
+    child = s.create_task(title="c", parents=parents)
+    for p in parents:
+        s.complete_task(p, summary="done")
+    s.block_task(child, reason="manual")
+
+    def _parents_str():
+        with pool.connection() as conn:
+            actions = krec._collect_reconcile_actions_pg(
+                conn, board, s, ready_age_seconds=900, now=int(time.time()))
+        act = next(a for a in actions
+                   if a.kind == "blocked_with_completed_parents_decision"
+                   and a.task_id == child)
+        return act.details["parents"]
+
+    expected = ", ".join(f"{pid}:done" for pid in sorted(parents))
+    first = _parents_str()
+    assert first == expected           # ordered by p.id
+    assert _parents_str() == first     # stable across runs (same signature)
