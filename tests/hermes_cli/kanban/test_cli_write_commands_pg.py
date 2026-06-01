@@ -57,3 +57,39 @@ def test_wake_arm_routes_through_store(pg, monkeypatch):
     subs = s.list_profile_event_subs(task_id=tid, profile="default", enabled_only=False)
     armed = [x for x in subs if (x.get("name") or "") == "jensen-orchestrator"]
     assert armed and bool(armed[0].get("wake_agent"))
+
+
+def test_claim_routes_through_store(pg, monkeypatch):
+    s, board = pg
+    tid = s.create_task(title="claim me")
+    monkeypatch.setattr(kb, "resolve_workspace", lambda task: "/tmp/ws-" + task.id)
+    _forbid_direct_connect(monkeypatch)
+    ns = argparse.Namespace(task_id=tid, ttl=900)
+    rc = kcli._cmd_claim(ns)
+    assert rc == 0
+    t = s.get_task(tid)
+    assert t.status == "running"
+    assert t.workspace_path == "/tmp/ws-" + tid
+
+
+def test_claim_unclaimable_reports_reason(pg, monkeypatch):
+    s, board = pg
+    tid = s.create_task(title="x")
+    s.claim_task(tid)                      # already running
+    monkeypatch.setattr(kb, "resolve_workspace", lambda task: "/tmp/ws")
+    _forbid_direct_connect(monkeypatch)
+    ns = argparse.Namespace(task_id=tid, ttl=900)
+    rc = kcli._cmd_claim(ns)               # cannot claim -> rc 1, no crash
+    assert rc == 1
+
+
+def test_notify_subscribe_routes_through_store(pg, monkeypatch):
+    s, board = pg
+    tid = s.create_task(title="notify me")
+    _forbid_direct_connect(monkeypatch)
+    ns = argparse.Namespace(task_id=tid, platform="slack", chat_id="C123",
+                            thread_id=None, user_id=None, notifier_profile="ops")
+    rc = kcli._cmd_notify_subscribe(ns)
+    assert rc == 0
+    subs = s.list_notify_subs(tid)
+    assert any(x["platform"] == "slack" and x["chat_id"] == "C123" for x in subs)

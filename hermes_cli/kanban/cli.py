@@ -2472,11 +2472,11 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+    store = _make_store()
+    try:
+        task = store.claim_task(args.task_id, ttl_seconds=args.ttl)
         if task is None:
-            # Report why
-            existing = kb.get_task(conn, args.task_id)
+            existing = store.get_task(args.task_id)
             if existing is None:
                 print(f"no such task: {args.task_id}", file=sys.stderr)
                 return 1
@@ -2487,7 +2487,9 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             )
             return 1
         workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        store.set_workspace_path(task.id, str(workspace))
+    finally:
+        store.close()
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0
@@ -3135,16 +3137,19 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        if kb.get_task(conn, args.task_id) is None:
+    store = _make_store()
+    try:
+        if store.get_task(args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        kb.add_notify_sub(
-            conn, task_id=args.task_id,
+        store.add_notify_sub(
+            task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
         )
+    finally:
+        store.close()
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")
           + f" to {args.task_id}")
