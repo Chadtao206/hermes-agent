@@ -199,6 +199,85 @@ def _current_state_metrics(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _current_state_metrics_pg(cur, board) -> dict[str, Any]:
+    cur.execute("SELECT status, COUNT(*) AS count FROM tasks WHERE board=%s "
+                "GROUP BY status ORDER BY status", (board,))
+    task_status_counts = {str(r["status"]): int(r["count"]) for r in cur.fetchall()}
+    cur.execute("SELECT status, outcome, COUNT(*) AS count FROM task_runs WHERE board=%s "
+                "GROUP BY status, outcome ORDER BY status, outcome", (board,))
+    run_status_counts = {f"{r['status']}:{r['outcome'] or 'none'}": int(r["count"])
+                         for r in cur.fetchall()}
+    cur.execute(
+        "SELECT "
+        "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_tasks, "
+        "SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) AS spawnable_pending_tasks, "
+        "SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) AS blocked_tasks, "
+        "SUM(CASE WHEN current_run_id IS NOT NULL THEN 1 ELSE 0 END) AS current_run_pointers, "
+        "COALESCE(MAX(consecutive_failures),0) AS max_consecutive_failures, "
+        "COALESCE(SUM(consecutive_failures),0) AS total_consecutive_failures "
+        "FROM tasks WHERE board=%s", (board,))
+    row = cur.fetchone() or {}
+    cur.execute("SELECT COUNT(*) AS c FROM task_runs WHERE board=%s AND status='running'", (board,))
+    running_run_rows = int((cur.fetchone() or {}).get("c") or 0)
+    return {
+        "task_status_counts": task_status_counts,
+        "run_status_counts": run_status_counts,
+        "running_tasks": int(row.get("running_tasks") or 0),
+        "spawnable_pending_tasks": int(row.get("spawnable_pending_tasks") or 0),
+        "blocked_tasks": int(row.get("blocked_tasks") or 0),
+        "current_run_pointers": int(row.get("current_run_pointers") or 0),
+        "running_run_rows": running_run_rows,
+        "max_consecutive_failures": int(row.get("max_consecutive_failures") or 0),
+        "total_consecutive_failures": int(row.get("total_consecutive_failures") or 0),
+    }
+
+
+def _window_metrics_pg(cur, board, *, label, cutoff, now) -> dict[str, Any]:
+    if cutoff is None:
+        cur.execute("SELECT * FROM task_runs WHERE board=%s", (board,)); rows = cur.fetchall()
+        cur.execute("SELECT kind FROM task_events WHERE board=%s", (board,)); event_rows = cur.fetchall()
+    else:
+        cur.execute("SELECT * FROM task_runs WHERE board=%s AND COALESCE(started_at,0) >= %s",
+                    (board, cutoff)); rows = cur.fetchall()
+        cur.execute("SELECT kind FROM task_events WHERE board=%s AND COALESCE(created_at,0) >= %s",
+                    (board, cutoff)); event_rows = cur.fetchall()
+    return _aggregate_window(rows, event_rows, label=label, cutoff=cutoff, now=now)
+
+
+def _empty_current_state() -> dict[str, Any]:
+    return {
+        "task_status_counts": {}, "run_status_counts": {}, "running_tasks": 0,
+        "spawnable_pending_tasks": 0, "blocked_tasks": 0, "current_run_pointers": 0,
+        "running_run_rows": 0, "max_consecutive_failures": 0, "total_consecutive_failures": 0,
+    }
+
+
+def _read_metrics_pg(board, *, since_epoch, now):
+    """Return (db_path, current_state, windows) from the live PG board. On a
+    connectivity error, degrade to a redacted db_path + empty metrics (no raise,
+    no leak); the shared doctor/reconcile calls in collect_metrics already
+    surface ok=False on an unreachable backend."""
+    from hermes_cli.kanban import pg_pool
+    from psycopg.rows import dict_row
+    from hermes_cli.kanban_board_doctor import _redacted_pg_dsn
+    db_path = _redacted_pg_dsn()
+    try:
+        pool = pg_pool.get_pool()
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            current_state = _current_state_metrics_pg(cur, board)
+            windows = [
+                _window_metrics_pg(cur, board, label=label,
+                                   cutoff=None if seconds is None else now - int(seconds), now=now)
+                for label, seconds in _DEFAULT_WINDOWS
+            ]
+            if since_epoch is not None:
+                windows.append(_window_metrics_pg(cur, board, label="since",
+                                                  cutoff=int(since_epoch), now=now))
+        return db_path, current_state, windows
+    except Exception:
+        return db_path, _empty_current_state(), []
+
+
 def default_snapshot_db_path() -> Path:
     return get_hermes_home() / "kanban_metrics_snapshots.db"
 
@@ -262,31 +341,42 @@ def collect_metrics(
     snapshot_db: Optional[Path] = None,
 ) -> dict[str, Any]:
     as_of = int(now if now is not None else time.time())
-    path = kb.kanban_db_path(board=board)
     board_name = board or kb.get_current_board()
-    # Metrics are observational. Read the hot board through the same
-    # filesystem snapshot pattern used by the reconciler so this command does
-    # not create/mutate the live board's WAL/SHM sidecars just to count rows.
-    with kb.snapshot_connect(path) as conn:
-        current_state = _current_state_metrics(conn)
-        windows = [
-            _run_window_metrics(
-                conn,
-                label=label,
-                cutoff=None if seconds is None else as_of - int(seconds),
-                now=as_of,
-            )
-            for label, seconds in _DEFAULT_WINDOWS
-        ]
-        if since_epoch is not None:
-            windows.append(
+    _backend = "sqlite"
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        _backend = resolve_backend()
+    except Exception:
+        _backend = "sqlite"
+    if _backend == "postgres":
+        db_path, current_state, windows = _read_metrics_pg(
+            board_name, since_epoch=since_epoch, now=as_of)
+    else:
+        path = kb.kanban_db_path(board=board)
+        db_path = str(path)
+        # Metrics are observational. Read the hot board through the same
+        # filesystem snapshot pattern used by the reconciler so this command does
+        # not create/mutate the live board's WAL/SHM sidecars just to count rows.
+        with kb.snapshot_connect(path) as conn:
+            current_state = _current_state_metrics(conn)
+            windows = [
                 _run_window_metrics(
                     conn,
-                    label="since",
-                    cutoff=int(since_epoch),
+                    label=label,
+                    cutoff=None if seconds is None else as_of - int(seconds),
                     now=as_of,
                 )
-            )
+                for label, seconds in _DEFAULT_WINDOWS
+            ]
+            if since_epoch is not None:
+                windows.append(
+                    _run_window_metrics(
+                        conn,
+                        label="since",
+                        cutoff=int(since_epoch),
+                        now=as_of,
+                    )
+                )
     doctor = kdoc.run_board_doctor(
         board=board,
         ready_age_seconds=max(1, int(ready_age_seconds or 1)),
@@ -299,7 +389,7 @@ def collect_metrics(
     result: dict[str, Any] = {
         "ok": bool(doctor.get("ok")) and bool(reconcile.get("ok")),
         "board": board_name,
-        "db_path": str(path),
+        "db_path": db_path,
         "captured_at": as_of,
         "current_state": current_state,
         "health": {
