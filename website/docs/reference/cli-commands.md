@@ -550,7 +550,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Return a blocked or scheduled task to ready (or `todo` if dependencies are still open). |
-| `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. |
+| `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. `--rm <id…>` permanently purges already-archived tasks — dry-run preview by default; pass `--confirm` to actually delete. |
 | `tail <id>` | Follow a task's event stream. |
 | `dispatch` | One dispatcher pass on the active board. Flags: `--dry-run`, `--max N`, `--failure-limit N`, `--json`. |
 | `context <id>` | Print the full context a worker would see (title + body + parent results + comments). |

@@ -791,6 +791,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+    p_archive.add_argument(
+        "--confirm", action="store_true",
+        help="Actually delete with --rm (default is a dry-run preview)",
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -2745,15 +2749,36 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return 1
     failed: list[str] = []
     if purge_ids:
-        # delete_archived_task is not in the store protocol; use raw conn.
-        with kb.connect_closing() as conn:
+        store = _make_store()
+        try:
+            confirm = bool(getattr(args, "confirm", False))
+            if not confirm:
+                any_deletable = False
+                for tid in purge_ids:
+                    task = store.get_task(tid)
+                    if task is None or task.status != "archived":
+                        print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
+                        continue
+                    any_deletable = True
+                    n_events = len(store.list_events(tid))
+                    n_comments = len(store.list_comments(tid))
+                    n_runs = len(store.list_runs(tid))
+                    n_links = len(store.parent_ids(tid)) + len(store.child_ids(tid))
+                    print(
+                        f"would delete {tid}: events={n_events} comments={n_comments} "
+                        f"runs={n_runs} links={n_links}"
+                    )
+                print("(dry-run — pass --confirm to permanently delete)")
+                return 0 if any_deletable else 1
             for tid in purge_ids:
-                if not kb.delete_archived_task(conn, tid):
+                if not store.delete_archived_task(tid):
                     failed.append(tid)
                     print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
                 else:
                     print(f"Deleted {tid}")
-        return 0 if not failed else 1
+            return 0 if not failed else 1
+        finally:
+            store.close()
     store = _make_store()
     try:
         for tid in ids:

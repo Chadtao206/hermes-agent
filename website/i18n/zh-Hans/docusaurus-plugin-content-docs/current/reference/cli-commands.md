@@ -416,7 +416,7 @@ hermes kanban [--board <slug>] <action> [options]
 | `block <id> "<reason>"` | 将任务标记为等待人工输入。同时将原因追加为评论。 |
 | `schedule <id> "<reason>"` | 将时间延迟/后续工作停放到 `scheduled` 状态，使其不显示为人工阻塞项。 |
 | `unblock <id>` | 将已阻塞或已调度的任务返回就绪状态（如果依赖仍未完成则返回 `todo`）。 |
-| `archive <id>` | 从默认列表中隐藏。`gc` 将删除 scratch 工作区。 |
+| `archive <id>` | 从默认列表中隐藏。`gc` 将删除 scratch 工作区。`--rm <id…>` 永久清除已归档任务——默认为预览（dry-run）；实际删除需传入 `--confirm`。 |
 | `tail <id>` | 跟踪任务的事件流。 |
 | `dispatch` | 对活跃看板执行一次调度器扫描。标志：`--dry-run`、`--max N`、`--failure-limit N`、`--json`。 |
 | `context <id>` | 打印 worker 将看到的完整上下文（标题 + 正文 + 父任务结果 + 评论）。 |
