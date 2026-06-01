@@ -3331,14 +3331,15 @@ def _cmd_profile_subs_add(args: argparse.Namespace) -> int:
     # from "--clear-wake-prompt" (which lands as a literal None).
     wake_prompt = getattr(args, "wake_prompt", _PROFILE_SUB_CLI_UNSET)
 
-    with kb.connect() as conn:
-        if kb.get_task(conn, task_id) is None:
+    store = _make_store()
+    try:
+        if store.get_task(task_id) is None:
             print(f"no such task: {task_id}", file=sys.stderr)
             return 1
         existed = any(
             (s.get("name") or "") == name
-            for s in kb.list_profile_event_subs(
-                conn, task_id=task_id, profile=profile, enabled_only=False,
+            for s in store.list_profile_event_subs(
+                task_id=task_id, profile=profile, enabled_only=False,
             )
         )
         add_kwargs: dict[str, Any] = {
@@ -3361,13 +3362,15 @@ def _cmd_profile_subs_add(args: argparse.Namespace) -> int:
             add_kwargs["wake_prompt"] = wake_prompt
         if enabled is not None:
             add_kwargs["enabled"] = enabled
-        kb.add_profile_event_sub(conn, **add_kwargs)
+        store.add_profile_event_sub(**add_kwargs)
         stored = [
-            s for s in kb.list_profile_event_subs(
-                conn, task_id=task_id, profile=profile, enabled_only=False,
+            s for s in store.list_profile_event_subs(
+                task_id=task_id, profile=profile, enabled_only=False,
             )
             if (s.get("name") or "") == name
         ]
+    finally:
+        store.close()
 
     sub_id = _format_profile_sub_id(task_id, profile, name)
     if getattr(args, "json", False):
@@ -3453,18 +3456,18 @@ def _cmd_kanban_wake_arm(args: argparse.Namespace) -> int:
         )
         return 1
 
-    with kb.connect() as conn:
-        if kb.get_task(conn, task_id) is None:
+    store = _make_store()
+    try:
+        if store.get_task(task_id) is None:
             print(f"kanban wake-arm: no such task: {task_id}", file=sys.stderr)
             return 1
         existed = any(
             (s.get("name") or "") == name
-            for s in kb.list_profile_event_subs(
-                conn, task_id=task_id, profile=profile, enabled_only=False,
+            for s in store.list_profile_event_subs(
+                task_id=task_id, profile=profile, enabled_only=False,
             )
         )
-        kb.add_profile_event_sub(
-            conn,
+        store.add_profile_event_sub(
             task_id=task_id,
             profile=profile,
             name=name,
@@ -3475,11 +3478,13 @@ def _cmd_kanban_wake_arm(args: argparse.Namespace) -> int:
             enabled=True,
         )
         stored = [
-            s for s in kb.list_profile_event_subs(
-                conn, task_id=task_id, profile=profile, enabled_only=False,
+            s for s in store.list_profile_event_subs(
+                task_id=task_id, profile=profile, enabled_only=False,
             )
             if (s.get("name") or "") == name
         ]
+    finally:
+        store.close()
 
     sub_id = _format_profile_sub_id(task_id, profile, name)
     if getattr(args, "json", False):
