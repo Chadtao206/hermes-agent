@@ -1451,7 +1451,9 @@ class PostgresKanbanStore:
                     "started_at=COALESCE(started_at,%s), current_run_id=%s "
                     "WHERE board=%s AND id=%s",
                     (claimer, now + ttl, now, run_id, self.board, task_id))
-                self._emit(cur, task_id, "claimed", {"claimer": claimer}, run_id=run_id)
+                self._emit(cur, task_id, "claimed",
+                           {"lock": claimer, "expires": now + ttl, "run_id": run_id},
+                           run_id=run_id)
         return self.get_task(task_id)
 
     # --- record_task_failure (circuit breaker / gave_up) ------------------
