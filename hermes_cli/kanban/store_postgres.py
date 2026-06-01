@@ -41,7 +41,6 @@ from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across bac
 from hermes_cli.kanban_db import DispatchResult
 from hermes_cli.kanban import pg_pool
 
-_VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 _DEFAULT_NOTIFY_TERMINAL_KINDS = ("completed", "blocked", "gave_up",
                                   "crashed", "timed_out", "archived")
 _UNSET = object()
@@ -221,7 +220,7 @@ class PostgresKanbanStore:
                 self._emit(cur, tid, "created", {
                     "assignee": assignee, "status": status,
                     "parents": list(parents), "tenant": tenant,
-                    "branch_name": branch_name, "skills": skills_list})
+                    "branch_name": branch_name, "skills": skills_list or None})
                 if status == "blocked":
                     self._emit(cur, tid, "blocked", {"reason": "initial_status=blocked"})
             return tid
