@@ -295,3 +295,23 @@ def test_run_reconciler_pg_unreachable_returns_shape(monkeypatch):
     assert res["actions"] == []
     assert "nope-secret-host" not in str(res)   # no raw exception text / no DSN
     assert "partial" in res
+
+
+def test_run_reconciler_pg_error_does_not_fall_through_to_sqlite(pg, monkeypatch):
+    """A post-probe PG error must NOT silently fall through to the frozen
+    sqlite snapshot; it returns a redacted PG error dict."""
+    s, pool, board = pg
+    monkeypatch.setattr(pg_pool, "get_pool", lambda *a, **k: pool)
+    monkeypatch.setattr("hermes_cli.kanban.store.resolve_backend", lambda: "postgres")
+    monkeypatch.setattr("hermes_cli.kanban_db.get_current_board", lambda *a, **k: board)
+    def _boom(*a, **k):
+        raise RuntimeError("boom-secret-host port=5432")
+    monkeypatch.setattr(krec, "_collect_reconcile_actions_pg", _boom)
+    res = krec.run_reconciler(ready_age_seconds=900)
+    assert res["ok"] is False
+    assert res["actions"] == []
+    assert res["db_path"].startswith("postgres://")   # PG path, NOT frozen sqlite file
+    assert "boom-secret-host" not in str(res)          # no raw exception / DSN leak
+    assert res.get("error")                            # explicit error marker
+    # crucially, db_path is NOT a local sqlite path:
+    assert "kanban.db" not in res["db_path"]

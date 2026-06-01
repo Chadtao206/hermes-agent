@@ -1580,14 +1580,16 @@ def run_reconciler(
     ready_age_seconds: int = 15 * 60,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
+    use_pg = False
     try:
         from hermes_cli.kanban.store import resolve_backend
-        if resolve_backend() == "postgres":
-            return _run_reconciler_pg(board=board,
-                                      ready_age_seconds=ready_age_seconds, now=now)
+        use_pg = resolve_backend() == "postgres"
     except Exception:
-        pass  # defensive: fall through to sqlite (default deployments unaffected)
-    # ---- existing sqlite body, verbatim ----
+        use_pg = False  # backend undecidable -> default/upstream deployments use sqlite
+    if use_pg:
+        return _run_reconciler_pg(
+            board=board, ready_age_seconds=ready_age_seconds, now=now)
+    # ---- existing sqlite body, verbatim (UNCHANGED) ----
     path = kb.kanban_db_path(board=board)
     as_of = int(now if now is not None else time.time())
     with _snapshot_connect(path) as conn:
@@ -1645,21 +1647,31 @@ def _run_reconciler_pg(*, board, ready_age_seconds, now=None, pool=None):
         return {"ok": False, "board": slug, "db_path": db_path, "actions": [],
                 "wake_triage": {"mode": "auto_silent", "wake_agent": False,
                                 "suppressed_decision_packet_count": 0},
-                "as_of": as_of, "mutation_applied": False, "partial": partial}
-    store = PostgresKanbanStore(board=slug, pool=pool)
-    with pool.connection() as conn:
-        actions = _collect_reconcile_actions_pg(
-            conn, slug, store, ready_age_seconds=ready_age_seconds, now=as_of)
-    action_dicts = actions_to_dicts(actions)
-    action_dicts, suppressed_packets = _filter_acknowledged_decision_packets_pg(
-        store, action_dicts)
-    wake_triage = classify_wake_triage(action_dicts)
-    wake_triage["suppressed_decision_packet_count"] = len(suppressed_packets)
-    if suppressed_packets:
-        wake_triage["suppressed_decision_packets"] = suppressed_packets
-    return {"ok": not action_dicts, "board": slug, "db_path": db_path,
-            "actions": action_dicts, "wake_triage": wake_triage, "as_of": as_of,
-            "mutation_applied": False, "partial": partial}
+                "as_of": as_of, "mutation_applied": False, "partial": partial,
+                "unreachable": True}
+    try:
+        store = PostgresKanbanStore(board=slug, pool=pool)
+        with pool.connection() as conn:
+            actions = _collect_reconcile_actions_pg(
+                conn, slug, store, ready_age_seconds=ready_age_seconds, now=as_of)
+        action_dicts = actions_to_dicts(actions)
+        action_dicts, suppressed_packets = _filter_acknowledged_decision_packets_pg(
+            store, action_dicts)
+        wake_triage = classify_wake_triage(action_dicts)
+        wake_triage["suppressed_decision_packet_count"] = len(suppressed_packets)
+        if suppressed_packets:
+            wake_triage["suppressed_decision_packets"] = suppressed_packets
+        return {"ok": not action_dicts, "board": slug, "db_path": db_path,
+                "actions": action_dicts, "wake_triage": wake_triage, "as_of": as_of,
+                "mutation_applied": False, "partial": partial}
+    except Exception as exc:
+        logger.warning("kanban reconcile (postgres): collect/filter failed: %s",
+                       type(exc).__name__)
+        return {"ok": False, "board": slug, "db_path": db_path, "actions": [],
+                "wake_triage": {"mode": "auto_silent", "wake_agent": False,
+                                "suppressed_decision_packet_count": 0},
+                "as_of": as_of, "mutation_applied": False, "partial": partial,
+                "error": type(exc).__name__}
 
 
 def _filter_acknowledged_decision_packets_pg(store, action_dicts):
