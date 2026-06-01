@@ -19,6 +19,10 @@ from hermes_cli.kanban_db import (  # reuse dataclasses
 from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across backends
     HallucinatedCardsError, PRHeadGateError, ExternalHandoffGateError,
     LINK_RELATION_DEPENDENCY,
+    VALID_INITIAL_STATUSES,
+    VALID_WORKSPACE_KINDS,
+    KNOWN_TOOLSET_NAMES,
+    _canonical_assignee,
     _lane_type_for_assignee,
     _closeout_pr_evidence,
     _closeout_external_handoff_evidence,
@@ -68,6 +72,19 @@ class PostgresKanbanStore:
              Jsonb(payload) if payload is not None else None, int(time.time())),
         )
 
+    def _find_missing_parents(self, cur, parents: Iterable[str]) -> list[str]:
+        """Board-scoped parity with kanban_db._find_missing_parents: return the
+        subset of ``parents`` that do not exist as tasks on this board, in input
+        order (so the ValueError message matches the sqlite path)."""
+        parents = list(parents)
+        if not parents:
+            return []
+        cur.execute(
+            "SELECT id FROM tasks WHERE board=%s AND id = ANY(%s)",
+            (self.board, parents))
+        present = {r["id"] for r in cur.fetchall()}
+        return [p for p in parents if p not in present]
+
     def _row_to_task(self, row: dict) -> Task:
         d = dict(row)
         d.pop("board", None)
@@ -93,9 +110,64 @@ class PostgresKanbanStore:
                     idempotency_key=None, max_runtime_seconds=None, skills=None,
                     max_retries=None, initial_status="running", session_id=None,
                     **_ignored: Any) -> str:
-        if initial_status not in _VALID_INITIAL_STATUSES:
+        # Input-validation parity with kanban_db.create_task (sqlite). Mirror the
+        # SAME checks, in the same order, raising the SAME ValueError messages so
+        # both backends behave identically. Reuse the upstream constants/helpers
+        # (do not hardcode the sets) to stay in lockstep with kanban_db.
+        assignee = _canonical_assignee(assignee)
+        if not title or not title.strip():
+            raise ValueError("title is required")
+        if initial_status not in VALID_INITIAL_STATUSES:
             raise ValueError(
-                f"initial_status must be one of {sorted(_VALID_INITIAL_STATUSES)}")
+                f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+        if workspace_kind not in VALID_WORKSPACE_KINDS:
+            raise ValueError(
+                f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+                f"got {workspace_kind!r}")
+        if branch_name is not None:
+            branch_name = str(branch_name).strip() or None
+        if branch_name and workspace_kind != "worktree":
+            raise ValueError("branch_name is only valid for worktree workspaces")
+        parents = tuple(p for p in parents if p)
+
+        # Normalise + validate skills: strip whitespace, drop empties, dedupe
+        # (preserving order). Refuse commas inside a single name, and collect
+        # toolset-name confusions up front so the user sees the whole list at once.
+        skills_list: Optional[list[str]] = None
+        if skills is not None:
+            cleaned: list[str] = []
+            seen: set[str] = set()
+            toolset_typos: list[str] = []
+            for s in skills:
+                if not s:
+                    continue
+                name = str(s).strip()
+                if not name:
+                    continue
+                if "," in name:
+                    raise ValueError(
+                        f"skill name cannot contain comma: {name!r} "
+                        f"(pass a list of separate names instead of a comma-joined string)"
+                    )
+                if name.casefold() in KNOWN_TOOLSET_NAMES:
+                    toolset_typos.append(name)
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+                cleaned.append(name)
+            if toolset_typos:
+                quoted = ", ".join(repr(n) for n in toolset_typos)
+                noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+                raise ValueError(
+                    f"{quoted} {noun}, not skill name(s). "
+                    "Put toolsets in the assignee profile's `toolsets:` config "
+                    "instead of per-task skills. Skills are named skill bundles "
+                    "(e.g. `kanban-worker`, `blogwatcher`); toolsets are runtime "
+                    "capabilities (e.g. `web`, `browser`, `terminal`)."
+                )
+            skills_list = cleaned
+
         now = int(time.time())
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
@@ -106,6 +178,16 @@ class PostgresKanbanStore:
                     hit = cur.fetchone()
                     if hit:
                         return hit["id"]
+                # Parent existence — board-scoped, mirrors sqlite's
+                # _find_missing_parents (input-order-preserving). Runs whenever
+                # parents are supplied (ready/todo, blocked/scheduled, triage)
+                # so link rows never dangle. Done inside the transaction, before
+                # the INSERT, so the check + insert are atomic.
+                if parents:
+                    missing = self._find_missing_parents(cur, parents)
+                    if missing:
+                        raise ValueError(
+                            f"unknown parent task(s): {', '.join(missing)}")
                 if initial_status in ("blocked", "scheduled"):
                     status = initial_status
                 elif triage:
@@ -126,10 +208,11 @@ class PostgresKanbanStore:
                     "branch_name, tenant, idempotency_key, max_runtime_seconds, skills, "
                     "max_retries, session_id) VALUES "
                     "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (self.board, tid, title, body, assignee, status, priority,
+                    (self.board, tid, title.strip(), body, assignee, status, priority,
                      created_by, now, workspace_kind, workspace_path, branch_name,
                      tenant, idempotency_key, max_runtime_seconds,
-                     json.dumps(skills) if skills else None, max_retries, session_id))
+                     json.dumps(skills_list) if skills_list is not None else None,
+                     max_retries, session_id))
                 for p in parents:
                     cur.execute(
                         "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
@@ -138,7 +221,7 @@ class PostgresKanbanStore:
                 self._emit(cur, tid, "created", {
                     "assignee": assignee, "status": status,
                     "parents": list(parents), "tenant": tenant,
-                    "branch_name": branch_name, "skills": skills})
+                    "branch_name": branch_name, "skills": skills_list})
                 if status == "blocked":
                     self._emit(cur, tid, "blocked", {"reason": "initial_status=blocked"})
             return tid

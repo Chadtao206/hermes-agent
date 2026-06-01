@@ -619,3 +619,46 @@ def test_parent_ids_rollup_relation(store):
     store.link_tasks(p, c, relation_type=LINK_RELATION_ROLLUP)
     assert store.parent_ids(c, relation_type=LINK_RELATION_ROLLUP) == [p]
     assert store.parent_ids(c) == []  # default dependency relation only
+
+
+# --- create_task input-validation parity (sqlite vs postgres) -------------
+import pytest
+
+
+def test_create_task_rejects_blank_title(store):
+    with pytest.raises(ValueError):
+        store.create_task(title="   ", assignee="engineer")
+
+
+def test_create_task_strips_title(store):
+    tid = store.create_task(title="  padded  ", assignee="engineer")
+    assert store.get_task(tid).title == "padded"
+
+
+def test_create_task_rejects_unknown_parent(store):
+    with pytest.raises(ValueError):
+        store.create_task(title="child", assignee="engineer",
+                          parents=["does-not-exist"])
+
+
+def test_create_task_rejects_bad_workspace_kind(store):
+    with pytest.raises(ValueError):
+        store.create_task(title="x", assignee="engineer",
+                          workspace_kind="bogus")
+
+
+def test_create_task_rejects_toolset_named_skill(store):
+    # 'web' is a toolset, not a skill -> ValueError on both backends
+    with pytest.raises(ValueError):
+        store.create_task(title="x", assignee="engineer", skills=["web"])
+
+
+def test_create_task_rejects_comma_skill(store):
+    with pytest.raises(ValueError):
+        store.create_task(title="x", assignee="engineer", skills=["a,b"])
+
+
+def test_create_task_branch_name_requires_worktree(store):
+    with pytest.raises(ValueError):
+        store.create_task(title="x", assignee="engineer", branch_name="b",
+                          workspace_kind="scratch")
