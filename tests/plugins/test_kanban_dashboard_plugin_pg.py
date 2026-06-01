@@ -177,6 +177,31 @@ def test_get_task_pool_failure_503_no_dsn_leak(pg_client, monkeypatch):
     assert fake_dsn not in r.text
 
 
+def test_get_board_pool_failure_503_no_dsn_leak(pg_client, monkeypatch):
+    """If _store()/_pg_reads() raises during /board PG branch, it must produce a
+    controlled 503 — not an unguarded 500 — and must not leak the DSN.
+
+    Regression for the bug where _store() ran OUTSIDE the guarded try in get_board,
+    so a pool failure escaped as a 500 with a DSN-bearing traceback.
+    """
+    import sys
+    from fastapi.testclient import TestClient
+
+    plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    fake_dsn = "postgresql://postgres:SUPERSECRET@db.example.invalid:6543/kanban"
+
+    def _boom(*_a, **_k):
+        raise RuntimeError(f"connection to pooler failed using {fake_dsn}")
+
+    monkeypatch.setattr(plugin_mod, "_store", _boom)
+
+    client = TestClient(pg_client.app, raise_server_exceptions=False)
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 503, r.text
+    assert "SUPERSECRET" not in r.text
+    assert fake_dsn not in r.text
+
+
 def test_writes_land_in_postgres(pg_client):
     s = pg_client.pg_store
     r = pg_client.post("/api/plugins/kanban/tasks", json={"title": "made in dashboard", "assignee": "engineer"})

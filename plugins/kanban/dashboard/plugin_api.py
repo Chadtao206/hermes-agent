@@ -828,10 +828,11 @@ def get_board(
     """
     board = _resolve_board(board)
     if _backend() == "postgres":
-        pg = _pg_reads()
-        bslug = pg.slug(board)
-        store = _store(board=bslug)
+        store = None
         try:
+            pg = _pg_reads()
+            bslug = pg.slug(board)
+            store = _store(board=bslug)
             tasks = store.list_tasks(
                 tenant=tenant, include_archived=include_archived,
                 workflow_template_id=workflow_template_id,
@@ -880,7 +881,8 @@ def get_board(
         except Exception as exc:
             _raise_pg_read_unavailable(exc, board)
         finally:
-            store.close()
+            if store is not None:
+                store.close()
     conn = _conn(board=board, readonly=True)
     try:
         tasks = kanban_db.list_tasks(
