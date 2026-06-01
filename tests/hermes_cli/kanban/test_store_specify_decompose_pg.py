@@ -107,6 +107,12 @@ def test_decompose_creates_child_graph_and_promotes_root(store):
     dec = [e for e in store.list_events(root) if e.kind == "decomposed"]
     assert len(dec) == 1
     assert dec[0].payload == {"child_ids": [a, b], "root_assignee": "orchestrator"}
+    # exact created/linked payload parity
+    created_a = [e for e in store.list_events(a) if e.kind == "created"]
+    assert len(created_a) == 1
+    assert created_a[0].payload == {"by": "alice", "from_decompose_of": root}
+    linked_b = [e for e in store.list_events(b) if e.kind == "linked"]
+    assert any(e.payload == {"parent": a, "child": b} for e in linked_b)
 
 
 def test_decompose_returns_none_when_not_in_triage(store):
@@ -127,3 +133,24 @@ def test_decompose_cycle_raises_and_aborts(store):
     with pytest.raises(ValueError):
         _decompose(store, root, root_assignee=None, children=children)
     assert store.get_task(root).status == "triage"  # atomic abort, no children created
+    assert store.parent_ids(root) == []   # no children/links created on cycle abort
+
+
+def test_decompose_mid_txn_failure_rolls_back(store, monkeypatch):
+    """An error after the first child INSERT must roll back the entire
+    decomposition: no orphan children, root stays in triage."""
+    root = store.create_task(title="atomic", triage=True)
+    # Force a duplicate child id so the 2nd INSERT violates the PK mid-txn.
+    if isinstance(store, PostgresKanbanStore):
+        monkeypatch.setattr("hermes_cli.kanban.store_postgres._new_task_id",
+                            lambda: "t_dupe")
+    else:
+        monkeypatch.setattr("hermes_cli.kanban_db._new_task_id", lambda: "t_dupe")
+    children = [{"title": "A", "parents": []}, {"title": "B", "parents": []}]
+    with pytest.raises(Exception):  # psycopg UniqueViolation / sqlite IntegrityError
+        _decompose(store, root, root_assignee="orchestrator",
+                   children=children, author="alice")
+    # atomic abort: root unchanged, the partially-inserted child is gone
+    assert store.get_task(root).status == "triage"
+    assert store.get_task("t_dupe") is None
+    assert store.parent_ids(root) == []   # no root-as-child links survived
