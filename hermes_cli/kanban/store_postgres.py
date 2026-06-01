@@ -276,7 +276,7 @@ class PostgresKanbanStore:
             with conn.transaction():
                 cur.execute(
                     "SELECT title, body, assignee FROM tasks "
-                    "WHERE board=%s AND id=%s AND status='triage'",
+                    "WHERE board=%s AND id=%s AND status='triage' FOR UPDATE",
                     (self.board, task_id))
                 existing = cur.fetchone()
                 if existing is None:

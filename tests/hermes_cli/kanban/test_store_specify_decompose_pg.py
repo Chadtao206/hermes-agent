@@ -38,6 +38,12 @@ def test_specify_promotes_triage_to_todo_with_changes(store):
     assert "specified" in kinds
     bodies = [c.body for c in store.list_comments(tid)]
     assert any("Specified" in b for b in bodies)
+    # exact payload + comment parity (highest-risk drift dimension)
+    specified = [e for e in store.list_events(tid) if e.kind == "specified"]
+    assert len(specified) == 1
+    assert specified[0].payload == {"changed_fields": ["title", "body"]}
+    assert any(c.body == "Specified — updated title, body and promoted to todo."
+               for c in store.list_comments(tid))
 
 
 def test_specify_status_only_no_comment_no_changed_fields(store):
@@ -59,3 +65,12 @@ def test_specify_blank_title_raises(store):
     tid = store.create_task(title="x", triage=True)
     with pytest.raises(ValueError):
         _specify(store, tid, title="   ")
+
+
+def test_specify_with_open_parent_lands_in_todo(store):
+    parent = store.create_task(title="open parent")  # ready, not done
+    tid = store.create_task(title="gated idea", triage=True, parents=[parent])
+    ok = _specify(store, tid, title="Specced", author="alice")
+    assert ok is True
+    # parent is not done -> recompute_ready must NOT promote past todo
+    assert store.get_task(tid).status == "todo"
