@@ -69,26 +69,9 @@ def _top_counts(counts: dict[str, int], *, limit: int = 10) -> list[dict[str, An
     ]
 
 
-def _run_window_metrics(
-    conn: sqlite3.Connection,
-    *,
-    label: str,
-    cutoff: Optional[int],
-    now: int,
-) -> dict[str, Any]:
-    if cutoff is None:
-        rows = conn.execute("SELECT * FROM task_runs").fetchall()
-        event_rows = conn.execute("SELECT kind FROM task_events").fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM task_runs WHERE COALESCE(started_at, 0) >= ?",
-            (cutoff,),
-        ).fetchall()
-        event_rows = conn.execute(
-            "SELECT kind FROM task_events WHERE COALESCE(created_at, 0) >= ?",
-            (cutoff,),
-        ).fetchall()
-
+def _aggregate_window(rows, event_rows, *, label, cutoff, now):
+    """Pure aggregation over already-fetched task_runs rows + task_events kind
+    rows. Backend-neutral: rows support row["col"] (sqlite3.Row or psycopg dict_row)."""
     total_runs = len(rows)
     outcome_counts = _count_map(rows, "outcome")
     status_counts = _count_map(rows, "status")
@@ -157,6 +140,22 @@ def _run_window_metrics(
         "event_counts": dict(sorted(event_counts.items(), key=lambda item: (-item[1], item[0]))),
         "failure_event_counts": dict(sorted(failure_event_counts.items(), key=lambda item: (-item[1], item[0]))),
     }
+
+
+def _run_window_metrics(conn: sqlite3.Connection, *, label: str, cutoff: Optional[int], now: int) -> dict[str, Any]:
+    if cutoff is None:
+        rows = conn.execute("SELECT * FROM task_runs").fetchall()
+        event_rows = conn.execute("SELECT kind FROM task_events").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM task_runs WHERE COALESCE(started_at, 0) >= ?",
+            (cutoff,),
+        ).fetchall()
+        event_rows = conn.execute(
+            "SELECT kind FROM task_events WHERE COALESCE(created_at, 0) >= ?",
+            (cutoff,),
+        ).fetchall()
+    return _aggregate_window(rows, event_rows, label=label, cutoff=cutoff, now=now)
 
 
 def _current_state_metrics(conn: sqlite3.Connection) -> dict[str, Any]:
