@@ -77,7 +77,9 @@ def test_keep_ack_is_idempotent(pg):
 
 
 @pytest.mark.parametrize("bad_option", ["unblock", "close", "reclaim_dead_running",
-                                        "clear_orphan_claim_lock", "remediate_parent_closeout"])
+                                        "clear_orphan_claim_lock", "remediate_parent_closeout",
+                                        "manual_review_with_stale_pr_risk", "reclaim_expired_claim",
+                                        "close_stale_run_metadata"])
 def test_mutation_options_guarded_no_write(pg, bad_option):
     s, pool, board = pg
     child = _seed_blocked_with_done_parent(s)
@@ -122,6 +124,21 @@ def test_backend_unavailable_no_leak(monkeypatch):
     res = krec.apply_reconcile_decision(task_id="t_x", option="keep_parked",
                                         packet_signature="x", confirm_dry_run=True,
                                         author="jensen")
+    assert res["ok"] is False
+    assert "secret-host" not in str(res)
+    assert "postgres backend unavailable" in res["error"]
+
+
+def test_ack_write_failure_no_leak(pg, monkeypatch):
+    s, pool, board = pg
+    child = _seed_blocked_with_done_parent(s)
+    opt, sig = _ack_option_and_sig(board, child)
+    # make add_comment raise with a host-bearing message AFTER the collect/validation succeed
+    monkeypatch.setattr(PostgresKanbanStore, "add_comment",
+                        lambda self, *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("write to secret-host:5432 failed")))
+    res = krec.apply_reconcile_decision(task_id=child, option=opt, packet_signature=sig,
+                                        confirm_dry_run=True, board=board, author="jensen")
     assert res["ok"] is False
     assert "secret-host" not in str(res)
     assert "postgres backend unavailable" in res["error"]

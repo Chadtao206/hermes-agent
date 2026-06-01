@@ -2157,8 +2157,9 @@ def _apply_reconcile_decision_pg(*, task_id, option, packet_signature, board,
                                  ready_age_seconds, author, now=None):
     """Postgres path for apply_reconcile_decision. Ports keep_parked/keep_blocked
     acks to live PG (write the idempotency comment via the store, closing B1's
-    suppression loop) and hard-guards every mutation option. Never raises out;
-    never touches the frozen sqlite board."""
+    suppression loop) and hard-guards every mutation option. Never raises out
+    (all PG I/O is wrapped and degraded to a redacted error); never touches the
+    frozen sqlite board."""
     from hermes_cli.kanban import pg_pool
     from hermes_cli.kanban.store_postgres import PostgresKanbanStore
     from hermes_cli.kanban_board_doctor import _redacted_pg_dsn
@@ -2177,44 +2178,44 @@ def _apply_reconcile_decision_pg(*, task_id, option, packet_signature, board,
         with pool.connection() as conn:
             actions = _collect_reconcile_actions_pg(
                 conn, slug, store, ready_age_seconds=ready_age_seconds, now=as_of)
+        action_dicts = actions_to_dicts(actions)
+        triage = classify_wake_triage(action_dicts)
+        packet = _find_decision_packet(triage.get("decision_packets") or [], task_id)
+        if packet is None:
+            return _apply_error("no current decision packet for task",
+                                board=slug, task_id=task_id, option=option)
+        if packet.get("packet_signature") != packet_signature:
+            return _apply_error("packet_signature does not match current decision packet",
+                                board=slug, task_id=task_id, option=option, packet=packet)
+        plan = (packet.get("operator_plans") or {}).get(option)
+        if not isinstance(plan, dict):
+            return _apply_error("selected option is not available for current decision packet",
+                                board=slug, task_id=task_id, option=option, packet=packet)
+        mutation = "comment_only"
+        comment = _reconcile_decision_applied_comment(
+            option=option, packet_signature=packet_signature,
+            category=packet.get("primary_category"), mutation=mutation)
+        existing = None
+        for c in store.list_comments(task_id):
+            if _reconcile_decision_comment_matches(c, option=option,
+                                                   packet_signature=packet_signature):
+                existing = c
+                break
+        if existing is not None:
+            return {"ok": True, "board": slug, "db_path": db_path, "task_id": task_id,
+                    "option": option, "packet_signature": packet_signature, "packet": packet,
+                    "plan": plan, "comment_id": existing.id, "comment": existing.body,
+                    "mutation_applied": False, "mutation": mutation, "idempotent": True,
+                    "as_of": as_of}
+        comment_id = store.add_comment(task_id, author=author or "jensen", body=comment)
+        return {"ok": True, "board": slug, "db_path": db_path, "task_id": task_id,
+                "option": option, "packet_signature": packet_signature, "packet": packet,
+                "plan": plan, "comment_id": comment_id, "comment": comment,
+                "mutation_applied": True, "mutation": mutation, "as_of": as_of}
     except Exception as exc:
         return _apply_error(
             f"postgres backend unavailable: {type(exc).__name__}",
             board=slug, task_id=task_id, option=option)
-    action_dicts = actions_to_dicts(actions)
-    triage = classify_wake_triage(action_dicts)
-    packet = _find_decision_packet(triage.get("decision_packets") or [], task_id)
-    if packet is None:
-        return _apply_error("no current decision packet for task",
-                            board=slug, task_id=task_id, option=option)
-    if packet.get("packet_signature") != packet_signature:
-        return _apply_error("packet_signature does not match current decision packet",
-                            board=slug, task_id=task_id, option=option, packet=packet)
-    plan = (packet.get("operator_plans") or {}).get(option)
-    if not isinstance(plan, dict):
-        return _apply_error("selected option is not available for current decision packet",
-                            board=slug, task_id=task_id, option=option, packet=packet)
-    mutation = "comment_only"
-    comment = _reconcile_decision_applied_comment(
-        option=option, packet_signature=packet_signature,
-        category=packet.get("primary_category"), mutation=mutation)
-    existing = None
-    for c in store.list_comments(task_id):
-        if _reconcile_decision_comment_matches(c, option=option,
-                                               packet_signature=packet_signature):
-            existing = c
-            break
-    if existing is not None:
-        return {"ok": True, "board": slug, "db_path": db_path, "task_id": task_id,
-                "option": option, "packet_signature": packet_signature, "packet": packet,
-                "plan": plan, "comment_id": existing.id, "comment": existing.body,
-                "mutation_applied": False, "mutation": mutation, "idempotent": True,
-                "as_of": as_of}
-    comment_id = store.add_comment(task_id, author=author or "jensen", body=comment)
-    return {"ok": True, "board": slug, "db_path": db_path, "task_id": task_id,
-            "option": option, "packet_signature": packet_signature, "packet": packet,
-            "plan": plan, "comment_id": comment_id, "comment": comment,
-            "mutation_applied": True, "mutation": mutation, "as_of": as_of}
 
 
 def apply_reconcile_decision(
