@@ -775,6 +775,40 @@ class PostgresKanbanStore:
             self.recompute_ready()
         return result
 
+    def delete_archived_task(self, task_id: str) -> bool:
+        """Permanently remove an already-archived task + its related rows.
+
+        Mirrors hermes_cli.kanban_db.delete_archived_task: only an ``archived``
+        task may be deleted (so accidental loss needs a deliberate archive
+        first). Board-scoped; single transaction. Returns True iff a row was
+        deleted. (Parity note: the PG-only kanban_profile_event_* tables are
+        NOT purged here, matching the sqlite cascade.)
+        """
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT status FROM tasks WHERE board=%s AND id=%s FOR UPDATE",
+                    (self.board, task_id),
+                )
+                row = cur.fetchone()
+                if row is None or row["status"] != "archived":
+                    return False
+                cur.execute(
+                    "DELETE FROM task_links WHERE board=%s AND (parent_id=%s OR child_id=%s)",
+                    (self.board, task_id, task_id),
+                )
+                cur.execute("DELETE FROM task_comments WHERE board=%s AND task_id=%s",
+                            (self.board, task_id))
+                cur.execute("DELETE FROM task_events WHERE board=%s AND task_id=%s",
+                            (self.board, task_id))
+                cur.execute("DELETE FROM task_runs WHERE board=%s AND task_id=%s",
+                            (self.board, task_id))
+                cur.execute("DELETE FROM kanban_notify_subs WHERE board=%s AND task_id=%s",
+                            (self.board, task_id))
+                cur.execute("DELETE FROM tasks WHERE board=%s AND id=%s",
+                            (self.board, task_id))
+                return cur.rowcount == 1
+
     def promote_task(self, task_id: str, *, actor, reason=None, force=False,
                      dry_run=False) -> tuple:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:

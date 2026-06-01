@@ -172,6 +172,9 @@ class SqliteKanbanStore:
     def delete_task(self, task_id: str) -> bool:
         return self._write("delete_task", task_id=task_id)
 
+    def delete_archived_task(self, task_id: str) -> bool:
+        return self._write("delete_archived_task", task_id=task_id)
+
     def promote_task(self, task_id: str, **kwargs: Any):
         return self._write("promote_task", task_id=task_id, **kwargs)
 

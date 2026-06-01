@@ -806,6 +806,22 @@ def test_create_task_auto_wake_arm_respects_recursion_guard(store, monkeypatch):
     assert subs == []
 
 
+def test_delete_archived_task_only_when_archived(store):
+    tid = store.create_task(title="purge me", assignee="engineer")
+    # not archived → refused, no mutation
+    assert store.delete_archived_task(tid) is False
+    assert store.get_task(tid) is not None
+    # archive, then add related rows, then purge
+    store.add_comment(tid, author="engineer", body="note")
+    assert store.archive_task(tid) is True
+    assert store.delete_archived_task(tid) is True
+    assert store.get_task(tid) is None
+    assert store.list_comments(tid) == []
+    assert store.list_events(tid) == []
+    # deleting again → False (already gone)
+    assert store.delete_archived_task(tid) is False
+
+
 def test_create_task_idempotency_hit_auto_arms_existing_root(store, monkeypatch):
     if store.__class__.__name__ == "SqliteKanbanStore":
         pytest.skip("sqlite behavior covered by tests/hermes_cli/test_kanban_wake_arm_cli.py")
