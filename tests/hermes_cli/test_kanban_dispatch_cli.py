@@ -53,6 +53,8 @@ def test_dispatch_live_tick_spawns_via_glue(kanban_home, monkeypatch, all_assign
 
 
 def test_dispatch_dry_run_is_read_only(kanban_home, monkeypatch, capsys):
+    # The dry-run branch returns before the gateway-warning block, so
+    # find_gateway_pids is not exercised and needn't be patched here.
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ready one", assignee="engineer")
     # spawn must NEVER be called in dry-run
@@ -67,6 +69,24 @@ def test_dispatch_dry_run_is_read_only(kanban_home, monkeypatch, capsys):
     assert "preview" in out.lower()
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "ready"  # NOT mutated
+
+
+def test_dispatch_dry_run_json_lists_assigned_candidate(kanban_home, monkeypatch, capsys):
+    import json as _json
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ready assigned", assignee="engineer")
+    # dry-run must never spawn
+    monkeypatch.setattr(kb, "_default_spawn",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned in dry-run")))
+    from hermes_cli.kanban.cli import _cmd_dispatch
+    rc = _cmd_dispatch(argparse.Namespace(dry_run=True, json=True, max=None,
+                                          failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT))
+    assert rc == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["preview"] is True
+    assert {"task_id": tid, "assignee": "engineer"} in payload["candidates"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"  # not mutated
 
 
 def test_dispatch_warns_when_gateway_running(kanban_home, monkeypatch, capsys, all_assignees_spawnable):

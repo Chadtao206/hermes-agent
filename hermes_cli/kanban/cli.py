@@ -2888,7 +2888,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     except Exception:
-        pass
+        pass  # best-effort advisory; failure to detect the gateway must not block dispatch
     from hermes_cli import kanban_glue as _glue
     try:
         from hermes_cli.profiles import profile_exists as _profile_exists
