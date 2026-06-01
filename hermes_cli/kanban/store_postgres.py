@@ -319,6 +319,117 @@ class PostgresKanbanStore:
             self.recompute_ready()
         return True
 
+    def decompose_triage_task(self, task_id: str, *, root_assignee, children,
+                              author=None, auto_promote=True):
+        """Fan a triage task into a child graph and promote the root to ``todo``
+        (PG mirror of kanban_db.decompose_triage_task). One transaction; emits
+        created/linked/decomposed events; recompute_ready() after iff auto_promote.
+        Returns child ids (input order) or None (missing/not-triage/empty/cycle)."""
+        if not children:
+            return None
+        if root_assignee is not None:
+            root_assignee = _canonical_assignee(root_assignee)
+        # --- pre-validate child shape (verbatim from kanban_db 5738-5753) ---
+        for idx, child in enumerate(children):
+            if not isinstance(child, dict):
+                raise ValueError(f"child[{idx}] is not a dict")
+            title = child.get("title")
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError(f"child[{idx}].title is required")
+            parents_idx = child.get("parents") or []
+            if not isinstance(parents_idx, list):
+                raise ValueError(f"child[{idx}].parents must be a list")
+            for p in parents_idx:
+                if not isinstance(p, int) or p < 0 or p >= len(children):
+                    raise ValueError(
+                        f"child[{idx}].parents[{p}] is not a valid index into children")
+                if p == idx:
+                    raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        # --- cycle detection (Kahn, verbatim from kanban_db 5760-5776) ---
+        _in_deg = [0] * len(children)
+        _adj = [[] for _ in range(len(children))]
+        for _i, _c in enumerate(children):
+            for _p in (_c.get("parents") or []):
+                _adj[_p].append(_i)
+                _in_deg[_i] += 1
+        _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
+        _seen = 0
+        while _queue:
+            _node = _queue.pop()
+            _seen += 1
+            for _nb in _adj[_node]:
+                _in_deg[_nb] -= 1
+                if _in_deg[_nb] == 0:
+                    _queue.append(_nb)
+        if _seen != len(children):
+            raise ValueError("cyclic dependency detected in decomposed children list")
+
+        now = int(time.time())
+        child_ids: list[str] = []
+        committed = False
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT id, status, tenant FROM tasks "
+                    "WHERE board=%s AND id=%s FOR UPDATE",
+                    (self.board, task_id))
+                root_row = cur.fetchone()
+                if root_row is None or root_row["status"] != "triage":
+                    return None
+                tenant = root_row["tenant"]
+                for child in children:
+                    new_id = _new_task_id()
+                    body = child.get("body")
+                    cur.execute(
+                        "INSERT INTO tasks (board, id, title, body, assignee, status, "
+                        "workspace_kind, tenant, created_at, created_by) "
+                        "VALUES (%s,%s,%s,%s,%s,'todo','scratch',%s,%s,%s)",
+                        (self.board, new_id, child["title"].strip(),
+                         body if isinstance(body, str) else None,
+                         _canonical_assignee(child.get("assignee")),
+                         tenant, now, (author or "decomposer")))
+                    self._emit(cur, new_id, "created",
+                               {"by": author or "decomposer",
+                                "from_decompose_of": task_id})
+                    child_ids.append(new_id)
+                for idx, child in enumerate(children):
+                    for p_idx in child.get("parents") or []:
+                        parent_id = child_ids[p_idx]
+                        child_id = child_ids[idx]
+                        cur.execute(
+                            "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
+                            "VALUES (%s,%s,%s,'dependency') ON CONFLICT DO NOTHING",
+                            (self.board, parent_id, child_id))
+                        self._emit(cur, child_id, "linked",
+                                   {"parent": parent_id, "child": child_id})
+                for cid in child_ids:
+                    cur.execute(
+                        "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
+                        "VALUES (%s,%s,%s,'dependency') ON CONFLICT DO NOTHING",
+                        (self.board, cid, task_id))
+                sets = ["status='todo'"]
+                params: list[Any] = []
+                if root_assignee is not None:
+                    sets.append("assignee=%s")
+                    params.append(root_assignee)
+                params.extend([self.board, task_id])
+                cur.execute(
+                    f"UPDATE tasks SET {', '.join(sets)} WHERE board=%s AND id=%s",
+                    tuple(params))
+                if author and author.strip():
+                    cur.execute(
+                        "INSERT INTO task_comments (board, task_id, author, body, created_at) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (self.board, task_id, author.strip(),
+                         "Decomposed into " + ", ".join(child_ids)
+                         + ". Root will wake when all children complete.", now))
+                self._emit(cur, task_id, "decomposed",
+                           {"child_ids": child_ids, "root_assignee": root_assignee})
+                committed = True
+        if committed and auto_promote:
+            self.recompute_ready()
+        return child_ids
+
     # --- status transitions ----------------------------------------------
 
     def block_task(self, task_id: str, *, reason=None, expected_run_id=None) -> bool:

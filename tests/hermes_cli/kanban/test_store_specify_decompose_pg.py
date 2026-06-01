@@ -74,3 +74,56 @@ def test_specify_with_open_parent_lands_in_todo(store):
     assert ok is True
     # parent is not done -> recompute_ready must NOT promote past todo
     assert store.get_task(tid).status == "todo"
+
+
+def _decompose(store, task_id, **kw):
+    if isinstance(store, PostgresKanbanStore):
+        return store.decompose_triage_task(task_id, **kw)
+    with kb.connect_closing() as conn:
+        return kb.decompose_triage_task(conn, task_id, **kw)
+
+
+def test_decompose_creates_child_graph_and_promotes_root(store):
+    root = store.create_task(title="big idea", triage=True)
+    children = [
+        {"title": "child A", "body": "do A", "assignee": "engineer", "parents": []},
+        {"title": "child B", "body": "do B", "assignee": "reviewer", "parents": [0]},
+    ]
+    child_ids = _decompose(store, root, root_assignee="orchestrator",
+                           children=children, author="alice")
+    assert isinstance(child_ids, list) and len(child_ids) == 2
+    a, b = child_ids
+    rt = store.get_task(root)
+    assert rt.status == "todo"
+    assert rt.assignee == "orchestrator"
+    assert store.get_task(a).assignee == "engineer"
+    assert store.get_task(b).assignee == "reviewer"
+    assert a in store.parent_ids(b)                 # A is a parent of B
+    assert set(store.parent_ids(root)) >= {a, b}    # root waits on both children
+    assert "decomposed" in [e.kind for e in store.list_events(root)]
+    assert "created" in [e.kind for e in store.list_events(a)]
+    assert "linked" in [e.kind for e in store.list_events(b)]
+    # exact decomposed-event payload parity
+    dec = [e for e in store.list_events(root) if e.kind == "decomposed"]
+    assert len(dec) == 1
+    assert dec[0].payload == {"child_ids": [a, b], "root_assignee": "orchestrator"}
+
+
+def test_decompose_returns_none_when_not_in_triage(store):
+    live = store.create_task(title="live")  # ready, not triage
+    assert _decompose(store, live, root_assignee=None,
+                      children=[{"title": "c"}]) is None
+
+
+def test_decompose_empty_children_returns_none(store):
+    root = store.create_task(title="x", triage=True)
+    assert _decompose(store, root, root_assignee=None, children=[]) is None
+    assert store.get_task(root).status == "triage"
+
+
+def test_decompose_cycle_raises_and_aborts(store):
+    root = store.create_task(title="x", triage=True)
+    children = [{"title": "a", "parents": [1]}, {"title": "b", "parents": [0]}]
+    with pytest.raises(ValueError):
+        _decompose(store, root, root_assignee=None, children=children)
+    assert store.get_task(root).status == "triage"  # atomic abort, no children created
