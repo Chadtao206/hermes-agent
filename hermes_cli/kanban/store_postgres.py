@@ -259,6 +259,66 @@ class PostgresKanbanStore:
             cur.execute(sql, tuple(params))
             return [self._row_to_task(r) for r in cur.fetchall()]
 
+    # --- triage composite writes -----------------------------------------
+
+    def specify_triage_task(self, task_id: str, *, title: Optional[str] = None,
+                            body: Optional[str] = None, assignee: Optional[str] = None,
+                            author: Optional[str] = None) -> bool:
+        """Flesh out a triage task and promote it to ``todo`` (PG mirror of
+        kanban_db.specify_triage_task). Single transaction; emits one
+        ``specified`` event; optional inline audit comment; recompute_ready()
+        outside the txn. Returns False when missing / not in triage."""
+        if title is not None and not title.strip():
+            raise ValueError("title cannot be blank")
+        assignee = _canonical_assignee(assignee)
+        promoted = False
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT title, body, assignee FROM tasks "
+                    "WHERE board=%s AND id=%s AND status='triage'",
+                    (self.board, task_id))
+                existing = cur.fetchone()
+                if existing is None:
+                    return False
+                sets = ["status='todo'"]
+                params: list[Any] = []
+                changed_fields: list[str] = []
+                if title is not None and title.strip() != (existing["title"] or ""):
+                    sets.append("title=%s")
+                    params.append(title.strip())
+                    changed_fields.append("title")
+                if body is not None and (body or "") != (existing["body"] or ""):
+                    sets.append("body=%s")
+                    params.append(body)
+                    changed_fields.append("body")
+                if assignee is not None and assignee != (existing["assignee"] or None):
+                    sets.append("assignee=%s")
+                    params.append(assignee)
+                    changed_fields.append("assignee")
+                params.extend([self.board, task_id])
+                cur.execute(
+                    f"UPDATE tasks SET {', '.join(sets)} "
+                    f"WHERE board=%s AND id=%s AND status='triage'",
+                    tuple(params))
+                if cur.rowcount != 1:
+                    return False
+                if changed_fields and author and author.strip():
+                    cur.execute(
+                        "INSERT INTO task_comments "
+                        "(board, task_id, author, body, created_at) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (self.board, task_id, author.strip(),
+                         "Specified — updated " + ", ".join(changed_fields)
+                         + " and promoted to todo.",
+                         int(time.time())))
+                self._emit(cur, task_id, "specified",
+                           {"changed_fields": changed_fields} if changed_fields else None)
+                promoted = True
+        if promoted:
+            self.recompute_ready()
+        return True
+
     # --- status transitions ----------------------------------------------
 
     def block_task(self, task_id: str, *, reason=None, expected_run_id=None) -> bool:
