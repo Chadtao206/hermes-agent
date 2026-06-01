@@ -2925,6 +2925,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _profile_exists = None
     store = _make_store()
     try:
+        # stale_timeout_seconds omitted: the CLI never passed it; run_dispatch_tick defaults it to 0.
         summary = _glue.run_dispatch_tick(
             store,
             board=kb.get_current_board(),

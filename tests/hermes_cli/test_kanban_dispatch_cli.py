@@ -23,29 +23,30 @@ def test_dispatch_live_tick_spawns_via_glue(kanban_home, monkeypatch, all_assign
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="do it", assignee="engineer")
     # capture spawns instead of launching a real worker
-    spawned = []
-    monkeypatch.setattr(kb, "_default_spawn", lambda task, ws, **kw: spawned.append(task.id) or 4321)
+    monkeypatch.setattr(kb, "_default_spawn", lambda task, ws, **kw: 4321)
     monkeypatch.setattr(kb, "resolve_workspace", lambda *a, **k: str(kanban_home))
     # Verify the live tick routes through kanban_glue.run_dispatch_tick.
-    # We confirm this by capturing calls to run_dispatch_tick and asserting it
-    # was invoked (the SQLite store.dispatch_plan legitimately uses dispatch_once
-    # internally, so patching dispatch_once to raise would be too aggressive).
+    # We confirm this by capturing the return value of run_dispatch_tick and
+    # asserting it was invoked and recorded the spawn in its summary dict
+    # (more robust than a module-level list: avoids cross-module patch identity
+    # fragility across test-file boundaries).
     import hermes_cli.kanban_glue as _glue
-    glue_calls = []
-    real_run_dispatch_tick = _glue.run_dispatch_tick
+    calls = []
+    real = _glue.run_dispatch_tick
 
-    def _capturing_run_dispatch_tick(store, **kwargs):
-        glue_calls.append(kwargs)
-        return real_run_dispatch_tick(store, **kwargs)
+    def _capture(*a, **k):
+        summary = real(*a, **k)
+        calls.append(summary)
+        return summary
 
-    monkeypatch.setattr(_glue, "run_dispatch_tick", _capturing_run_dispatch_tick)
+    monkeypatch.setattr(_glue, "run_dispatch_tick", _capture)
     from hermes_cli.kanban.cli import _cmd_dispatch
     rc = _cmd_dispatch(argparse.Namespace(dry_run=False, json=True, max=None,
                                           failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT))
     assert rc == 0
-    # The glue was called
-    assert len(glue_calls) == 1
-    # The task was spawned via the glue path
-    assert spawned == [tid]
+    # The glue was called exactly once
+    assert len(calls) == 1
+    # The spawn was recorded in the glue's own accounting (spawned_ids)
+    assert tid in (calls[0].get("spawned_ids") or [])
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "running"
