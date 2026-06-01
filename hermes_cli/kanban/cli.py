@@ -2808,10 +2808,22 @@ def _cmd_archive(args: argparse.Namespace) -> int:
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
+    # Route reads through the backend-aware store under Postgres (mirrors
+    # _cmd_runs). Resolve once: the backend can't change mid-session. Without
+    # this, tail would open the frozen sqlite kanban.db (stale events) and
+    # could recreate an empty board file after it's retired.
+    pg = resolve_backend() == "postgres"
     try:
         while True:
-            with kb.connect_closing() as conn:
-                events = kb.list_events(conn, args.task_id)
+            if pg:
+                store = _make_store()
+                try:
+                    events = store.list_events(args.task_id)
+                finally:
+                    store.close()
+            else:
+                with kb.connect_closing() as conn:
+                    events = kb.list_events(conn, args.task_id)
             for e in events:
                 if e.id > last_id:
                     pl = f" {e.payload}" if e.payload else ""
