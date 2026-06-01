@@ -1186,6 +1186,326 @@ def collect_reconcile_actions(
     return _sort_actions(actions)
 
 
+def _collect_reconcile_actions_pg(
+    conn,
+    slug: str,
+    store,
+    *,
+    ready_age_seconds: int = 15 * 60,
+    now: Optional[int] = None,
+) -> list[ReconcileAction]:
+    """Board-scoped Postgres port of ``collect_reconcile_actions``.
+
+    Read-only: emits the same nine CORE action kinds (same kind/severity/reason/
+    safe_to_apply/details as the sqlite collector) but never writes/mutates the
+    board. ``conn`` is an open psycopg connection (caller-owned); ``store`` is a
+    ``PostgresKanbanStore`` bound to ``slug`` (used only for ``store.get_task``
+    in the pre-spawn check). The two niche DEFERRED kinds
+    (``review_parent_pr_head_evidence_missing`` and
+    ``repeated_failure_signature_decision``) are intentionally not emitted.
+    """
+    from psycopg.rows import dict_row
+
+    as_of = int(now if now is not None else time.time())
+    ready_age_seconds = max(1, int(ready_age_seconds or 900))
+    actions: list[ReconcileAction] = []
+    host_prefix = _host_prefix()
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Running tasks: split dead/expired/stale-heartbeat observations so a
+        # heartbeat warning alone never becomes reclaim authority.
+        cur.execute(
+            "SELECT id, title, assignee, worker_pid, claim_lock, claim_expires, "
+            "       last_heartbeat_at, current_run_id, started_at "
+            "  FROM tasks "
+            " WHERE board=%s AND status='running' "
+            " ORDER BY started_at, created_at, id",
+            (slug,),
+        )
+        for row in cur.fetchall():
+            pid_alive = _pid_alive(row["worker_pid"])
+            claim_expires = row["claim_expires"]
+            expired = bool(claim_expires and int(claim_expires) < as_of)
+            hb = row["last_heartbeat_at"]
+            heartbeat_age = (as_of - int(hb)) if hb is not None else None
+            stale_hb = bool(heartbeat_age is not None and heartbeat_age > 15 * 60)
+            base = {
+                "assignee": row["assignee"],
+                "worker_pid": row["worker_pid"],
+                "pid_alive": pid_alive,
+                "claim_lock": row["claim_lock"],
+                "claim_expires": claim_expires,
+                "last_heartbeat_at": hb,
+                "current_run_id": row["current_run_id"],
+            }
+            if not pid_alive:
+                # Safe only when this is clearly a host-local worker claim or no
+                # pid was ever recorded.  The dry-run record remains advisory.
+                lock = row["claim_lock"] or ""
+                host_local = bool(host_prefix and lock.startswith(host_prefix))
+                safe = host_local or row["worker_pid"] is None
+                actions.append(_action(
+                    "dead_running_candidate",
+                    row["id"],
+                    "critical",
+                    "running task has no live worker PID",
+                    safe_to_apply=safe,
+                    details={**base, "host_local": host_local},
+                ))
+            if expired:
+                lock = row["claim_lock"] or ""
+                host_local = bool(host_prefix and lock.startswith(host_prefix))
+                safe = (host_local and not pid_alive) or row["worker_pid"] is None
+                actions.append(_action(
+                    "expired_claim_candidate",
+                    row["id"],
+                    "warning",
+                    "running task claim has expired",
+                    safe_to_apply=safe,
+                    details={
+                        **base,
+                        "seconds_expired": as_of - int(claim_expires),
+                        "host_local": host_local,
+                    },
+                ))
+            if stale_hb:
+                actions.append(_action(
+                    "stale_heartbeat_observed",
+                    row["id"],
+                    "warning",
+                    "running task heartbeat is older than the advisory threshold",
+                    safe_to_apply=False,
+                    details={**base, "heartbeat_age_seconds": heartbeat_age},
+                ))
+
+        # Stale run metadata: run row still marked running but no longer the
+        # current task run.  Phase 1A reports only; Phase 1B may clean this up.
+        cur.execute(
+            "SELECT r.id AS run_id, r.task_id, r.profile, r.worker_pid, r.started_at, "
+            "       t.status AS task_status, t.current_run_id "
+            "  FROM task_runs r "
+            "  JOIN tasks t ON t.board=r.board AND t.id=r.task_id "
+            " WHERE r.board=%s AND r.status='running' "
+            "   AND (t.status != 'running' OR t.current_run_id IS NULL "
+            "        OR t.current_run_id != r.id) "
+            " ORDER BY r.started_at DESC, r.id DESC",
+            (slug,),
+        )
+        for row in cur.fetchall():
+            pid_alive = _pid_alive(row["worker_pid"])
+            actions.append(_action(
+                "stale_run_metadata",
+                row["task_id"],
+                "warning",
+                "task_run is marked running but is not the task current active run",
+                safe_to_apply=not pid_alive,
+                details={
+                    "run_id": row["run_id"],
+                    "profile": row["profile"],
+                    "worker_pid": row["worker_pid"],
+                    "pid_alive": pid_alive,
+                    "task_status": row["task_status"],
+                    "current_run_id": row["current_run_id"],
+                },
+            ))
+
+        # Orphan claim locks: claim_lock is set but the task is no longer
+        # running.  All claim/release/timeout/complete paths clear claim_lock
+        # atomically when they leave 'running', so a non-terminal, non-running
+        # row carrying a lock is an invariant violation that blocks future
+        # claim_task CAS attempts (which require claim_lock IS NULL).  Terminal
+        # states (done/archived) can never be reclaimed, so a residual lock
+        # there is cosmetic and excluded to keep the watchdog signal actionable.
+        cur.execute(
+            "SELECT id, status, assignee, claim_lock, claim_expires, worker_pid, "
+            "       current_run_id, last_heartbeat_at, started_at, created_at "
+            "  FROM tasks "
+            " WHERE board=%s AND claim_lock IS NOT NULL "
+            "   AND status NOT IN ('running', 'done', 'archived') "
+            " ORDER BY id",
+            (slug,),
+        )
+        for row in cur.fetchall():
+            claim_expires = row["claim_expires"]
+            actions.append(_action(
+                "orphan_claim_lock_observed",
+                row["id"],
+                "error",
+                "task is not running but still carries a claim_lock; "
+                "future claim_task CAS will fail until the lock is cleared",
+                safe_to_apply=False,
+                details={
+                    "status": row["status"],
+                    "assignee": row["assignee"],
+                    "claim_lock": row["claim_lock"],
+                    "claim_expires": claim_expires,
+                    "claim_expired": bool(
+                        claim_expires is not None and int(claim_expires) < as_of
+                    ),
+                    "worker_pid": row["worker_pid"],
+                    "pid_alive": _pid_alive(row["worker_pid"]),
+                    "current_run_id": row["current_run_id"],
+                    "last_heartbeat_at": row["last_heartbeat_at"],
+                    "started_at": row["started_at"],
+                    "age_seconds": as_of - int(row["created_at"]),
+                },
+            ))
+
+        # Blocked tasks whose dependency parents are all terminal need an
+        # explicit Jensen/reviewer decision, not automatic unblocking.
+        cur.execute(
+            "SELECT c.id, c.title, c.assignee, COUNT(l.parent_id) AS parents, "
+            "  SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) "
+            "      AS terminal_parents, "
+            "  string_agg(p.id || ':' || p.status, ', ') AS parent_state "
+            "  FROM tasks c "
+            "  JOIN task_links l ON l.board=c.board AND l.child_id=c.id "
+            "  JOIN tasks p ON p.board=l.board AND p.id=l.parent_id "
+            " WHERE c.board=%s AND c.status='blocked' "
+            "   AND COALESCE(l.relation_type,'dependency')='dependency' "
+            " GROUP BY c.id, c.title, c.assignee, c.created_at "
+            "HAVING COUNT(l.parent_id) > 0 "
+            "   AND COUNT(l.parent_id) = "
+            "       SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) "
+            " ORDER BY c.created_at, c.id",
+            (slug,),
+        )
+        for row in cur.fetchall():
+            actions.append(_action(
+                "blocked_with_completed_parents_decision",
+                row["id"],
+                "warning",
+                "blocked task has all dependency parents completed; explicit unblock/re-review decision needed",
+                safe_to_apply=False,
+                details={
+                    "assignee": row["assignee"],
+                    "parents": row["parent_state"],
+                    "parent_count": row["parents"],
+                },
+            ))
+
+        # Scheduled tasks are intentionally non-dispatchable, so do not
+        # auto-unblock them.  But when all dependency parents are terminal and
+        # the card has no active claim/run, an old scheduled task is often a
+        # parked decision rather than healthy idle work.  Surface it as
+        # decision-only so Jensen/operator wakes can inspect and choose unblock,
+        # keep parked, or close out.
+        cur.execute(
+            "SELECT c.id, c.title, c.assignee, c.created_at, c.started_at, "
+            "       c.current_run_id, c.last_heartbeat_at, "
+            "       COUNT(l.parent_id) AS parents, "
+            "  SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) "
+            "      AS terminal_parents, "
+            "  string_agg(p.id || ':' || p.status, ', ') AS parent_state "
+            "  FROM tasks c "
+            "  JOIN task_links l ON l.board=c.board AND l.child_id=c.id "
+            "  JOIN tasks p ON p.board=l.board AND p.id=l.parent_id "
+            " WHERE c.board=%s AND c.status='scheduled' "
+            "   AND c.claim_lock IS NULL "
+            "   AND c.current_run_id IS NULL "
+            "   AND c.worker_pid IS NULL "
+            "   AND COALESCE(l.relation_type,'dependency')='dependency' "
+            " GROUP BY c.id, c.title, c.assignee, c.created_at, c.started_at, "
+            "          c.current_run_id, c.last_heartbeat_at "
+            "HAVING COUNT(l.parent_id) > 0 "
+            "   AND COUNT(l.parent_id) = "
+            "       SUM(CASE WHEN p.status IN ('done','archived') THEN 1 ELSE 0 END) "
+            " ORDER BY c.created_at, c.id",
+            (slug,),
+        )
+        for row in cur.fetchall():
+            age = as_of - int(row["created_at"])
+            if age < ready_age_seconds:
+                continue
+            actions.append(_action(
+                "scheduled_with_completed_parents_decision",
+                row["id"],
+                "warning",
+                "scheduled task has all dependency parents completed and needs an explicit keep-parked/unblock/close decision",
+                safe_to_apply=False,
+                details={
+                    "assignee": row["assignee"],
+                    "parents": row["parent_state"],
+                    "parent_count": row["parents"],
+                    "age_seconds": age,
+                    "created_at": row["created_at"],
+                    "started_at": row["started_at"],
+                    "current_run_id": row["current_run_id"],
+                    "last_heartbeat_at": row["last_heartbeat_at"],
+                },
+            ))
+
+        # NOTE: review_parent_pr_head_evidence_missing is DEFERRED (not emitted).
+
+        # Spawn prerequisite validation mirrors the dispatcher's deterministic
+        # pre-spawn checks without claiming tasks or writing failure rows.  This
+        # gives Jensen/operator wakes an actionable decision queue for profile,
+        # skill, and workspace defects before the dispatcher burns retries.
+        cur.execute(
+            "SELECT id, status, title, assignee, created_at "
+            "  FROM tasks "
+            " WHERE board=%s AND status='ready' "
+            "   AND claim_lock IS NULL "
+            " ORDER BY priority DESC, created_at, id",
+            (slug,),
+        )
+        ready_unclaimed_rows = cur.fetchall()
+        for row in ready_unclaimed_rows:
+            task = store.get_task(row["id"])
+            if task is None:
+                continue
+            errors = _pre_spawn_validation_errors_for_reconcile(task)
+            if not errors:
+                continue
+            actions.append(_action(
+                "pre_spawn_validation_decision",
+                row["id"],
+                "warning",
+                "task is eligible to spawn but deterministic profile/skill/workspace prerequisites are not satisfied",
+                safe_to_apply=False,
+                details={
+                    "assignee": row["assignee"],
+                    "status": row["status"],
+                    "age_seconds": as_of - int(row["created_at"]),
+                    "workspace_kind": task.workspace_kind,
+                    "workspace_path": task.workspace_path,
+                    "skills": task.skills or [],
+                    "validation_errors": errors,
+                },
+            ))
+
+        # NOTE: repeated_failure_signature_decision is DEFERRED (not emitted).
+
+        cur.execute(
+            "SELECT id, title, assignee, created_at "
+            "  FROM tasks "
+            " WHERE board=%s AND status='ready' AND claim_lock IS NULL "
+            " ORDER BY created_at, id",
+            (slug,),
+        )
+        for row in cur.fetchall():
+            age = as_of - int(row["created_at"])
+            if age < ready_age_seconds:
+                continue
+            spawnable = _profile_spawnable(row["assignee"])
+            kind = f"old_ready_{'spawnable' if spawnable else 'nonspawnable'}"
+            actions.append(_action(
+                kind,
+                row["id"],
+                "warning" if spawnable else "info",
+                "ready task has not been claimed within threshold",
+                safe_to_apply=False,
+                details={
+                    "assignee": row["assignee"],
+                    "age_seconds": age,
+                    "created_at": row["created_at"],
+                    "spawnable_profile": spawnable,
+                },
+            ))
+
+    return _sort_actions(actions)
+
+
 def actions_to_dicts(actions: list[ReconcileAction]) -> list[dict[str, Any]]:
     return [asdict(action) for action in actions]
 
@@ -1314,6 +1634,25 @@ def _reconcile_decision_applied_comment(
     )
 
 
+def _reconcile_decision_comment_matches(
+    comment: kb.Comment,
+    *,
+    option: str,
+    packet_signature: str,
+) -> bool:
+    """Pure per-comment predicate for an applied-decision audit comment.
+
+    Extracted so backend-specific packet filters (e.g. the PG path) can reuse
+    the same marker test without an open sqlite connection. Behavior is
+    identical to the inlined sqlite check.
+    """
+    return (
+        "Jensen reconcile decision applied:" in comment.body
+        and f"option={option};" in comment.body
+        and f"packet_signature={packet_signature};" in comment.body
+    )
+
+
 def _find_existing_reconcile_decision_comment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1328,14 +1667,9 @@ def _find_existing_reconcile_decision_comment(
     with the same option and packet signature as the durable idempotency record
     rather than appending another comment.
     """
-    marker = "Jensen reconcile decision applied:"
-    option_marker = f"option={option};"
-    signature_marker = f"packet_signature={packet_signature};"
     for comment in kb.list_comments(conn, task_id):
-        if (
-            marker in comment.body
-            and option_marker in comment.body
-            and signature_marker in comment.body
+        if _reconcile_decision_comment_matches(
+            comment, option=option, packet_signature=packet_signature
         ):
             return comment
     return None
