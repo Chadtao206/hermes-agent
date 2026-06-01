@@ -2848,73 +2848,119 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
+    if getattr(args, "dry_run", False):
+        # Dry-run branch: keep legacy dispatch_once path (Task 5 will replace).
+        with kb.connect_closing() as conn:
+            res = kb.dispatch_once(
+                conn,
+                dry_run=True,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+            )
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "reclaimed": res.reclaimed,
+                "crashed": res.crashed,
+                "timed_out": res.timed_out,
+                "stale": res.stale,
+                "auto_blocked": res.auto_blocked,
+                "promoted": res.promoted,
+                "spawned": [
+                    {"task_id": tid, "assignee": who, "workspace": ws}
+                    for (tid, who, ws) in res.spawned
+                ],
+                "skipped_unassigned": res.skipped_unassigned,
+                "skipped_nonspawnable": res.skipped_nonspawnable,
+                "summary": res.summary(),
+                "skipped_per_profile_capped": [
+                    {"task_id": tid, "assignee": who, "current": current}
+                    for (tid, who, current) in res.skipped_per_profile_capped
+                ],
+                "auto_assigned_default": res.auto_assigned_default,
+            }, indent=2))
+            return 0
+        print(f"Reclaimed:    {res.reclaimed}")
+        print(f"Crashed:      {len(res.crashed)}")
+        if res.crashed:
+            print(f"  {', '.join(res.crashed)}")
+        print(f"Timed out:    {len(res.timed_out)}")
+        if res.timed_out:
+            print(f"  {', '.join(res.timed_out)}")
+        print(f"Stale:        {len(res.stale)}")
+        if res.stale:
+            print(f"  {', '.join(res.stale)}")
+        print(f"Auto-blocked: {len(res.auto_blocked)}")
+        if res.auto_blocked:
+            print(f"  {', '.join(res.auto_blocked)}")
+        print(f"Promoted:     {res.promoted}")
+        print(f"Spawned:      {len(res.spawned)}")
+        for tid, who, ws in res.spawned:
+            print(f"  - {tid}  ->  {who}  @ {ws or '-'} (dry)")
+        if res.auto_assigned_default:
+            print(
+                f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
+                f"{', '.join(res.auto_assigned_default)}"
+            )
+        if res.skipped_unassigned:
+            print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+        if res.skipped_per_profile_capped:
+            for tid, who, current in res.skipped_per_profile_capped:
+                print(
+                    f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+                )
+        if res.skipped_nonspawnable:
+            print(
+                f"Skipped (non-spawnable assignee — terminal lane, OK): "
+                f"{', '.join(res.skipped_nonspawnable)}"
+            )
+        return 0
+    # Live tick: route through the backend-agnostic glue (mirrors gateway/run.py ~6987).
+    from hermes_cli import kanban_glue as _glue
+    try:
+        from hermes_cli.profiles import profile_exists as _profile_exists
+    except Exception:
+        _profile_exists = None
+    store = _make_store()
+    try:
+        summary = _glue.run_dispatch_tick(
+            store,
+            board=kb.get_current_board(),
+            spawn_fn=kb._default_spawn,
+            resolve_workspace=kb.resolve_workspace,
+            profile_exists=_profile_exists,
+            terminate_fn=lambda pid, lock: kb._terminate_reclaimed_worker(pid, lock, signal_fn=os.kill),
+            pid_alive_fn=kb._pid_alive,
+            classify_exit_fn=kb._classify_worker_exit,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    finally:
+        store.close()
     if getattr(args, "json", False):
-        print(json.dumps({
-            "reclaimed": res.reclaimed,
-            "crashed": res.crashed,
-            "timed_out": res.timed_out,
-            "stale": res.stale,
-            "auto_blocked": res.auto_blocked,
-            "promoted": res.promoted,
-            "spawned": [
-                {"task_id": tid, "assignee": who, "workspace": ws}
-                for (tid, who, ws) in res.spawned
-            ],
-            "skipped_unassigned": res.skipped_unassigned,
-            "skipped_nonspawnable": res.skipped_nonspawnable,
-            "summary": res.summary(),
-            "skipped_per_profile_capped": [
-                {"task_id": tid, "assignee": who, "current": current}
-                for (tid, who, current) in res.skipped_per_profile_capped
-            ],
-            "auto_assigned_default": res.auto_assigned_default,
-        }, indent=2))
+        print(json.dumps(summary, indent=2))
         return 0
-    print(f"Reclaimed:    {res.reclaimed}")
-    print(f"Crashed:      {len(res.crashed)}")
-    if res.crashed:
-        print(f"  {', '.join(res.crashed)}")
-    print(f"Timed out:    {len(res.timed_out)}")
-    if res.timed_out:
-        print(f"  {', '.join(res.timed_out)}")
-    print(f"Stale:        {len(res.stale)}")
-    if res.stale:
-        print(f"  {', '.join(res.stale)}")
-    print(f"Auto-blocked: {len(res.auto_blocked)}")
-    if res.auto_blocked:
-        print(f"  {', '.join(res.auto_blocked)}")
-    print(f"Promoted:     {res.promoted}")
-    print(f"Spawned:      {len(res.spawned)}")
-    for tid, who, ws in res.spawned:
-        tag = " (dry)" if args.dry_run else ""
-        print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
-    if res.auto_assigned_default:
-        print(
-            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
-            f"{', '.join(res.auto_assigned_default)}"
-        )
-    if res.skipped_unassigned:
-        print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
-    if res.skipped_per_profile_capped:
-        for tid, who, current in res.skipped_per_profile_capped:
-            print(
-                f"Deferred ({who} at per-profile cap, {current} running): {tid}"
-            )
-    if res.skipped_nonspawnable:
-        print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
-            f"{', '.join(res.skipped_nonspawnable)}"
-        )
+    # Human output rebuilt from the glue summary dict (counts; ids in *_ids).
+    print(f"Reclaimed:    {summary.get('reclaimed', 0)}")
+    print(f"Crashed:      {summary.get('crashed', 0)}")
+    print(f"Timed out:    {summary.get('timed_out', 0)}")
+    print(f"Stale:        {summary.get('stale', 0)}")
+    auto_ids = summary.get('auto_blocked_ids') or []
+    print(f"Auto-blocked: {summary.get('auto_blocked', len(auto_ids))}")
+    if auto_ids:
+        print(f"  {', '.join(auto_ids)}")
+    print(f"Promoted:     {summary.get('promoted', 0)}")
+    spawned_ids = summary.get('spawned_ids') or []
+    print(f"Spawned:      {summary.get('spawned', len(spawned_ids))}")
+    for tid in spawned_ids:
+        print(f"  - {tid}")
+    if summary.get('skipped_unassigned'):
+        print(f"Skipped (unassigned): {summary['skipped_unassigned']}")
     return 0
 
 
