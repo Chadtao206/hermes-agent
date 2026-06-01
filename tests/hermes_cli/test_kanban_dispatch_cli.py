@@ -50,3 +50,32 @@ def test_dispatch_live_tick_spawns_via_glue(kanban_home, monkeypatch, all_assign
     assert tid in (calls[0].get("spawned_ids") or [])
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "running"
+
+
+def test_dispatch_dry_run_is_read_only(kanban_home, monkeypatch, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ready one", assignee="engineer")
+    # spawn must NEVER be called in dry-run
+    monkeypatch.setattr(kb, "_default_spawn",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned in dry-run")))
+    from hermes_cli.kanban.cli import _cmd_dispatch
+    rc = _cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
+                                          failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert tid in out
+    assert "preview" in out.lower()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"  # NOT mutated
+
+
+def test_dispatch_warns_when_gateway_running(kanban_home, monkeypatch, capsys, all_assignees_spawnable):
+    with kb.connect() as conn:
+        kb.create_task(conn, title="x", assignee="engineer")
+    monkeypatch.setattr(kb, "_default_spawn", lambda *a, **k: None)
+    monkeypatch.setattr(kb, "resolve_workspace", lambda *a, **k: str(kanban_home))
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [9999])
+    from hermes_cli.kanban.cli import _cmd_dispatch
+    _cmd_dispatch(argparse.Namespace(dry_run=False, json=True, max=None,
+                                     failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT))
+    assert "double-spawn" in capsys.readouterr().err

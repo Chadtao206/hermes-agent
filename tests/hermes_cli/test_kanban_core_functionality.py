@@ -923,7 +923,7 @@ def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
         assert kb.archive_task(conn, tid)
     finally:
         conn.close()
-    out = run_slash(f"archive --rm {tid}")
+    out = run_slash(f"archive --rm {tid} --confirm")
     assert f"Deleted {tid}" in out
     conn = kb.connect()
     try:
@@ -1075,22 +1075,16 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
         assert out.strip() != "", f"empty output for `/kanban {cmd}`"
 
 
-def test_dispatch_json_preserves_legacy_lists_and_adds_summary(kanban_home):
-    """dispatch --json remains backward-compatible while exposing diagnostics."""
+def test_dispatch_dry_run_json_preview_format(kanban_home):
+    """dispatch --dry-run --json returns a read-only preview payload."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="needs assignment")
+        kb.create_task(conn, title="needs assignment")
 
     payload = json.loads(run_slash("dispatch --dry-run --json"))
 
-    assert payload["spawned"] == []
-    assert payload["skipped_unassigned"] == [tid]
-    assert isinstance(payload["crashed"], list)
-    assert isinstance(payload["timed_out"], list)
-    assert isinstance(payload["stale"], list)
-    assert isinstance(payload["auto_blocked"], list)
-    assert payload["summary"]["ready_count"] == 1
-    assert payload["summary"]["spawned"] == 0
-    assert payload["summary"]["skipped_unassigned"] == 1
+    # New preview format: preview=True, candidates list (empty — task has no assignee)
+    assert payload["preview"] is True
+    assert payload["candidates"] == []
 
 
 # ---------------------------------------------------------------------------

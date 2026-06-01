@@ -31,10 +31,13 @@ def isolated_kanban_home(monkeypatch):
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
     """#33488: hermes kanban dispatch must pass kanban.max_in_progress from
-    config to dispatch_once. Without this, the global concurrency cap is
+    config to run_dispatch_tick. Without this, the global concurrency cap is
     unreachable from the CLI even though it works from the gateway."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    import hermes_cli.kanban_glue as _glue
+
+    kanban_db.init_db()
 
     # Configure max_in_progress in the loaded config.
     fake_config = {
@@ -50,17 +53,20 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
 
     captured = {}
+    real_tick = _glue.run_dispatch_tick
 
-    def fake_dispatch_once(conn, **kwargs):
+    def fake_tick(store, **kwargs):
         captured.update(kwargs)
-        return kanban_db.DispatchResult()
+        return real_tick(store, **kwargs)
 
-    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(_glue, "run_dispatch_tick", fake_tick)
+    # suppress gateway warning
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
 
-    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
     kb_cli._cmd_dispatch(args)
 
-    # Every config value must have reached dispatch_once.
+    # Every config value must have reached run_dispatch_tick.
     assert captured.get("max_in_progress") == 3, (
         f"CLI must pass kanban.max_in_progress from config; got {captured.get('max_in_progress')!r}"
     )
@@ -76,17 +82,25 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     The CLI flag is the explicit operator signal; config is the default."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    import hermes_cli.kanban_glue as _glue
+
+    kanban_db.init_db()
 
     fake_config = {"kanban": {"max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
 
     captured = {}
-    monkeypatch.setattr(
-        kanban_db, "dispatch_once",
-        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
-    )
+    real_tick = _glue.run_dispatch_tick
 
-    args = argparse.Namespace(dry_run=True, max=2, failure_limit=2, json=False)
+    def fake_tick(store, **kwargs):
+        captured.update(kwargs)
+        return real_tick(store, **kwargs)
+
+    monkeypatch.setattr(_glue, "run_dispatch_tick", fake_tick)
+    # suppress gateway warning
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+    args = argparse.Namespace(dry_run=False, max=2, failure_limit=2, json=False)
     kb_cli._cmd_dispatch(args)
 
     assert captured.get("max_spawn") == 2, (

@@ -170,7 +170,9 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")
     out = kc.run_slash("dispatch --dry-run")
-    assert "Spawned:" in out
+    # dry-run is now a read-only preview (no spawning); confirm preview header + task ids present
+    assert "preview" in out.lower()
+    assert "alice" in out or "bob" in out
 
 
 def test_run_slash_context_output_format(kanban_home):

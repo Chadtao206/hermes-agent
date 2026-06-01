@@ -64,6 +64,19 @@ def _make_store():
     return kanban_store(board=None)
 
 
+def _dispatch_preview(store, *, default_assignee):
+    """Read-only, APPROXIMATE preview of what the next dispatch tick would
+    consider: current 'ready' tasks with an assignee (or the configured
+    default_assignee). Mutates nothing. The live tick is authoritative."""
+    tasks = store.list_tasks(status="ready")
+    out = []
+    for t in tasks:
+        who = getattr(t, "assignee", None) or default_assignee
+        if who:
+            out.append((t.id, who))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Small formatting helpers
 # ---------------------------------------------------------------------------
@@ -2849,75 +2862,33 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     if getattr(args, "dry_run", False):
-        # Dry-run branch: keep legacy dispatch_once path (Task 5 will replace).
-        with kb.connect_closing() as conn:
-            res = kb.dispatch_once(
-                conn,
-                dry_run=True,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-            )
+        store = _make_store()
+        try:
+            candidates = _dispatch_preview(store, default_assignee=default_assignee)
+        finally:
+            store.close()
         if getattr(args, "json", False):
-            print(json.dumps({
-                "reclaimed": res.reclaimed,
-                "crashed": res.crashed,
-                "timed_out": res.timed_out,
-                "stale": res.stale,
-                "auto_blocked": res.auto_blocked,
-                "promoted": res.promoted,
-                "spawned": [
-                    {"task_id": tid, "assignee": who, "workspace": ws}
-                    for (tid, who, ws) in res.spawned
-                ],
-                "skipped_unassigned": res.skipped_unassigned,
-                "skipped_nonspawnable": res.skipped_nonspawnable,
-                "summary": res.summary(),
-                "skipped_per_profile_capped": [
-                    {"task_id": tid, "assignee": who, "current": current}
-                    for (tid, who, current) in res.skipped_per_profile_capped
-                ],
-                "auto_assigned_default": res.auto_assigned_default,
-            }, indent=2))
+            print(json.dumps({"preview": True, "candidates": [
+                {"task_id": tid, "assignee": who} for tid, who in candidates]}, indent=2))
             return 0
-        print(f"Reclaimed:    {res.reclaimed}")
-        print(f"Crashed:      {len(res.crashed)}")
-        if res.crashed:
-            print(f"  {', '.join(res.crashed)}")
-        print(f"Timed out:    {len(res.timed_out)}")
-        if res.timed_out:
-            print(f"  {', '.join(res.timed_out)}")
-        print(f"Stale:        {len(res.stale)}")
-        if res.stale:
-            print(f"  {', '.join(res.stale)}")
-        print(f"Auto-blocked: {len(res.auto_blocked)}")
-        if res.auto_blocked:
-            print(f"  {', '.join(res.auto_blocked)}")
-        print(f"Promoted:     {res.promoted}")
-        print(f"Spawned:      {len(res.spawned)}")
-        for tid, who, ws in res.spawned:
-            print(f"  - {tid}  ->  {who}  @ {ws or '-'} (dry)")
-        if res.auto_assigned_default:
-            print(
-                f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
-                f"{', '.join(res.auto_assigned_default)}"
-            )
-        if res.skipped_unassigned:
-            print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
-        if res.skipped_per_profile_capped:
-            for tid, who, current in res.skipped_per_profile_capped:
-                print(
-                    f"Deferred ({who} at per-profile cap, {current} running): {tid}"
-                )
-        if res.skipped_nonspawnable:
-            print(
-                f"Skipped (non-spawnable assignee — terminal lane, OK): "
-                f"{', '.join(res.skipped_nonspawnable)}"
-            )
+        print("Dispatch preview (read-only, approximate — the live tick is authoritative):")
+        if not candidates:
+            print("  (no ready, assigned tasks)")
+        for tid, who in candidates:
+            print(f"  - {tid}  ->  {who}")
         return 0
     # Live tick: route through the backend-agnostic glue (mirrors gateway/run.py ~6987).
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+        if find_gateway_pids():
+            print(
+                "warning: the gateway is running and may already be dispatching; "
+                "a manual tick can double-spawn. Use the gateway's embedded "
+                "dispatcher, or stop it first.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
     from hermes_cli import kanban_glue as _glue
     try:
         from hermes_cli.profiles import profile_exists as _profile_exists
