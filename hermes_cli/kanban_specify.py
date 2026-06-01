@@ -40,6 +40,21 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 
+
+def _resolve_backend() -> str:
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        return resolve_backend()
+    except Exception:
+        return "sqlite"
+
+
+def _pg_store():
+    """Construct a PG store bound to the current board (resolve slug once)."""
+    from hermes_cli.kanban.store_postgres import PostgresKanbanStore
+    return PostgresKanbanStore(board=kb.get_current_board())
+
+
 HERMES_KANBAN_SPECIFY_MAX_TOKENS = max(
     1500,
     int(os.getenv("HERMES_KANBAN_SPECIFY_MAX_TOKENS", "6000")),
@@ -150,8 +165,13 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
-    with kb.connect_closing() as conn:
-        task = kb.get_task(conn, task_id)
+    backend = _resolve_backend()
+    _pg = _pg_store() if backend == "postgres" else None
+    if backend == "postgres":
+        task = _pg.get_task(task_id)
+    else:
+        with kb.connect_closing() as conn:          # EXISTING verbatim
+            task = kb.get_task(conn, task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
@@ -239,14 +259,19 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
-    with kb.connect_closing() as conn:
-        ok = kb.specify_triage_task(
-            conn,
-            task_id,
-            title=new_title,
-            body=new_body,
-            author=author or _profile_author(),
-        )
+    if backend == "postgres":
+        ok = _pg.specify_triage_task(
+            task_id, title=new_title, body=new_body,
+            author=author or _profile_author())
+    else:
+        with kb.connect_closing() as conn:          # EXISTING verbatim
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=new_title,
+                body=new_body,
+                author=author or _profile_author(),
+            )
     if not ok:
         # Race: someone else promoted / archived the task between our
         # read above and the write. Report, don't crash.
@@ -261,7 +286,11 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
-    with kb.connect_closing() as conn:
+    if _resolve_backend() == "postgres":
+        tasks = _pg_store().list_tasks(status="triage", tenant=tenant,
+                                       include_archived=False)
+        return [t.id for t in tasks]
+    with kb.connect_closing() as conn:               # EXISTING verbatim
         tasks = kb.list_tasks(
             conn,
             status="triage",
