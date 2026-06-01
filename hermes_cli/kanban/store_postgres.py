@@ -23,6 +23,7 @@ from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across bac
     VALID_WORKSPACE_KINDS,
     KNOWN_TOOLSET_NAMES,
     _canonical_assignee,
+    _claimer_id,
     _lane_type_for_assignee,
     _closeout_pr_evidence,
     _closeout_external_handoff_evidence,
@@ -1605,6 +1606,7 @@ class PostgresKanbanStore:
     def claim_task(self, task_id, *, ttl_seconds=None, claimer=None):
         now = int(time.time())
         ttl = int(ttl_seconds) if ttl_seconds else 900
+        claimer = claimer or _claimer_id()   # sqlite parity: default lock = host:pid
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 cur.execute(
