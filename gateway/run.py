@@ -5579,9 +5579,30 @@ class GatewayRunner:
             int(kanban_cfg.get("writer_backup_interval_seconds", 300)),
         )
 
+    def _writer_daemon_should_run(self) -> bool:
+        """Whether to run the sqlite single-writer daemon + watchdog.
+
+        The daemon serializes writable sqlite access; under
+        ``kanban.backend=postgres`` writes route through the store, so the
+        daemon serves no purpose and would needlessly open the frozen
+        ``kanban.db`` (+ WAL sidecars). Run it only for the sqlite backend with
+        the single-writer flag enabled. A backend-resolution failure falls back
+        to flag-only behavior (sqlite default), so a config hiccup never
+        mis-gates the gateway."""
+        try:
+            from hermes_cli.kanban.store import resolve_backend
+            if resolve_backend() == "postgres":
+                return False
+        except Exception:
+            pass
+        import hermes_cli.kanban_db as _kb
+        return _kb.single_writer_enabled()
+
     def _start_kanban_writer_daemon(self) -> None:
         import hermes_cli.kanban_db as _kb
-        if not _kb.single_writer_enabled():
+        if not self._writer_daemon_should_run():
+            logger.debug("kanban writer daemon: skipped (postgres backend or "
+                         "single-writer disabled)")
             return
         auto_recovery, keep, interval = self._kanban_writer_recovery_cfg()
         try:
@@ -5671,8 +5692,7 @@ class GatewayRunner:
         Started alongside the writer daemon(s). The per-tick logic is sync and
         cheap (thread liveness + ``health()`` checks), pushed to a thread so the
         event loop never blocks. No-op body when the flag is off."""
-        import hermes_cli.kanban_db as _kb
-        if not _kb.single_writer_enabled():
+        if not self._writer_daemon_should_run():
             return
         await asyncio.sleep(interval)
         while self._running:
