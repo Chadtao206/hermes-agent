@@ -17,7 +17,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _archived_task() -> str:
+def _archived_task(kanban_home) -> str:
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="purge me", assignee="engineer")
         kb.archive_task(conn, tid)
@@ -26,7 +26,7 @@ def _archived_task() -> str:
 
 def test_archive_rm_dry_run_does_not_delete(kanban_home, capsys):
     from hermes_cli.kanban.cli import _cmd_archive
-    tid = _archived_task()
+    tid = _archived_task(kanban_home)
     rc = _cmd_archive(argparse.Namespace(task_ids=None, purge_ids=[tid], confirm=False))
     assert rc == 0
     out = capsys.readouterr().out
@@ -37,8 +37,21 @@ def test_archive_rm_dry_run_does_not_delete(kanban_home, capsys):
 
 def test_archive_rm_confirm_deletes(kanban_home):
     from hermes_cli.kanban.cli import _cmd_archive
-    tid = _archived_task()
+    tid = _archived_task(kanban_home)
     rc = _cmd_archive(argparse.Namespace(task_ids=None, purge_ids=[tid], confirm=True))
     assert rc == 0
     with kb.connect() as conn:
         assert kb.get_task(conn, tid) is None  # deleted
+
+
+def test_archive_rm_dry_run_non_archived_returns_1(kanban_home, capsys):
+    from hermes_cli.kanban.cli import _cmd_archive
+    # a task that exists but is NOT archived
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="not archived", assignee="engineer")
+    rc = _cmd_archive(argparse.Namespace(task_ids=None, purge_ids=[tid], confirm=False))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "cannot delete" in err.lower()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid) is not None  # untouched

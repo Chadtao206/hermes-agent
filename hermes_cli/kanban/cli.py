@@ -789,7 +789,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="purge_ids",
         nargs="+",
         default=None,
-        help="Permanently delete already-archived task ids from the board",
+        help="Preview (dry-run by default); with --confirm, permanently delete already-archived task ids",
     )
     p_archive.add_argument(
         "--confirm", action="store_true",
@@ -2753,13 +2753,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         try:
             confirm = bool(getattr(args, "confirm", False))
             if not confirm:
-                any_deletable = False
+                not_deletable: list[str] = []
                 for tid in purge_ids:
                     task = store.get_task(tid)
                     if task is None or task.status != "archived":
                         print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
+                        not_deletable.append(tid)
                         continue
-                    any_deletable = True
                     n_events = len(store.list_events(tid))
                     n_comments = len(store.list_comments(tid))
                     n_runs = len(store.list_runs(tid))
@@ -2769,7 +2769,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                         f"runs={n_runs} links={n_links}"
                     )
                 print("(dry-run — pass --confirm to permanently delete)")
-                return 0 if any_deletable else 1
+                return 0 if not not_deletable else 1
             for tid in purge_ids:
                 if not store.delete_archived_task(tid):
                     failed.append(tid)
