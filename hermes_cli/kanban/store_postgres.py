@@ -2127,16 +2127,17 @@ class PostgresKanbanStore:
         return reclaimed
 
     def _pg_detect_crashed_workers(self, *, pid_alive_fn=None,
-                                   classify_exit_fn=None) -> list:
-        """Liveness-based crash reclaim with rc=0 protocol-violation
-        classification. When ``pid_alive_fn`` is None this returns ``[]`` (no OS
-        liveness server-side). For each running task whose ``worker_pid`` is NOT
-        alive, ``classify_exit_fn(pid) -> (kind, code)`` decides the outcome:
-        ``clean_exit`` => protocol violation (immediate cap-block); any other
-        kind => genuine crash (retry via the normal counter)."""
+                                   classify_exit_fn=None, skip_unknown=False) -> list:
+        """Liveness-based crash reclaim with rc=0 protocol-violation classification
+        + systemic-crash fingerprint cap-block (sqlite detect_crashed_workers
+        parity). pid_alive_fn None => [] (no server-side OS liveness). skip_unknown
+        leaves dead pids that classify 'unknown' for the stale/TTL lane (mirrors
+        dispatch_once). Single-host: the sqlite host_prefix(claim_lock) filter is
+        intentionally NOT applied (deferred multi-host parity item)."""
         if pid_alive_fn is None:
             return []
         crashed: list = []
+        crash_details: list = []  # (tid, pid, lock, protocol_violation, error_text)
         with self._pool.connection() as conn, \
                 conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -2160,6 +2161,8 @@ class PostgresKanbanStore:
                     kind, code = classify_exit_fn(pid)
                 except Exception:
                     kind, code = ("unknown", None)
+            if kind == "unknown" and skip_unknown:
+                continue
             protocol_violation = (kind == "clean_exit")
             if protocol_violation:
                 error_text = ("worker exited cleanly (rc=0) without calling "
@@ -2172,9 +2175,17 @@ class PostgresKanbanStore:
                     "guidance": kanban_db._PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
                 }
             else:
-                error_text = f"pid {pid} not alive ({kind})"
+                if kind == "nonzero_exit":
+                    error_text = f"pid {pid} exited with code {code}"
+                elif kind == "signaled":
+                    error_text = f"pid {pid} killed by signal {code}"
+                else:
+                    error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": lock, "exit_kind": kind}
+                event_payload = {"pid": pid, "claimer": lock}
+                if code is not None and kind != "unknown":
+                    event_payload["exit_kind"] = kind
+                    event_payload["exit_code"] = code
             with self._pool.connection() as conn, \
                     conn.cursor(row_factory=dict_row) as cur:
                 with conn.transaction():
@@ -2190,22 +2201,33 @@ class PostgresKanbanStore:
                         error=error_text, metadata=event_payload)
                     self._emit(cur, tid, event_kind, event_payload, run_id=run_id)
                     crashed.append(tid)
-            # rc=0 protocol violation caps the breaker immediately; a genuine
-            # crash uses the normal counter so a flaky task can still retry.
-            extra = {"exit_kind": kind}
-            if protocol_violation:
-                extra["failure_class"] = \
-                    kanban_db.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
-                extra["guidance"] = \
-                    kanban_db._PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE
-                extra["pid"] = pid
-                extra["claimer"] = lock
-            self.record_task_failure(
-                tid, error_text, outcome="crashed",
-                failure_limit=1 if protocol_violation else None,
-                failure_limit_is_cap=protocol_violation,
-                release_claim=False, end_run=False,
-                event_payload_extra=extra)
+                    crash_details.append(
+                        (tid, pid, lock, protocol_violation, error_text))
+        # Pass 2: fingerprint-aware failure accounting (sqlite parity). A genuine
+        # (non-protocol-violation) crash whose error fingerprint recurs >= the
+        # systemic threshold within this tick caps the breaker immediately.
+        if crash_details:
+            _fp_counts: dict = {}
+            for _, _, _, _, err in crash_details:
+                fp = kanban_db._error_fingerprint(err)
+                _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
+            for tid, pid, lock, protocol_violation, error_text in crash_details:
+                fp = kanban_db._error_fingerprint(error_text)
+                is_systemic = (
+                    not protocol_violation
+                    and _fp_counts.get(fp, 0)
+                    >= kanban_db.SYSTEMIC_SPAWN_FAILURE_SIGNATURE_THRESHOLD)
+                extra = {"pid": pid, "claimer": lock}
+                if protocol_violation:
+                    extra["failure_class"] = \
+                        kanban_db.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT
+                    extra["guidance"] = \
+                        kanban_db._PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE
+                self.record_task_failure(
+                    tid, error_text, outcome="crashed",
+                    failure_limit=1 if (protocol_violation or is_systemic) else None,
+                    failure_limit_is_cap=bool(protocol_violation or is_systemic),
+                    release_claim=False, end_run=False, event_payload_extra=extra)
         return crashed
 
     def _pg_promote_cleared_scheduled(self) -> int:
@@ -2337,7 +2359,8 @@ class PostgresKanbanStore:
 
         # --- reclaim phase (mirror dispatch_once ordering) ---------------
         result.crashed = self._pg_detect_crashed_workers(
-            pid_alive_fn=pid_alive_fn, classify_exit_fn=classify_exit_fn)
+            pid_alive_fn=pid_alive_fn, classify_exit_fn=classify_exit_fn,
+            skip_unknown=True)
         result.reclaimed = self._pg_release_stale_claims(
             terminate_fn=terminate_fn, signal_fn=signal_fn,
             pid_alive_fn=pid_alive_fn)
