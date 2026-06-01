@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
 from psycopg_pool import ConnectionPool
 
 _SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
@@ -20,7 +22,8 @@ _SCHEMA_DONE: set[str] = set()
 def resolve_dsn() -> str:
     """Resolve the Postgres DSN for the kanban board.
 
-    Order: HERMES_KANBAN_PG_DSN env -> config kanban.postgres.dsn -> raise.
+    Order: HERMES_KANBAN_PG_DSN env -> active config kanban.postgres.dsn ->
+    default-root config kanban.postgres.dsn -> raise.
     (Supabase: use the transaction-pooler connection string. No LISTEN/NOTIFY
     is used, so transaction-mode pooling is safe.)
     """
@@ -34,6 +37,16 @@ def resolve_dsn() -> str:
         dsn = pg.get("dsn")
     except Exception:
         dsn = None
+    if not dsn:
+        try:
+            home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+            root = home.parent.parent if home.parent.name == "profiles" else home
+            cfg_path = root / "config.yaml"
+            root_cfg = yaml.safe_load(cfg_path.read_text()) or {}
+            pg = ((root_cfg.get("kanban") or {}).get("postgres") or {})
+            dsn = pg.get("dsn")
+        except Exception:
+            dsn = None
     if not dsn:
         raise RuntimeError(
             "kanban backend=postgres but no DSN configured "

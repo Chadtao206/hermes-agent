@@ -3923,13 +3923,12 @@ class TestRunConversation:
             tool_resp, tool_resp, summary_resp,
         ]
 
-        mock_record_failure = MagicMock(return_value=False)
-        mock_connect = MagicMock(return_value=MagicMock())
+        mock_store = MagicMock()
+        mock_store.record_task_failure.return_value = False
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
-            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch("hermes_cli.kanban.store.kanban_store", return_value=mock_store),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -3939,16 +3938,15 @@ class TestRunConversation:
         # The agent should have reported the task as not completed.
         assert result["completed"] is False
 
-        # _record_task_failure should have been called exactly once for
+        # record_task_failure should have been called exactly once for
         # the exhaustion event, with outcome="timed_out".
-        assert mock_record_failure.call_count == 1, (
-            f"Expected exactly 1 _record_task_failure call, "
-            f"got {mock_record_failure.call_count}. "
-            f"Calls: {mock_record_failure.call_args_list}"
+        assert mock_store.record_task_failure.call_count == 1, (
+            "Expected exactly 1 record_task_failure call, "
+            f"got {mock_store.record_task_failure.call_count}. "
+            f"Calls: {mock_store.record_task_failure.call_args_list}"
         )
-        call = mock_record_failure.call_args_list[0]
-        # Positional: (conn, task_id, ...)
-        assert call.args[1] == "t_test_task_123"
+        call = mock_store.record_task_failure.call_args_list[0]
+        assert call.args[0] == "t_test_task_123"
         assert call.kwargs.get("outcome") == "timed_out"
         assert call.kwargs.get("release_claim") is True
         assert call.kwargs.get("end_run") is True
@@ -3973,19 +3971,20 @@ class TestRunConversation:
             tool_resp, tool_resp, summary_resp,
         ]
 
-        mock_record_failure = MagicMock(return_value=False)
+        mock_store = MagicMock()
+        mock_store.record_task_failure.return_value = False
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch("hermes_cli.kanban.store.kanban_store", return_value=mock_store),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
             agent.run_conversation("do stuff")
 
-        assert mock_record_failure.call_count == 0, (
-            "_record_task_failure should not be called outside kanban mode"
+        assert mock_store.record_task_failure.call_count == 0, (
+            "record_task_failure should not be called outside kanban mode"
         )
 
 

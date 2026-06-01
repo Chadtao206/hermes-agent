@@ -10,9 +10,11 @@ Why tools instead of just shelling out to ``hermes kanban``?
 
 1. **Backend portability.** A worker whose terminal tool points at Docker
    / Modal / Singularity / SSH would run ``hermes kanban complete …``
-   inside the container, where ``hermes`` isn't installed and the DB
-   isn't mounted. Tools run in the agent's Python process, so they
-   always reach ``~/.hermes/kanban.db`` regardless of terminal backend.
+   inside the container, where ``hermes`` isn't installed and the board
+   backend may not be reachable. Tools run in the agent's Python process,
+   so they reach the configured Kanban store (Postgres on current shared
+   deployments; SQLite only for legacy/local compatibility) regardless of
+   terminal backend.
 
 2. **No shell-quoting footguns.** Passing ``--metadata '{"x": [...]}'``
    through shlex+argparse is fragile. Structured tool args skip it.
@@ -165,12 +167,12 @@ def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
 
-    When ``board`` is provided it's forwarded to :func:`kb.connect`, which
-    routes the connection to that board's sqlite file. ``None`` (the
-    default) preserves the legacy resolution chain
-    (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
-    → ``default``). Per-tool ``board`` lets a Telegram-side agent override
-    the env-pinned active board without restarting Hermes.
+    When ``board`` is provided it's forwarded to the Kanban backend adapter for
+    that board. ``None`` preserves the standard board resolution chain
+    (``HERMES_KANBAN_BOARD`` env → current symlink → ``default``; legacy
+    SQLite-only ``HERMES_KANBAN_DB`` applies only when the SQLite backend is in
+    use). Per-tool ``board`` lets a Telegram-side agent override the env-pinned
+    active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
     # Under the single-writer daemon, client processes (workers, CLI) must not
@@ -1134,11 +1136,12 @@ _DESC_TASK_ID_DEFAULT = (
 
 _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "active board the usual way: HERMES_KANBAN_BOARD env → the 'current' "
+    "symlink under the kanban home → 'default'. HERMES_KANBAN_DB is a "
+    "legacy SQLite-only override and is not authoritative on Postgres-backed "
+    "installs. Pass an explicit slug only when the caller (e.g. a Telegram "
+    "routing layer) needs to override the env-pinned active board for this one "
+    "call."
 )
 
 

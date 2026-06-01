@@ -35,8 +35,9 @@ Hermes Kanban 拥有生命周期的真实状态——`ready` → `running` → `
 | 变量 | 携带内容 |
 |---|---|
 | `HERMES_KANBAN_TASK` | worker 正在操作的任务 id |
-| `HERMES_KANBAN_DB` | 每个看板 SQLite 文件的绝对路径 |
+| `HERMES_KANBAN_DB` | 使用 SQLite 后端时的旧版/仅 SQLite 每看板 DB 路径 |
 | `HERMES_KANBAN_BOARD` | 看板 slug |
+| `HERMES_KANBAN_PG_DSN` | 当 `kanban.backend=postgres` 时的可选 Postgres DSN 覆盖项；否则从配置解析 |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | 看板工作区树的根目录 |
 | `HERMES_KANBAN_WORKSPACE` | *本*任务工作区的绝对路径 |
 | `HERMES_KANBAN_RUN_ID` | 当前运行的 id（用于生命周期门控） |

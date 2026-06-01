@@ -1,23 +1,23 @@
 ---
 sidebar_position: 12
 title: "Kanban (Multi-Agent Board)"
-description: "Durable SQLite-backed task board for coordinating multiple Hermes profiles"
+description: "Durable Postgres-backed task board for coordinating multiple Hermes profiles"
 ---
 
 # Kanban — Multi-Agent Profile Collaboration
 
 > **Want a walkthrough?** Read the [Kanban tutorial](./kanban-tutorial) — four user stories (solo dev, fleet farming, role pipeline with retry, circuit breaker) with dashboard screenshots of each. This page is the reference; the tutorial is the narrative.
 
-Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
+Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. The production board is Postgres-backed (`kanban.backend: postgres`); every task and handoff is a durable database row any authorized Hermes surface can read and write; every worker is a full OS process with its own identity.
 
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
-The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
+The board has two front doors, both backed by the same Kanban store:
 
 - **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
-Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
+Both surfaces route through the same Kanban store abstraction, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
 This is the shape that covers the workloads `delegate_task` can't:
 
@@ -41,7 +41,7 @@ They look similar; they are not the same primitive.
 | Resumability | None — failed = failed | Block → unblock → re-run; crash → reclaim |
 | Human in the loop | Not supported | Comment / unblock at any point |
 | Agents per task | One call = one subagent | N agents over task's life (retry, review, follow-up) |
-| Audit trail | Lost on context compression | Durable rows in SQLite forever |
+| Audit trail | Lost on context compression | Durable database rows forever |
 | Coordination | Hierarchical (caller → callee) | Peer — any profile reads/writes any task |
 
 **One-sentence distinction:** `delegate_task` is a function call; Kanban is a work queue where every handoff is a row any profile (or human) can see and edit.
@@ -54,8 +54,8 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 
 ## Core concepts
 
-- **Board** — a standalone queue of tasks with its own SQLite DB, workspaces
-  directory, and dispatcher loop. A single install can have many boards
+- **Board** — a standalone queue of tasks in the configured Kanban store, with a
+  workspaces directory and dispatcher scope. A single install can have many boards
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
@@ -73,13 +73,13 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 
 Boards let you separate unrelated streams of work — one per project, repo,
 or domain — into isolated queues. A new install has exactly one board
-called `default` (DB at `~/.hermes/kanban.db` for back-compat). Users who
+called `default`. Users who
 only want one stream of work never need to know about boards; the feature
 is opt-in.
 
 Per-board isolation is absolute:
 
-- Separate SQLite DB per board (`~/.hermes/kanban/boards/<slug>/kanban.db`).
+- Separate board namespace in Postgres (with the same `--board` / `HERMES_KANBAN_BOARD` scoping). Legacy SQLite deployments still isolate boards as separate DB files, but new/default deployments use Postgres.
 - Separate `workspaces/` and `logs/` directories.
 - Workers spawned for a task see **only** their board's tasks — the
   dispatcher sets `HERMES_KANBAN_BOARD` in the child env and every
@@ -204,7 +204,7 @@ use the gateway. If you truly cannot run the gateway (headless host
 policy forbids long-lived services, etc.) a `--force` escape hatch keeps
 the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
-`kanban.db` causes claim races and is not supported.
+Kanban store causes claim races and is not supported.
 
 ### Idempotent create (for automation / webhooks)
 
@@ -231,7 +231,7 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 
 ## How workers interact with the board
 
-**Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
+**Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python Kanban store layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
 
 | Tool | Purpose | Required params |
 |---|---|---|
@@ -286,7 +286,7 @@ The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `
 
 Three reasons:
 
-1. **Backend portability.** Workers whose terminal tool points at a remote backend (Docker / Modal / Singularity / SSH) would run `hermes kanban complete` *inside* the container, where `hermes` isn't installed and `~/.hermes/kanban.db` isn't mounted. The kanban tools run in the agent's own Python process and always reach `~/.hermes/kanban.db` regardless of terminal backend.
+1. **Backend portability.** Workers whose terminal tool points at a remote backend (Docker / Modal / Singularity / SSH) would run `hermes kanban complete` *inside* the container, where `hermes` may not be installed and the host's Kanban credentials/config may not be available. The kanban tools run in the agent's own Python process and always reach the configured Kanban store regardless of terminal backend.
 2. **No shell-quoting fragility.** Passing `--metadata '{"files": [...]}'` through shlex + argparse is a latent footgun. Structured tool args skip it entirely.
 3. **Better errors.** Tool results are structured JSON the model can reason about, not stderr strings it has to parse.
 
@@ -472,8 +472,8 @@ hermes kanban reconcile --json
 hermes kanban metrics --json
 ```
 
-`doctor` is the DB/board-integrity surface: SQLite header/quick-check, orphan
-links/subscriptions, stale running tasks, stale run metadata, blocked-with-done
+`doctor` is the DB/board-integrity surface: backend connectivity/health checks,
+orphan links/subscriptions, stale running tasks, stale run metadata, blocked-with-done
 parents, and old ready cards. It also embeds a compact `reconcile_summary` so a
 healthy DB can still show that operator decisions are pending without flipping
 `doctor.ok` to false.
@@ -511,7 +511,7 @@ rates, p50/p95/max run duration, failure-event counts, current running/pending
 state, consecutive-failure totals, wake mode, and suppressed decision packets.
 By default it is read-only. Pass `--write-snapshot` to persist the payload into
 `$HERMES_HOME/kanban_metrics_snapshots.db`, a sidecar SQLite database outside
-authoritative `kanban.db`, so stability can be trended without mutating the
+the authoritative Kanban store, so stability can be trended without mutating the
 board:
 
 ```bash
@@ -526,7 +526,7 @@ python scripts/kanban_reconcile_wake_triage.py --mode no-agent
 ```
 
 It runs the reconciler, dedupes unchanged output in a sidecar JSON file outside
-`kanban.db`, emits bounded Slack-safe text, and records zero-LLM token/time SLO
+the authoritative Kanban store, emits bounded Slack-safe text, and records zero-LLM token/time SLO
 metadata (`script_slo`) so monitoring can verify the watchdog stayed cheap. Use
 `--mode agent-gate` when an LLM cron job should wake Jensen only for
 `jensen_decision_required`; compact notifications and unchanged repeats return
@@ -539,23 +539,22 @@ The dashboard plugin exposes the same read-only control-plane data through:
 
 Both accept `?board=<slug>` so dashboard, CLI, and cron surfaces stay aligned.
 
-### Repairing or replacing the board DB
+### Repairing or replacing the board store
 
-Never `cp`, `mv`, `rsync`, or otherwise hot-swap `~/.hermes/kanban.db` while
-gateway/dashboard/cron services may still hold open file handles. SQLite WAL
-sidecars and dispatcher claims can desynchronize against inode swaps, and ad hoc
-replacement is the fastest path to silent durable-row loss.
+New/default deployments use Postgres as the authoritative Kanban store. Do not
+inspect or repair the old `~/.hermes/kanban.db` as if it were live state when
+`kanban.backend: postgres` is configured; that file is legacy/frozen unless you
+are explicitly working on SQLite compatibility or a migration artifact.
 
-Use only the guarded `hermes kanban repair-db` workflow:
+For Postgres deployments, use normal database operational controls: verify the
+configured DSN/pooler, run `hermes kanban doctor --json`, take provider-native
+backups/snapshots, and quiesce gateway/dashboard/cron writers before any schema
+or restore operation. Do not hot-swap local files to "fix" a Postgres-backed
+board.
 
-1. Stop dashboard, cron/scheduler writers, then gateway.
-2. Verify candidate without install: `hermes kanban repair-db --candidate <path.db>`.
-3. Install only after gates pass: `hermes kanban repair-db --candidate <path.db> --install --confirm-quiesced --confirm-freshness-checked`.
-4. If candidate durable markers are older than live, the guard fails closed; pass `--allow-data-loss` only when a human explicitly accepts the regression.
-
-If `hermes kanban doctor` reports `db_invalid_header`, `db_quick_check_failed`,
-or `db_unreadable`, follow this quiesced repair flow instead of live DB
-replacement.
+The guarded `hermes kanban repair-db` flow is retained for legacy SQLite boards
+only. If you are intentionally repairing a SQLite board, quiesce services first
+and follow that guarded workflow instead of copying or replacing live DB files.
 
 ## Dashboard (GUI)
 
@@ -564,7 +563,7 @@ The `/kanban` CLI and slash command are enough to run the board headlessly, but 
 Open it with:
 
 ```bash
-hermes kanban init      # one-time: create kanban.db if not already present
+hermes kanban init      # one-time: initialize the configured Kanban store
 hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 ```
 
@@ -619,7 +618,7 @@ And the two auxiliary LLM slots:
 
 ### Architecture
 
-The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer with no domain logic of its own:
+The GUI is strictly a **read-through-the-store + write-through-kanban-store** layer with no domain logic of its own:
 
 <!-- ascii-guard-ignore -->
 ```
@@ -637,8 +636,8 @@ The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer wi
            │                                                  │
            ▼                                                  │
 ┌────────────────────────┐                                    │
-│  ~/.hermes/kanban.db   │ ───── append task_events ──────────┘
-│  (WAL, shared)         │
+│  Kanban store          │ ───── append task_events ──────────┘
+│  (Postgres/default)    │
 └────────────────────────┘
 ```
 <!-- ascii-guard-ignore-end -->
@@ -668,7 +667,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `include_archived_by_default`, `render_markdown` |
 | `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows |
 
-Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
+Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. It opens the configured Kanban store on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
 
 ### Dashboard config
 
@@ -693,11 +692,11 @@ The WebSocket takes one additional step: it requires the dashboard's ephemeral s
 
 If you run `hermes dashboard --host 0.0.0.0`, every plugin route — kanban included — becomes reachable from the network. **Don't do that on a shared host.** The board contains task bodies, comments, and workspace paths; an attacker reaching these routes gets read access to your entire collaboration surface and can also create / reassign / archive tasks.
 
-Tasks in `~/.hermes/kanban.db` are profile-agnostic on purpose (that's the coordination primitive). If you open the dashboard with `hermes -p <profile> dashboard`, the board still shows tasks created by any other profile on the host. Same user owns all profiles, but this is worth knowing if multiple personas coexist.
+Tasks in the Kanban store are profile-agnostic on purpose (that's the coordination primitive). If you open the dashboard with `hermes -p <profile> dashboard`, the board still shows tasks created by any other profile using the same configured store. Same user owns all profiles, but this is worth knowing if multiple personas coexist.
 
 ### Live updates
 
-`task_events` is an append-only SQLite table with a monotonic `id`. The WebSocket endpoint holds each client's last-seen event id and pushes new rows as they land. When a burst of events arrives, the frontend reloads the (very cheap) board endpoint — simpler and more correct than trying to patch local state from every event kind. WAL mode means the read loop never blocks the dispatcher's `BEGIN IMMEDIATE` claim transactions.
+`task_events` is an append-only table with a monotonic `id`. The WebSocket endpoint holds each client's last-seen event id and pushes new rows as they land. When a burst of events arrives, the frontend reloads the (very cheap) board endpoint — simpler and more correct than trying to patch local state from every event kind. The Postgres backend handles concurrent readers and writers through normal transaction isolation.
 
 ### Extending it
 
@@ -714,7 +713,7 @@ The GUI is deliberately thin. Everything the plugin does is reachable from the C
 This is the surface **you** (or scripts, cron, the dashboard) use to drive the board. Workers running inside the dispatcher use the `kanban_*` [tool surface](#how-workers-interact-with-the-board) for the same operations — the CLI here and the tools there both route through `kanban_db`, so the two surfaces agree by construction.
 
 ```
-hermes kanban init                                     # create kanban.db + print daemon hint
+hermes kanban init                                     # initialize the configured Kanban store
 hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
@@ -844,7 +843,7 @@ Quote multi-word arguments the same way you would on a shell — `run_slash` par
 
 ### Mid-run usage: `/kanban` bypasses the running-agent guard
 
-The gateway normally queues slash commands and user messages while an agent is still thinking — that's what stops you from accidentally starting a second turn while the first is in flight. **`/kanban` is explicitly exempted from this guard.** The board lives in `~/.hermes/kanban.db`, not in the running agent's state, so reads (`list`, `show`, `context`, `tail`, `watch`, `stats`, `runs`) and writes (`comment`, `unblock`, `block`, `assign`, `archive`, `create`, `link`, …) all go through immediately, even mid-turn.
+The gateway normally queues slash commands and user messages while an agent is still thinking — that's what stops you from accidentally starting a second turn while the first is in flight. **`/kanban` is explicitly exempted from this guard.** The board lives in the configured Kanban store, not in the running agent's state, so reads (`list`, `show`, `context`, `tail`, `watch`, `stats`, `runs`) and writes (`comment`, `unblock`, `block`, `assign`, `archive`, `create`, `link`, …) all go through immediately, even mid-turn.
 
 This is the whole point of the separation:
 
@@ -1022,7 +1021,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 ## Out of scope
 
-Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file and the dispatcher spawns workers on the same machine. Running a shared board across two hosts is not supported — there's no coordination primitive for "worker X on host A, worker Y on host B," and the crash-detection path assumes PIDs are host-local. If you need multi-host, run an independent board per host and use `delegate_task` / a message queue to bridge them.
+Kanban's authoritative store can be Postgres-backed, but the default dispatcher execution model still spawns workers on the local machine running the gateway. Multiple hosts may inspect the same Postgres board, but running multiple independent dispatchers against one board requires explicit operational coordination; worker crash detection and PID handling are host-local assumptions unless you have designed a multi-host worker topology.
 
 ## Design spec
 

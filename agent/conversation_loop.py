@@ -4457,12 +4457,11 @@ def run_conversation(
             _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
             if _kanban_task:
                 try:
-                    from hermes_cli import kanban_db as _kb
+                    from hermes_cli.kanban.store import kanban_store as _kanban_store
 
-                    _conn = _kb.connect()
+                    _store = _kanban_store(board=None)
                     try:
-                        _kb._record_task_failure(
-                            _conn,
+                        _store.record_task_failure(
                             _kanban_task,
                             error=(
                                 f"Iteration budget exhausted "
@@ -4486,7 +4485,7 @@ def run_conversation(
                         )
                     finally:
                         try:
-                            _conn.close()
+                            _store.close()
                         except Exception:
                             pass
                 except Exception:

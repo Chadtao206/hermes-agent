@@ -680,7 +680,10 @@ User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/curato
 
 ### Kanban (multi-agent work queue)
 
-Durable SQLite board for multi-profile / multi-worker collaboration.
+Durable Kanban board for multi-profile / multi-worker collaboration. Current
+deployments use Postgres (`kanban.backend: postgres`); SQLite is a legacy/test
+backend and `~/.hermes/kanban.db` should not be treated as authoritative when
+Postgres is configured.
 Users drive it via `hermes kanban <verb>`; dispatcher-spawned workers
 see a focused `kanban_*` toolset gated by `HERMES_KANBAN_TASK`, and
 orchestrator profiles can opt into the broader `kanban` toolset. Normal

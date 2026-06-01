@@ -1791,9 +1791,10 @@ def _kanban_worker_db_mutation_error(command: str) -> str:
 
 
 _KANBAN_WORKER_DB_MUTATION_MESSAGE = (
-    "Kanban worker commands may not mutate or replace the live kanban DB. "
-    "Block/escalate to Grace/Jensen and use the quiesced repair path instead "
-    "of shelling out against ~/.hermes/kanban.db."
+    "Kanban worker commands may not mutate or replace the underlying Kanban store. "
+    "On Postgres-backed installs, ~/.hermes/kanban.db is legacy/frozen state, not "
+    "the live board. Block/escalate to Grace/Jensen and use the backend-appropriate "
+    "repair path instead of shelling out against board storage."
 )
 
 

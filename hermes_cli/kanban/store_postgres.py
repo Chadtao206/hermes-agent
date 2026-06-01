@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import time
@@ -22,6 +23,9 @@ from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across bac
     VALID_INITIAL_STATUSES,
     VALID_WORKSPACE_KINDS,
     KNOWN_TOOLSET_NAMES,
+    WAKE_ARM_EVENT_KINDS,
+    WAKE_ARM_PROMPT,
+    _auto_wake_arm_config,
     _canonical_assignee,
     _claimer_id,
     _lane_type_for_assignee,
@@ -45,6 +49,7 @@ from hermes_cli.kanban import pg_pool
 _DEFAULT_NOTIFY_TERMINAL_KINDS = ("completed", "blocked", "gave_up",
                                   "crashed", "timed_out", "archived")
 _UNSET = object()
+_log = logging.getLogger(__name__)
 
 
 def _new_task_id() -> str:
@@ -84,6 +89,49 @@ class PostgresKanbanStore:
             (self.board, parents))
         present = {r["id"] for r in cur.fetchall()}
         return [p for p in parents if p not in present]
+
+    def _maybe_auto_wake_arm_root(self, *, task_id: str, parents: Iterable[str]) -> None:
+        """Idempotently arm the configured orchestrator on new root cards.
+
+        Mirrors the sqlite helper in hermes_cli.kanban_db while keeping task
+        creation reliable: this hook is best-effort and must not fail create_task.
+        """
+        if os.environ.get("HERMES_KANBAN_EVENT_WAKE") == "1":
+            return
+        if tuple(p for p in parents if p):
+            return
+
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT 1 FROM task_links "
+                "WHERE board=%s AND child_id=%s AND relation_type=%s LIMIT 1",
+                (self.board, task_id, LINK_RELATION_DEPENDENCY),
+            )
+            existing_parent = cur.fetchone()
+        if existing_parent:
+            return
+
+        cfg = _auto_wake_arm_config()
+        if not cfg["enabled"]:
+            return
+
+        try:
+            self.add_profile_event_sub(
+                task_id=task_id,
+                profile=cfg["profile"],
+                name=cfg["name"],
+                event_kinds=list(WAKE_ARM_EVENT_KINDS),
+                include_children=True,
+                wake_agent=True,
+                wake_prompt=WAKE_ARM_PROMPT,
+                enabled=True,
+            )
+        except Exception as exc:
+            _log.warning(
+                "kanban auto-wake-arm failed for root %s: %s",
+                task_id,
+                exc,
+            )
 
     def _row_to_task(self, row: dict) -> Task:
         d = dict(row)
@@ -169,6 +217,7 @@ class PostgresKanbanStore:
             skills_list = cleaned
 
         now = int(time.time())
+        target_task_id: Optional[str] = None
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             with conn.transaction():
                 if idempotency_key:
@@ -177,54 +226,62 @@ class PostgresKanbanStore:
                         "AND status != 'archived'", (self.board, idempotency_key))
                     hit = cur.fetchone()
                     if hit:
-                        return hit["id"]
-                # Parent existence — board-scoped, mirrors sqlite's
-                # _find_missing_parents (input-order-preserving). Runs whenever
-                # parents are supplied (ready/todo, blocked/scheduled, triage)
-                # so link rows never dangle. Done inside the transaction, before
-                # the INSERT, so the check + insert are atomic.
-                if parents:
-                    missing = self._find_missing_parents(cur, parents)
-                    if missing:
-                        raise ValueError(
-                            f"unknown parent task(s): {', '.join(missing)}")
-                if initial_status in ("blocked", "scheduled"):
-                    status = initial_status
-                elif triage:
-                    status = "triage"
-                else:
-                    status = "ready"
+                        target_task_id = hit["id"]
+                    else:
+                        target_task_id = None
+                if target_task_id is None:
+                    # Parent existence — board-scoped, mirrors sqlite's
+                    # _find_missing_parents (input-order-preserving). Runs whenever
+                    # parents are supplied (ready/todo, blocked/scheduled, triage)
+                    # so link rows never dangle. Done inside the transaction, before
+                    # the INSERT, so the check + insert are atomic.
                     if parents:
-                        cur.execute(
-                            "SELECT 1 FROM tasks WHERE board=%s AND id = ANY(%s) "
-                            "AND status != 'done' LIMIT 1",
-                            (self.board, list(parents)))
-                        if cur.fetchone():
-                            status = "todo"
-                tid = _new_task_id()
-                cur.execute(
-                    "INSERT INTO tasks (board, id, title, body, assignee, status, "
-                    "priority, created_by, created_at, workspace_kind, workspace_path, "
-                    "branch_name, tenant, idempotency_key, max_runtime_seconds, skills, "
-                    "max_retries, session_id) VALUES "
-                    "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (self.board, tid, title.strip(), body, assignee, status, priority,
-                     created_by, now, workspace_kind, workspace_path, branch_name,
-                     tenant, idempotency_key, max_runtime_seconds,
-                     json.dumps(skills_list) if skills_list is not None else None,
-                     max_retries, session_id))
-                for p in parents:
+                        missing = self._find_missing_parents(cur, parents)
+                        if missing:
+                            raise ValueError(
+                                f"unknown parent task(s): {', '.join(missing)}")
+                    if initial_status in ("blocked", "scheduled"):
+                        status = initial_status
+                    elif triage:
+                        status = "triage"
+                    else:
+                        status = "ready"
+                        if parents:
+                            cur.execute(
+                                "SELECT 1 FROM tasks WHERE board=%s AND id = ANY(%s) "
+                                "AND status != 'done' LIMIT 1",
+                                (self.board, list(parents)))
+                            if cur.fetchone():
+                                status = "todo"
+                    tid = _new_task_id()
                     cur.execute(
-                        "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
-                        "VALUES (%s,%s,%s,'dependency') ON CONFLICT DO NOTHING",
-                        (self.board, p, tid))
-                self._emit(cur, tid, "created", {
-                    "assignee": assignee, "status": status,
-                    "parents": list(parents), "tenant": tenant,
-                    "branch_name": branch_name, "skills": skills_list or None})
-                if status == "blocked":
-                    self._emit(cur, tid, "blocked", {"reason": "initial_status=blocked"})
-            return tid
+                        "INSERT INTO tasks (board, id, title, body, assignee, status, "
+                        "priority, created_by, created_at, workspace_kind, workspace_path, "
+                        "branch_name, tenant, idempotency_key, max_runtime_seconds, skills, "
+                        "max_retries, session_id) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (self.board, tid, title.strip(), body, assignee, status, priority,
+                         created_by, now, workspace_kind, workspace_path, branch_name,
+                         tenant, idempotency_key, max_runtime_seconds,
+                         json.dumps(skills_list) if skills_list is not None else None,
+                         max_retries, session_id))
+                    for p in parents:
+                        cur.execute(
+                            "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
+                            "VALUES (%s,%s,%s,'dependency') ON CONFLICT DO NOTHING",
+                            (self.board, p, tid))
+                    self._emit(cur, tid, "created", {
+                        "assignee": assignee, "status": status,
+                        "parents": list(parents), "tenant": tenant,
+                        "branch_name": branch_name, "skills": skills_list or None})
+                    if status == "blocked":
+                        self._emit(cur, tid, "blocked", {"reason": "initial_status=blocked"})
+                    target_task_id = tid
+
+        if target_task_id is None:
+            raise RuntimeError("create_task failed to resolve task id")
+        self._maybe_auto_wake_arm_root(task_id=target_task_id, parents=parents)
+        return target_task_id
 
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -1756,6 +1813,122 @@ class PostgresKanbanStore:
                             run_id=run_id)
                     # Timeout/crash path's caller already emitted its own event.
         return blocked
+
+    def auto_block_unclosed_worker_turn(
+        self,
+        task_id: str,
+        *,
+        final_response: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+        expected_claim_lock: Optional[str] = None,
+    ) -> bool:
+        task_id = (task_id or "").strip()
+        if not task_id:
+            return False
+
+        response_text = (final_response or "").strip()
+        response_tail = response_text[-4096:] if response_text else ""
+        reason = (
+            "Protocol violation: worker returned a final response without calling "
+            "kanban_complete or kanban_block; CLI closeout guard auto-blocked "
+            "the task before process exit."
+        )
+        if response_tail:
+            reason += "\n\nFinal response tail:\n" + response_tail
+
+        now = int(time.time())
+        with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            with conn.transaction():
+                cur.execute(
+                    "SELECT status, current_run_id, claim_lock FROM tasks "
+                    "WHERE board=%s AND id=%s FOR UPDATE",
+                    (self.board, task_id),
+                )
+                row = cur.fetchone()
+                if row is None or row["status"] != "running":
+                    return False
+
+                active_run_id = row["current_run_id"]
+                if expected_run_id is not None:
+                    if active_run_id is None or int(active_run_id) != int(expected_run_id):
+                        return False
+                if expected_claim_lock and row["claim_lock"] != expected_claim_lock:
+                    return False
+
+                run_id_for_block = (
+                    int(active_run_id)
+                    if active_run_id is not None
+                    else (int(expected_run_id) if expected_run_id is not None else None)
+                )
+
+                payload: dict[str, Any] = {
+                    "failure_class": kanban_db.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+                    "guidance": kanban_db._PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
+                    "source": "cli_closeout_guard",
+                }
+                if expected_claim_lock:
+                    payload["claimer"] = expected_claim_lock
+                if run_id_for_block is not None:
+                    payload["run_id"] = run_id_for_block
+                if response_tail:
+                    payload["final_response_tail"] = response_tail
+
+                run_metadata: dict[str, Any] = {}
+                if run_id_for_block is not None:
+                    cur.execute(
+                        "SELECT metadata FROM task_runs WHERE board=%s AND id=%s FOR UPDATE",
+                        (self.board, run_id_for_block),
+                    )
+                    run_row = cur.fetchone()
+                    if run_row and run_row.get("metadata"):
+                        try:
+                            parsed = run_row["metadata"]
+                            if isinstance(parsed, dict):
+                                run_metadata = dict(parsed)
+                            elif isinstance(parsed, str):
+                                run_metadata = json.loads(parsed)
+                                if not isinstance(run_metadata, dict):
+                                    run_metadata = {}
+                        except Exception:
+                            run_metadata = {}
+
+                cur.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL, current_run_id=NULL "
+                    "WHERE board=%s AND id=%s AND status='running'",
+                    (self.board, task_id),
+                )
+                if cur.rowcount != 1:
+                    return False
+
+                if run_id_for_block is not None:
+                    run_metadata.update(
+                        {
+                            "failure_class": kanban_db.FAILURE_CLASS_PROTOCOL_VIOLATION_CLEAN_EXIT,
+                            "guidance": kanban_db._PROTOCOL_VIOLATION_CLEAN_EXIT_GUIDANCE,
+                            "closeout_guard": "cli_final_response_auto_block",
+                        }
+                    )
+                    if response_tail:
+                        run_metadata["final_response_tail"] = response_tail
+                    cur.execute(
+                        "UPDATE task_runs SET status=%s, outcome=%s, ended_at=%s, summary=%s, "
+                        "metadata=%s, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                        "WHERE board=%s AND id=%s AND ended_at IS NULL",
+                        (
+                            "blocked",
+                            "blocked",
+                            now,
+                            reason,
+                            Jsonb(run_metadata),
+                            self.board,
+                            run_id_for_block,
+                        ),
+                    )
+
+                self._emit(cur, task_id, "blocked", {"reason": reason}, run_id=run_id_for_block)
+                self._emit(cur, task_id, "protocol_violation", payload, run_id=run_id_for_block)
+                return True
 
     # --- spawn result recording (A5) -------------------------------------
 

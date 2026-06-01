@@ -99,9 +99,10 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `HERMES_HOME` | 覆盖 Hermes 配置目录（默认：`~/.hermes`）。同时限定 gateway PID 文件和 systemd 服务名称，允许多个安装并发运行 |
 | `HERMES_GIT_BASH_PATH` | **仅 Windows。** 覆盖终端工具的 `bash.exe` 发现路径。可指向任意 bash——完整 Git-for-Windows 安装、通过符号链接的 WSL bash、MSYS2、Cygwin。安装程序会自动将其设置为所配置的 PortableGit。参见 [Windows（原生）指南](../user-guide/windows-native.md#how-hermes-runs-shell-commands-on-windows) |
 | `HERMES_DISABLE_WINDOWS_UTF8` | **仅 Windows。** 设为 `1` 可禁用 UTF-8 stdio shim（`configure_windows_stdio()`），回退到控制台的本地代码页。用于排查编码问题；正常操作中极少需要 |
-| `HERMES_KANBAN_HOME` | 覆盖锚定 kanban 看板（数据库 + 工作区 + 工作日志）的共享 Hermes 根目录。回退到 `get_default_hermes_root()`（任意活动 profile 的父目录）。适用于测试和非常规部署 |
+| `HERMES_KANBAN_HOME` | 覆盖锚定 kanban 工作区、worker 日志和旧版 SQLite 看板文件的共享 Hermes 根目录。回退到 `get_default_hermes_root()`（任意活动 profile 的父目录）。适用于测试和非常规部署 |
 | `HERMES_KANBAN_BOARD` | 为当前进程固定活动 kanban 看板。优先于 `~/.hermes/kanban/current`；调度器将其注入工作进程子进程环境，使工作进程无法看到其他看板上的任务。默认为 `default`。slug 验证：小写字母数字 + 连字符 + 下划线，1-64 字符 |
-| `HERMES_KANBAN_DB` | 直接固定 kanban 数据库文件路径（最高优先级；优先于 `HERMES_KANBAN_BOARD` 和 `HERMES_KANBAN_HOME`）。调度器将其注入工作进程子进程环境，使 profile 工作进程收敛到调度器的看板 |
+| `HERMES_KANBAN_DB` | 旧版/仅 SQLite 的覆盖项，用于直接固定 kanban 数据库文件路径。当配置 `kanban.backend: postgres` 时，不要把它当作权威看板选择器；看板作用域使用 `HERMES_KANBAN_BOARD`，Postgres 连接使用 `HERMES_KANBAN_PG_DSN` / `kanban.postgres.dsn`。 |
+| `HERMES_KANBAN_PG_DSN` | `kanban.backend: postgres` 的 Postgres DSN 覆盖项。优先于 `config.yaml` 中的 `kanban.postgres.dsn`；该值应作为秘密处理。 |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | 直接固定 kanban 工作区根目录（工作区最高优先级；优先于 `HERMES_KANBAN_HOME`）。调度器将其注入工作进程子进程环境 |
 | `HERMES_KANBAN_DISPATCH_IN_GATEWAY` | `kanban.dispatch_in_gateway` 的运行时覆盖。设为 `0`、`false`、`no` 或 `off` 可阻止 gateway 启动内嵌 Kanban 调度器；任何其他非空值则启用。适用于独立调度器进程拥有看板的场景。 |
 

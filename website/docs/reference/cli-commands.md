@@ -519,7 +519,7 @@ hermes cron <list|create|edit|pause|resume|run|remove|status|tick>
 hermes kanban [--board <slug>] <action> [options]
 ```
 
-Multi-profile, multi-project collaboration board. Each install can host many boards (one per project, repo, or domain); each board is a standalone queue with its own SQLite DB and dispatcher scope. New installs start with one board called `default`, whose DB is `~/.hermes/kanban.db` for back-compat; additional boards live at `~/.hermes/kanban/boards/<slug>/kanban.db`. The gateway-embedded dispatcher sweeps every board per tick.
+Multi-profile, multi-project collaboration board. Each install can host many boards (one per project, repo, or domain); each board is a standalone queue in the configured Kanban store with its own dispatcher scope. New/default deployments use Postgres (`kanban.backend: postgres`); SQLite remains a legacy/test backend. The gateway-embedded dispatcher sweeps every board per tick.
 
 **Global flags (apply to every action below):**
 
@@ -531,11 +531,11 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 
 | Action | Purpose |
 |--------|---------|
-| `init` | Create `kanban.db` if missing. Idempotent. |
+| `init` | Initialize the configured Kanban store if needed. Idempotent. |
 | `boards list` / `boards ls` | List all boards with task counts. `--json`, `--all` (include archived). |
 | `boards create <slug>` | Create a new board. Flags: `--name`, `--description`, `--icon`, `--color`, `--switch` (make active). Slug is kebab-case, auto-downcased. |
 | `boards switch <slug>` / `boards use` | Persist `<slug>` as the active board (writes `~/.hermes/kanban/current`). |
-| `boards show` / `boards current` | Print the currently-active board's name, DB path, and task counts. |
+| `boards show` / `boards current` | Print the currently-active board's name, backend/store context, and task counts. |
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
 | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
 | `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |

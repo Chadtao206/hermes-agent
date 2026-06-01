@@ -35,8 +35,9 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | Variable | Carries |
 |---|---|
 | `HERMES_KANBAN_TASK` | the task id the worker is operating on |
-| `HERMES_KANBAN_DB` | absolute path to the per-board SQLite file |
+| `HERMES_KANBAN_DB` | legacy/SQLite-only per-board DB path when the SQLite backend is in use |
 | `HERMES_KANBAN_BOARD` | board slug |
+| `HERMES_KANBAN_PG_DSN` | optional Postgres DSN override when `kanban.backend=postgres`; otherwise resolved from config |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | root of the board's workspace tree |
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |
 | `HERMES_KANBAN_RUN_ID` | the current run's id (for the lifecycle gate) |

@@ -2656,17 +2656,23 @@ def _auto_block_unclosed_kanban_worker_turn(
     ).strip() or None
 
     try:
-        from hermes_cli import kanban_db as _kanban_db
-        import contextlib as _contextlib
+        from hermes_cli.kanban.store import kanban_store as _kanban_store
 
-        with _contextlib.closing(_kanban_db.connect()) as conn:
-            return _kanban_db.auto_block_unclosed_worker_turn(
-                conn,
-                task_id,
-                final_response=response,
-                expected_run_id=expected_run_id,
-                expected_claim_lock=expected_claim_lock,
+        store = _kanban_store(board=None)
+        try:
+            return bool(
+                store.auto_block_unclosed_worker_turn(
+                    task_id,
+                    final_response=response,
+                    expected_run_id=expected_run_id,
+                    expected_claim_lock=expected_claim_lock,
+                )
             )
+        finally:
+            try:
+                store.close()
+            except Exception:
+                pass
     except Exception as exc:
         logging.warning("kanban closeout guard failed for %s: %s", task_id, exc)
         return False

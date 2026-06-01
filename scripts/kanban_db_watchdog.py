@@ -45,8 +45,8 @@ def build_message(
     issues = select_issues(result, min_severity)
     board = result.get("board") or "default"
     lines = [
-        f"Kanban DB watchdog alert ({board})",
-        f"db_path: {result.get('db_path')}",
+        f"Kanban store watchdog alert ({board})",
+        f"store: {result.get('db_path')}",
         f"matched_issues: {len(issues)} (threshold={min_severity})",
     ]
     for issue in issues[:max_issues]:
@@ -70,7 +70,7 @@ def build_message(
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Read-only kanban DB watchdog. Silent on healthy boards; prints only "
+            "Read-only kanban store watchdog. Silent on healthy boards; prints only "
             "when board-doctor findings meet the requested severity threshold."
         )
     )

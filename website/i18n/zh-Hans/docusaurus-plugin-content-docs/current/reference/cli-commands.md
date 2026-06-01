@@ -385,7 +385,7 @@ hermes cron <list|create|edit|pause|resume|run|remove|status|tick>
 hermes kanban [--board <slug>] <action> [options]
 ```
 
-多 profile、多项目协作看板。每个安装可托管多个看板（每个项目、仓库或领域一个）；每个看板是独立的队列，拥有自己的 SQLite 数据库和调度器作用域。新安装从名为 `default` 的单个看板开始，其数据库为 `~/.hermes/kanban.db`（向后兼容）；其他看板位于 `~/.hermes/kanban/boards/<slug>/kanban.db`。嵌入在 gateway 中的调度器每次 tick 扫描所有看板。
+多 profile、多项目协作看板。每个安装可托管多个看板（每个项目、仓库或领域一个）；每个看板是配置的 Kanban store 中的独立队列，并拥有自己的调度器作用域。当前/默认部署使用 Postgres（`kanban.backend: postgres`）；SQLite 仅保留为旧版/测试后端。嵌入在 gateway 中的调度器每次 tick 扫描所有看板。
 
 **全局标志（适用于以下所有操作）：**
 
@@ -397,11 +397,11 @@ hermes kanban [--board <slug>] <action> [options]
 
 | 操作 | 用途 |
 |--------|---------|
-| `init` | 如果缺少则创建 `kanban.db`。幂等操作。 |
+| `init` | 如果需要则初始化配置的 Kanban store。幂等操作。 |
 | `boards list` / `boards ls` | 列出所有看板及任务数量。支持 `--json`、`--all`（包含已归档）。 |
 | `boards create <slug>` | 创建新看板。标志：`--name`、`--description`、`--icon`、`--color`、`--switch`（设为活跃）。Slug 为 kebab-case，自动转小写。 |
 | `boards switch <slug>` / `boards use` | 将 `<slug>` 持久化为活跃看板（写入 `~/.hermes/kanban/current`）。 |
-| `boards show` / `boards current` | 打印当前活跃看板的名称、数据库路径和任务数量。 |
+| `boards show` / `boards current` | 打印当前活跃看板的名称、后端/store 上下文和任务数量。 |
 | `boards rename <slug> "<name>"` | 更改看板的显示名称。Slug 不可变。 |
 | `boards rm <slug>` | 归档（默认）或硬删除看板。`--delete` 跳过归档步骤。已归档看板移至 `boards/_archived/<slug>-<ts>/`。`default` 看板拒绝此操作。 |
 | `create "<title>"` | 在活跃看板上创建新任务。标志：`--body`、`--assignee`、`--parent`（可重复）、`--workspace scratch\|worktree\|dir:<path>`、`--tenant`、`--priority`、`--triage`、`--idempotency-key`、`--max-runtime`、`--max-retries`、`--skill`（可重复）。 |

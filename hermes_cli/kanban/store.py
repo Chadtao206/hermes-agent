@@ -1,7 +1,11 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+import yaml
+
 try:
     from typing import Protocol, runtime_checkable
 except ImportError:  # Python 3.7
@@ -100,6 +104,15 @@ class KanbanStore(Protocol):
         release_claim: bool = True,
         end_run: bool = True,
         event_payload_extra=None,
+    ) -> bool: ...
+
+    def auto_block_unclosed_worker_turn(
+        self,
+        task_id: str,
+        *,
+        final_response: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+        expected_claim_lock: Optional[str] = None,
     ) -> bool: ...
 
     # ------------------------------------------------------------------
@@ -273,9 +286,11 @@ def resolve_backend() -> str:
 
     Precedence: the ``HERMES_KANBAN_BACKEND`` env override (if it names a valid
     backend) wins, so the gateway can propagate the live backend to spawned
-    workers whose profile-scoped config does not carry it. Otherwise read
-    config defensively; any failure falls back to 'sqlite' so default
-    deployments and upstream are unaffected."""
+    workers whose profile-scoped config does not carry it. Otherwise read the
+    active config, then the default-root config. The default-root fallback keeps
+    standalone named-profile commands on the shared Postgres board when profile
+    configs omit kanban.backend.
+    """
     env_backend = (os.environ.get("HERMES_KANBAN_BACKEND") or "").strip().lower()
     if env_backend in _VALID_BACKENDS:
         return env_backend
@@ -283,7 +298,23 @@ def resolve_backend() -> str:
         from hermes_cli.config import load_config
         cfg = load_config()
         kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
-        backend = str(kanban_cfg.get("backend") or "sqlite").strip().lower()
+        backend = str(kanban_cfg.get("backend") or "").strip().lower()
     except Exception:
-        return "sqlite"
-    return backend if backend in _VALID_BACKENDS else "sqlite"
+        backend = ""
+    if backend in _VALID_BACKENDS:
+        return backend
+
+    try:
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+        # Only profile-scoped commands inherit the root backend. Default/root
+        # sessions and tests with an empty config keep upstream's sqlite default.
+        if home.parent.name == "profiles":
+            root = home.parent.parent
+            cfg_path = root / "config.yaml"
+            root_cfg = yaml.safe_load(cfg_path.read_text()) or {}
+            root_backend = str(((root_cfg.get("kanban") or {}).get("backend") or "").strip().lower())
+            if root_backend in _VALID_BACKENDS:
+                return root_backend
+    except Exception:
+        pass
+    return "sqlite"

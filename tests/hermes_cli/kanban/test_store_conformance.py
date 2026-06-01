@@ -2,6 +2,7 @@ import json
 import time
 from uuid import uuid4
 
+from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db import HallucinatedCardsError
 
 
@@ -756,3 +757,76 @@ def test_create_task_branch_name_requires_worktree(store):
     with pytest.raises(ValueError):
         store.create_task(title="x", assignee="engineer", branch_name="b",
                           workspace_kind="scratch")
+
+
+def _set_auto_wake_arm_config(monkeypatch, *, enabled, profile="default", name="jensen-orchestrator"):
+    cfg = {"enabled": bool(enabled), "profile": profile, "name": name}
+    monkeypatch.setattr(kb, "_auto_wake_arm_config", lambda: cfg)
+    try:
+        from hermes_cli.kanban import store_postgres as pg_store
+
+        monkeypatch.setattr(pg_store, "_auto_wake_arm_config", lambda: cfg)
+    except Exception:
+        pass
+
+
+def test_create_root_auto_arms_configured_orchestrator_across_backends(store, monkeypatch):
+    if store.__class__.__name__ == "SqliteKanbanStore":
+        pytest.skip("sqlite behavior covered by tests/hermes_cli/test_kanban_wake_arm_cli.py")
+    _set_auto_wake_arm_config(monkeypatch, enabled=True)
+    monkeypatch.delenv("HERMES_KANBAN_EVENT_WAKE", raising=False)
+
+    root = store.create_task(title="root", assignee="default")
+    child = store.create_task(title="child", assignee="engineer", parents=[root])
+
+    root_subs = store.list_profile_event_subs(
+        task_id=root, profile="default", enabled_only=False)
+    child_subs = store.list_profile_event_subs(task_id=child, enabled_only=False)
+
+    assert len(root_subs) == 1
+    row = root_subs[0]
+    assert (row.get("name") or "") == "jensen-orchestrator"
+    assert kb._parse_event_kinds_column(row["event_kinds"]) == list(kb.WAKE_ARM_EVENT_KINDS)
+    assert bool(row["include_children"]) is True
+    assert bool(row["wake_agent"]) is True
+    assert bool(row["enabled"]) is True
+    assert row["wake_prompt"] == kb.WAKE_ARM_PROMPT
+    assert child_subs == []
+
+
+def test_create_task_auto_wake_arm_respects_recursion_guard(store, monkeypatch):
+    if store.__class__.__name__ == "SqliteKanbanStore":
+        pytest.skip("sqlite behavior covered by tests/hermes_cli/test_kanban_wake_arm_cli.py")
+    _set_auto_wake_arm_config(monkeypatch, enabled=True)
+    monkeypatch.setenv("HERMES_KANBAN_EVENT_WAKE", "1")
+
+    root = store.create_task(title="root", assignee="default")
+    subs = store.list_profile_event_subs(task_id=root, enabled_only=False)
+
+    assert subs == []
+
+
+def test_create_task_idempotency_hit_auto_arms_existing_root(store, monkeypatch):
+    if store.__class__.__name__ == "SqliteKanbanStore":
+        pytest.skip("sqlite behavior covered by tests/hermes_cli/test_kanban_wake_arm_cli.py")
+    _set_auto_wake_arm_config(monkeypatch, enabled=False)
+    monkeypatch.delenv("HERMES_KANBAN_EVENT_WAKE", raising=False)
+
+    root = store.create_task(
+        title="idempotent root",
+        assignee="default",
+        idempotency_key="same-key",
+    )
+    assert store.list_profile_event_subs(task_id=root, enabled_only=False) == []
+
+    _set_auto_wake_arm_config(monkeypatch, enabled=True)
+
+    same = store.create_task(
+        title="idempotent root",
+        assignee="default",
+        idempotency_key="same-key",
+    )
+    rows = store.list_profile_event_subs(task_id=root, enabled_only=False)
+
+    assert same == root
+    assert len(rows) == 1

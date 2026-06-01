@@ -81,6 +81,22 @@ class SqliteKanbanStore:
                            release_claim=release_claim, end_run=end_run,
                            event_payload_extra=event_payload_extra)
 
+    def auto_block_unclosed_worker_turn(
+        self,
+        task_id: str,
+        *,
+        final_response: Optional[str] = None,
+        expected_run_id: Optional[int] = None,
+        expected_claim_lock: Optional[str] = None,
+    ) -> bool:
+        return self._write(
+            "auto_block_unclosed_worker_turn",
+            task_id=task_id,
+            final_response=final_response,
+            expected_run_id=expected_run_id,
+            expected_claim_lock=expected_claim_lock,
+        )
+
     def record_spawn_success(self, task_id: str, pid: int) -> None:
         return self._write("record_spawn_success", task_id=task_id, pid=int(pid))
 

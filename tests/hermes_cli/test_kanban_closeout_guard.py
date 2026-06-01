@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -16,7 +17,9 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "sqlite")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kb, "single_writer_enabled", lambda: False)
     kb.init_db()
     return home
 
@@ -115,3 +118,32 @@ def test_cli_guard_auto_blocks_from_kanban_worker_env(kanban_home, monkeypatch):
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.status == "blocked"
+
+
+def test_cli_guard_routes_through_backend_store(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_backend_store")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claimer:42")
+
+    fake_store = MagicMock()
+    fake_store.auto_block_unclosed_worker_turn.return_value = True
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban.store.kanban_store",
+        lambda board=None: fake_store,
+    )
+
+    from cli import _auto_block_unclosed_kanban_worker_turn
+
+    assert _auto_block_unclosed_kanban_worker_turn(
+        "API call failed after 3 retries: Connection error.",
+        {"completed": False, "failed": True},
+    ) is True
+
+    fake_store.auto_block_unclosed_worker_turn.assert_called_once_with(
+        "t_backend_store",
+        final_response="API call failed after 3 retries: Connection error.",
+        expected_run_id=42,
+        expected_claim_lock="claimer:42",
+    )
+    fake_store.close.assert_called_once_with()
