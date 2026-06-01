@@ -18,7 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
+
+if TYPE_CHECKING:
+    from hermes_cli.kanban.store import KanbanStore
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -72,7 +75,7 @@ def _swarm_context(root_id: str, goal: str) -> str:
 
 
 def create_swarm(
-    store: "KanbanStore",
+    store: KanbanStore,
     *,
     goal: str,
     workers: Iterable[SwarmWorkerSpec],
@@ -216,7 +219,7 @@ def create_swarm(
 
 
 def post_blackboard_update(
-    store: "KanbanStore",
+    store: KanbanStore,
     root_id: str,
     *,
     author: str,
