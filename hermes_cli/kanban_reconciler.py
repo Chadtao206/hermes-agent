@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -22,6 +23,14 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 
+logger = logging.getLogger(__name__)
+
+
+_DEFERRED_PG_RECONCILE_KINDS = [
+    "review_parent_pr_head_evidence_missing",
+    "repeated_failure_signature_decision",
+]
+_pg_partial_logged = False  # log the deferral once per process
 
 _SYSTEMIC_FAILURE_CLASSES = {
     kb.FAILURE_CLASS_SYSTEMIC_SPAWN_FAILURE,
@@ -1571,6 +1580,14 @@ def run_reconciler(
     ready_age_seconds: int = 15 * 60,
     now: Optional[int] = None,
 ) -> dict[str, Any]:
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        if resolve_backend() == "postgres":
+            return _run_reconciler_pg(board=board,
+                                      ready_age_seconds=ready_age_seconds, now=now)
+    except Exception:
+        pass  # defensive: fall through to sqlite (default deployments unaffected)
+    # ---- existing sqlite body, verbatim ----
     path = kb.kanban_db_path(board=board)
     as_of = int(now if now is not None else time.time())
     with _snapshot_connect(path) as conn:
@@ -1599,6 +1616,85 @@ def run_reconciler(
         "as_of": as_of,
         "mutation_applied": False,
     }
+
+
+def _run_reconciler_pg(*, board, ready_age_seconds, now=None, pool=None):
+    from hermes_cli.kanban import pg_pool
+    from hermes_cli.kanban.store_postgres import PostgresKanbanStore
+    from hermes_cli.kanban_board_doctor import _redacted_pg_dsn
+    global _pg_partial_logged
+    slug = board or kb.get_current_board()      # resolve once
+    as_of = int(now if now is not None else time.time())
+    db_path = _redacted_pg_dsn()
+    partial = {"deferred_kinds": list(_DEFERRED_PG_RECONCILE_KINDS),
+               "note": "PG reconcile omits PR-head-evidence + systemic-failure-"
+                       "signature checks (Phase 6 B1); run sqlite reconcile for "
+                       "full coverage."}
+    if not _pg_partial_logged:
+        logger.info("kanban reconcile (postgres): %d action kinds deferred: %s",
+                    len(_DEFERRED_PG_RECONCILE_KINDS),
+                    ", ".join(_DEFERRED_PG_RECONCILE_KINDS))
+        _pg_partial_logged = True
+    try:
+        pool = pool or pg_pool.get_pool()
+        with pool.connection(timeout=5) as conn:
+            conn.execute("SELECT 1").fetchone()
+    except Exception as exc:
+        logger.warning("kanban reconcile (postgres): backend unreachable: %s",
+                       type(exc).__name__)
+        return {"ok": False, "board": slug, "db_path": db_path, "actions": [],
+                "wake_triage": {"mode": "auto_silent", "wake_agent": False,
+                                "suppressed_decision_packet_count": 0},
+                "as_of": as_of, "mutation_applied": False, "partial": partial}
+    store = PostgresKanbanStore(board=slug, pool=pool)
+    with pool.connection() as conn:
+        actions = _collect_reconcile_actions_pg(
+            conn, slug, store, ready_age_seconds=ready_age_seconds, now=as_of)
+    action_dicts = actions_to_dicts(actions)
+    action_dicts, suppressed_packets = _filter_acknowledged_decision_packets_pg(
+        store, action_dicts)
+    wake_triage = classify_wake_triage(action_dicts)
+    wake_triage["suppressed_decision_packet_count"] = len(suppressed_packets)
+    if suppressed_packets:
+        wake_triage["suppressed_decision_packets"] = suppressed_packets
+    return {"ok": not action_dicts, "board": slug, "db_path": db_path,
+            "actions": action_dicts, "wake_triage": wake_triage, "as_of": as_of,
+            "mutation_applied": False, "partial": partial}
+
+
+def _filter_acknowledged_decision_packets_pg(store, action_dicts):
+    """Mirror ``_filter_acknowledged_decision_packets`` using PG store.list_comments."""
+    triage = classify_wake_triage(action_dicts)
+    suppressed_action_signatures: set[str] = set()
+    suppressed_packets: list[dict[str, Any]] = []
+    for packet in triage.get("decision_packets") or []:
+        task_id = str(packet.get("task_id") or "").strip()
+        packet_signature = str(packet.get("packet_signature") or "").strip()
+        if not task_id or not packet_signature:
+            continue
+        comments = store.list_comments(task_id)
+        applied_option: Optional[str] = None
+        for option in ("keep_parked", "keep_blocked"):
+            if any(_reconcile_decision_comment_matches(
+                    c, option=option, packet_signature=packet_signature)
+                   for c in comments):
+                applied_option = option
+                break
+        if not applied_option:
+            continue
+        sigs = [str(a.get("signature") or "")
+                for a in packet.get("actions") or [] if a.get("signature")]
+        suppressed_action_signatures.update(sigs)
+        suppressed_packets.append({
+            "task_id": task_id, "packet_signature": packet_signature,
+            "option": applied_option,
+            "action_count": int(packet.get("action_count") or len(sigs)),
+            "kinds": list(packet.get("kinds") or [])})
+    if not suppressed_action_signatures:
+        return action_dicts, []
+    filtered = [a for a in action_dicts
+                if str(a.get("signature") or "") not in suppressed_action_signatures]
+    return filtered, suppressed_packets
 
 
 def _apply_error(

@@ -258,3 +258,40 @@ def test_blocked_parents_string_is_p_id_ordered_and_stable(pg):
     first = _parents_str()
     assert first == expected           # ordered by p.id
     assert _parents_str() == first     # stable across runs (same signature)
+
+
+# --- run_reconciler PG dispatch ----------------------------------------------
+
+def test_run_reconciler_pg_returns_real_actions_and_partial(pg, monkeypatch):
+    s, pool, board = pg
+    monkeypatch.setattr(pg_pool, "get_pool", lambda *a, **k: pool)
+    monkeypatch.setattr("hermes_cli.kanban.store.resolve_backend", lambda: "postgres")
+    monkeypatch.setattr("hermes_cli.kanban_db.get_current_board", lambda *a, **k: board)
+    t = s.create_task(title="x", assignee=None)
+    old = int(time.time()) - 10_000
+    with pool.connection() as conn:
+        conn.execute("UPDATE tasks SET created_at=%s WHERE board=%s AND id=%s",
+                     (old, board, t)); conn.commit()
+    res = krec.run_reconciler(ready_age_seconds=900)
+    assert res["mutation_applied"] is False
+    assert res["board"] == board
+    assert any(a["kind"].startswith("old_ready_") for a in res["actions"])
+    assert "partial" in res
+    assert set(res["partial"]["deferred_kinds"]) == {
+        "review_parent_pr_head_evidence_missing",
+        "repeated_failure_signature_decision"}
+    assert "://" in res["db_path"]
+    assert "postgres:postgres@" not in res["db_path"]   # no password/userinfo
+
+
+def test_run_reconciler_pg_unreachable_returns_shape(monkeypatch):
+    monkeypatch.setattr("hermes_cli.kanban.store.resolve_backend", lambda: "postgres")
+    monkeypatch.setattr("hermes_cli.kanban_db.get_current_board", lambda *a, **k: "default")
+    class _BadPool:
+        def connection(self, *a, **k): raise RuntimeError("nope-secret-host")
+    monkeypatch.setattr(pg_pool, "get_pool", lambda *a, **k: _BadPool())
+    res = krec.run_reconciler()
+    assert res["ok"] is False
+    assert res["actions"] == []
+    assert "nope-secret-host" not in str(res)   # no raw exception text / no DSN
+    assert "partial" in res
