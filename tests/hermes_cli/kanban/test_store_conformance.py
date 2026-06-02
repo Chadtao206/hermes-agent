@@ -846,3 +846,69 @@ def test_create_task_idempotency_hit_auto_arms_existing_root(store, monkeypatch)
 
     assert same == root
     assert len(rows) == 1
+
+
+def test_recompute_promotes_todo_when_all_parents_done(store):
+    p = store.create_task(title="parent", assignee="engineer")
+    c = store.create_task(title="child", assignee="engineer")
+    store.link_tasks(p, c)
+    assert store.set_status_direct(c, "todo") is True
+    # parent still 'ready' (not done) -> child must NOT promote
+    store.recompute_ready()
+    assert store.get_task(c).status == "todo"
+    # parent done -> child promotes to ready
+    assert store.complete_task(p, result="r", summary="s") is True
+    store.recompute_ready()
+    assert store.get_task(c).status == "ready"
+
+
+def test_recompute_fan_in_waits_for_all_parents(store):
+    p1 = store.create_task(title="p1", assignee="engineer")
+    p2 = store.create_task(title="p2", assignee="engineer")
+    c = store.create_task(title="child", assignee="engineer")
+    store.link_tasks(p1, c)
+    store.link_tasks(p2, c)
+    assert store.set_status_direct(c, "todo") is True
+    assert store.complete_task(p1, result="r", summary="s") is True
+    store.recompute_ready()
+    assert store.get_task(c).status == "todo"   # p2 still open
+    assert store.complete_task(p2, result="r", summary="s") is True
+    store.recompute_ready()
+    assert store.get_task(c).status == "ready"
+
+
+def test_recompute_promotes_root_with_no_parents(store):
+    t = store.create_task(title="root", assignee="engineer")
+    assert store.set_status_direct(t, "todo") is True
+    assert store.recompute_ready() >= 1
+    assert store.get_task(t).status == "ready"
+
+
+def test_recompute_cascades_one_level_per_call(store):
+    a = store.create_task(title="a", assignee="engineer")
+    b = store.create_task(title="b", assignee="engineer")
+    c = store.create_task(title="c", assignee="engineer")
+    store.link_tasks(a, b)
+    store.link_tasks(b, c)
+    assert store.set_status_direct(b, "todo") is True
+    assert store.set_status_direct(c, "todo") is True
+    assert store.complete_task(a, result="r", summary="s") is True
+    store.recompute_ready()
+    assert store.get_task(b).status == "ready"   # promoted
+    assert store.get_task(c).status == "todo"    # still waits on b
+    assert store.complete_task(b, result="r", summary="s") is True
+    store.recompute_ready()
+    assert store.get_task(c).status == "ready"
+
+
+def test_recompute_count_matches_promotions(store):
+    # Two parent-less roots forced to 'todo'. set_status_direct('todo') does NOT
+    # trigger an internal recompute (only 'done'/'ready' do), so the explicit
+    # recompute_ready() below is the sole promoter and its count is observable.
+    t1 = store.create_task(title="t1", assignee="engineer")
+    t2 = store.create_task(title="t2", assignee="engineer")
+    assert store.set_status_direct(t1, "todo") is True
+    assert store.set_status_direct(t2, "todo") is True
+    assert store.recompute_ready() == 2
+    assert store.get_task(t1).status == "ready"
+    assert store.get_task(t2).status == "ready"

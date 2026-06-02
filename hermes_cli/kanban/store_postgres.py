@@ -847,40 +847,32 @@ class PostgresKanbanStore:
                 return (False, f"task {task_id} status changed concurrently; promote had no effect")
 
     def recompute_ready(self) -> int:
-        # Phase-2 simplification: sticky-block re-promotion deferred (phase-2-tail);
-        # only 'todo' tasks are recomputed.
-        count = 0
+        # Behavior-preserving, single-statement form of the historical per-task
+        # connection loop (which opened N+1 pooled connections and starved the
+        # Supabase pooler). Promotes every 'todo' whose dependency parents are all
+        # done/archived, in one CTE, and emits a 'promoted' event per promotion in
+        # the same statement. 'blocked' is left untouched (sticky-block re-promotion
+        # remains a deferred phase-2-tail parity gap), exactly as before.
+        now = int(time.time())
         with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, status FROM tasks WHERE board=%s AND status IN ('todo','blocked')",
-                (self.board,))
-            candidates = cur.fetchall()
-        for row in candidates:
-            tid = row["id"]
-            status = row["status"]
-            if status == "blocked":
-                continue
-            # status == "todo": promote if all dependency parents are done/archived
-            with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-                with conn.transaction():
-                    cur.execute(
-                        "SELECT count(*) AS n FROM task_links l "
-                        "JOIN tasks t ON t.board=l.board AND t.id=l.parent_id "
-                        "WHERE l.board=%s AND l.child_id=%s "
-                        "AND l.relation_type='dependency' "
-                        "AND t.status NOT IN ('done','archived')",
-                        (self.board, tid))
-                    n = cur.fetchone()["n"]
-                    if n == 0:
-                        cur.execute(
-                            "UPDATE tasks SET status='ready', consecutive_failures=0, "
-                            "last_failure_error=NULL "
-                            "WHERE board=%s AND id=%s AND status='todo'",
-                            (self.board, tid))
-                        if cur.rowcount == 1:
-                            self._emit(cur, tid, "promoted")
-                            count += 1
-        return count
+                "WITH promoted AS ("
+                "  UPDATE tasks t "
+                "     SET status='ready', consecutive_failures=0, "
+                "         last_failure_error=NULL "
+                "   WHERE t.board=%s AND t.status='todo' "
+                "     AND NOT EXISTS ("
+                "       SELECT 1 FROM task_links l "
+                "         JOIN tasks p ON p.board=l.board AND p.id=l.parent_id "
+                "        WHERE l.board=t.board AND l.child_id=t.id "
+                "          AND l.relation_type='dependency' "
+                "          AND p.status NOT IN ('done','archived')) "
+                "  RETURNING t.id) "
+                "INSERT INTO task_events (board, task_id, run_id, kind, payload, created_at) "
+                "SELECT %s, id, NULL, 'promoted', NULL, %s FROM promoted "
+                "RETURNING task_id",
+                (self.board, self.board, now))
+            return len(cur.fetchall())
 
     def has_spawnable_ready(self) -> bool:
         # Phase-2 simplification: on-disk profile validation deferred (phase-2-tail);
