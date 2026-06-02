@@ -26,26 +26,28 @@ _SCHEMA_DONE: set[str] = set()
 # ConnectionPool.connection() delegates to getconn().
 POOL_GETCONN_TIMEOUT = 10.0       # seconds, per attempt
 POOL_GETCONN_ATTEMPTS = 3
-_POOL_GETCONN_BACKOFF = (0.5, 1.0)  # sleep before retrying (last attempt: no sleep)
+_POOL_GETCONN_BACKOFF = (0.5, 1.0)  # sleeps between attempts; total ceiling ~31.5s
 
 
 class _RetryingConnectionPool(ConnectionPool):
     """ConnectionPool that retries getconn on PoolTimeout with bounded backoff."""
 
     def getconn(self, timeout=None):
-        last_exc: PoolTimeout | None = None
+        """Retry getconn on PoolTimeout with bounded backoff.
+
+        NOTE: ``timeout`` is a PER-ATTEMPT budget, not an absolute deadline.
+        With the default ``POOL_GETCONN_TIMEOUT`` the total wall-time ceiling is
+        ``POOL_GETCONN_ATTEMPTS * timeout + sum(_POOL_GETCONN_BACKOFF)`` (~31.5s).
+        """
+        eff_timeout = timeout if timeout is not None else POOL_GETCONN_TIMEOUT
         for attempt in range(POOL_GETCONN_ATTEMPTS):
             try:
-                return super().getconn(
-                    timeout=timeout if timeout is not None else POOL_GETCONN_TIMEOUT
-                )
-            except PoolTimeout as exc:
-                last_exc = exc
-                if attempt < POOL_GETCONN_ATTEMPTS - 1:
-                    time.sleep(_POOL_GETCONN_BACKOFF[
-                        min(attempt, len(_POOL_GETCONN_BACKOFF) - 1)])
-        assert last_exc is not None
-        raise last_exc
+                return super().getconn(timeout=eff_timeout)
+            except PoolTimeout:
+                if attempt == POOL_GETCONN_ATTEMPTS - 1:
+                    raise
+                time.sleep(_POOL_GETCONN_BACKOFF[
+                    min(attempt, len(_POOL_GETCONN_BACKOFF) - 1)])
 
 
 def resolve_dsn() -> str:
