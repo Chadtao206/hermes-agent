@@ -33,16 +33,21 @@ class _RetryingConnectionPool(ConnectionPool):
     """ConnectionPool that retries getconn on PoolTimeout with bounded backoff."""
 
     def getconn(self, timeout=None):
-        """Retry getconn on PoolTimeout with bounded backoff.
+        """Retry getconn on PoolTimeout, but ONLY for default-timeout callers.
 
-        NOTE: ``timeout`` is a PER-ATTEMPT budget, not an absolute deadline.
-        With the default ``POOL_GETCONN_TIMEOUT`` the total wall-time ceiling is
-        ``POOL_GETCONN_ATTEMPTS * timeout + sum(_POOL_GETCONN_BACKOFF)`` (~31.5s).
+        An explicit ``timeout`` is honored as a caller-chosen ABSOLUTE deadline
+        (single attempt, no retry) — fail-fast connectivity probes / liveness
+        ticks (gateway, reconciler, board doctor) pass one and must not have it
+        silently multiplied. Default-timeout callers (every normal store op via
+        ``pool.connection()``) get the bounded retry: the wall-time ceiling is
+        ``POOL_GETCONN_ATTEMPTS * POOL_GETCONN_TIMEOUT + sum(_POOL_GETCONN_BACKOFF)``
+        (~31.5s), split so a pooler that recovers mid-window is caught.
         """
-        eff_timeout = timeout if timeout is not None else POOL_GETCONN_TIMEOUT
+        if timeout is not None:
+            return super().getconn(timeout=timeout)
         for attempt in range(POOL_GETCONN_ATTEMPTS):
             try:
-                return super().getconn(timeout=eff_timeout)
+                return super().getconn(timeout=POOL_GETCONN_TIMEOUT)
             except PoolTimeout:
                 if attempt == POOL_GETCONN_ATTEMPTS - 1:
                     raise

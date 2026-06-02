@@ -67,3 +67,24 @@ def test_make_pool_sets_resilience_kwargs():
         assert pool._check is ConnectionPool.check_connection
     finally:
         pool.close()
+
+
+def test_getconn_with_explicit_timeout_does_not_retry(monkeypatch):
+    # An explicit timeout is an absolute deadline (fail-fast probes); it must be
+    # a single attempt, NOT multiplied by the retry loop.
+    calls = {"n": 0}
+
+    def always_timeout(self, timeout=None):
+        calls["n"] += 1
+        raise PoolTimeout("saturated")
+
+    monkeypatch.setattr(ConnectionPool, "getconn", always_timeout)
+    monkeypatch.setattr(pg_pool.time, "sleep", lambda *_: None)
+
+    pool = _RetryingConnectionPool(conninfo=_DEAD_DSN, open=False)
+    try:
+        with pytest.raises(PoolTimeout):
+            pool.getconn(timeout=1)
+        assert calls["n"] == 1  # exactly one attempt, no retry
+    finally:
+        pool.close()
