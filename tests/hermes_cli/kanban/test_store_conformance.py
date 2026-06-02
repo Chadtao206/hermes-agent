@@ -849,16 +849,27 @@ def test_create_task_idempotency_hit_auto_arms_existing_root(store, monkeypatch)
 
 
 def test_recompute_promotes_todo_when_all_parents_done(store):
+    # Finish the parent BEFORE the child becomes a promotable 'todo', so the
+    # child's promotion is attributable solely to the explicit recompute_ready()
+    # call under test. (complete_task and set_status_direct(->done/ready) both
+    # trigger an internal recompute that would otherwise pre-empt it.)
     p = store.create_task(title="parent", assignee="engineer")
+    assert store.complete_task(p, result="r", summary="s") is True  # parent -> done
+    c = store.create_task(title="child", assignee="engineer")
+    store.link_tasks(p, c)
+    assert store.set_status_direct(c, "todo") is True  # 'todo' -> no internal recompute
+    assert store.recompute_ready() == 1  # the explicit call is the sole promoter
+    assert store.get_task(c).status == "ready"
+
+
+def test_recompute_promotes_when_parent_archived(store):
+    # The gate treats 'archived' parents as satisfied, same as 'done'.
+    p = store.create_task(title="parent", assignee="engineer")
+    assert store.set_status_direct(p, "archived") is True  # no internal recompute
     c = store.create_task(title="child", assignee="engineer")
     store.link_tasks(p, c)
     assert store.set_status_direct(c, "todo") is True
-    # parent still 'ready' (not done) -> child must NOT promote
-    store.recompute_ready()
-    assert store.get_task(c).status == "todo"
-    # parent done -> child promotes to ready
-    assert store.complete_task(p, result="r", summary="s") is True
-    store.recompute_ready()
+    assert store.recompute_ready() == 1
     assert store.get_task(c).status == "ready"
 
 
@@ -870,17 +881,17 @@ def test_recompute_fan_in_waits_for_all_parents(store):
     store.link_tasks(p2, c)
     assert store.set_status_direct(c, "todo") is True
     assert store.complete_task(p1, result="r", summary="s") is True
-    store.recompute_ready()
-    assert store.get_task(c).status == "todo"   # p2 still open
+    # p2 still open -> the explicit recompute is a no-op and child stays 'todo'
+    assert store.recompute_ready() == 0
+    assert store.get_task(c).status == "todo"
     assert store.complete_task(p2, result="r", summary="s") is True
-    store.recompute_ready()
     assert store.get_task(c).status == "ready"
 
 
 def test_recompute_promotes_root_with_no_parents(store):
     t = store.create_task(title="root", assignee="engineer")
     assert store.set_status_direct(t, "todo") is True
-    assert store.recompute_ready() >= 1
+    assert store.recompute_ready() == 1
     assert store.get_task(t).status == "ready"
 
 
@@ -892,12 +903,13 @@ def test_recompute_cascades_one_level_per_call(store):
     store.link_tasks(b, c)
     assert store.set_status_direct(b, "todo") is True
     assert store.set_status_direct(c, "todo") is True
+    # complete_task(a)'s internal recompute promotes b; c still waits on b. The
+    # explicit call below is then a confirmed no-op (nothing left to promote).
     assert store.complete_task(a, result="r", summary="s") is True
-    store.recompute_ready()
-    assert store.get_task(b).status == "ready"   # promoted
+    assert store.recompute_ready() == 0
+    assert store.get_task(b).status == "ready"   # promoted (one level)
     assert store.get_task(c).status == "todo"    # still waits on b
     assert store.complete_task(b, result="r", summary="s") is True
-    store.recompute_ready()
     assert store.get_task(c).status == "ready"
 
 
