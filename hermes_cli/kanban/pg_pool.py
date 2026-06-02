@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 _SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
 
@@ -17,6 +18,34 @@ _SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
 _POOLS: dict[str, ConnectionPool] = {}
 _POOLS_LOCK = threading.Lock()
 _SCHEMA_DONE: set[str] = set()
+
+# getconn retry: ride through bursty Supabase-pooler PoolTimeouts. Total wait
+# budget stays comparable to the historical single 30s (ATTEMPTS * per-attempt
+# TIMEOUT + backoff), but split so a pooler that recovers mid-window is caught
+# instead of hard-failing. Covers every store call site transparently because
+# ConnectionPool.connection() delegates to getconn().
+POOL_GETCONN_TIMEOUT = 10.0       # seconds, per attempt
+POOL_GETCONN_ATTEMPTS = 3
+_POOL_GETCONN_BACKOFF = (0.5, 1.0)  # sleep before retrying (last attempt: no sleep)
+
+
+class _RetryingConnectionPool(ConnectionPool):
+    """ConnectionPool that retries getconn on PoolTimeout with bounded backoff."""
+
+    def getconn(self, timeout=None):
+        last_exc: PoolTimeout | None = None
+        for attempt in range(POOL_GETCONN_ATTEMPTS):
+            try:
+                return super().getconn(
+                    timeout=timeout if timeout is not None else POOL_GETCONN_TIMEOUT
+                )
+            except PoolTimeout as exc:
+                last_exc = exc
+                if attempt < POOL_GETCONN_ATTEMPTS - 1:
+                    time.sleep(_POOL_GETCONN_BACKOFF[
+                        min(attempt, len(_POOL_GETCONN_BACKOFF) - 1)])
+        assert last_exc is not None
+        raise last_exc
 
 
 def resolve_dsn() -> str:
@@ -67,13 +96,22 @@ def make_pool(dsn: str, *, min_size: int = 1, max_size: int = 8,
     Supabase's transaction pooler (Supavisor) does not pin a backend across
     transactions, so auto-prepared statements collide (`prepared statement
     "_pg3_N" already exists`). Disabling them is the supported pattern for
-    transaction-mode pooling."""
+    transaction-mode pooling.
+
+    Pools also set ``check`` (drop dead pooler connections on checkout),
+    ``max_lifetime``/``max_idle`` (recycle to survive Supavisor reaping), and a
+    short per-attempt ``timeout``; the returned pool retries ``getconn`` on
+    ``PoolTimeout`` (see ``_RetryingConnectionPool``)."""
     kwargs: dict = {"autocommit": True, "prepare_threshold": None}
     if search_path is not None:
         kwargs["options"] = f"-c search_path={search_path}"
-    return ConnectionPool(
+    return _RetryingConnectionPool(
         conninfo=dsn, min_size=min_size, max_size=max_size,
         kwargs=kwargs, open=True,
+        check=ConnectionPool.check_connection,
+        max_lifetime=1800,   # recycle before Supavisor reaps long server sessions
+        max_idle=300,        # release idle conns above min_size -> lower pooler footprint
+        timeout=POOL_GETCONN_TIMEOUT,
     )
 
 
