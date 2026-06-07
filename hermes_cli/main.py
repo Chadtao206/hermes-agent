@@ -313,13 +313,34 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
 
+    # Subcommands that define their OWN --profile argument (scoped to the
+    # subcommand, e.g. `hermes cron create --profile ops`). For these the flag
+    # must be left for argparse: consuming it here as a global HERMES_HOME
+    # override mis-routes the cron job into a per-profile store the scheduler
+    # never runs, and strips the flag so the job's own `profile` field is never
+    # set. Regression from bb9ecb217 ("feat: add cron job profile support").
+    _subcmd_own_profile = {("cron", "create"), ("cron", "add"), ("cron", "edit")}
+
+    def _profile_is_subcommand_scoped(idx: int) -> bool:
+        positionals = [a for a in argv[:idx] if not a.startswith("-")]
+        return (
+            len(positionals) >= 2
+            and (positionals[0], positionals[1]) in _subcmd_own_profile
+        )
+
     # 1. Check for explicit -p / --profile flag
     for i, arg in enumerate(argv):
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
+            # `--profile` (long form) is owned by some subcommands' own parsers;
+            # leave it for argparse so the subcommand sets it (e.g. cron's field).
+            if arg == "--profile" and _profile_is_subcommand_scoped(i):
+                break
             profile_name = argv[i + 1]
             consume = 2
             break
         elif arg.startswith("--profile="):
+            if _profile_is_subcommand_scoped(i):
+                break
             profile_name = arg.split("=", 1)[1]
             consume = 1
             break
