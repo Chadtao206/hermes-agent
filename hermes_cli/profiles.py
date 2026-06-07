@@ -422,6 +422,50 @@ def remove_wrapper_script(name: str) -> bool:
     return False
 
 
+def find_alias_for_profile(profile_name: str) -> Optional[str]:
+    """Return the alias name of the wrapper that activates *profile_name*, or None.
+
+    A wrapper created by :func:`create_wrapper_script` is a file named after the
+    alias whose body invokes ``hermes -p <profile>``. When the alias name equals
+    the profile name this is trivial, but a custom alias (``hermes profile alias
+    <profile> --name <custom>``) produces a differently-named file — so the
+    display side cannot assume ``wrapper == profile`` and must reverse-look-up.
+
+    A custom alias (name != profile) is preferred over the profile-named wrapper
+    so ``profile list``/``show`` surface the command the user actually typed.
+    Results are sorted for deterministic output when several aliases match.
+    """
+    wrapper_dir = _get_wrapper_dir()
+    if not wrapper_dir.is_dir():
+        return None
+    canon = normalize_profile_name(profile_name)
+    is_windows = sys.platform == "win32"
+    needle = f"hermes -p {canon}"
+
+    custom: Optional[str] = None
+    profile_named: Optional[str] = None
+    for entry in sorted(wrapper_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        # Only our own wrappers are named with the alias and (on Windows) .bat.
+        if is_windows and entry.suffix != ".bat":
+            continue
+        if not is_windows and entry.suffix:
+            continue
+        try:
+            content = entry.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if needle not in content:
+            continue
+        alias = entry.stem if is_windows else entry.name
+        if alias == canon:
+            profile_named = alias
+        elif custom is None:
+            custom = alias
+    return custom if custom is not None else profile_named
+
+
 # ---------------------------------------------------------------------------
 # ProfileInfo
 # ---------------------------------------------------------------------------
@@ -438,6 +482,10 @@ class ProfileInfo:
     has_env: bool = False
     skill_count: int = 0
     alias_path: Optional[Path] = None
+    # Custom alias name (the wrapper file name) when it differs from ``name``;
+    # falls back to ``name`` when a profile-named wrapper exists. None if no
+    # wrapper points at this profile. See ``find_alias_for_profile``.
+    alias_name: Optional[str] = None
     # Distribution metadata (None if the profile wasn't installed from a distribution).
     distribution_name: Optional[str] = None
     distribution_version: Optional[str] = None
@@ -638,7 +686,12 @@ def list_profiles() -> List[ProfileInfo]:
             if not _PROFILE_ID_RE.match(name):
                 continue
             model, provider = _read_config_model(entry)
-            alias_path = wrapper_dir / name
+            alias_name = find_alias_for_profile(name)
+            if alias_name:
+                is_windows = sys.platform == "win32"
+                alias_path = wrapper_dir / (f"{alias_name}.bat" if is_windows else alias_name)
+            else:
+                alias_path = None
             dist_name, dist_version, dist_source = _read_distribution_meta(entry)
             meta = read_profile_meta(entry)
             profiles.append(ProfileInfo(
@@ -650,7 +703,8 @@ def list_profiles() -> List[ProfileInfo]:
                 provider=provider,
                 has_env=(entry / ".env").exists(),
                 skill_count=_count_skills(entry),
-                alias_path=alias_path if alias_path.exists() else None,
+                alias_path=alias_path if (alias_path and alias_path.exists()) else None,
+                alias_name=alias_name,
                 distribution_name=dist_name,
                 distribution_version=dist_version,
                 distribution_source=dist_source,
@@ -1471,8 +1525,9 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
 
 def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) -> None:
     """Rename Honcho host blocks for a renamed profile without changing peers."""
-    old_host = f"hermes.{old_name}"
-    new_host = f"hermes.{new_name}"
+    old_host = f"hermes_{old_name}"
+    legacy_old_host = f"hermes.{old_name}"
+    new_host = f"hermes_{new_name}"
 
     candidates = [
         new_dir / "honcho.json",
@@ -1496,18 +1551,24 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
             continue
 
         hosts = raw.get("hosts")
-        if not isinstance(hosts, dict) or old_host not in hosts:
+        if not isinstance(hosts, dict):
+            continue
+        source_host = old_host if old_host in hosts else legacy_old_host
+        if source_host not in hosts:
             continue
 
         if new_host in hosts:
             print(f"⚠ Honcho host block not migrated: {new_host} already exists in {path}")
             continue
 
-        block = hosts[old_host]
+        block = hosts[source_host]
         if isinstance(block, dict) and "aiPeer" not in block:
-            bare = old_host.split(".", 1)[1] if "." in old_host else old_host
+            if source_host.startswith("hermes_"):
+                bare = source_host.split("_", 1)[1]
+            else:
+                bare = source_host.split(".", 1)[1] if "." in source_host else source_host
             block["aiPeer"] = bare
-        hosts[new_host] = hosts.pop(old_host)
+        hosts[new_host] = hosts.pop(source_host)
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
             tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1519,7 +1580,7 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
                 pass
             continue
 
-        print(f"✓ Honcho host updated: {old_host} → {new_host}")
+        print(f"✓ Honcho host updated: {source_host} → {new_host}")
 
 
 def rename_profile(old_name: str, new_name: str) -> Path:

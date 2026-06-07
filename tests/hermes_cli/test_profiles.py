@@ -710,6 +710,63 @@ class TestWrapperScript:
 
 
 # ===================================================================
+# TestFindAliasForProfile — display-side reverse lookup
+# ===================================================================
+
+class TestFindAliasForProfile:
+    """Tests for find_alias_for_profile() and alias display in list/show."""
+
+    def test_profile_named_alias(self, profile_env, monkeypatch):
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import create_wrapper_script, find_alias_for_profile
+        create_wrapper_script("steve")
+        assert find_alias_for_profile("steve") == "steve"
+
+    def test_custom_alias_name_preferred(self, profile_env, monkeypatch):
+        # qiaobusi -> steve-jobs: the custom alias name must surface, not the
+        # profile name, because that's the command the user actually typed.
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import create_wrapper_script, find_alias_for_profile
+        create_wrapper_script("qiaobusi", target="steve")
+        assert find_alias_for_profile("steve") == "qiaobusi"
+
+    def test_no_alias_returns_none(self, profile_env, monkeypatch):
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import find_alias_for_profile
+        assert find_alias_for_profile("steve") is None
+
+    def test_ignores_unrelated_files(self, profile_env, monkeypatch):
+        # ~/.local/bin commonly holds unrelated binaries; they must not match.
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import _get_wrapper_dir, find_alias_for_profile
+        wrapper_dir = _get_wrapper_dir()
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        (wrapper_dir / "pip").write_text("#!/bin/sh\nexec python -m pip \"$@\"\n")
+        assert find_alias_for_profile("steve") is None
+
+    def test_custom_alias_on_windows(self, profile_env, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
+        from hermes_cli.profiles import create_wrapper_script, find_alias_for_profile
+        create_wrapper_script("qiaobusi", target="steve")
+        # The .bat extension must be stripped from the returned alias name.
+        assert find_alias_for_profile("steve") == "qiaobusi"
+
+    def test_list_profiles_surfaces_custom_alias(self, profile_env, monkeypatch):
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import (
+            create_profile,
+            create_wrapper_script,
+            list_profiles,
+        )
+        create_profile("steve", no_alias=True)
+        create_wrapper_script("qiaobusi", target="steve")
+        info = next(p for p in list_profiles() if p.name == "steve")
+        assert info.alias_name == "qiaobusi"
+        assert info.alias_path is not None
+        assert info.alias_path.name == "qiaobusi"
+
+
+# ===================================================================
 # TestRenameProfile
 # ===================================================================
 
@@ -754,8 +811,8 @@ class TestRenameProfile:
 
         cfg = json.loads(honcho_path.read_text())
         assert "hermes.ssi_health" not in cfg["hosts"]
-        assert cfg["hosts"]["hermes.heimdall"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["hermes.heimdall"]["peerName"] == "user-peer"
+        assert cfg["hosts"]["hermes_heimdall"]["aiPeer"] == "ssi_health"
+        assert cfg["hosts"]["hermes_heimdall"]["peerName"] == "user-peer"
 
     def test_pins_ai_peer_when_absent_on_honcho_host_rename(self, profile_env):
         tmp_path = profile_env
@@ -772,8 +829,8 @@ class TestRenameProfile:
 
         cfg = json.loads(honcho_path.read_text())
         assert "hermes.ssi_health" not in cfg["hosts"]
-        assert cfg["hosts"]["hermes.heimdall"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["hermes.heimdall"]["workspace"] == "hermes"
+        assert cfg["hosts"]["hermes_heimdall"]["aiPeer"] == "ssi_health"
+        assert cfg["hosts"]["hermes_heimdall"]["workspace"] == "hermes"
 
     def test_does_not_overwrite_existing_honcho_host_on_rename(self, profile_env):
         tmp_path = profile_env
@@ -782,7 +839,7 @@ class TestRenameProfile:
         honcho_path.write_text(json.dumps({
             "hosts": {
                 "hermes.ssi_health": {"aiPeer": "ssi_health"},
-                "hermes.heimdall": {"aiPeer": "heimdall"},
+                "hermes_heimdall": {"aiPeer": "heimdall"},
             }
         }))
 
@@ -791,7 +848,7 @@ class TestRenameProfile:
 
         cfg = json.loads(honcho_path.read_text())
         assert cfg["hosts"]["hermes.ssi_health"]["aiPeer"] == "ssi_health"
-        assert cfg["hosts"]["hermes.heimdall"]["aiPeer"] == "heimdall"
+        assert cfg["hosts"]["hermes_heimdall"]["aiPeer"] == "heimdall"
 
     def test_default_raises_value_error(self, profile_env):
         with pytest.raises(ValueError, match="default"):

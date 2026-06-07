@@ -2,13 +2,19 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import {
+  AlignLeft,
+  Check,
   ChevronDown,
+  Cpu,
+  MoreVertical,
   Pencil,
-  Settings,
+  Package,
+  Sparkles,
   Terminal,
   Trash2,
   Users,
@@ -17,7 +23,7 @@ import {
 import spinners from "unicode-animations";
 import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { api } from "@/lib/api";
-import type { ProfileInfo, SkillInfo } from "@/lib/api";
+import type { ActiveProfileInfo, ProfileInfo } from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
@@ -29,6 +35,10 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
+import {
+  Select,
+  SelectOption,
+} from "@nous-research/ui/ui/components/select";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { cn, themedBody } from "@/lib/utils";
@@ -36,7 +46,6 @@ import { cn, themedBody } from "@/lib/utils";
 // Mirrors hermes_cli/profiles.py::_PROFILE_ID_RE so we can reject obviously
 // invalid names (uppercase, spaces, …) before round-tripping a doomed POST.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-type ProfileTab = "soul" | "skills" | "config";
 
 /** Braille unicode spinner (`unicode-animations`); static first frame when reduced motion is preferred. */
 function ProfilesLoadingSpinner() {
@@ -67,18 +76,237 @@ function ProfilesLoadingSpinner() {
   );
 }
 
+/**
+ * Per-card "⋯" actions menu. Holds every action for the profile (set active,
+ * model, description, SOUL, copy command, rename, delete) so the card row stays
+ * a single button. Mirrors the hand-rolled dropdown pattern used by ModelsPage's
+ * "Use as" menu (button + absolute panel + outside-click close).
+ */
+function ProfileActionsMenu({
+  isActive,
+  isDefault,
+  isEditingDesc,
+  isEditingModel,
+  isEditingSoul,
+  labels,
+  settingActive,
+  onCopyCommand,
+  onDelete,
+  onEditDescription,
+  onEditModel,
+  onEditSoul,
+  onRename,
+  onSetActive,
+}: ProfileActionsMenuProps) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      // Close only when the click lands outside *this* menu. Matching any
+      // `[data-profile-actions]` would treat another card's menu as "inside"
+      // and leave several menus open at once.
+      if (target && !containerRef.current?.contains(target)) setOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Run the action, then collapse the menu. Toggle editors (model/description/
+  // SOUL) expand the inline section below the card once the menu closes.
+  const run = (fn: () => void) => () => {
+    fn();
+    setOpen(false);
+  };
+
+  const itemClass =
+    "flex w-full items-center gap-2.5 px-3 py-2 text-xs uppercase tracking-wider hover:bg-muted/50 disabled:opacity-40";
+
+  return (
+    <div className="relative" data-profile-actions ref={containerRef}>
+      <Button
+        ghost
+        size="icon"
+        title={labels.actions}
+        aria-label={labels.actions}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <MoreVertical className="h-4 w-4" />
+      </Button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-50 mt-1 min-w-[200px] border border-border bg-card shadow-lg"
+        >
+          {!isActive && (
+            <button
+              type="button"
+              role="menuitem"
+              className={itemClass}
+              disabled={settingActive}
+              onClick={run(onSetActive)}
+            >
+              <Check className="h-4 w-4" />
+              {labels.setActive}
+            </button>
+          )}
+
+          <button
+            type="button"
+            role="menuitem"
+            className={itemClass}
+            onClick={run(onEditModel)}
+          >
+            {isEditingModel ? (
+              <ChevronDown className="h-4 w-4" />
+            ) : (
+              <Cpu className="h-4 w-4" />
+            )}
+            {labels.editModel}
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            className={itemClass}
+            onClick={run(onEditDescription)}
+          >
+            {isEditingDesc ? (
+              <ChevronDown className="h-4 w-4" />
+            ) : (
+              <AlignLeft className="h-4 w-4" />
+            )}
+            {labels.editDescription}
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            className={itemClass}
+            onClick={run(onEditSoul)}
+          >
+            {isEditingSoul ? (
+              <ChevronDown className="h-4 w-4" />
+            ) : (
+              <span aria-hidden className="w-4 text-center text-xs font-bold">
+                S
+              </span>
+            )}
+            {labels.editSoul}
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            className={itemClass}
+            onClick={run(onCopyCommand)}
+          >
+            <Terminal className="h-4 w-4" />
+            {labels.openInTerminal}
+          </button>
+
+          {!isDefault && (
+            <button
+              type="button"
+              role="menuitem"
+              className={cn(itemClass, "border-t border-border/50")}
+              onClick={run(onRename)}
+            >
+              <Pencil className="h-4 w-4" />
+              {labels.rename}
+            </button>
+          )}
+
+          {!isDefault && (
+            <button
+              type="button"
+              role="menuitem"
+              className={cn(itemClass, "text-destructive hover:bg-destructive/10")}
+              onClick={run(onDelete)}
+            >
+              <Trash2 className="h-4 w-4" />
+              {labels.delete}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ProfilesPage() {
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  const [activeInfo, setActiveInfo] = useState<ActiveProfileInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
 
+  // Locale strings with English fallbacks. The enriched keys are optional in
+  // the i18n type so untranslated locales don't break the build — they render
+  // the English literal until translated.
+  const L = useMemo(() => {
+    const p = t.profiles;
+    return {
+      activeProfile: p.activeProfile ?? "Active profile",
+      activeBadge: p.activeBadge ?? "active",
+      setActive: p.setActive ?? "Set as active",
+      activeSet: p.activeSet ?? "Active profile set",
+      gatewayRunning: p.gatewayRunning ?? "Gateway running",
+      gatewayStopped: p.gatewayStopped ?? "Gateway stopped",
+      gatewayRunningWarning:
+        p.gatewayRunningWarning ??
+        "This profile's gateway is running — it will be stopped.",
+      aliasBadge: p.aliasBadge ?? "alias",
+      description: p.description ?? "Description",
+      descriptionPlaceholder:
+        p.descriptionPlaceholder ??
+        "What is this profile good at? Used to route kanban tasks by role.",
+      noDescription: p.noDescription ?? "No description",
+      editDescription: p.editDescription ?? "Edit description",
+      descriptionSaved: p.descriptionSaved ?? "Description saved",
+      reviewBadge: p.reviewBadge ?? "review",
+      autoGenerate: p.autoGenerate ?? "Auto-generate",
+      generating: p.generating ?? "Generating…",
+      describeFailed: p.describeFailed ?? "Could not generate description",
+      distribution: p.distribution ?? "Distribution",
+      advancedOptions: p.advancedOptions ?? "Advanced options",
+      cloneAll:
+        p.cloneAll ?? "Clone everything (memories, sessions, skills, state)",
+      noSkillsOption: p.noSkillsOption ?? "Don't seed bundled skills",
+      descriptionOptional: p.descriptionOptional ?? "Description (optional)",
+      modelOptional: p.modelOptional ?? "Model (optional)",
+      modelInherit: p.modelInherit ?? "Inherit from clone / default",
+      modelLoading: p.modelLoading ?? "Loading models…",
+      modelNone:
+        p.modelNone ?? "No authenticated providers — set a key first",
+      editModel: p.editModel ?? "Change model",
+      modelSaved: p.modelSaved ?? "Model updated",
+      modelSelect: p.modelSelect ?? "Select a model",
+      actions: p.actions ?? "Actions",
+    };
+  }, [t.profiles]);
+
   // Create modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [cloneFromDefault, setCloneFromDefault] = useState(true);
+  const [cloneAll, setCloneAll] = useState(false);
+  const [noSkills, setNoSkills] = useState(false);
+  const [newDescription, setNewDescription] = useState("");
   const [creating, setCreating] = useState(false);
+  // Model picker (lazy-loaded the first time a picker is opened). modelChoice
+  // is a "slug\u0000model" key, or "" to inherit from clone/default.
+  const [modelChoices, setModelChoices] = useState<
+    { provider: string; model: string; label: string }[] | null
+  >(null);
+  const modelChoicesLoading = useRef(false);
+  const [modelChoice, setModelChoice] = useState("");
   const closeCreateModal = useCallback(() => setCreateModalOpen(false), []);
   const createModalRef = useModalBehavior({
     open: createModalOpen,
@@ -96,23 +324,61 @@ export default function ProfilesPage() {
   // Tracks the latest SOUL request so out-of-order responses don't overwrite
   // newer state when the user switches profiles or closes the editor.
   const activeSoulRequest = useRef<string | null>(null);
-  const activeSkillsRequest = useRef<string | null>(null);
-  const activeConfigRequest = useRef<string | null>(null);
-  const [activeProfileTab, setActiveProfileTab] = useState<ProfileTab>("soul");
-  const [profileSkills, setProfileSkills] = useState<SkillInfo[]>([]);
-  const [skillsLoading, setSkillsLoading] = useState(false);
-  const [skillFilter, setSkillFilter] = useState("");
-  const [configText, setConfigText] = useState("");
-  const [configOriginalText, setConfigOriginalText] = useState("");
-  const [configReviewConfirmed, setConfigReviewConfirmed] = useState(false);
-  const [configPath, setConfigPath] = useState("");
-  const [configLoading, setConfigLoading] = useState(false);
-  const [configSaving, setConfigSaving] = useState(false);
+
+  // Inline description editor state
+  const [editingDescFor, setEditingDescFor] = useState<string | null>(null);
+  const [descText, setDescText] = useState("");
+  const [descSaving, setDescSaving] = useState(false);
+  const [describing, setDescribing] = useState(false);
+  // Tracks the latest description request (save / auto-describe) so a late
+  // response can't overwrite state for a different, newly-opened editor.
+  const activeDescRequest = useRef<string | null>(null);
+  // Counts in-flight save / auto-describe requests so the saving indicator
+  // is only cleared when the last concurrent request settles.
+  const descSavingCount = useRef(0);
+  const describingCount = useRef(0);
+
+  // Inline model editor state
+  const [editingModelFor, setEditingModelFor] = useState<string | null>(null);
+  const [modelEditChoice, setModelEditChoice] = useState("");
+  const [modelSaving, setModelSaving] = useState(false);
+
+  // Per-profile "set active" in-flight name
+  const [settingActive, setSettingActive] = useState<string | null>(null);
+
+  const modelKey = (provider: string | null, model: string | null) =>
+    provider && model ? `${provider}\u0000${model}` : "";
+
+  const loadModelChoices = useCallback(() => {
+    if (modelChoices !== null || modelChoicesLoading.current) return;
+    modelChoicesLoading.current = true;
+    api
+      .getModelOptions()
+      .then((res) => {
+        const flat: { provider: string; model: string; label: string }[] = [];
+        for (const prov of res.providers ?? []) {
+          for (const m of prov.models ?? []) {
+            flat.push({
+              provider: prov.slug,
+              model: m,
+              label: `${prov.name} · ${m}`,
+            });
+          }
+        }
+        setModelChoices(flat);
+      })
+      .catch(() => setModelChoices([]))
+      .finally(() => {
+        modelChoicesLoading.current = false;
+      });
+  }, [modelChoices]);
 
   const load = useCallback(() => {
-    api
-      .getProfiles()
-      .then((res) => setProfiles(res.profiles))
+    Promise.all([api.getProfiles(), api.getActiveProfile().catch(() => null)])
+      .then(([res, active]) => {
+        setProfiles(res.profiles);
+        setActiveInfo(active);
+      })
       .catch((e) => showToast(`${t.status.error}: ${e}`, "error"))
       .finally(() => setLoading(false));
   }, [showToast, t.status.error]);
@@ -120,6 +386,19 @@ export default function ProfilesPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Lazily load the model picker the first time the create modal opens.
+  useEffect(() => {
+    if (createModalOpen) loadModelChoices();
+  }, [createModalOpen, loadModelChoices]);
+
+  const isActive = useCallback(
+    (p: ProfileInfo) =>
+      activeInfo != null &&
+      (activeInfo.active === p.name ||
+        (activeInfo.active === "default" && p.is_default)),
+    [activeInfo],
+  );
 
   const handleCreate = async () => {
     const name = newName.trim();
@@ -133,9 +412,34 @@ export default function ProfilesPage() {
     }
     setCreating(true);
     try {
-      await api.createProfile({ name, clone_from_default: cloneFromDefault });
+      const cloning = cloneAll || cloneFromDefault;
+      const picked = modelChoice
+        ? modelChoices?.find(
+            (c) => `${c.provider}\u0000${c.model}` === modelChoice,
+          )
+        : undefined;
+      const res = await api.createProfile({
+        name,
+        clone_from_default: cloneAll ? false : cloneFromDefault,
+        clone_all: cloneAll,
+        no_skills: cloning ? false : noSkills,
+        description: newDescription.trim() || undefined,
+        provider: picked?.provider,
+        model: picked?.model,
+      });
       showToast(`${t.profiles.created}: ${name}`, "success");
+      if (picked && res.model_set === false) {
+        showToast(
+          `Profile created, but the model could not be saved — set it from the profile editor.`,
+          "error",
+        );
+      }
       setNewName("");
+      setNewDescription("");
+      setNoSkills(false);
+      setCloneAll(false);
+      setCloneFromDefault(true);
+      setModelChoice("");
       setCreateModalOpen(false);
       load();
     } catch (e) {
@@ -159,10 +463,7 @@ export default function ProfilesPage() {
     }
     try {
       await api.renameProfile(renamingFrom, target);
-      showToast(
-        `${t.profiles.renamed}: ${renamingFrom} → ${target}`,
-        "success",
-      );
+      showToast(`${t.profiles.renamed}: ${renamingFrom} → ${target}`, "success");
       setRenamingFrom(null);
       setRenameTo("");
       load();
@@ -171,24 +472,44 @@ export default function ProfilesPage() {
     }
   };
 
+  const handleSetActive = async (name: string) => {
+    setSettingActive(name);
+    try {
+      // The backend normalizes/validates the name; trust the canonical
+      // value it returns rather than the raw input.
+      const { active } = await api.setActiveProfile(name);
+      showToast(`${L.activeSet}: ${active}`, "success");
+      setActiveInfo((prev) =>
+        prev ? { ...prev, active } : { active, current: active },
+      );
+    } catch (e) {
+      showToast(`${t.status.error}: ${e}`, "error");
+    } finally {
+      setSettingActive(null);
+    }
+  };
+
+  // Closes whichever editor dialog is open (model / description / SOUL).
+  const closeEditor = useCallback(() => {
+    activeSoulRequest.current = null;
+    activeDescRequest.current = null;
+    setEditingModelFor(null);
+    setEditingDescFor(null);
+    setEditingSoulFor(null);
+  }, []);
+
   const openSoulEditor = useCallback(
     async (name: string) => {
+      // Re-selecting the action for the already-open editor collapses it,
+      // matching the chevron-down affordance in the actions menu.
       if (editingSoulFor === name) {
-        activeSoulRequest.current = null;
-        activeSkillsRequest.current = null;
-        activeConfigRequest.current = null;
-        setEditingSoulFor(null);
+        closeEditor();
         return;
       }
+      setEditingDescFor(null);
+      setEditingModelFor(null);
       setEditingSoulFor(name);
-      setActiveProfileTab("soul");
       setSoulText("");
-      setProfileSkills([]);
-      setSkillFilter("");
-      setConfigText("");
-      setConfigOriginalText("");
-      setConfigReviewConfirmed(false);
-      setConfigPath("");
       activeSoulRequest.current = name;
       try {
         const soul = await api.getProfileSoul(name);
@@ -201,7 +522,7 @@ export default function ProfilesPage() {
         }
       }
     },
-    [editingSoulFor, showToast, t.status.error],
+    [closeEditor, editingSoulFor, showToast, t.status.error],
   );
 
   const handleSaveSoul = async (name: string) => {
@@ -209,6 +530,8 @@ export default function ProfilesPage() {
     try {
       await api.updateProfileSoul(name, soulText);
       showToast(`${t.profiles.soulSaved}: ${name}`, "success");
+      activeSoulRequest.current = null;
+      setEditingSoulFor(null);
     } catch (e) {
       showToast(`${t.status.error}: ${e}`, "error");
     } finally {
@@ -216,90 +539,143 @@ export default function ProfilesPage() {
     }
   };
 
-  const loadProfileSkills = useCallback(
-    async (name: string) => {
-      setSkillsLoading(true);
-      activeSkillsRequest.current = name;
-      try {
-        const res = await api.getProfileSkills(name);
-        if (activeSkillsRequest.current === name) {
-          setProfileSkills(res.skills);
-        }
-      } catch (e) {
-        if (activeSkillsRequest.current === name) {
-          showToast(`${t.status.error}: ${e}`, "error");
-        }
-      } finally {
-        if (activeSkillsRequest.current === name) {
-          setSkillsLoading(false);
-        }
+  const openDescEditor = useCallback(
+    (p: ProfileInfo) => {
+      if (editingDescFor === p.name) {
+        closeEditor();
+        return;
       }
+      activeDescRequest.current = p.name;
+      setEditingSoulFor(null);
+      setEditingModelFor(null);
+      setEditingDescFor(p.name);
+      setDescText(p.description ?? "");
     },
-    [showToast, t.status.error],
+    [closeEditor, editingDescFor],
   );
 
-  const loadProfileConfig = useCallback(
-    async (name: string) => {
-      setConfigLoading(true);
-      activeConfigRequest.current = name;
-      try {
-        const res = await api.getProfileConfig(name);
-        if (activeConfigRequest.current === name) {
-          setConfigText(res.content);
-          setConfigOriginalText(res.content);
-          setConfigReviewConfirmed(false);
-          setConfigPath(res.path);
-        }
-      } catch (e) {
-        if (activeConfigRequest.current === name) {
-          showToast(`${t.status.error}: ${e}`, "error");
-        }
-      } finally {
-        if (activeConfigRequest.current === name) {
-          setConfigLoading(false);
-        }
-      }
-    },
-    [showToast, t.status.error],
-  );
-
-  const handleProfileTab = (name: string, tab: ProfileTab) => {
-    setActiveProfileTab(tab);
-    if (tab === "skills") loadProfileSkills(name);
-    if (tab === "config") loadProfileConfig(name);
-  };
-
-  const handleToggleProfileSkill = async (profileName: string, skillName: string, enabled: boolean) => {
-    setProfileSkills((items) =>
-      items.map((skill) =>
-        skill.name === skillName ? { ...skill, enabled } : skill,
-      ),
-    );
+  const handleSaveDesc = async (name: string) => {
+    descSavingCount.current += 1;
+    setDescSaving(true);
+    activeDescRequest.current = name;
     try {
-      await api.toggleProfileSkill(profileName, skillName, enabled);
-      showToast(`${skillName} ${enabled ? "enabled" : "disabled"} for ${profileName}`, "success");
-      load();
+      const res = await api.updateProfileDescription(name, descText);
+      // Profile-list state always reflects the persisted result, but only
+      // touch the open editor if it's still showing this profile.
+      setProfiles((prev) =>
+        prev.map((p) =>
+          p.name === name
+            ? {
+                ...p,
+                description: res.description,
+                description_auto: res.description_auto,
+              }
+            : p,
+        ),
+      );
+      if (activeDescRequest.current === name) {
+        showToast(`${L.descriptionSaved}: ${name}`, "success");
+        setEditingDescFor(null);
+      }
     } catch (e) {
-      showToast(`${t.status.error}: ${e}`, "error");
-      loadProfileSkills(profileName);
+      if (activeDescRequest.current === name) {
+        showToast(`${t.status.error}: ${e}`, "error");
+      }
+    } finally {
+      descSavingCount.current -= 1;
+      if (descSavingCount.current === 0) setDescSaving(false);
     }
   };
 
-  const handleSaveProfileConfig = async (name: string) => {
-    setConfigSaving(true);
+  const handleAutoDescribe = async (name: string) => {
+    describingCount.current += 1;
+    setDescribing(true);
+    activeDescRequest.current = name;
     try {
-      const res = await api.updateProfileConfig(name, configText);
-      setConfigPath(res.path);
-      setConfigOriginalText(configText);
-      setConfigReviewConfirmed(false);
-      showToast(`config.yaml saved for ${name}. Changes apply to new sessions/restarts.`, "success");
-      load();
+      const res = await api.describeProfileAuto(name);
+      const current = activeDescRequest.current === name;
+      if (res.ok && res.description != null) {
+        if (current) setDescText(res.description);
+        setProfiles((prev) =>
+          prev.map((p) =>
+            p.name === name
+              ? {
+                  ...p,
+                  description: res.description ?? "",
+                  description_auto: res.description_auto,
+                }
+              : p,
+          ),
+        );
+        if (current) showToast(`${L.descriptionSaved}: ${name}`, "success");
+      } else if (current) {
+        showToast(`${L.describeFailed}: ${res.reason}`, "error");
+      }
+    } catch (e) {
+      if (activeDescRequest.current === name) {
+        showToast(`${t.status.error}: ${e}`, "error");
+      }
+    } finally {
+      describingCount.current -= 1;
+      if (describingCount.current === 0) setDescribing(false);
+    }
+  };
+
+  const openModelEditor = useCallback(
+    (p: ProfileInfo) => {
+      if (editingModelFor === p.name) {
+        closeEditor();
+        return;
+      }
+      setEditingSoulFor(null);
+      setEditingDescFor(null);
+      setEditingModelFor(p.name);
+      setModelEditChoice(modelKey(p.provider, p.model));
+      loadModelChoices();
+    },
+    [closeEditor, editingModelFor, loadModelChoices],
+  );
+
+  const handleSaveModel = async (name: string) => {
+    const picked = modelEditChoice
+      ? modelChoices?.find(
+          (c) => `${c.provider}\u0000${c.model}` === modelEditChoice,
+        )
+      : undefined;
+    if (!picked) return;
+    setModelSaving(true);
+    try {
+      await api.setProfileModel(name, picked.provider, picked.model);
+      showToast(`${L.modelSaved}: ${picked.model}`, "success");
+      setProfiles((prev) =>
+        prev.map((p) =>
+          p.name === name
+            ? { ...p, model: picked.model, provider: picked.provider }
+            : p,
+        ),
+      );
+      setEditingModelFor(null);
     } catch (e) {
       showToast(`${t.status.error}: ${e}`, "error");
     } finally {
-      setConfigSaving(false);
+      setModelSaving(false);
     }
   };
+
+  // Exactly one editor is open at a time; derive which profile + kind so a
+  // single dialog can render the right body.
+  const editorName = editingModelFor ?? editingDescFor ?? editingSoulFor;
+  const editorKind: "model" | "desc" | "soul" | null = editingModelFor
+    ? "model"
+    : editingDescFor
+      ? "desc"
+      : editingSoulFor
+        ? "soul"
+        : null;
+  const editorModalRef = useModalBehavior({
+    open: editorName != null,
+    onClose: closeEditor,
+  });
 
   const handleCopyTerminalCommand = async (name: string) => {
     let cmd: string;
@@ -335,6 +711,16 @@ export default function ProfilesPage() {
   });
 
   const pendingName = profileDelete.pendingId;
+  const pendingProfile = pendingName
+    ? profiles.find((p) => p.name === pendingName)
+    : undefined;
+  const deleteMessage = (() => {
+    if (!pendingName) return t.profiles.confirmDeleteMessage;
+    const base = t.profiles.confirmDeleteMessage.replace("{name}", pendingName);
+    return pendingProfile?.gateway_running
+      ? `${base}\n\n${L.gatewayRunningWarning}`
+      : base;
+  })();
 
   // Put "Create" button in page header
   useLayoutEffect(() => {
@@ -351,6 +737,8 @@ export default function ProfilesPage() {
       setEnd(null);
     };
   }, [setEnd, t.common.create, loading]);
+
+  const cloning = cloneAll || cloneFromDefault;
 
   if (loading) {
     return (
@@ -375,11 +763,7 @@ export default function ProfilesPage() {
         onCancel={profileDelete.cancel}
         onConfirm={profileDelete.confirm}
         title={t.profiles.confirmDeleteTitle}
-        description={
-          pendingName
-            ? t.profiles.confirmDeleteMessage.replace("{name}", pendingName)
-            : t.profiles.confirmDeleteMessage
-        }
+        description={deleteMessage}
         loading={profileDelete.isDeleting}
       />
 
@@ -395,7 +779,12 @@ export default function ProfilesPage() {
           aria-modal="true"
           aria-labelledby="create-profile-title"
         >
-          <div className={cn(themedBody, "relative w-full max-w-md border border-border bg-card shadow-2xl flex flex-col")}>
+          <div
+            className={cn(
+              themedBody,
+              "relative w-full max-w-md border border-border bg-card shadow-2xl flex flex-col max-h-[90vh] overflow-y-auto",
+            )}
+          >
             <Button
               ghost
               size="icon"
@@ -418,6 +807,7 @@ export default function ProfilesPage() {
             <div className="p-5 grid gap-4">
               <div className="grid gap-2">
                 <Label htmlFor="profile-name">{t.profiles.name}</Label>
+
                 <Input
                   id="profile-name"
                   autoFocus
@@ -432,27 +822,111 @@ export default function ProfilesPage() {
                     !PROFILE_NAME_RE.test(newName.trim())
                   }
                 />
+
                 <p className="text-xs text-muted-foreground">
                   {t.profiles.nameRule}
                 </p>
               </div>
 
-              <div className="flex items-center gap-2.5">
-                <Checkbox
-                  checked={cloneFromDefault}
-                  id="clone-from-default"
-                  onCheckedChange={(checked) =>
-                    setCloneFromDefault(checked === true)
-                  }
-                />
-
-                <Label
-                  className="font-mondwest normal-case tracking-normal text-sm cursor-pointer"
-                  htmlFor="clone-from-default"
-                >
-                  {t.profiles.cloneFromDefault}
+              <div className="grid gap-2">
+                <Label htmlFor="profile-description">
+                  {L.descriptionOptional}
                 </Label>
+
+                <textarea
+                  id="profile-description"
+                  className="flex min-h-[64px] w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  placeholder={L.descriptionPlaceholder}
+                  value={newDescription}
+                  onChange={(e) => setNewDescription(e.target.value)}
+                />
               </div>
+
+              <div className="grid gap-2">
+                <Label htmlFor="profile-model">{L.modelOptional}</Label>
+
+                <Select
+                  id="profile-model"
+                  value={modelChoice}
+                  disabled={modelChoices === null}
+                  onValueChange={setModelChoice}
+                >
+                  <SelectOption value="">
+                    {modelChoices === null ? L.modelLoading : L.modelInherit}
+                  </SelectOption>
+
+                  {(modelChoices ?? []).map((c) => (
+                    <SelectOption
+                      key={`${c.provider}\u0000${c.model}`}
+                      value={`${c.provider}\u0000${c.model}`}
+                    >
+                      {c.label}
+                    </SelectOption>
+                  ))}
+                </Select>
+
+                {modelChoices !== null && modelChoices.length === 0 && (
+                  <p className="text-xs text-muted-foreground">{L.modelNone}</p>
+                )}
+              </div>
+
+              <fieldset className="grid gap-3 border-t border-border pt-4">
+                <legend className="font-mondwest text-display text-xs tracking-wider text-muted-foreground">
+                  {L.advancedOptions}
+                </legend>
+
+                <div className="flex items-center gap-2.5">
+                  <Checkbox
+                    checked={cloneFromDefault}
+                    id="clone-from-default"
+                    disabled={cloneAll}
+                    onCheckedChange={(checked) =>
+                      setCloneFromDefault(checked === true)
+                    }
+                  />
+
+                  <Label
+                    className="font-mondwest normal-case tracking-normal text-sm cursor-pointer"
+                    htmlFor="clone-from-default"
+                  >
+                    {t.profiles.cloneFromDefault}
+                  </Label>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <Checkbox
+                    checked={cloneAll}
+                    id="clone-all"
+                    onCheckedChange={(checked) => setCloneAll(checked === true)}
+                  />
+
+                  <Label
+                    className="font-mondwest normal-case tracking-normal text-sm cursor-pointer"
+                    htmlFor="clone-all"
+                  >
+                    {L.cloneAll}
+                  </Label>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <Checkbox
+                    checked={noSkills}
+                    id="no-skills"
+                    disabled={cloning}
+                    onCheckedChange={(checked) => setNoSkills(checked === true)}
+                  />
+
+                  <Label
+                    className={cn(
+                      "font-mondwest normal-case tracking-normal text-sm cursor-pointer",
+                      cloning && "opacity-50",
+                    )}
+                    htmlFor="no-skills"
+                  >
+                    {L.noSkillsOption}
+                  </Label>
+                </div>
+              </fieldset>
 
               <div className="flex justify-end">
                 <Button
@@ -467,6 +941,30 @@ export default function ProfilesPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Active profile banner */}
+      {activeInfo && (
+        <Card>
+          <CardContent className="flex flex-wrap items-center gap-x-4 gap-y-1 py-3 text-xs">
+            <span className="flex items-center gap-2 text-muted-foreground">
+              <Check className="h-3.5 w-3.5 text-success" />
+
+              <span>
+                {L.activeProfile}:{" "}
+                <span className="font-medium text-foreground">
+                  {activeInfo.active}
+                </span>
+              </span>
+            </span>
+
+            {activeInfo.current !== activeInfo.active && (
+              <span className="font-mono text-muted-foreground/80">
+                ({activeInfo.current})
+              </span>
+            )}
+          </CardContent>
+        </Card>
       )}
 
       {/* List */}
@@ -487,25 +985,18 @@ export default function ProfilesPage() {
           </Card>
         )}
 
-        {profiles.map((p) => {
-          const isRenaming = renamingFrom === p.name;
-          const isEditingSoul = editingSoulFor === p.name;
-          const skillQuery = skillFilter.trim().toLowerCase();
-          const configDirty = configText !== configOriginalText;
-          const filteredProfileSkills = skillQuery
-            ? profileSkills.filter((skill) =>
-                [skill.name, skill.description, skill.category]
-                  .join(" ")
-                  .toLowerCase()
-                  .includes(skillQuery),
-              )
-            : profileSkills;
-          return (
-            <Card key={p.name}>
-              <CardContent className="flex items-start gap-4 py-4">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1 flex-wrap">
-                    {isRenaming ? (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {profiles.map((p) => {
+            const isRenaming = renamingFrom === p.name;
+            const isEditingSoul = editingSoulFor === p.name;
+            const isEditingDesc = editingDescFor === p.name;
+            const isEditingModel = editingModelFor === p.name;
+            const active = isActive(p);
+            return (
+              <Card key={p.name} className="h-full">
+                <CardContent className="flex h-full flex-col gap-2 py-4">
+                  {isRenaming ? (
+                    <div className="flex flex-col gap-2">
                       <Input
                         autoFocus
                         value={renameTo}
@@ -519,292 +1010,364 @@ export default function ProfilesPage() {
                           renameTo.trim() !== p.name &&
                           !PROFILE_NAME_RE.test(renameTo.trim())
                         }
-                        className="max-w-xs"
                       />
-                    ) : (
-                      <span className="font-medium text-sm truncate">
-                        {p.name}
-                      </span>
-                    )}
-                    {p.is_default && (
-                      <Badge tone="secondary">{t.profiles.defaultBadge}</Badge>
-                    )}
-                    {p.has_env && (
-                      <Badge tone="outline">{t.profiles.hasEnv}</Badge>
-                    )}
-                  </div>
-                  {isRenaming &&
-                    (() => {
-                      const trimmed = renameTo.trim();
-                      const invalid =
-                        trimmed !== "" &&
-                        trimmed !== p.name &&
-                        !PROFILE_NAME_RE.test(trimmed);
-                      return (
-                        <p
-                          className={
-                            "text-xs mb-1 " +
-                            (invalid
-                              ? "text-destructive"
-                              : "text-muted-foreground")
-                          }
-                        >
-                          {invalid
-                            ? `${t.profiles.invalidName}: ${t.profiles.nameRule}`
-                            : t.profiles.nameRule}
-                        </p>
-                      );
-                    })()}
-                  <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap">
-                    {p.model && (
-                      <span>
-                        {t.profiles.model}: {p.model}
-                        {p.provider ? ` (${p.provider})` : ""}
-                      </span>
-                    )}
-                    <span>
-                      {t.profiles.skills}: {p.active_skill_count ?? "?"}/{p.skill_count} active
-                    </span>
-                    <span className="font-mono truncate max-w-[28rem]">
-                      {p.path}
-                    </span>
-                  </div>
-                </div>
 
-                <div className="flex items-center gap-1 shrink-0">
-                  {isRenaming ? (
-                    <>
-                      <Button size="sm" onClick={handleRenameSubmit}>
-                        {t.common.save}
-                      </Button>
-                      <Button
-                        size="sm"
-                        ghost
-                        onClick={() => setRenamingFrom(null)}
-                      >
-                        {t.common.cancel}
-                      </Button>
-                    </>
+                      {(() => {
+                        const trimmed = renameTo.trim();
+                        const invalid =
+                          trimmed !== "" &&
+                          trimmed !== p.name &&
+                          !PROFILE_NAME_RE.test(trimmed);
+                        return (
+                          <p
+                            className={cn(
+                              "text-xs",
+                              invalid
+                                ? "text-destructive"
+                                : "text-muted-foreground",
+                            )}
+                          >
+                            {invalid
+                              ? `${t.profiles.invalidName}: ${t.profiles.nameRule}`
+                              : t.profiles.nameRule}
+                          </p>
+                        );
+                      })()}
+
+                      <div className="flex gap-1.5">
+                        <Button size="sm" onClick={handleRenameSubmit}>
+                          {t.common.save}
+                        </Button>
+
+                        <Button
+                          size="sm"
+                          ghost
+                          onClick={() => setRenamingFrom(null)}
+                        >
+                          {t.common.cancel}
+                        </Button>
+                      </div>
+                    </div>
                   ) : (
                     <>
-                      <Button
-                        ghost
-                        size="icon"
-                        title="Configure profile"
-                        aria-label="Configure profile"
-                        onClick={() => openSoulEditor(p.name)}
-                      >
-                        {isEditingSoul ? (
-                          <ChevronDown className="h-4 w-4" />
-                        ) : (
-                          <Settings className="h-4 w-4" />
-                        )}
-                      </Button>
-                      <Button
-                        ghost
-                        size="icon"
-                        title={t.profiles.openInTerminal}
-                        aria-label={t.profiles.openInTerminal}
-                        onClick={() => handleCopyTerminalCommand(p.name)}
-                      >
-                        <Terminal className="h-4 w-4" />
-                      </Button>
-                      {!p.is_default && (
-                        <Button
-                          ghost
-                          size="icon"
-                          title={t.profiles.rename}
-                          aria-label={t.profiles.rename}
-                          onClick={() => {
+                      <div className="flex items-start gap-2">
+                        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+                          <span className="font-medium text-sm truncate">
+                            {p.name}
+                          </span>
+
+                          {active && (
+                            <Badge tone="success">{L.activeBadge}</Badge>
+                          )}
+
+                          {p.is_default && (
+                            <Badge tone="secondary">
+                              {t.profiles.defaultBadge}
+                            </Badge>
+                          )}
+
+                          {p.has_alias && (
+                            <Badge tone="outline">{L.aliasBadge}</Badge>
+                          )}
+
+                          {p.has_env && (
+                            <Badge tone="outline">{t.profiles.hasEnv}</Badge>
+                          )}
+
+                          {p.distribution_name && (
+                            <Badge tone="outline" className="gap-1">
+                              <Package className="h-3 w-3" />
+                              {p.distribution_name}
+                              {p.distribution_version
+                                ? `@${p.distribution_version}`
+                                : ""}
+                            </Badge>
+                          )}
+                        </div>
+
+                        <ProfileActionsMenu
+                          isActive={active}
+                          isDefault={p.is_default}
+                          isEditingDesc={isEditingDesc}
+                          isEditingModel={isEditingModel}
+                          isEditingSoul={isEditingSoul}
+                          settingActive={settingActive === p.name}
+                          labels={{
+                            actions: L.actions,
+                            setActive: L.setActive,
+                            editModel: L.editModel,
+                            editDescription: L.editDescription,
+                            editSoul: t.profiles.editSoul,
+                            openInTerminal: t.profiles.openInTerminal,
+                            rename: t.profiles.rename,
+                            delete: t.common.delete,
+                          }}
+                          onCopyCommand={() =>
+                            handleCopyTerminalCommand(p.name)
+                          }
+                          onDelete={() => profileDelete.requestDelete(p.name)}
+                          onEditDescription={() => openDescEditor(p)}
+                          onEditModel={() => openModelEditor(p)}
+                          onEditSoul={() => openSoulEditor(p.name)}
+                          onRename={() => {
                             setRenamingFrom(p.name);
                             setRenameTo(p.name);
                           }}
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                      )}
-                      {!p.is_default && (
-                        <Button
-                          ghost
-                          size="icon"
-                          title={t.common.delete}
-                          aria-label={t.common.delete}
-                          onClick={() => profileDelete.requestDelete(p.name)}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
-                      )}
-                    </>
-                  )}
-                </div>
-              </CardContent>
-
-              {isEditingSoul && (
-                <div className="border-t border-border px-4 pb-4 pt-3 flex flex-col gap-4">
-                  <div className="flex flex-wrap gap-2" role="tablist" aria-label={`${p.name} settings`}>
-                    {([
-                      ["soul", "SOUL.md"],
-                      ["skills", "Skills"],
-                      ["config", "Config YAML"],
-                    ] as const).map(([tab, label]) => (
-                      <Button
-                        key={tab}
-                        size="sm"
-                        ghost={activeProfileTab !== tab}
-                        onClick={() => handleProfileTab(p.name, tab)}
-                        aria-pressed={activeProfileTab === tab}
-                      >
-                        {label}
-                      </Button>
-                    ))}
-                  </div>
-
-                  {activeProfileTab === "soul" && (
-                    <div className="flex flex-col gap-2">
-                      <Label
-                        htmlFor={`soul-editor-${p.name}`}
-                        className="flex items-center gap-2 font-mondwest text-display text-xs tracking-wider text-muted-foreground"
-                      >
-                        {t.profiles.soulSection}
-                      </Label>
-                      <textarea
-                        id={`soul-editor-${p.name}`}
-                        className="flex min-h-[180px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        placeholder={t.profiles.soulPlaceholder}
-                        value={soulText}
-                        onChange={(e) => setSoulText(e.target.value)}
-                      />
-                      <div>
-                        <Button
-                          size="sm"
-                          onClick={() => handleSaveSoul(p.name)}
-                          disabled={soulSaving}
-                        >
-                          {soulSaving ? t.common.saving : t.profiles.saveSoul}
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-
-                  {activeProfileTab === "skills" && (
-                    <div className="flex flex-col gap-3">
-                      <div className="flex items-center gap-3 flex-wrap">
-                        <Input
-                          value={skillFilter}
-                          onChange={(e) => setSkillFilter(e.target.value)}
-                          placeholder="Filter profile skills…"
-                          className="max-w-sm"
+                          onSetActive={() => handleSetActive(p.name)}
                         />
-                        <span className="text-xs text-muted-foreground">
-                          {profileSkills.filter((skill) => skill.enabled).length}/{profileSkills.length} enabled
+                      </div>
+
+                      <div className="flex items-center gap-1.5 text-xs">
+                        <span
+                          className={cn(
+                            "h-1.5 w-1.5 rounded-full",
+                            p.gateway_running
+                              ? "bg-success"
+                              : "bg-muted-foreground/40",
+                          )}
+                        />
+
+                        <span
+                          className={cn(
+                            p.gateway_running
+                              ? "text-success"
+                              : "text-muted-foreground",
+                          )}
+                        >
+                          {p.gateway_running
+                            ? L.gatewayRunning
+                            : L.gatewayStopped}
                         </span>
                       </div>
-                      {skillsLoading ? (
-                        <p className="text-sm text-muted-foreground">Loading skills…</p>
-                      ) : filteredProfileSkills.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">No skills found for this profile.</p>
-                      ) : (
-                        <div className="grid gap-2 md:grid-cols-2">
-                          {filteredProfileSkills.map((skill) => (
-                            <label
-                              key={skill.name}
-                              className="flex items-start gap-3 border border-border px-3 py-2 text-sm"
-                            >
-                              <Checkbox
-                                checked={skill.enabled}
-                                onCheckedChange={(checked) =>
-                                  handleToggleProfileSkill(p.name, skill.name, checked === true)
-                                }
-                              />
-                              <span className="min-w-0">
-                                <span className="block font-medium">{skill.name}</span>
-                                <span className="block text-xs text-muted-foreground">
-                                  {skill.category || "uncategorized"}
-                                  {skill.description ? ` — ${skill.description}` : ""}
-                                </span>
-                              </span>
-                            </label>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
 
-                  {activeProfileTab === "config" && (
-                    <div className="flex flex-col gap-2">
-                      <div className="border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-muted-foreground">
-                        Advanced: edits write this profile's config.yaml. Existing sessions may need a restart or new session before changes take effect.
-                      </div>
-                      {configPath && (
-                        <p className="font-mono text-xs text-muted-foreground truncate">
-                          {configPath}
-                        </p>
-                      )}
-                      <textarea
-                        id={`config-editor-${p.name}`}
-                        className="flex min-h-[260px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        placeholder="model:
-  default: ..."
-                        value={configText}
-                        onChange={(e) => {
-                          setConfigText(e.target.value);
-                          setConfigReviewConfirmed(false);
-                        }}
-                        disabled={configLoading}
-                      />
-                      {configDirty && (
-                        <details className="border border-border p-3 text-xs" open>
-                          <summary className="cursor-pointer text-muted-foreground">
-                            Review changes before saving
-                          </summary>
-                          <div className="mt-3 grid gap-3 md:grid-cols-2">
-                            <div>
-                              <p className="mb-1 text-muted-foreground">Current on disk</p>
-                              <pre className="max-h-48 overflow-auto whitespace-pre-wrap border border-border p-2 font-mono">
-                                {configOriginalText || "(empty)"}
-                              </pre>
-                            </div>
-                            <div>
-                              <p className="mb-1 text-muted-foreground">Pending save</p>
-                              <pre className="max-h-48 overflow-auto whitespace-pre-wrap border border-border p-2 font-mono">
-                                {configText || "(empty)"}
-                              </pre>
-                            </div>
-                          </div>
-                          <label className="mt-3 flex items-center gap-2 text-muted-foreground">
-                            <Checkbox
-                              checked={configReviewConfirmed}
-                              onCheckedChange={(checked) => setConfigReviewConfirmed(checked === true)}
-                            />
-                            I reviewed the pending config.yaml changes
-                          </label>
-                        </details>
-                      )}
-                      <div className="flex gap-2">
-                        <Button
-                          size="sm"
-                          onClick={() => handleSaveProfileConfig(p.name)}
-                          disabled={configSaving || configLoading || (configDirty && !configReviewConfirmed)}
+                      <div className="flex items-start gap-2 text-xs">
+                        <span
+                          className={cn(
+                            "line-clamp-2",
+                            p.description
+                              ? "text-muted-foreground"
+                              : "text-muted-foreground/60 italic",
+                          )}
                         >
-                          {configSaving ? t.common.saving : "Save config.yaml"}
-                        </Button>
-                        <Button
-                          size="sm"
-                          ghost
-                          onClick={() => loadProfileConfig(p.name)}
-                          disabled={configLoading}
-                        >
-                          Reload
-                        </Button>
+                          {p.description || L.noDescription}
+                        </span>
+
+                        {p.description && p.description_auto && (
+                          <Badge tone="warning" className="shrink-0">
+                            {L.reviewBadge}
+                          </Badge>
+                        )}
                       </div>
-                    </div>
+
+                      <div className="mt-auto flex flex-col gap-0.5 pt-1 text-xs text-muted-foreground">
+                        {p.model && (
+                          <span className="truncate">
+                            {t.profiles.model}: {p.model}
+                            {p.provider ? ` (${p.provider})` : ""}
+                          </span>
+                        )}
+
+                        <span>
+                          {t.profiles.skills}: {p.skill_count}
+                        </span>
+
+                        <span className="font-mono truncate">{p.path}</span>
+                      </div>
+                    </>
                   )}
-                </div>
-              )}
-            </Card>
-          );
-        })}
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
       </div>
+
+      {/* Editor dialog — model / description / SOUL for the selected profile */}
+      {editorName && (
+        <div
+          ref={editorModalRef}
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 backdrop-blur-sm p-4"
+          onClick={(e) => e.target === e.currentTarget && closeEditor()}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="profile-editor-title"
+        >
+          <div
+            className={cn(
+              themedBody,
+              "relative w-full max-w-lg border border-border bg-card shadow-2xl flex flex-col max-h-[90vh] overflow-y-auto",
+            )}
+          >
+            <Button
+              ghost
+              size="icon"
+              onClick={closeEditor}
+              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+              aria-label="Close"
+            >
+              <X />
+            </Button>
+
+            <header className="p-5 pb-3 border-b border-border">
+              <h2
+                id="profile-editor-title"
+                className="font-mondwest text-display text-base tracking-wider"
+              >
+                {editorKind === "model"
+                  ? L.editModel
+                  : editorKind === "desc"
+                    ? L.description
+                    : t.profiles.soulSection}
+                <span className="text-muted-foreground"> · {editorName}</span>
+              </h2>
+            </header>
+
+            <div className="p-5 grid gap-4">
+              {editorKind === "model" &&
+                (modelChoices !== null && modelChoices.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">{L.modelNone}</p>
+                ) : (
+                  <>
+                    <Select
+                      value={modelEditChoice}
+                      disabled={modelChoices === null}
+                      placeholder={
+                        modelChoices === null ? L.modelLoading : L.modelSelect
+                      }
+                      onValueChange={setModelEditChoice}
+                    >
+                      {(modelChoices ?? []).map((c) => (
+                        <SelectOption
+                          key={`${c.provider}\u0000${c.model}`}
+                          value={`${c.provider}\u0000${c.model}`}
+                        >
+                          {c.label}
+                        </SelectOption>
+                      ))}
+                    </Select>
+
+                    <div className="flex justify-end">
+                      <Button
+                        size="sm"
+                        className="uppercase"
+                        onClick={() => handleSaveModel(editorName)}
+                        disabled={
+                          modelSaving ||
+                          !modelChoices?.some(
+                            (c) =>
+                              `${c.provider}\u0000${c.model}` ===
+                              modelEditChoice,
+                          )
+                        }
+                      >
+                        {modelSaving ? t.common.saving : t.common.save}
+                      </Button>
+                    </div>
+                  </>
+                ))}
+
+              {editorKind === "desc" && (
+                <>
+                  <div className="flex items-center justify-between gap-2">
+                    <Label
+                      htmlFor="profile-desc-editor"
+                      className="font-mondwest text-display text-xs tracking-wider text-muted-foreground"
+                    >
+                      {L.description}
+                    </Label>
+
+                    <Button
+                      size="sm"
+                      ghost
+                      className="gap-1.5"
+                      disabled={describing}
+                      onClick={() => handleAutoDescribe(editorName)}
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      {describing ? L.generating : L.autoGenerate}
+                    </Button>
+                  </div>
+
+                  <textarea
+                    id="profile-desc-editor"
+                    className="flex min-h-[96px] w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    placeholder={L.descriptionPlaceholder}
+                    value={descText}
+                    onChange={(e) => setDescText(e.target.value)}
+                  />
+
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      className="uppercase"
+                      onClick={() => handleSaveDesc(editorName)}
+                      disabled={descSaving}
+                    >
+                      {descSaving ? t.common.saving : t.common.save}
+                    </Button>
+                  </div>
+                </>
+              )}
+
+              {editorKind === "soul" && (
+                <>
+                  <Label
+                    htmlFor="profile-soul-editor"
+                    className="font-mondwest text-display text-xs tracking-wider text-muted-foreground"
+                  >
+                    {t.profiles.soulSection}
+                  </Label>
+
+                  <textarea
+                    id="profile-soul-editor"
+                    className="flex min-h-[280px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    placeholder={t.profiles.soulPlaceholder}
+                    value={soulText}
+                    onChange={(e) => setSoulText(e.target.value)}
+                  />
+
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      className="uppercase"
+                      onClick={() => handleSaveSoul(editorName)}
+                      disabled={soulSaving}
+                    >
+                      {soulSaving ? t.common.saving : t.common.save}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+interface ProfileActionsMenuProps {
+  isActive: boolean;
+  isDefault: boolean;
+  isEditingDesc: boolean;
+  isEditingModel: boolean;
+  isEditingSoul: boolean;
+  labels: {
+    actions: string;
+    delete: string;
+    editDescription: string;
+    editModel: string;
+    editSoul: string;
+    openInTerminal: string;
+    rename: string;
+    setActive: string;
+  };
+  settingActive: boolean;
+  onCopyCommand: () => void;
+  onDelete: () => void;
+  onEditDescription: () => void;
+  onEditModel: () => void;
+  onEditSoul: () => void;
+  onRename: () => void;
+  onSetActive: () => void;
 }
