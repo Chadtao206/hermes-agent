@@ -21,6 +21,7 @@ from hermes_cli import kanban_health
 Issue = dict[str, Any]
 
 _TERMINAL = {"done", "archived"}
+_EXPLICIT_DECISION_GATE_STATUSES = {"blocked", "scheduled"}
 
 
 def _alive(pid: Any) -> bool:
@@ -39,6 +40,221 @@ def _issue(severity: str, kind: str, message: str, **extra: Any) -> Issue:
     data: Issue = {"severity": severity, "kind": kind, "message": message}
     data.update({k: v for k, v in extra.items() if v is not None})
     return data
+
+
+def _jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _normalize_title(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _format_status_path(path: list[str], tasks: dict[str, dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for task_id in path:
+        task = tasks.get(task_id) or {}
+        parts.append(f"{task_id}:{task.get('status') or 'unknown'}")
+    return " <- ".join(parts)
+
+
+def _nearest_blocked_paths(
+    start_id: str,
+    dependency_parents: dict[str, list[str]],
+    tasks: dict[str, dict[str, Any]],
+    *,
+    max_depth: int = 8,
+) -> list[list[str]]:
+    queue: list[list[str]] = [[start_id]]
+    seen: set[tuple[str, ...]] = set()
+    blocked_paths: list[list[str]] = []
+    while queue:
+        path = queue.pop(0)
+        key = tuple(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        current_id = path[-1]
+        current = tasks.get(current_id) or {}
+        status = str(current.get("status") or "")
+        if status == "blocked":
+            blocked_paths.append(path)
+            continue
+        if len(path) >= max_depth or status in _TERMINAL:
+            continue
+        for parent_id in dependency_parents.get(current_id, []):
+            if parent_id in path:
+                continue
+            queue.append(path + [parent_id])
+    return blocked_paths
+
+
+def _append_graph_visibility_issues(
+    issues: list[Issue],
+    *,
+    tasks: dict[str, dict[str, Any]],
+    links: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+) -> None:
+    dependency_parents: dict[str, list[str]] = {}
+    dependency_children: dict[str, list[str]] = {}
+    supersedes_pairs: list[tuple[str, str]] = []
+    for raw_link in links:
+        parent_id = str(raw_link.get("parent_id") or "")
+        child_id = str(raw_link.get("child_id") or "")
+        relation = str(raw_link.get("relation_type") or "dependency")
+        if relation == "dependency":
+            dependency_parents.setdefault(child_id, []).append(parent_id)
+            dependency_children.setdefault(parent_id, []).append(child_id)
+        elif relation == "supersedes":
+            supersedes_pairs.append((parent_id, child_id))
+
+    for task_id, task in tasks.items():
+        if str(task.get("status") or "") != "todo":
+            continue
+        direct_parents = dependency_parents.get(task_id) or []
+        if not direct_parents:
+            continue
+        completed_parents = [
+            parent_id
+            for parent_id in direct_parents
+            if str((tasks.get(parent_id) or {}).get("status") or "") in _TERMINAL
+        ]
+        if not completed_parents:
+            continue
+        blocked_paths: list[str] = []
+        blocked_ancestors: set[str] = set()
+        nonterminal_direct_parents: list[str] = []
+        for parent_id in direct_parents:
+            parent_status = str((tasks.get(parent_id) or {}).get("status") or "")
+            if parent_status in _TERMINAL:
+                continue
+            nonterminal_direct_parents.append(f"{parent_id}:{parent_status or 'unknown'}")
+            for path in _nearest_blocked_paths(parent_id, dependency_parents, tasks):
+                blocked_paths.append(_format_status_path(path, tasks))
+                if path:
+                    blocked_ancestors.add(path[-1])
+        if blocked_paths:
+            issues.append(_issue(
+                "warning",
+                "todo_with_completed_parents_blocked_by_ancestor",
+                "todo task already has completed dependency parents, but another dependency chain is blocked so promotion is intentionally suppressed",
+                task_id=task_id,
+                assignee=task.get("assignee"),
+                completed_parents=", ".join(
+                    f"{parent_id}:{(tasks.get(parent_id) or {}).get('status') or 'unknown'}"
+                    for parent_id in completed_parents
+                ),
+                pending_parents=", ".join(nonterminal_direct_parents) or None,
+                blocked_ancestors=sorted(blocked_ancestors) or None,
+                blocked_paths=blocked_paths,
+                action="inspect the blocked ancestor / human-decision gate rather than dispatcher health; downstream promotion resumes only after that chain is resolved",
+            ))
+
+    latest_runs: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        task_id = str(run.get("task_id") or "")
+        if not task_id:
+            continue
+        ts = int(run.get("ended_at") or run.get("started_at") or 0)
+        prev = latest_runs.get(task_id)
+        prev_ts = int(prev.get("ended_at") or prev.get("started_at") or 0) if prev else -1
+        if prev is None or ts >= prev_ts:
+            latest_runs[task_id] = run
+
+    for task_id, run in latest_runs.items():
+        task = tasks.get(task_id) or {}
+        if str(task.get("status") or "") != "done":
+            continue
+        metadata = _jsonish(run.get("metadata"))
+        if metadata.get("chad_decision_required") is not True:
+            continue
+        child_states = [
+            f"{child_id}:{(tasks.get(child_id) or {}).get('status') or 'unknown'}"
+            for child_id in dependency_children.get(task_id, [])
+        ]
+        explicit_gate_children = [
+            child_id
+            for child_id in dependency_children.get(task_id, [])
+            if str((tasks.get(child_id) or {}).get("status") or "") in _EXPLICIT_DECISION_GATE_STATUSES
+        ]
+        if explicit_gate_children:
+            continue
+        issues.append(_issue(
+            "warning",
+            "completed_closeout_decision_flag_without_gate",
+            "completed task metadata requested Chad decision, but there is no explicit blocked/scheduled downstream decision gate",
+            task_id=task_id,
+            assignee=task.get("assignee"),
+            direct_child_states=", ".join(child_states) or None,
+            action="create or link an explicit human-decision / Jensen checkpoint instead of relying on chad_decision_required metadata alone",
+        ))
+
+    for canonical_id, duplicate_id in supersedes_pairs:
+        canonical = tasks.get(canonical_id) or {}
+        duplicate = tasks.get(duplicate_id) or {}
+        duplicate_status = str(duplicate.get("status") or "")
+        if not canonical or not duplicate or duplicate_status in _TERMINAL:
+            continue
+        if _normalize_title(canonical.get("title")) != _normalize_title(duplicate.get("title")):
+            continue
+        if str(canonical.get("assignee") or "") != str(duplicate.get("assignee") or ""):
+            continue
+        issues.append(_issue(
+            "warning",
+            "superseded_duplicate_task",
+            "superseded duplicate task is still active and can mislead dependency inspection",
+            task_id=duplicate_id,
+            assignee=duplicate.get("assignee"),
+            superseded_by=canonical_id,
+            duplicate_status=duplicate.get("status"),
+            canonical_status=canonical.get("status"),
+            action="archive or close the superseded duplicate and keep only the canonical replacement active in the dependency graph",
+        ))
+
+
+def _finalize_doctor_result(
+    *,
+    board: str,
+    db_path: str,
+    issues: list[Issue],
+    ready_age_seconds: int,
+    as_of: int,
+) -> dict[str, Any]:
+    reconcile_summary = _reconcile_summary(board=board, ready_age_seconds=ready_age_seconds)
+    suppressed_blocked_tasks = {
+        str(packet.get("task_id"))
+        for packet in reconcile_summary.get("suppressed_decision_packets") or []
+        if "blocked_with_completed_parents_decision" in (packet.get("kinds") or [])
+    }
+    if suppressed_blocked_tasks:
+        before = len(issues)
+        issues = [
+            issue for issue in issues
+            if not (
+                issue.get("kind") == "blocked_with_completed_parents"
+                and str(issue.get("task_id")) in suppressed_blocked_tasks
+            )
+        ]
+        suppressed_count = before - len(issues)
+        if suppressed_count:
+            reconcile_summary["suppressed_doctor_issue_count"] = suppressed_count
+    return {
+        "ok": not issues,
+        "board": board,
+        "db_path": db_path,
+        "issues": issues,
+        "reconcile_summary": reconcile_summary,
+        "as_of": as_of,
+    }
 
 
 def _quick_check(path: Path) -> Issue | None:
@@ -165,6 +381,9 @@ def _run_board_doctor_pg(*, board: str | None, ready_age_seconds: int, pool=None
         return {"ok": False, "board": slug, "db_path": db_path, "issues": issues,
                 "reconcile_summary": {"ok": False, "backend": "postgres", "note": "unreachable"},
                 "as_of": now}
+    tasks_by_id: dict[str, dict[str, Any]] = {}
+    links: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
     # 2. logical invariant checks (board-scoped PG SQL; same issue kinds as sqlite)
     with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         # orphan dependency/rollup links
@@ -262,10 +481,28 @@ def _run_board_doctor_pg(*, board: str | None, ready_age_seconds: int, pool=None
                     "ready task has not been claimed within the threshold",
                     task_id=row["id"], assignee=row["assignee"], age_seconds=age,
                     action="check gateway dispatcher health and whether assignee profile exists"))
-    return {"ok": not issues, "board": slug, "db_path": db_path, "issues": issues,
-            "reconcile_summary": {"ok": True, "backend": "postgres",
-                                  "note": "reconciler embed not run on postgres"},
-            "as_of": now}
+        cur.execute("SELECT id, title, assignee, status FROM tasks WHERE board=%s", (slug,))
+        tasks_by_id = {str(row["id"]): dict(row) for row in cur.fetchall()}
+        cur.execute(
+            "SELECT parent_id, child_id, COALESCE(relation_type,'dependency') AS relation_type "
+            "FROM task_links WHERE board=%s",
+            (slug,),
+        )
+        links = [dict(row) for row in cur.fetchall()]
+        cur.execute(
+            "SELECT id, task_id, started_at, ended_at, status, outcome, metadata "
+            "FROM task_runs WHERE board=%s",
+            (slug,),
+        )
+        runs = [dict(row) for row in cur.fetchall()]
+    _append_graph_visibility_issues(issues, tasks=tasks_by_id, links=links, runs=runs)
+    return _finalize_doctor_result(
+        board=slug,
+        db_path=db_path,
+        issues=issues,
+        ready_age_seconds=ready_age_seconds,
+        as_of=now,
+    )
 
 
 def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 60) -> dict[str, Any]:
@@ -285,6 +522,9 @@ def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 
         if db_issue.get("severity") == "critical":
             return {"ok": False, "board": board or kb.get_current_board(), "db_path": str(path), "issues": issues, "as_of": now}
 
+    tasks_by_id: dict[str, dict[str, Any]] = {}
+    links: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
     with kb.snapshot_connect(board=board) as conn:
         # Orphan dependency/rollup links.
         for row in conn.execute(
@@ -410,26 +650,31 @@ def run_board_doctor(*, board: str | None = None, ready_age_seconds: int = 15 * 
                     task_id=row["id"], assignee=row["assignee"], age_seconds=age,
                     action="check gateway dispatcher health and whether assignee profile exists",
                 ))
-
-    reconcile_summary = _reconcile_summary(board=board, ready_age_seconds=ready_age_seconds)
-    suppressed_blocked_tasks = {
-        str(packet.get("task_id"))
-        for packet in reconcile_summary.get("suppressed_decision_packets") or []
-        if "blocked_with_completed_parents_decision" in (packet.get("kinds") or [])
-    }
-    if suppressed_blocked_tasks:
-        before = len(issues)
-        issues = [
-            issue for issue in issues
-            if not (
-                issue.get("kind") == "blocked_with_completed_parents"
-                and str(issue.get("task_id")) in suppressed_blocked_tasks
+        tasks_by_id = {
+            str(row["id"]): dict(row)
+            for row in conn.execute("SELECT id, title, assignee, status FROM tasks")
+        }
+        links = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT parent_id, child_id, COALESCE(relation_type, 'dependency') AS relation_type FROM task_links"
             )
         ]
-        suppressed_count = before - len(issues)
-        if suppressed_count:
-            reconcile_summary["suppressed_doctor_issue_count"] = suppressed_count
-    return {"ok": not issues, "board": board or kb.get_current_board(), "db_path": str(path), "issues": issues, "reconcile_summary": reconcile_summary, "as_of": now}
+        runs = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT id, task_id, started_at, ended_at, status, outcome, metadata FROM task_runs"
+            )
+        ]
+
+    _append_graph_visibility_issues(issues, tasks=tasks_by_id, links=links, runs=runs)
+    return _finalize_doctor_result(
+        board=board or kb.get_current_board(),
+        db_path=str(path),
+        issues=issues,
+        ready_age_seconds=ready_age_seconds,
+        as_of=now,
+    )
 
 
 def _reconcile_summary(*, board: str | None, ready_age_seconds: int) -> dict[str, Any]:

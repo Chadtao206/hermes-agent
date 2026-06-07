@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     model_override       TEXT,
     max_retries          INTEGER,
     session_id           TEXT,
+    review_target_pr_head_sha TEXT,
     PRIMARY KEY (board, id)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(board, assignee, status);
@@ -179,3 +180,7 @@ CREATE TABLE IF NOT EXISTS kanban_notifier_heartbeats (
     PRIMARY KEY (board, notifier_id, board_slug, db_path)
 );
 CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen ON kanban_notifier_heartbeats(last_seen_at);
+
+-- Idempotent additive migrations for deployments that already created tasks
+-- before pg_schema.sql gained the explicit review-target column.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_target_pr_head_sha TEXT;

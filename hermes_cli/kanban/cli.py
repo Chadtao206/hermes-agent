@@ -125,6 +125,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
+        "review_target_pr_head_sha": t.review_target_pr_head_sha,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -397,6 +398,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate), "
                                "or 'scheduled' for non-dispatchable/root "
                                "coordination cards.")
+    p_create.add_argument("--review-target-pr-head-sha", default=None,
+                          help="Explicit PR head SHA a review-lane task must "
+                               "verify via metadata.reviewed_pr_head_sha. Use "
+                               "for superseding exact-head review cards when "
+                               "the dependency parent's PR SHA is stale.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1959,6 +1965,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             initial_status=getattr(args, "initial_status", "running"),
+            review_target_pr_head_sha=getattr(args, "review_target_pr_head_sha", None),
         )
         task = store.get_task(task_id)
     finally:
@@ -2173,6 +2180,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
         print(f"  model:     {task.model_override}")
+    if task.review_target_pr_head_sha:
+        print(f"  review-target-pr-head-sha: {task.review_target_pr_head_sha}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

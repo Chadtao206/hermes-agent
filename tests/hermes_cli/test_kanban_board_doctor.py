@@ -15,6 +15,8 @@ from hermes_cli import kanban_db_repair as krepair
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
+    import hermes_cli.kanban.store as store_mod
+
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -27,6 +29,8 @@ def kanban_home(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(store_mod, "resolve_backend", lambda: "sqlite", raising=True)
+    monkeypatch.setattr(kb, "single_writer_enabled", lambda board=None: False, raising=True)
     kb.init_db()
     return home
 
@@ -41,10 +45,14 @@ def test_readonly_connect_does_not_create_missing_db(tmp_path):
 
 
 def test_doctor_reports_unreadable_db_without_deleting_sidecars(tmp_path, monkeypatch):
+    import hermes_cli.kanban.store as store_mod
+
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(store_mod, "resolve_backend", lambda: "sqlite", raising=True)
+    monkeypatch.setattr(kb, "single_writer_enabled", lambda board=None: False, raising=True)
 
     db = home / "kanban.db"
     wal = home / "kanban.db-wal"
@@ -164,6 +172,42 @@ def test_doctor_reports_orphan_links_and_stale_running_runs(kanban_home):
     assert "orphan_task_link" in kinds
     assert "blocked_with_completed_parents" in kinds
     assert "stale_running_run" in kinds
+
+
+def test_doctor_surfaces_dependency_chain_decision_flag_and_superseded_duplicate(kanban_home):
+    with kb.connect() as conn:
+        human_gate = kb.create_task(conn, title="human architecture gate", assignee="ops")
+        blocked_parent = kb.create_task(conn, title="waiting on human", assignee="reviewer", parents=[human_gate])
+        decision_packet = kb.create_task(conn, title="decision packet", assignee="ops")
+        downstream = kb.create_task(
+            conn,
+            title="downstream review",
+            assignee="reviewer",
+            parents=[decision_packet, blocked_parent],
+        )
+        canonical = kb.create_task(conn, title="publish gate", assignee="ops")
+        duplicate = kb.create_task(conn, title="publish gate", assignee="ops")
+
+        kb.block_task(conn, human_gate, reason="human decision required")
+        kb.complete_task(
+            conn,
+            decision_packet,
+            summary="done",
+            metadata={"chad_decision_required": True},
+        )
+        conn.execute(
+            "INSERT INTO task_links(parent_id, child_id, relation_type) VALUES (?, ?, 'supersedes')",
+            (canonical, duplicate),
+        )
+
+    result = doctor.run_board_doctor()
+    matching = {issue["kind"]: issue for issue in result["issues"]}
+
+    assert matching["todo_with_completed_parents_blocked_by_ancestor"]["task_id"] == downstream
+    assert human_gate in matching["todo_with_completed_parents_blocked_by_ancestor"]["blocked_ancestors"]
+    assert matching["completed_closeout_decision_flag_without_gate"]["task_id"] == decision_packet
+    assert matching["superseded_duplicate_task"]["task_id"] == duplicate
+    assert matching["superseded_duplicate_task"]["superseded_by"] == canonical
 
 
 def test_doctor_cli_json(kanban_home):

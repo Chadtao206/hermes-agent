@@ -34,6 +34,7 @@ from hermes_cli.kanban_db import (  # reuse PURE helpers + exceptions across bac
     _external_handoff_required,
     _extract_reviewed_pr_head_sha,
     _extract_pr_head_sha,
+    _normalize_review_target_pr_head_sha,
     _TASK_ID_PROSE_RE,
     _EXTERNAL_HANDOFF_METADATA_KEYS,
     _pre_spawn_validation_errors,
@@ -64,6 +65,10 @@ class PostgresKanbanStore:
     def __init__(self, board: Optional[str] = None, pool=None):
         self.board = board or "default"
         self._pool = pool or pg_pool.get_pool()
+        # Keep Postgres deployments migration-safe when code adds columns. This
+        # is idempotent per pool and mirrors the CLI comment that PG schema is
+        # ensured by the store rather than by sqlite ``init_db``.
+        pg_pool.ensure_schema(self._pool)
 
     def close(self) -> None:
         return None  # shared pool; owner closes it
@@ -157,6 +162,7 @@ class PostgresKanbanStore:
                     tenant=None, priority=0, parents=(), triage=False,
                     idempotency_key=None, max_runtime_seconds=None, skills=None,
                     max_retries=None, initial_status="running", session_id=None,
+                    review_target_pr_head_sha=None,
                     **_ignored: Any) -> str:
         # Input-validation parity with kanban_db.create_task (sqlite). Mirror the
         # SAME checks, in the same order, raising the SAME ValueError messages so
@@ -176,6 +182,9 @@ class PostgresKanbanStore:
             branch_name = str(branch_name).strip() or None
         if branch_name and workspace_kind != "worktree":
             raise ValueError("branch_name is only valid for worktree workspaces")
+        review_target_pr_head_sha = _normalize_review_target_pr_head_sha(
+            review_target_pr_head_sha
+        )
         parents = tuple(p for p in parents if p)
 
         # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -258,13 +267,13 @@ class PostgresKanbanStore:
                         "INSERT INTO tasks (board, id, title, body, assignee, status, "
                         "priority, created_by, created_at, workspace_kind, workspace_path, "
                         "branch_name, tenant, idempotency_key, max_runtime_seconds, skills, "
-                        "max_retries, session_id) VALUES "
-                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "max_retries, session_id, review_target_pr_head_sha) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (self.board, tid, title.strip(), body, assignee, status, priority,
                          created_by, now, workspace_kind, workspace_path, branch_name,
                          tenant, idempotency_key, max_runtime_seconds,
                          json.dumps(skills_list) if skills_list is not None else None,
-                         max_retries, session_id))
+                         max_retries, session_id, review_target_pr_head_sha))
                     for p in parents:
                         cur.execute(
                             "INSERT INTO task_links (board, parent_id, child_id, relation_type) "
@@ -273,7 +282,8 @@ class PostgresKanbanStore:
                     self._emit(cur, tid, "created", {
                         "assignee": assignee, "status": status,
                         "parents": list(parents), "tenant": tenant,
-                        "branch_name": branch_name, "skills": skills_list or None})
+                        "branch_name": branch_name, "skills": skills_list or None,
+                        "review_target_pr_head_sha": review_target_pr_head_sha})
                     if status == "blocked":
                         self._emit(cur, tid, "blocked", {"reason": "initial_status=blocked"})
                     target_task_id = tid
@@ -1239,16 +1249,32 @@ class PostgresKanbanStore:
                         return sha, parent_id, None
         return None
 
+    def _pg_expected_review_pr_head_sha(
+        self, task_id: str,
+    ) -> Optional[tuple[str, Optional[str], Optional[int], str]]:
+        """Return explicit task review target, else parent-derived PR head."""
+        task = self.get_task(task_id)
+        explicit = _normalize_review_target_pr_head_sha(
+            task.review_target_pr_head_sha if task else None
+        )
+        if explicit:
+            return explicit, None, None, "task"
+        parent = self._pg_expected_parent_pr_head_sha(task_id)
+        if parent is None:
+            return None
+        sha, parent_task_id, parent_run_id = parent
+        return sha, parent_task_id, parent_run_id, "parent"
+
     def _pg_enforce_review_pr_head_gate(
         self, task_id: str, metadata: Optional[dict], *, summary: Optional[str],
     ) -> None:
         task = self.get_task(task_id)
         if not task or _lane_type_for_assignee(task.assignee) != "review":
             return
-        expected = self._pg_expected_parent_pr_head_sha(task_id)
+        expected = self._pg_expected_review_pr_head_sha(task_id)
         if expected is None:
             return
-        expected_sha, parent_task_id, parent_run_id = expected
+        expected_sha, parent_task_id, parent_run_id, target_source = expected
         reviewed_sha = _extract_reviewed_pr_head_sha(metadata)
         if reviewed_sha == expected_sha:
             return
@@ -1257,6 +1283,7 @@ class PostgresKanbanStore:
             "reviewed_pr_head_sha": reviewed_sha,
             "parent_task_id": parent_task_id,
             "parent_run_id": parent_run_id,
+            "target_source": target_source,
             "summary_preview": (
                 (summary or "").strip().splitlines()[0][:200] if summary else None
             ),
@@ -1272,6 +1299,7 @@ class PostgresKanbanStore:
             reviewed_sha=reviewed_sha,
             parent_task_id=parent_task_id,
             parent_run_id=parent_run_id,
+            target_source=target_source,
         )
 
     def _pg_enforce_external_handoff_gate(

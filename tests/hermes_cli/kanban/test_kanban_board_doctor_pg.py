@@ -70,3 +70,40 @@ def test_doctor_pg_unresolvable_dsn_degrades(pg, monkeypatch):
     assert any(i["kind"] == "pg_unreachable" and i["severity"] == "critical"
                for i in res["issues"])
     assert "reconcile_summary" in res  # shape uniformity
+
+
+def test_doctor_pg_surfaces_dependency_chain_decision_flag_and_superseded_duplicate(pg):
+    from hermes_cli import kanban_board_doctor as kdoc
+
+    s, pool, board = pg
+    human_gate = s.create_task(title="human architecture gate", assignee="ops")
+    s.claim_task(human_gate)
+    s.block_task(human_gate, reason="human decision required")
+
+    blocked_parent = s.create_task(title="waiting on human", assignee="reviewer", parents=[human_gate])
+    decision_packet = s.create_task(title="decision packet", assignee="ops")
+    s.claim_task(decision_packet)
+    s.complete_task(decision_packet, summary="done", metadata={"chad_decision_required": True})
+
+    downstream = s.create_task(
+        title="downstream review",
+        assignee="reviewer",
+        parents=[decision_packet, blocked_parent],
+    )
+    canonical = s.create_task(title="publish gate", assignee="ops")
+    duplicate = s.create_task(title="publish gate", assignee="ops")
+    with pool.connection() as c:
+        c.execute(
+            "INSERT INTO task_links (board, parent_id, child_id, relation_type) VALUES (%s,%s,%s,'supersedes')",
+            (board, canonical, duplicate),
+        )
+
+    res = kdoc._run_board_doctor_pg(board=board, ready_age_seconds=900, pool=pool)
+    matching = {issue["kind"]: issue for issue in res["issues"]}
+
+    assert matching["todo_with_completed_parents_blocked_by_ancestor"]["task_id"] == downstream
+    assert human_gate in matching["todo_with_completed_parents_blocked_by_ancestor"]["blocked_ancestors"]
+    assert matching["completed_closeout_decision_flag_without_gate"]["task_id"] == decision_packet
+    assert matching["superseded_duplicate_task"]["task_id"] == duplicate
+    assert matching["superseded_duplicate_task"]["superseded_by"] == canonical
+    assert "reconcile_summary" in res

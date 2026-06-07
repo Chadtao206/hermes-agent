@@ -1031,7 +1031,7 @@ def collect_reconcile_actions(
     ):
         if not _is_review_lane(row["assignee"]):
             continue
-        if kb._expected_parent_pr_head_sha(conn, row["id"]) is not None:
+        if kb._expected_review_pr_head_sha(conn, row["id"]) is not None:
             continue
         age = as_of - int(row["created_at"])
         parent_details = _parent_pr_head_evidence_details(conn, row["id"])

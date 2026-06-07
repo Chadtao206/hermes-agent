@@ -1947,6 +1947,107 @@ def test_reviewer_completion_accepts_matching_current_pr_head(kanban_home):
     assert len([e for e in events if e.kind == "completed"]) == 1
 
 
+def test_reviewer_completion_uses_explicit_review_target_over_stale_parent(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="Opened PR for review.",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+        review = kb.create_task(
+            conn,
+            title="fresh exact-head review",
+            assignee="reviewer",
+            parents=[parent],
+            review_target_pr_head_sha="bbbbbbbb22222222",
+        )
+        kb.claim_task(conn, review)
+        task = kb.get_task(conn, review)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+        context = kb.build_worker_context(conn, review)
+
+        assert "explicit refreshed PR head target" in context
+        assert "review_target_pr_head_sha" in context
+        assert "reviewed_pr_head_sha: bbbbbbbb22222222" in context
+        assert "reviewed_pr_head_sha: abcdef1234567890" not in context
+
+        assert kb.complete_task(
+            conn,
+            review,
+            summary="Approved refreshed PR head.",
+            metadata={"reviewed_pr_head_sha": "bbbbbbbb22222222"},
+            expected_run_id=run_id,
+        )
+        task_after = kb.get_task(conn, review)
+        run = kb.latest_run(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert task_after is not None
+    assert task_after.status == "done"
+    assert run is not None
+    assert run.metadata is not None
+    assert run.metadata["reviewed_pr_head_sha"] == "bbbbbbbb22222222"
+    assert not [e for e in events if e.kind == "completion_blocked_pr_head_gate"]
+
+
+def test_reviewer_completion_rejects_mismatch_against_explicit_review_target(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="engineer")
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="Opened PR for review.",
+            metadata={"pull_request_head_sha": "abcdef1234567890"},
+        )
+        review = kb.create_task(
+            conn,
+            title="fresh exact-head review",
+            assignee="reviewer",
+            parents=[parent],
+            review_target_pr_head_sha="bbbbbbbb22222222",
+        )
+        kb.claim_task(conn, review)
+        task = kb.get_task(conn, review)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        with pytest.raises(ValueError, match="explicit review target"):
+            kb.complete_task(
+                conn,
+                review,
+                summary="Approved stale parent head.",
+                metadata={"reviewed_pr_head_sha": "abcdef1234567890"},
+                expected_run_id=run_id,
+            )
+        task_after = kb.get_task(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert task_after is not None
+    assert task_after.status == "running"
+    gate_events = [e for e in events if e.kind == "completion_blocked_pr_head_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0].payload is not None
+    assert gate_events[0].payload["expected_pr_head_sha"] == "bbbbbbbb22222222"
+    assert gate_events[0].payload["reviewed_pr_head_sha"] == "abcdef1234567890"
+    assert gate_events[0].payload["target_source"] == "task"
+
+
+def test_create_task_rejects_invalid_explicit_review_target(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="review_target_pr_head_sha"):
+            kb.create_task(
+                conn,
+                title="fresh exact-head review",
+                assignee="reviewer",
+                review_target_pr_head_sha="not-a-sha",
+            )
+
+
 def test_reviewer_completion_uses_newest_parent_pr_head_across_parents(kanban_home):
     with kb.connect() as conn:
         parent_a = kb.create_task(conn, title="implementation A", assignee="engineer")

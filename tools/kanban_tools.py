@@ -358,6 +358,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "review_target_pr_head_sha": task.review_target_pr_head_sha,
         "parents": parents,
         "children": children,
         "rollup_children": rollup_children,
@@ -389,6 +390,7 @@ def _task_summary_dict_store(store, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "review_target_pr_head_sha": task.review_target_pr_head_sha,
         "parents": parents,
         "children": children,
         "rollup_children": rollup_children,
@@ -695,16 +697,25 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             except kb.PRHeadGateError as pr_err:
                 reviewed = pr_err.reviewed_sha or "missing"
+                if getattr(pr_err, "target_source", "parent") == "task":
+                    target_desc = (
+                        f"Explicit review target is {pr_err.expected_sha} "
+                        "from review_target_pr_head_sha"
+                    )
+                else:
+                    target_desc = (
+                        f"Current parent PR head is {pr_err.expected_sha} "
+                        f"from parent task {pr_err.parent_task_id}"
+                    )
                 return tool_error(
                     f"kanban_complete blocked: final-review PR-head gate failed. "
-                    f"Current parent PR head is {pr_err.expected_sha} "
-                    f"from parent task {pr_err.parent_task_id}; your "
-                    f"reviewed_pr_head_sha was {reviewed}. Your task is still "
-                    f"in-flight (no state change). If you reviewed the current "
-                    f"head, retry kanban_complete with the same summary and "
-                    f"metadata.reviewed_pr_head_sha={pr_err.expected_sha}. "
-                    f"If the PR changed or you cannot verify that SHA, call "
-                    f"kanban_block with the exact verification gap instead."
+                    f"{target_desc}; your reviewed_pr_head_sha was {reviewed}. "
+                    f"Your task is still in-flight (no state change). If you "
+                    f"reviewed the expected head, retry kanban_complete with "
+                    f"the same summary and metadata.reviewed_pr_head_sha="
+                    f"{pr_err.expected_sha}. If the PR changed or you cannot "
+                    f"verify that SHA, call kanban_block with the exact "
+                    f"verification gap instead."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -912,6 +923,7 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    review_target_pr_head_sha = args.get("review_target_pr_head_sha")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -947,6 +959,7 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 skills=skills,
                 initial_status=str(initial_status),
+                review_target_pr_head_sha=review_target_pr_head_sha,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1510,6 +1523,15 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "review_target_pr_head_sha": {
+                "type": "string",
+                "description": (
+                    "Optional explicit PR head SHA that a final-review task "
+                    "must verify via metadata.reviewed_pr_head_sha. Use for "
+                    "superseding exact-head review cards when the dependency "
+                    "parent's recorded pull_request_head_sha is stale."
                 ),
             },
             "skills": {

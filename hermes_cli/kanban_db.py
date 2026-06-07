@@ -951,6 +951,10 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Optional machine-readable PR head a review-lane task is expected to
+    # verify. When set, the final-review gate uses this explicit target
+    # instead of deriving the expected SHA from a dependency parent closeout.
+    review_target_pr_head_sha: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1019,6 +1023,10 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            review_target_pr_head_sha=(
+                row["review_target_pr_head_sha"]
+                if "review_target_pr_head_sha" in keys else None
             ),
         )
 
@@ -1157,7 +1165,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Optional explicit PR head target for review-lane tasks. This lets a
+    -- superseding exact-head review card intentionally target a newer PR head
+    -- while preserving the stale-review guard's exact-SHA invariant.
+    review_target_pr_head_sha TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2233,6 +2245,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "review_target_pr_head_sha" not in cols:
+        # Explicit exact-head review target for superseding review cards.
+        # NULL preserves the legacy parent-derived safety invariant.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "review_target_pr_head_sha",
+            "review_target_pr_head_sha TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2697,6 +2719,7 @@ def create_task(
     max_retries: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    review_target_pr_head_sha: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2722,6 +2745,11 @@ def create_task(
     ``kanban-worker``. Use this to pin a task to a specialist skill
     (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``review_target_pr_head_sha`` is an optional explicit final-review
+    target. Review-lane tasks with this set must complete with matching
+    ``metadata.reviewed_pr_head_sha`` even when a dependency parent's PR
+    evidence is older; this is the supported exact-head re-review path.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -2739,6 +2767,9 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    review_target_pr_head_sha = _normalize_review_target_pr_head_sha(
+        review_target_pr_head_sha
+    )
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2864,8 +2895,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, session_id, review_target_pr_head_sha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2885,6 +2916,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         session_id,
+                        review_target_pr_head_sha,
                     ),
                 )
                 for pid in parents:
@@ -2903,6 +2935,7 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "review_target_pr_head_sha": review_target_pr_head_sha,
                     },
                 )
                 if task_status == "blocked":
@@ -3863,6 +3896,40 @@ def _extract_reviewed_pr_head_sha(metadata: Optional[dict]) -> Optional[str]:
     return _extract_pr_head_sha(metadata.get("reviewed_pr_head_sha"))
 
 
+def _normalize_review_target_pr_head_sha(value: Any) -> Optional[str]:
+    """Normalize the explicit review gate target, rejecting non-SHA input."""
+    if value is None:
+        return None
+    sha = _extract_pr_head_sha(value)
+    if sha:
+        return sha
+    raise ValueError(
+        "review_target_pr_head_sha must be a 7-40 character git SHA"
+    )
+
+
+def _expected_review_pr_head_sha(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[str, Optional[str], Optional[int], str]]:
+    """Return expected review target as ``(sha, parent_task_id, run_id, source)``.
+
+    ``source`` is ``"task"`` when an explicit review target is set on the
+    review task, otherwise ``"parent"`` for the legacy parent-derived target.
+    """
+    task = get_task(conn, task_id)
+    explicit = _normalize_review_target_pr_head_sha(
+        task.review_target_pr_head_sha if task else None
+    )
+    if explicit:
+        return explicit, None, None, "task"
+    parent = _expected_parent_pr_head_sha(conn, task_id)
+    if parent is None:
+        return None
+    sha, parent_task_id, parent_run_id = parent
+    return sha, parent_task_id, parent_run_id, "parent"
+
+
 def _expected_parent_pr_head_sha(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3914,24 +3981,30 @@ class PRHeadGateError(ValueError):
         task_id: str,
         expected_sha: str,
         reviewed_sha: Optional[str],
-        parent_task_id: str,
+        parent_task_id: Optional[str],
         parent_run_id: Optional[int],
+        target_source: str = "parent",
     ) -> None:
         self.task_id = task_id
         self.expected_sha = expected_sha
         self.reviewed_sha = reviewed_sha
         self.parent_task_id = parent_task_id
         self.parent_run_id = parent_run_id
+        self.target_source = target_source
+        target_label = (
+            "explicit review target"
+            if target_source == "task" else "current parent PR head"
+        )
         if reviewed_sha:
             msg = (
                 "completion blocked: reviewer closeout references PR head "
-                f"{reviewed_sha}, but current parent PR head is {expected_sha}"
+                f"{reviewed_sha}, but {target_label} is {expected_sha}"
             )
         else:
             msg = (
                 "completion blocked: reviewer closeout must include "
                 f"reviewed_pr_head_sha={expected_sha} to prove final review "
-                "covered the current PR head"
+                f"covered the {target_label}"
             )
         super().__init__(msg)
 
@@ -3981,10 +4054,10 @@ def _enforce_review_pr_head_gate(
     task = get_task(conn, task_id)
     if not task or _lane_type_for_assignee(task.assignee) != "review":
         return
-    expected = _expected_parent_pr_head_sha(conn, task_id)
+    expected = _expected_review_pr_head_sha(conn, task_id)
     if expected is None:
         return
-    expected_sha, parent_task_id, parent_run_id = expected
+    expected_sha, parent_task_id, parent_run_id, target_source = expected
     reviewed_sha = _extract_reviewed_pr_head_sha(metadata)
     if reviewed_sha == expected_sha:
         return
@@ -3993,6 +4066,7 @@ def _enforce_review_pr_head_gate(
         "reviewed_pr_head_sha": reviewed_sha,
         "parent_task_id": parent_task_id,
         "parent_run_id": parent_run_id,
+        "target_source": target_source,
         "summary_preview": (
             (summary or "").strip().splitlines()[0][:200] if summary else None
         ),
@@ -4005,6 +4079,7 @@ def _enforce_review_pr_head_gate(
         reviewed_sha=reviewed_sha,
         parent_task_id=parent_task_id,
         parent_run_id=parent_run_id,
+        target_source=target_source,
     )
 
 
@@ -4704,7 +4779,7 @@ class HallucinatedCardsError(ValueError):
 _RECONSTRUCTABLE_ERRORS: dict[str, tuple[type, str, tuple[str, ...]]] = {
     "PRHeadGateError": (
         PRHeadGateError, "kw",
-        ("task_id", "expected_sha", "reviewed_sha", "parent_task_id", "parent_run_id"),
+        ("task_id", "expected_sha", "reviewed_sha", "parent_task_id", "parent_run_id", "target_source"),
     ),
     "ExternalHandoffGateError": (ExternalHandoffGateError, "kw", ("task_id",)),
     "HallucinatedCardsError": (
@@ -8676,19 +8751,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         )
         lines.append("")
     if lane_type == "review":
-        expected_review_head = _expected_parent_pr_head_sha(conn, task_id)
+        expected_review_head = _expected_review_pr_head_sha(conn, task_id)
     if expected_review_head is not None:
-        expected_sha, parent_task_id, parent_run_id = expected_review_head
+        expected_sha, parent_task_id, parent_run_id, target_source = expected_review_head
         lines.append("## Final-review PR-head gate")
-        lines.append(
-            "This review has a parent implementation closeout with current "
-            f"PR head `{expected_sha}` (parent `{parent_task_id}`"
-            + (f", run `{parent_run_id}`" if parent_run_id is not None else "")
-            + "). To complete this task, your `kanban_complete` metadata "
-            f"MUST include `reviewed_pr_head_sha: {expected_sha}`. If the "
-            "PR head has changed or you cannot verify it, call `kanban_block` "
-            "instead of approving stale evidence."
-        )
+        if target_source == "task":
+            lines.append(
+                "This review has an explicit refreshed PR head target "
+                f"`{expected_sha}` from `review_target_pr_head_sha`. To complete "
+                "this task, your `kanban_complete` metadata MUST include "
+                f"`reviewed_pr_head_sha: {expected_sha}`. If you cannot verify "
+                "that exact SHA, call `kanban_block` instead of approving stale "
+                "evidence."
+            )
+        else:
+            lines.append(
+                "This review has a parent implementation closeout with current "
+                f"PR head `{expected_sha}` (parent `{parent_task_id}`"
+                + (f", run `{parent_run_id}`" if parent_run_id is not None else "")
+                + "). To complete this task, your `kanban_complete` metadata "
+                f"MUST include `reviewed_pr_head_sha: {expected_sha}`. If the "
+                "PR head has changed or you cannot verify it, call `kanban_block` "
+                "instead of approving stale evidence."
+            )
         lines.append("")
 
     if task.body and task.body.strip():
