@@ -1798,6 +1798,40 @@ _KANBAN_WORKER_DB_MUTATION_MESSAGE = (
 )
 
 
+_FORK_UPDATE_GUARD_MESSAGE = (
+    "Blocked: this Hermes install is a CUSTOMIZED FORK. `hermes update` (and "
+    "`git reset --hard origin/main`) reset `main` to NousResearch upstream and WIPE "
+    "every local customization — the kanban Postgres store, control-center, ylopo "
+    "tools — which already nuked the live board once (2026-06-06). Agents/workers "
+    "must NEVER run it. Upstream syncs go through the controlled merge workflow "
+    "(merging-hermes-upstream skill → reviewed PR onto the `chad` fork), never "
+    "`hermes update`. Escalate to Chad/Jensen."
+)
+
+
+def _fork_destroying_command_error(command: str) -> str:
+    """Block fork-destroying framework updates from worker/agent shells.
+
+    On this fork ``origin`` is NousResearch upstream, so ``hermes update`` does
+    ``git reset --hard origin/main`` and wipes all local customizations. An agent
+    ran exactly this on 2026-06-06 and reset the install to raw upstream (board
+    went empty; recovered from reflog/chad). This guard only fires in agent
+    contexts (``HERMES_KANBAN_TASK`` set); an operator can still run it manually.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return ""
+    lowered = command.lower()
+    # `hermes update` / `python -m hermes_cli.main update` in any flag form
+    if re.search(r"\bhermes\s+update\b", lowered) or re.search(
+        r"hermes_cli\.main\s+update\b", lowered
+    ):
+        return _FORK_UPDATE_GUARD_MESSAGE
+    # destructive hard-reset/checkout of main onto the upstream remote
+    if re.search(r"\bgit\b.*\breset\b.*--hard.*\b(origin|upstream)/(main|master)\b", lowered):
+        return _FORK_UPDATE_GUARD_MESSAGE
+    return ""
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1862,6 +1896,19 @@ def terminal_tool(
                 "output": "",
                 "exit_code": -1,
                 "error": kanban_guard_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
+        fork_guard_error = _fork_destroying_command_error(command)
+        if fork_guard_error:
+            logger.warning(
+                "Rejected fork-destroying update command from worker/agent: %s",
+                fork_guard_error,
+            )
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": fork_guard_error,
                 "status": "blocked",
             }, ensure_ascii=False)
 
