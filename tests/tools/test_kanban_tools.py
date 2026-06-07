@@ -1299,7 +1299,11 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
+    # Upper bound bumped 4096 -> 4608 in the 2026-06-06 upstream merge: upstream
+    # replaced our 3-line hermes-agent-docs pointer with a more thorough 8-line
+    # version (legit content growth, not bloat/duplication). Still a sanity
+    # ceiling against unbounded system-prompt growth.
+    assert 1_500 < len(KANBAN_GUIDANCE) < 4_608, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

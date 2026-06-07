@@ -3165,8 +3165,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, session_id, review_target_pr_head_sha
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id, review_target_pr_head_sha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6674,6 +6674,13 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Sentinel exit code a kanban worker uses to signal "I bailed because the
+# provider rate-limited / exhausted quota, not because the task failed."
+# detect_crashed_workers maps this to a ``rate_limited`` release that requeues
+# the task to ``ready`` WITHOUT counting a failure (the breaker must never trip
+# on a transient throttle). 75 == BSD EX_TEMPFAIL. Adopted from upstream #38223.
+KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -6690,6 +6697,11 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    rate_limited: list[str] = field(default_factory=list)
+    """Task ids released back to ``ready`` because their worker bailed on a
+    provider rate-limit / quota wall (EX_TEMPFAIL). These did NOT count a
+    failure — a long quota window just bounces the task cheaply until it
+    clears. (adopted from upstream #38223)"""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -7417,6 +7429,10 @@ def detect_crashed_workers(
     reclaim_candidates: list[tuple[str, int, str, bool, str, str, dict]] = []
     # (task_id, pid, claim_lock, protocol_violation, error_text, event_kind,
     #  event_payload)
+    # Rate-limited workers (EX_TEMPFAIL) are released to ``ready`` WITHOUT
+    # counting a failure — tracked separately from crashes (upstream #38223).
+    rate_limited: list[str] = []
+    rate_limited_candidates: list[tuple[str, int, str]] = []  # (task_id, pid, lock)
     for row in rows:
         # Only check liveness for claims owned by this host.
         lock = row["claim_lock"] or ""
@@ -7433,6 +7449,12 @@ def detect_crashed_workers(
             # terminal status. In dispatcher ticks, leave this lane for
             # TTL/heartbeat-based stale handling instead of letting
             # unknown status pre-empt stale classification.
+            continue
+        if kind == "rate_limited":
+            # Provider rate-limit / quota wall (EX_TEMPFAIL sentinel). NOT a
+            # crash: release to ``ready`` without counting a failure; the
+            # respawn guard defers it on a cooldown until quota returns (#38223).
+            rate_limited_candidates.append((task_id, pid, lock))
             continue
         if kind == "clean_exit":
             # Worker subprocess returned 0 but its task is still
@@ -7480,6 +7502,34 @@ def detect_crashed_workers(
         reclaim_candidates.append(
             (task_id, pid, lock, protocol_violation, error_text, event_kind, event_payload)
         )
+
+    # Release rate-limited workers back to ``ready`` WITHOUT counting a failure
+    # (upstream #38223). Separate write_txn + ``rate_limited`` run outcome so the
+    # respawn guard's rate-limit cooldown (keyed on that outcome) defers the
+    # requeue until the quota window clears, and the circuit breaker never trips.
+    if rate_limited_candidates:
+        with write_txn(conn):
+            for task_id, pid, lock in rate_limited_candidates:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' AND worker_pid = ? "
+                    "AND COALESCE(claim_lock, '') = ?",
+                    (task_id, pid, lock),
+                )
+                if cur.rowcount == 1:
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="rate_limited", status="rate_limited",
+                        error="worker bailed on provider rate-limit / quota wall "
+                              "(EX_TEMPFAIL); requeued without counting a failure",
+                        metadata={"pid": pid, "claimer": lock},
+                    )
+                    _append_event(
+                        conn, task_id, "rate_limited",
+                        {"pid": pid, "claimer": lock}, run_id=run_id,
+                    )
+                    rate_limited.append(task_id)
 
     if reclaim_candidates:
         with write_txn(conn):

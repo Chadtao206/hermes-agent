@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_retries          INTEGER,
     session_id           TEXT,
     review_target_pr_head_sha TEXT,
+    goal_mode            INTEGER NOT NULL DEFAULT 0,
+    goal_max_turns       INTEGER,
     PRIMARY KEY (board, id)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(board, assignee, status);
@@ -184,3 +186,6 @@ CREATE INDEX IF NOT EXISTS idx_notifier_heartbeats_seen ON kanban_notifier_heart
 -- Idempotent additive migrations for deployments that already created tasks
 -- before pg_schema.sql gained the explicit review-target column.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_target_pr_head_sha TEXT;
+-- goal_mode / goal_max_turns adopted from upstream #35710 (2026-06-06 merge).
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS goal_mode INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS goal_max_turns INTEGER;
