@@ -145,6 +145,140 @@ def case_load_waivers_handles_missing_and_malformed_file() -> None:
         assert len(loaded) == 1 and loaded[0]["gate_id"] == "kanban_telemetry_drift_state", loaded
 
 
+
+def _drift_ctx(access, telemetry_records: dict, sync_run_at: str = "2026-06-12T12:00:00+00:00"):
+    return SimpleNamespace(
+        kanban_access=access,
+        kanban_db=Path("/tmp/ignored-kanban.db"),
+        cron_jobs={
+            "daily-telemetry-kanban-sync": {
+                "last_status": "ok",
+                "last_run_at": sync_run_at,
+            }
+        },
+        task_by_id=telemetry_records,
+    )
+
+
+class _DriftStubAccess:
+    """Postgres-mode stand-in: serves done/blocked rows + blocked-event epochs."""
+
+    def __init__(self, tasks: list[dict], blocked_epochs: dict | None = None):
+        self._tasks = tasks
+        self._blocked_epochs = blocked_epochs or {}
+        self.backend = "postgres"
+
+    def done_blocked_tasks(self):
+        return self._tasks
+
+    def latest_blocked_event_epoch(self, task_id: str):
+        return self._blocked_epochs.get(task_id)
+
+
+def _telemetry_record(status: str = "completed", outcome: str = "success", closed: bool = True):
+    return SimpleNamespace(
+        row={"status": status, "outcome": outcome},
+        closed_at="2026-06-12T01:00:00+00:00" if closed else None,
+    )
+
+
+def case_drift_gate_passes_via_kanban_access() -> None:
+    access = _DriftStubAccess(
+        [
+            {
+                "id": "t_done_1",
+                "status": "done",
+                "completed_at": 1781200000,
+                "consecutive_failures": 0,
+                "last_heartbeat_at": None,
+                "started_at": None,
+                "created_at": 1781100000,
+            }
+        ]
+    )
+    ctx = _drift_ctx(access, {"kanban:t_done_1": _telemetry_record()})
+    gate = rd.gate_kanban_telemetry_drift_state(ctx)
+    assert gate["status"] == "pass", gate
+
+
+def case_drift_gate_fails_on_unsynced_done_task() -> None:
+    access = _DriftStubAccess(
+        [
+            {
+                "id": "t_done_2",
+                "status": "done",
+                "completed_at": 1781200000,
+                "consecutive_failures": 0,
+                "last_heartbeat_at": None,
+                "started_at": None,
+                "created_at": 1781100000,
+            }
+        ]
+    )
+    ctx = _drift_ctx(access, {})
+    gate = rd.gate_kanban_telemetry_drift_state(ctx)
+    assert gate["status"] == "fail", gate
+    assert "t_done_2" in gate["evidence"]["unsynced_kanban_done_task_ids"], gate["evidence"]
+
+
+def case_drift_gate_fails_closed_when_access_unavailable() -> None:
+    class _Unavailable:
+        backend = "postgres"
+
+        def done_blocked_tasks(self):
+            return None
+
+        def latest_blocked_event_epoch(self, task_id):
+            return None
+
+    ctx = _drift_ctx(_Unavailable(), {})
+    gate = rd.gate_kanban_telemetry_drift_state(ctx)
+    assert gate["status"] == "fail", gate
+
+
+
+def case_drift_gate_ignores_inflight_blocked_without_failures() -> None:
+    """blocked + 0 failures = in-flight (synced as 'open'); drift must not demand a closed record."""
+    access = _DriftStubAccess(
+        [
+            {
+                "id": "t_blocked_clean",
+                "status": "blocked",
+                "completed_at": None,
+                "consecutive_failures": 0,
+                "last_heartbeat_at": None,
+                "started_at": 1781100000,
+                "created_at": 1781000000,
+            }
+        ],
+        blocked_epochs={"t_blocked_clean": 1781200000},
+    )
+    ctx = _drift_ctx(access, {})
+    gate = rd.gate_kanban_telemetry_drift_state(ctx)
+    assert gate["status"] == "pass", gate
+
+
+def case_drift_gate_flags_failed_blocked_task() -> None:
+    access = _DriftStubAccess(
+        [
+            {
+                "id": "t_blocked_failed",
+                "status": "blocked",
+                "completed_at": None,
+                "consecutive_failures": 2,
+                "last_heartbeat_at": None,
+                "started_at": 1781100000,
+                "created_at": 1781000000,
+            }
+        ],
+        blocked_epochs={"t_blocked_failed": 1781200000},
+    )
+    ctx = _drift_ctx(access, {})
+    gate = rd.gate_kanban_telemetry_drift_state(ctx)
+    assert gate["status"] == "fail", gate
+    assert "t_blocked_failed" in gate["evidence"]["unsynced_kanban_blocked_task_ids"], gate["evidence"]
+
+
 def case_waived_gate_produces_no_repair_proposal() -> None:
     readiness = {
         "gates": [
@@ -175,6 +309,11 @@ def main() -> int:
     case_waiver_never_touches_passing_gate()
     case_overall_verdict_counts_waived_as_complete()
     case_load_waivers_handles_missing_and_malformed_file()
+    case_drift_gate_passes_via_kanban_access()
+    case_drift_gate_fails_on_unsynced_done_task()
+    case_drift_gate_fails_closed_when_access_unavailable()
+    case_drift_gate_ignores_inflight_blocked_without_failures()
+    case_drift_gate_flags_failed_blocked_task()
     case_waived_gate_produces_no_repair_proposal()
     print("OK")
     return 0

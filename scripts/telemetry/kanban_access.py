@@ -69,6 +69,77 @@ class KanbanAccess:
         newest = max(matches, key=lambda task: getattr(task, "created_at", 0) or 0)
         return self._task_to_state(newest)
 
+    def done_blocked_tasks(self) -> list[dict[str, Any]] | None:
+        """Return done/blocked tasks for drift checks, or None if unavailable.
+
+        Each dict carries the fields the readiness doctor's drift gate reads:
+        id, status, completed_at, consecutive_failures, last_heartbeat_at,
+        started_at, created_at.
+        """
+        if self.backend == "sqlite":
+            if not self.db_path.exists():
+                return None
+            conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status IN ('done', 'blocked') ORDER BY id"
+                ).fetchall()
+            except sqlite3.Error:
+                return None
+            finally:
+                conn.close()
+            return [self._drift_row(dict(row)) for row in rows]
+        try:
+            tasks = list(self._store.list_tasks(status="done")) + list(
+                self._store.list_tasks(status="blocked")
+            )
+        except Exception:
+            return None
+        tasks.sort(key=lambda task: str(task.id))
+        return [self._drift_row(vars(task) if hasattr(task, "__dict__") else task.__dict__) for task in tasks]
+
+    def latest_blocked_event_epoch(self, task_id: str) -> int | None:
+        """Return the newest 'blocked' event created_at epoch for a task, if any."""
+        if not task_id:
+            return None
+        if self.backend == "sqlite":
+            if not self.db_path.exists():
+                return None
+            conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                    (task_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                return None
+            finally:
+                conn.close()
+            return int(row[0]) if row and row[0] is not None else None
+        try:
+            events = self._store.list_events(task_id)
+        except Exception:
+            return None
+        epochs = [
+            int(event.created_at)
+            for event in events
+            if str(getattr(event, "kind", "")) == "blocked" and getattr(event, "created_at", None) is not None
+        ]
+        return max(epochs) if epochs else None
+
+    @staticmethod
+    def _drift_row(raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": str(raw.get("id")),
+            "status": str(raw.get("status") or ""),
+            "completed_at": raw.get("completed_at"),
+            "consecutive_failures": int(raw.get("consecutive_failures") or 0),
+            "last_heartbeat_at": raw.get("last_heartbeat_at"),
+            "started_at": raw.get("started_at"),
+            "created_at": raw.get("created_at"),
+        }
+
     # ------------------------------------------------------------------
     # Health / backup
     # ------------------------------------------------------------------

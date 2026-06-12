@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from common import resolve_telemetry_root
+from kanban_access import resolve_kanban_access
 
 
 REQUIRED_PROFILES = {"default", "engineer", "researcher", "reviewer", "ops", "designer"}
@@ -33,7 +35,6 @@ CANONICAL_TASK_TYPES = {"implementation", "ops", "review", "research", "planning
 TERMINAL_STATUS_BY_KANBAN_STATUS = {
     "done": ("completed", "success"),
     "blocked_failed": ("failed", "fail"),
-    "blocked": ("blocked", None),
 }
 
 
@@ -81,12 +82,12 @@ class DoctorContext:
     telemetry_root: Path
     events_db: Path
     experiments_db: Path
-    kanban_db: Path
+    kanban_db: Path | None
     cron_state_path: Path
     report_dir: Path
     events_conn: sqlite3.Connection | None
     experiments_conn: sqlite3.Connection | None
-    kanban_conn: sqlite3.Connection | None
+    kanban_access: Any | None
     cron_jobs: dict[str, dict[str, Any]] | None
     cron_state_error: str | None
     tasks: list[TaskRecord]
@@ -106,7 +107,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--telemetry-root", help="Override telemetry root path")
-    parser.add_argument("--kanban-db", default="/Users/ctao/.hermes/kanban.db", help="Path to kanban SQLite database")
+    parser.add_argument("--kanban-db", default=None, help="Explicit kanban SQLite DB path (tests/frozen-DB archaeology); omit to use the configured backend")
     parser.add_argument("--cron-state", default="/Users/ctao/.hermes/cron/jobs.json", help="Path to cron jobs.json")
     parser.add_argument("--json-only", action="store_true", help="Suppress human summary on stderr")
     return parser.parse_args()
@@ -402,12 +403,16 @@ def build_context(args: argparse.Namespace) -> DoctorContext:
     events_db = telemetry_root / "events.db"
     experiments_db = telemetry_root / "experiments.db"
     report_dir = telemetry_root / "reports"
-    kanban_db = Path(args.kanban_db).expanduser().resolve()
     cron_state_path = Path(args.cron_state).expanduser().resolve()
 
     events_conn, _ = connect_sqlite_readonly(events_db)
     experiments_conn, _ = connect_sqlite_readonly(experiments_db)
-    kanban_conn, _ = connect_sqlite_readonly(kanban_db)
+    hermes_home = Path(os.environ.get("HERMES_HOME") or telemetry_root.parent).expanduser().resolve()
+    try:
+        kanban_access = resolve_kanban_access(args.kanban_db, hermes_home=hermes_home)
+    except Exception:
+        # Fail closed: an unreachable backend reads as 'kanban unavailable'.
+        kanban_access = None
     cron_jobs, cron_state_error = load_cron_jobs(cron_state_path)
     tasks, task_by_id = load_task_records(events_conn)
     routing_evidence_task_ids = load_routing_evidence_task_ids(events_conn) if events_conn else set()
@@ -423,12 +428,12 @@ def build_context(args: argparse.Namespace) -> DoctorContext:
         telemetry_root=telemetry_root,
         events_db=events_db,
         experiments_db=experiments_db,
-        kanban_db=kanban_db,
+        kanban_db=kanban_access.db_path if kanban_access is not None else None,
         cron_state_path=cron_state_path,
         report_dir=report_dir,
         events_conn=events_conn,
         experiments_conn=experiments_conn,
-        kanban_conn=kanban_conn,
+        kanban_access=kanban_access,
         cron_jobs=cron_jobs,
         cron_state_error=cron_state_error,
         tasks=tasks,
@@ -920,24 +925,18 @@ def latest_successful_sync_at(ctx: DoctorContext) -> datetime | None:
 
 
 
-def latest_blocked_timestamp(kanban_conn: sqlite3.Connection, task_id: str, fallback_row: sqlite3.Row) -> datetime | None:
-    row = kanban_conn.execute(
-        "SELECT MAX(created_at) AS ts FROM task_events WHERE task_id = ? AND kind = 'blocked'",
-        (task_id,),
-    ).fetchone()
-    ts = parse_epoch_utc(row["ts"] if row else None)
+def latest_blocked_timestamp(kanban_access: Any, task_id: str, fallback_row: dict[str, Any]) -> datetime | None:
+    ts = parse_epoch_utc(kanban_access.latest_blocked_event_epoch(task_id))
     if ts:
         return ts
     return parse_epoch_utc(fallback_row["last_heartbeat_at"] or fallback_row["started_at"] or fallback_row["created_at"])
 
 
 
-def expected_telemetry_state(kanban_row: sqlite3.Row) -> tuple[str, str | None]:
+def expected_telemetry_state(kanban_row: dict[str, Any]) -> tuple[str, str | None]:
     if kanban_row["status"] == "done":
         return TERMINAL_STATUS_BY_KANBAN_STATUS["done"]
-    if kanban_row["status"] == "blocked" and int(kanban_row["consecutive_failures"] or 0) > 0:
-        return TERMINAL_STATUS_BY_KANBAN_STATUS["blocked_failed"]
-    return TERMINAL_STATUS_BY_KANBAN_STATUS["blocked"]
+    return TERMINAL_STATUS_BY_KANBAN_STATUS["blocked_failed"]
 
 
 
@@ -949,12 +948,13 @@ def gate_kanban_telemetry_drift_state(ctx: DoctorContext) -> dict[str, Any]:
         "unsynced_kanban_blocked_task_ids": [],
         "state_mismatch_task_ids": [],
     }
-    if ctx.kanban_conn is None:
-        reasons.append(f"Kanban DB unavailable: {ctx.kanban_db}")
+    relevant_rows = ctx.kanban_access.done_blocked_tasks() if ctx.kanban_access is not None else None
+    if relevant_rows is None:
+        reasons.append(f"Kanban backend unavailable (db={ctx.kanban_db}).")
         return gate_result(
             "kanban_telemetry_drift_state",
             "fail",
-            "Kanban DB is unavailable, so drift cannot be verified.",
+            "Kanban backend is unavailable, so drift cannot be verified.",
             evidence,
             reasons,
         )
@@ -971,15 +971,18 @@ def gate_kanban_telemetry_drift_state(ctx: DoctorContext) -> dict[str, Any]:
         )
 
     evidence["latest_successful_sync_at"] = sync_at.isoformat()
-    relevant_rows = ctx.kanban_conn.execute(
-        "SELECT * FROM tasks WHERE status IN ('done', 'blocked') ORDER BY id"
-    ).fetchall()
 
     unsynced_done: list[str] = []
     unsynced_blocked: list[str] = []
     mismatches: list[str] = []
     for row in relevant_rows:
-        source_ts = parse_epoch_utc(row["completed_at"]) if row["status"] == "done" else latest_blocked_timestamp(ctx.kanban_conn, str(row["id"]), row)
+        if row["status"] == "blocked" and int(row["consecutive_failures"] or 0) == 0:
+            # In-flight: blocked on parents/dependencies with no failed runs.
+            # The Postgres-aware sync deliberately projects these as telemetry
+            # 'open' (not a closed record), so they are excluded from drift
+            # accounting the same way running tasks are.
+            continue
+        source_ts = parse_epoch_utc(row["completed_at"]) if row["status"] == "done" else latest_blocked_timestamp(ctx.kanban_access, str(row["id"]), row)
         if source_ts is None or source_ts > sync_at:
             continue
         telemetry_id = f"kanban:{row['id']}"
@@ -1138,9 +1141,11 @@ def main() -> int:
     try:
         result = evaluate(ctx)
     finally:
-        for conn in (ctx.events_conn, ctx.experiments_conn, ctx.kanban_conn):
+        for conn in (ctx.events_conn, ctx.experiments_conn):
             if conn is not None:
                 conn.close()
+        if ctx.kanban_access is not None:
+            ctx.kanban_access.close()
 
     if not args.json_only:
         print_human_summary(result)

@@ -13,7 +13,6 @@ HOME = "/Users/ctao"
 HERMES_HOME = "/Users/ctao/.hermes"
 TELEMETRY_ROOT = Path(f"{HERMES_HOME}/telemetry")
 OUTPUT_DIR = TELEMETRY_ROOT / "proposals"
-KANBAN_DB = Path(f"{HERMES_HOME}/kanban.db")
 CRON_STATE = Path(f"{HERMES_HOME}/cron/jobs.json")
 GENERATOR = Path(f"{HERMES_HOME}/scripts/telemetry/generate_proposals.py")
 STATE = Path(f"{HERMES_HOME}/state/self_improvement_proposal_digest.json")
@@ -56,8 +55,6 @@ def run_generator(*, live: bool = False) -> dict:
         str(TELEMETRY_ROOT),
         "--output-dir",
         str(OUTPUT_DIR),
-        "--kanban-db",
-        str(KANBAN_DB),
         "--cron-state",
         str(CRON_STATE),
     ]

@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate evidence-backed proposal packets from telemetry readiness, completeness, and experiment state.")
     parser.add_argument("--telemetry-root", help="Override telemetry root path")
     parser.add_argument("--output-dir", required=True, help="Directory to write proposal packet JSON/Markdown files")
-    parser.add_argument("--kanban-db", default="/Users/ctao/.hermes/kanban.db", help="Path to kanban DB for readiness_doctor")
+    parser.add_argument("--kanban-db", default=None, help="Explicit kanban SQLite DB path for readiness_doctor (tests only); omit to use the configured backend")
     parser.add_argument("--cron-state", default="/Users/ctao/.hermes/cron/jobs.json", help="Path to cron jobs.json for readiness_doctor")
     parser.add_argument("--readiness-json", help="Optional precomputed readiness_doctor JSON payload")
     parser.add_argument("--audit-json", help="Optional precomputed audit_telemetry_completeness JSON payload")

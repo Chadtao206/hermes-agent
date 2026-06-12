@@ -28,7 +28,19 @@ def _init_sqlite_kanban(path: Path) -> None:
                 created_at INTEGER,
                 completed_at TEXT,
                 consecutive_failures INTEGER,
-                result TEXT
+                result TEXT,
+                last_heartbeat_at INTEGER,
+                started_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT,
+                kind TEXT,
+                created_at INTEGER
             )
             """
         )
@@ -178,6 +190,74 @@ def case_store_mode_health_probe_round_trips() -> None:
         raise AssertionError("expected verify_health to fail closed on store errors")
 
 
+
+
+def case_sqlite_done_blocked_tasks_and_blocked_epoch() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "kanban.db"
+        _init_sqlite_kanban(db)
+        _seed_sqlite_task(db, task_id="t_done", status="done", created_at=1, completed_at="100")
+        _seed_sqlite_task(db, task_id="t_blocked", status="blocked", created_at=2, consecutive_failures=1)
+        _seed_sqlite_task(db, task_id="t_ready", status="ready", created_at=3)
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO task_events(task_id, kind, created_at) VALUES('t_blocked', 'blocked', 555)")
+        conn.execute("INSERT INTO task_events(task_id, kind, created_at) VALUES('t_blocked', 'blocked', 999)")
+        conn.execute("INSERT INTO task_events(task_id, kind, created_at) VALUES('t_blocked', 'created', 2000)")
+        conn.commit()
+        conn.close()
+
+        access = ka.resolve_kanban_access(str(db), hermes_home=Path(tmp))
+        rows = access.done_blocked_tasks()
+        assert [row["id"] for row in rows] == ["t_blocked", "t_done"], rows
+        assert rows[0]["consecutive_failures"] == 1, rows[0]
+        assert access.latest_blocked_event_epoch("t_blocked") == 999
+        assert access.latest_blocked_event_epoch("t_done") is None
+
+        missing = ka.KanbanAccess(backend="sqlite", db_path=Path(tmp) / "absent.db")
+        assert missing.done_blocked_tasks() is None
+
+
+def case_store_mode_done_blocked_tasks_and_blocked_epoch() -> None:
+    class _EventStore(_StubStore):
+        def __init__(self, tasks, events):
+            super().__init__(tasks)
+            self.events = events
+
+        def list_tasks(self, **kwargs):
+            status = kwargs.get("status")
+            return [task for task in self.tasks.values() if task.status == status]
+
+        def list_events(self, task_id):
+            return self.events.get(task_id, [])
+
+    tasks = [
+        _stub_task("t_pg_done", status="done", completed_at=100),
+        _stub_task("t_pg_blocked", status="blocked", completed_at=None, consecutive_failures=2),
+        _stub_task("t_pg_ready", status="ready", completed_at=None),
+    ]
+    events = {
+        "t_pg_blocked": [
+            SimpleNamespace(kind="created", created_at=10),
+            SimpleNamespace(kind="blocked", created_at=42),
+            SimpleNamespace(kind="blocked", created_at=77),
+        ]
+    }
+    access = ka.KanbanAccess(backend="postgres", store=_EventStore(tasks, events))
+    rows = access.done_blocked_tasks()
+    assert sorted(row["id"] for row in rows) == ["t_pg_blocked", "t_pg_done"], rows
+    blocked = next(row for row in rows if row["id"] == "t_pg_blocked")
+    assert blocked["consecutive_failures"] == 2, blocked
+    assert access.latest_blocked_event_epoch("t_pg_blocked") == 77
+    assert access.latest_blocked_event_epoch("t_pg_done") is None
+
+    class _BrokenListStore(_StubStore):
+        def list_tasks(self, **kwargs):
+            raise RuntimeError("connection refused")
+
+    broken = ka.KanbanAccess(backend="postgres", store=_BrokenListStore([]))
+    assert broken.done_blocked_tasks() is None
+
+
 def main() -> int:
     case_explicit_db_path_resolves_sqlite_mode()
     case_sqlite_task_state_and_idempotency_lookup()
@@ -186,6 +266,8 @@ def main() -> int:
     case_store_mode_idempotency_lookup_prefers_newest_non_archived()
     case_store_mode_backup_none_and_describe_postgres()
     case_store_mode_health_probe_round_trips()
+    case_sqlite_done_blocked_tasks_and_blocked_epoch()
+    case_store_mode_done_blocked_tasks_and_blocked_epoch()
     print("OK")
     return 0
 
