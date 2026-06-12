@@ -2957,6 +2957,42 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_kanban_worker_skill_available_ignores_archived_copy(tmp_path):
+    home = tmp_path / ".hermes"
+    archived = (
+        home / "skills" / ".archive" / "curator-pass"
+        / "devops" / "kanban-worker"
+    )
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text("---\nname: kanban-worker\n---\n", encoding="utf-8")
+
+    assert kb._kanban_worker_skill_available(str(home)) is False
+
+    active = home / "skills" / "devops" / "kanban-worker"
+    active.mkdir(parents=True)
+    (active / "SKILL.md").write_text("---\nname: kanban-worker\n---\n", encoding="utf-8")
+
+    assert kb._kanban_worker_skill_available(str(home)) is True
+
+
+def test_forced_skill_available_for_home_ignores_archived_copy(tmp_path):
+    home = tmp_path / ".hermes"
+    archived = (
+        home / "skills" / ".archive" / "curator-pass"
+        / "software-development" / "ticket-hub"
+    )
+    archived.mkdir(parents=True)
+    (archived / "SKILL.md").write_text("---\nname: ticket-hub\n---\n", encoding="utf-8")
+
+    assert kb._skill_available_for_home("ticket-hub", str(home)) is False
+
+    active = home / "skills" / "software-development" / "ticket-hub"
+    active.mkdir(parents=True)
+    (active / "SKILL.md").write_text("---\nname: ticket-hub\n---\n", encoding="utf-8")
+
+    assert kb._skill_available_for_home("ticket-hub", str(home)) is True
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 

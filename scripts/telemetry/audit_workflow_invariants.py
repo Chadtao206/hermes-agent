@@ -18,7 +18,11 @@ HOME = Path('/Users/ctao')
 HERMES_HOME = HOME / '.hermes'
 PROFILES = ('default', 'engineer', 'researcher', 'reviewer', 'ops', 'designer')
 SPECIALIST_ATLASSIAN_PROFILES = ('engineer', 'researcher', 'reviewer', 'ops')
-RETAINED_GOVERNANCE_JOBS = {
+ACTIVE_GOVERNANCE_JOBS = {
+    'daily-ops-digest',
+    'weekly-ops-digest',
+}
+SUPERSEDED_GOVERNANCE_JOBS = {
     'daily-telemetry-kanban-sync',
     'daily-telemetry-metric-aggregation',
     'daily-routing-workflow-audit',
@@ -140,31 +144,49 @@ def audit(root: Path) -> dict[str, Any]:
             )
 
     jobs = cron_jobs(root)
-    for name in RETAINED_GOVERNANCE_JOBS:
+    for name in ACTIVE_GOVERNANCE_JOBS:
         job = jobs.get(name)
         add_check(
             checks,
-            f'cron_retained_enabled_{name}',
+            f'cron_consolidated_enabled_{name}',
             bool(job and job.get('enabled') is True),
-            f'{name} remains enabled as part of consolidated governance pipeline.',
+            f'{name} remains enabled as part of the consolidated governance pipeline.',
             evidence={'enabled': job.get('enabled') if job else None, 'toolsets': job.get('enabled_toolsets') if job else None},
+        )
+    for name in SUPERSEDED_GOVERNANCE_JOBS:
+        job = jobs.get(name)
+        add_check(
+            checks,
+            f'cron_superseded_removed_or_disabled_{name}',
+            job is None or job.get('enabled') is False,
+            f'{name} is absent or disabled because daily/weekly ops digests replaced it.',
+            evidence={'present': job is not None, 'enabled': job.get('enabled') if job else None},
         )
     for name in PAUSED_REDUNDANT_JOBS:
         job = jobs.get(name)
+        # Superseded governance jobs may be either paused during a proving
+        # window or fully removed after cleanup. Treat absence as healthy;
+        # otherwise the daily routing audit keeps re-reporting successful
+        # cleanup as a governance regression.
         add_check(
             checks,
-            f'cron_redundant_paused_{name}',
-            bool(job and job.get('enabled') is False),
-            f'{name} stays paused so governance reporting is consolidated.',
-            evidence={'enabled': job.get('enabled') if job else None},
+            f'cron_redundant_removed_or_disabled_{name}',
+            job is None or job.get('enabled') is False,
+            f'{name} is absent or disabled so governance reporting remains consolidated.',
+            evidence={'present': job is not None, 'enabled': job.get('enabled') if job else None},
         )
     morning = jobs.get('weekly-morning-signal-quality-review') or {}
+    morning_ok = (
+        not morning
+        or morning.get('enabled') is False
+        or morning.get('enabled_toolsets') == ['terminal', 'file']
+    )
     add_check(
         checks,
-        'morning_signal_review_scoped_tools',
-        morning.get('enabled_toolsets') == ['terminal', 'file'],
-        'Morning signal quality review stays scoped to terminal,file.',
-        evidence=morning.get('enabled_toolsets'),
+        'morning_signal_review_removed_or_scoped',
+        morning_ok,
+        'Morning signal quality review is removed/disabled or scoped to terminal,file.',
+        evidence={'present': bool(morning), 'enabled': morning.get('enabled') if morning else None, 'toolsets': morning.get('enabled_toolsets') if morning else None},
     )
 
     latest_profiles, latest_day = profile_metrics_latest(root)

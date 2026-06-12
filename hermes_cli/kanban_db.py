@@ -7938,8 +7938,9 @@ def _skill_available_for_home(skill_name: str, hermes_home: Optional[str]) -> bo
     # local profile skill tree and avoid interpreting path-like names as globs.
     if "/" not in name and "\\" not in name:
         try:
-            for candidate in skills_root.rglob(f"{name}/SKILL.md"):
-                if candidate.is_file():
+            from agent.skill_utils import iter_skill_index_files
+            for candidate in iter_skill_index_files(skills_root, "SKILL.md"):
+                if candidate.parent.name == name and candidate.is_file():
                     return True
         except OSError:
             pass
@@ -8945,8 +8946,9 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
         return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
+        from agent.skill_utils import iter_skill_index_files
+        for skill_md in iter_skill_index_files(skills_root, "SKILL.md"):
+            if skill_md.parent.name == "kanban-worker" and skill_md.is_file():
                 return True
     except OSError:
         pass
