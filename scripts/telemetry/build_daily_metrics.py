@@ -606,7 +606,6 @@ def compute_for_day(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
         1
         for row in eligible_tasks
         if int(row["telemetry_complete"] or 0) == 1
-        and (row["task_id"] not in eligible_routed_tasks or row["task_id"] in {item["task_id"] for item in canonical_routing_rows})
     )
     bench["telemetry_completeness_rate"] = safe_div(telemetry_complete_count, len(eligible_tasks))
 
@@ -692,12 +691,10 @@ def compute_for_day(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
         workflow_rerouted = {row["task_id"] for row in workflow_decisions if (row["sequence_index"] or 0) > 0}
         if not workflow_routed:
             workflow_routed = {row["task_id"] for row in canonical_routing_rows if row["task_id"] in workflow_task_ids}
-        workflow_known_routing = {row["task_id"] for row in canonical_routing_rows if row["task_id"] in workflow_task_ids}
         workflow_telemetry_complete = sum(
             1
             for row in workflow_tasks
             if int(row["telemetry_complete"] or 0) == 1
-            and (row["task_id"] not in workflow_routed or row["task_id"] in workflow_known_routing)
         )
 
         by_workflow[workflow] = {

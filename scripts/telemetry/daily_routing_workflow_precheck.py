@@ -96,6 +96,97 @@ def recent_event_counts(conn: sqlite3.Connection, table: str, event_col: str = "
         return {}
 
 
+def run_failure_attribution(conn: sqlite3.Connection, day: str | None) -> dict[str, Any]:
+    if not day:
+        return {}
+    try:
+        task_rows = rows(
+            conn,
+            """
+            SELECT task_id, title, owner_profile
+            FROM tasks
+            WHERE closed_at IS NOT NULL
+              AND substr(closed_at, 1, 10) = ?
+              AND lower(coalesce(provenance, '')) = 'real'
+              AND lower(coalesce(substantiality, '')) = 'substantial'
+            ORDER BY closed_at, task_id
+            """,
+            (day,),
+        )
+    except sqlite3.Error:
+        return {}
+    task_ids = {row["task_id"] for row in task_rows}
+    task_meta = {row["task_id"]: row for row in task_rows}
+    if not task_ids:
+        return {"date": day, "failed_run_groups": [], "affected_tasks": []}
+
+    placeholders = ",".join("?" for _ in task_ids)
+    run_rows = rows(
+        conn,
+        f"""
+        SELECT task_id, run_id, profile, status, outcome, started_at, ended_at, error, summary
+        FROM execution_runs
+        WHERE task_id IN ({placeholders})
+        ORDER BY started_at, run_id
+        """,
+        tuple(task_ids),
+    )
+    failed_runs = [
+        row for row in run_rows
+        if row.get("status") in {"crashed", "blocked", "reclaimed"}
+        or row.get("outcome") in {"crashed", "timed_out", "spawn_failed", "blocked", "failed"}
+    ]
+
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in failed_runs:
+        key = (str(row.get("profile") or "unknown"), str(row.get("status") or "unknown"), str(row.get("outcome") or "unknown"))
+        item = grouped.setdefault(
+            key,
+            {
+                "profile": key[0],
+                "status": key[1],
+                "outcome": key[2],
+                "count": 0,
+                "run_ids": [],
+                "sample_errors": [],
+            },
+        )
+        item["count"] += 1
+        if row.get("run_id"):
+            item["run_ids"].append(row.get("run_id"))
+        if row.get("error") and len(item["sample_errors"]) < 2:
+            item["sample_errors"].append(row.get("error"))
+
+    affected: dict[str, dict[str, Any]] = {}
+    for row in failed_runs:
+        task_id = row["task_id"]
+        meta = task_meta.get(task_id, {})
+        item = affected.setdefault(
+            task_id,
+            {
+                "task_id": task_id,
+                "title": meta.get("title"),
+                "owner_profile": meta.get("owner_profile"),
+                "failed_runs": [],
+            },
+        )
+        item["failed_runs"].append({
+            "run_id": row.get("run_id"),
+            "profile": row.get("profile"),
+            "status": row.get("status"),
+            "outcome": row.get("outcome"),
+            "error": row.get("error"),
+        })
+
+    return {
+        "date": day,
+        "failed_run_count": len(failed_runs),
+        "total_run_count": len(run_rows),
+        "failed_run_groups": sorted(grouped.values(), key=lambda item: (-item["count"], item["profile"], item["status"]))[:6],
+        "affected_tasks": sorted(affected.values(), key=lambda item: item["task_id"])[:6],
+    }
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -159,6 +250,8 @@ def analyze(root: Path, state_path: Path, write_state: bool) -> dict[str, Any]:
                 "tasks_completed": bench.get("tasks_completed"),
                 "first_owner_routing_accuracy": bench.get("first_owner_routing_accuracy"),
                 "first_owner_routing_sample": bench.get("first_owner_routing_accuracy_sample_size"),
+                "first_owner_routing_coverage_num": bench.get("first_owner_routing_coverage_num"),
+                "first_owner_routing_coverage_den": bench.get("first_owner_routing_coverage_den"),
                 "failed_run_rate": bench.get("failed_run_rate"),
                 "crash_rate_per_run": bench.get("crash_rate_per_run"),
                 "give_up_rate_per_run": bench.get("give_up_rate_per_run"),
@@ -166,6 +259,23 @@ def analyze(root: Path, state_path: Path, write_state: bool) -> dict[str, Any]:
                 "user_correction_rate": bench.get("user_correction_rate"),
                 "reopened_task_rate": bench.get("reopened_task_rate"),
             }
+            failure_attribution = run_failure_attribution(conn, bench_day)
+            if failure_attribution:
+                metric_watch["run_failure_attribution"] = failure_attribution
+            coverage_num = int(bench.get("first_owner_routing_coverage_num") or 0)
+            coverage_den = int(bench.get("first_owner_routing_coverage_den") or 0)
+            if coverage_den > coverage_num:
+                findings.append({
+                    "severity": "major",
+                    "type": "routing_correctness_coverage_gap",
+                    "summary": "First-owner routing correctness coverage is incomplete; routing accuracy is not scoreable.",
+                    "evidence": {
+                        "date": bench_day,
+                        "coverage_num": coverage_num,
+                        "coverage_den": coverage_den,
+                        "sample_size": bench.get("first_owner_routing_accuracy_sample_size"),
+                    },
+                })
             for key, threshold in (
                 ("failed_run_rate", 0.0),
                 ("crash_rate_per_run", 0.0),
@@ -175,7 +285,10 @@ def analyze(root: Path, state_path: Path, write_state: bool) -> dict[str, Any]:
             ):
                 value = bench.get(key)
                 if value is not None and float(value) > threshold:
-                    findings.append({"severity": "major", "type": f"bench_{key}", "summary": f"Bench metric {key} is non-zero.", "evidence": {"date": bench_day, key: value}})
+                    evidence = {"date": bench_day, key: value}
+                    if key in {"failed_run_rate", "crash_rate_per_run", "give_up_rate_per_run"} and failure_attribution:
+                        evidence["failure_attribution_ref"] = "metric_watch.run_failure_attribution"
+                    findings.append({"severity": "major", "type": f"bench_{key}", "summary": f"Bench metric {key} is non-zero.", "evidence": evidence})
             completeness = bench.get("telemetry_completeness_rate")
             if completeness is not None and float(completeness) < 0.98:
                 findings.append({"severity": "major", "type": "telemetry_completeness_regression", "summary": "Telemetry completeness is below 98%.", "evidence": {"date": bench_day, "telemetry_completeness_rate": completeness}})
@@ -211,9 +324,29 @@ def analyze(root: Path, state_path: Path, write_state: bool) -> dict[str, Any]:
     )
     comp_payload = completeness.get("payload") if isinstance(completeness.get("payload"), dict) else {}
     comp_summary = comp_payload.get("summary") or {}
-    incomplete_tasks = int(comp_summary.get("incomplete_tasks") or 0)
-    if incomplete_tasks:
-        findings.append({"severity": "major", "type": "incomplete_telemetry_tasks", "summary": "Closed eligible tasks still have incomplete telemetry/handoff evidence.", "evidence": {"summary": comp_summary, "tasks": (comp_payload.get("tasks") or [])[:5]}})
+    comp_tasks = comp_payload.get("tasks") or []
+    non_routing_gap_tasks = []
+    routing_only_gap_tasks = []
+    for task in comp_tasks:
+        gaps = [str(gap) for gap in (task.get("telemetry_gaps") or [])]
+        non_routing_gaps = [gap for gap in gaps if gap != "routing_correctness"]
+        if non_routing_gaps:
+            non_routing_gap_tasks.append({**task, "telemetry_gaps": non_routing_gaps})
+        elif gaps == ["routing_correctness"]:
+            routing_only_gap_tasks.append(task)
+    if non_routing_gap_tasks:
+        findings.append({
+            "severity": "major",
+            "type": "incomplete_telemetry_tasks",
+            "summary": "Closed eligible tasks still have incomplete closeout or handoff evidence.",
+            "evidence": {
+                "summary": comp_summary,
+                "sampled_non_routing_gap_count": len(non_routing_gap_tasks),
+                "tasks": non_routing_gap_tasks[:5],
+            },
+        })
+    if routing_only_gap_tasks:
+        metric_watch["routing_correctness_gap_sample"] = routing_only_gap_tasks[:5]
 
     severity = "silent_ready"
     if any(f.get("severity") == "critical" for f in findings):
