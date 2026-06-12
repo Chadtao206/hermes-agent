@@ -26,95 +26,73 @@ Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-refer
 - **Version check:** `claude --version` (requires v2.x+)
 - **Update:** `claude update` or `claude upgrade`
 
-## Two Orchestration Modes
+## Orchestration Modes
 
-Hermes interacts with Claude Code in two fundamentally different ways. Choose based on the task.
+### Default: the Hermes helper (interactive via tmux)
 
-### Mode 1: Print Mode (`-p`) — Non-Interactive (PREFERRED for most tasks)
+Use `python -m tools.claude_session` for all delegation. It drives the real `claude` CLI inside a tmux session by default, handles trust pre-acceptance and dialog-free launch (`--permission-mode bypassPermissions`), detects completion via Claude Code hooks, enforces turn/budget caps, and cleans up sessions. It returns JSON shaped identically to `claude -p --output-format json`'s consumed fields: `type`, `subtype`, `result`, `session_id`, `num_turns`, `total_cost_usd`, `usage`.
 
-Print mode runs a one-shot task, returns the result, and exits. No PTY needed. No interactive prompts. This is the cleanest integration path.
+**One-shot run (most tasks):**
+```
+terminal(command="python -m tools.claude_session run --task 'Add error handling to all API calls in src/' --workdir /path/to/project --max-turns 10 --max-budget-usd 1.00")
+```
+
+**Warm multi-turn session:**
+```
+# Open a warm session
+terminal(command="python -m tools.claude_session start --name mywork --workdir /path/to/project --max-turns 30")
+
+# Send a turn and get JSON result
+terminal(command="python -m tools.claude_session send --name mywork --prompt 'Refactor the auth module to use JWT tokens' --wait")
+
+# Watch the pane while Claude works
+terminal(command="python -m tools.claude_session capture --name mywork --lines 50")
+
+# Steer a running task mid-flight
+terminal(command="python -m tools.claude_session steer --name mywork --text 'Focus only on src/auth.ts, skip tests for now'")
+
+# Run a slash command (interactive-only)
+terminal(command="python -m tools.claude_session slash --name mywork --cmd '/compact'")
+
+# Tear down when done
+terminal(command="python -m tools.claude_session stop --name mywork")
+```
+
+**Full verb reference:**
+
+| verb | purpose |
+|------|---------|
+| `run --task "<t>" --workdir <p> [--oneshot --no-tmux --max-turns N --max-budget-usd X --timeout S]` | one call: launch + prompt; default keeps session warm, `--oneshot` tears down after; `--no-tmux` forces `-p` |
+| `start --name <n> --workdir <p> [caps]` | open a warm session |
+| `send --name <n> --prompt "<t>" [--wait]` | send a turn, get JSON back |
+| `capture --name <n> [--lines N]` | read the pane (watch) |
+| `steer --name <n> --text "<t>"` | inject a mid-flight message |
+| `slash --name <n> --cmd "/compact"` | run an interactive-only slash command |
+| `status --name <n>` / `stop --name <n>` / `list` / `gc` | lifecycle |
+
+Trust pre-acceptance, dialog handling, completion detection, turn/budget caps, and cleanup are handled by the helper — do not script tmux directly.
+
+### Fallback: print mode (`-p`)
+
+The helper automatically falls back to `claude -p` when tmux or `claude` is unavailable, or if an interactive handshake times out. You can also force it explicitly with `--no-tmux`:
+
+```
+terminal(command="python -m tools.claude_session run --task 'Analyze auth.py for security issues' --workdir /path/to/project --max-turns 5 --no-tmux")
+```
+
+Or invoke `claude -p` directly when you want raw print-mode output without the helper (e.g., piped input, CI scripts, `--bare` mode):
 
 ```
 terminal(command="claude -p 'Add error handling to all API calls in src/' --allowedTools 'Read,Edit' --max-turns 10", workdir="/path/to/project", timeout=120)
 ```
 
-**When to use print mode:**
-- One-shot coding tasks (fix a bug, add a feature, refactor)
-- CI/CD automation and scripting
-- Structured data extraction with `--json-schema`
+**When raw `-p` is appropriate:**
 - Piped input processing (`cat file | claude -p "analyze this"`)
-- Any task where you don't need multi-turn conversation
+- CI/CD scripts that manage their own output parsing
+- `--bare` mode for fastest-possible startup
+- Structured extraction with `--json-schema`
 
-**Print mode skips ALL interactive dialogs** — no workspace trust prompt, no permission confirmations. This makes it ideal for automation.
-
-### Mode 2: Interactive PTY via tmux — Multi-Turn Sessions
-
-Interactive mode gives you a full conversational REPL where you can send follow-up prompts, use slash commands, and watch Claude work in real time. **Requires tmux orchestration.**
-
-```
-# Start a tmux session
-terminal(command="tmux new-session -d -s claude-work -x 140 -y 40")
-
-# Launch Claude Code inside it
-terminal(command="tmux send-keys -t claude-work 'cd /path/to/project && claude' Enter")
-
-# Wait for startup, then send your task
-# (after ~3-5 seconds for the welcome screen)
-terminal(command="sleep 5 && tmux send-keys -t claude-work 'Refactor the auth module to use JWT tokens' Enter")
-
-# Monitor progress by capturing the pane
-terminal(command="sleep 15 && tmux capture-pane -t claude-work -p -S -50")
-
-# Send follow-up tasks
-terminal(command="tmux send-keys -t claude-work 'Now add unit tests for the new JWT code' Enter")
-
-# Exit when done
-terminal(command="tmux send-keys -t claude-work '/exit' Enter")
-```
-
-**When to use interactive mode:**
-- Multi-turn iterative work (refactor → review → fix → test cycle)
-- Tasks requiring human-in-the-loop decisions
-- Exploratory coding sessions
-- When you need to use Claude's slash commands (`/compact`, `/review`, `/model`)
-
-## PTY Dialog Handling (CRITICAL for Interactive Mode)
-
-Claude Code presents up to two confirmation dialogs on first launch. You MUST handle these via tmux send-keys:
-
-### Dialog 1: Workspace Trust (first visit to a directory)
-```
-❯ 1. Yes, I trust this folder    ← DEFAULT (just press Enter)
-  2. No, exit
-```
-**Handling:** `tmux send-keys -t <session> Enter` — default selection is correct.
-
-### Dialog 2: Bypass Permissions Warning (only with --dangerously-skip-permissions)
-```
-❯ 1. No, exit                    ← DEFAULT (WRONG choice!)
-  2. Yes, I accept
-```
-**Handling:** Must navigate DOWN first, then Enter:
-```
-tmux send-keys -t <session> Down && sleep 0.3 && tmux send-keys -t <session> Enter
-```
-
-### Robust Dialog Handling Pattern
-```
-# Launch with permissions bypass
-terminal(command="tmux send-keys -t claude-work 'claude --dangerously-skip-permissions \"your task\"' Enter")
-
-# Handle trust dialog (Enter for default "Yes")
-terminal(command="sleep 4 && tmux send-keys -t claude-work Enter")
-
-# Handle permissions dialog (Down then Enter for "Yes, I accept")
-terminal(command="sleep 3 && tmux send-keys -t claude-work Down && sleep 0.3 && tmux send-keys -t claude-work Enter")
-
-# Now wait for Claude to work
-terminal(command="sleep 15 && tmux capture-pane -t claude-work -p -S -60")
-```
-
-**Note:** After the first trust acceptance for a directory, the trust dialog won't appear again. Only the permissions dialog recurs each time you use `--dangerously-skip-permissions`.
+Print mode skips all interactive dialogs — no workspace trust prompt, no permission confirmations. The helper uses `--permission-mode bypassPermissions` to get the same behavior in tmux mode.
 
 ## CLI Subcommands
 
@@ -475,11 +453,10 @@ terminal(command="cd /path/to/repo && git diff main...feature-branch | claude -p
 
 ### Deep Review (Interactive + Worktree)
 ```
-terminal(command="tmux new-session -d -s review -x 140 -y 40")
-terminal(command="tmux send-keys -t review 'cd /path/to/repo && claude -w pr-review' Enter")
-terminal(command="sleep 5 && tmux send-keys -t review Enter")  # Trust dialog
-terminal(command="sleep 2 && tmux send-keys -t review 'Review all changes vs main. Check for bugs, security issues, race conditions, and missing tests.' Enter")
-terminal(command="sleep 30 && tmux capture-pane -t review -p -S -60")
+terminal(command="python -m tools.claude_session start --name review --workdir /path/to/repo --max-turns 30")
+terminal(command="python -m tools.claude_session send --name review --prompt 'Review all changes vs main. Check for bugs, security issues, race conditions, and missing tests.' --wait")
+terminal(command="python -m tools.claude_session capture --name review --lines 60")
+terminal(command="python -m tools.claude_session stop --name review")
 ```
 
 ### PR Review from Number
@@ -495,20 +472,20 @@ Creates an isolated git worktree at `.claude/worktrees/feature-x` AND a tmux ses
 
 ## Parallel Claude Instances
 
-Run multiple independent Claude tasks simultaneously:
+Run multiple independent Claude tasks simultaneously using the helper:
 
 ```
 # Task 1: Fix backend
-terminal(command="tmux new-session -d -s task1 -x 140 -y 40 && tmux send-keys -t task1 'cd ~/project && claude -p \"Fix the auth bug in src/auth.py\" --allowedTools \"Read,Edit\" --max-turns 10' Enter")
+terminal(command="python -m tools.claude_session run --task 'Fix the auth bug in src/auth.py' --workdir ~/project --max-turns 10 --max-budget-usd 0.50 --oneshot", run_in_background=True)
 
 # Task 2: Write tests
-terminal(command="tmux new-session -d -s task2 -x 140 -y 40 && tmux send-keys -t task2 'cd ~/project && claude -p \"Write integration tests for the API endpoints\" --allowedTools \"Read,Write,Bash\" --max-turns 15' Enter")
+terminal(command="python -m tools.claude_session run --task 'Write integration tests for the API endpoints' --workdir ~/project --max-turns 15 --max-budget-usd 0.75 --oneshot", run_in_background=True)
 
 # Task 3: Update docs
-terminal(command="tmux new-session -d -s task3 -x 140 -y 40 && tmux send-keys -t task3 'cd ~/project && claude -p \"Update README.md with the new API endpoints\" --allowedTools \"Read,Edit\" --max-turns 5' Enter")
+terminal(command="python -m tools.claude_session run --task 'Update README.md with the new API endpoints' --workdir ~/project --max-turns 5 --max-budget-usd 0.25 --oneshot", run_in_background=True)
 
-# Monitor all
-terminal(command="sleep 30 && for s in task1 task2 task3; do echo '=== '$s' ==='; tmux capture-pane -t $s -p -S -5 2>/dev/null; done")
+# Check active sessions
+terminal(command="python -m tools.claude_session list")
 ```
 
 ## CLAUDE.md — Project Context File
@@ -674,8 +651,8 @@ Reference MCP resources in chat: `@github:issue://123`
 
 ### Reading the TUI Status
 ```
-# Periodic capture to check if Claude is still working or waiting for input
-terminal(command="tmux capture-pane -t dev -p -S -10")
+# Check if Claude is still working or waiting for input
+terminal(command="python -m tools.claude_session capture --name dev --lines 10")
 ```
 
 Look for these indicators:
@@ -718,28 +695,26 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 
 ## Pitfalls & Gotchas
 
-1. **Interactive mode REQUIRES tmux** — Claude Code is a full TUI app. Using `pty=true` alone in Hermes terminal works but tmux gives you `capture-pane` for monitoring and `send-keys` for input, which is essential for orchestration.
-2. **`--dangerously-skip-permissions` dialog defaults to "No, exit"** — you must send Down then Enter to accept. Print mode (`-p`) skips this entirely.
+1. **Use the helper, not raw tmux** — Claude Code is a full TUI app; the helper (`python -m tools.claude_session`) manages the tmux session, dialog handling, and completion detection for you.
+2. **`--dangerously-skip-permissions` dialog defaults to "No, exit"** — if calling `claude` directly you must send Down then Enter to accept. The helper uses `--permission-mode bypassPermissions` to avoid this entirely.
 3. **`--max-budget-usd` minimum is ~$0.05** — system prompt cache creation alone costs this much. Setting lower will error immediately.
 4. **`--max-turns` is print-mode only** — ignored in interactive sessions.
 5. **Claude may use `python` instead of `python3`** — on systems without a `python` symlink, Claude's bash commands will fail on first try but it self-corrects.
 6. **Session resumption requires same directory** — `--continue` finds the most recent session for the current working directory.
 7. **`--json-schema` needs enough `--max-turns`** — Claude must read files before producing structured output, which takes multiple turns.
 8. **Trust dialog only appears once per directory** — first-time only, then cached.
-9. **Background tmux sessions persist** — always clean up with `tmux kill-session -t <name>` when done.
+9. **Sessions persist until stopped** — use `python -m tools.claude_session stop --name <n>` or `gc` to release resources; if using raw tmux, `tmux kill-session -t <name>`.
 10. **Slash commands (like `/commit`) only work in interactive mode** — in `-p` mode, describe the task in natural language instead.
 11. **`--bare` skips OAuth** — requires `ANTHROPIC_API_KEY` env var or an `apiKeyHelper` in settings.
 12. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
 
 ## Rules for Hermes Agents
 
-1. **Prefer print mode (`-p`) for single tasks** — cleaner, no dialog handling, structured output
-2. **Use tmux for multi-turn interactive work** — the only reliable way to orchestrate the TUI
-3. **Always set `workdir`** — keep Claude focused on the right project directory
-4. **Set `--max-turns` in print mode** — prevents infinite loops and runaway costs
-5. **Monitor tmux sessions** — use `tmux capture-pane -t <session> -p -S -50` to check progress
-6. **Look for the `❯` prompt** — indicates Claude is waiting for input (done or asking a question)
-7. **Clean up tmux sessions** — kill them when done to avoid resource leaks
-8. **Report results to user** — after completion, summarize what Claude did and what changed
-9. **Don't kill slow sessions** — Claude may be doing multi-step work; check progress instead
-10. **Use `--allowedTools`** — restrict capabilities to what the task actually needs
+1. **Prefer the helper (`python -m tools.claude_session`)** — it defaults to tmux interactive and falls back to `-p` automatically; do not hand-roll tmux orchestration
+2. **Always set `--workdir`** — keep Claude focused on the right project directory
+3. **Set `--max-turns` and `--max-budget-usd`** — prevents infinite loops and runaway costs; minimum budget ~$0.05 for system prompt cache creation
+4. **Use `capture` to watch progress** — `python -m tools.claude_session capture --name <n>` reads the live pane; look for the `❯` prompt indicating Claude is waiting for input
+5. **Use `stop` / `gc` when done** — the helper cleans up sessions, but call `stop` explicitly after warm sessions to release resources
+6. **Report results to user** — after completion, summarize what Claude did and what changed; include `total_cost_usd` and `num_turns` from the JSON result
+7. **Don't kill slow sessions** — Claude may be doing multi-step work; use `capture` to check progress instead
+8. **Use `--allowedTools`** — restrict capabilities to what the task actually needs (pass via `--task` prompt or raw `-p` when not using the helper)
