@@ -76,6 +76,16 @@ class Registry:
     def active_count(self) -> int:
         return len(self._load())
 
+    def bump(self, name: str, *, turns: int, cost: float) -> None:
+        """Record the latest cumulative turn count + cost for a warm session
+        (so `send` can enforce --max-turns and `status` can report progress)."""
+        with self._locked():
+            data = self._load()
+            if name in data:
+                data[name]["turns"] = turns
+                data[name]["cost"] = cost
+                self._save(data)
+
     def reap(self, *, now: float, pane_dead: Callable[[str], bool],
              kill: Callable[[str], None]) -> List[str]:
         reaped: List[str] = []

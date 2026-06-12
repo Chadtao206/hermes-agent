@@ -26,6 +26,14 @@ def test_reserve_is_atomic_and_respects_cap(tmp_path):
     assert reg.get("c") is None
 
 
+def test_bump_updates_turns_and_cost(tmp_path):
+    reg = Registry(tmp_path)
+    reg.add(_rec("a"))
+    reg.bump("a", turns=3, cost=0.42)
+    r = reg.get("a")
+    assert r.turns == 3 and r.cost == 0.42
+
+
 def test_reap_kills_dead_and_expired(tmp_path):
     reg = Registry(tmp_path)
     reg.add(_rec("dead"))
