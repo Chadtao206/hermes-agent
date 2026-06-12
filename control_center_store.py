@@ -1085,6 +1085,7 @@ _HERMES_PROCESS_KEYWORDS = (
     "tui_gateway",
     "control_center_store.py",
     "claude_print.py",
+    "tools.claude_session",
 )
 
 
@@ -1098,7 +1099,8 @@ def _classify_system_process(command: str) -> str:
         return "cron"
     if "tui_gateway" in lower or " --tui" in lower:
         return "tui"
-    if "claude_print.py" in lower or " claude " in lower:
+    if ("claude_print.py" in lower or "tools.claude_session" in lower
+            or " claude " in lower):
         return "worker"
     if "/lsp/" in lower or "language-server" in lower or "langserver" in lower:
         return "lsp"
