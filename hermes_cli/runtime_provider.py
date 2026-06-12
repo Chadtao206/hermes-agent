@@ -1474,6 +1474,19 @@ def resolve_runtime_provider(
             logger.info("Google Gemini OAuth credentials failed; "
                         "falling through to next provider.")
 
+    # Claude Session provider (Claude Code via tmux)
+    # Uses tools.claude_session for warm multi-turn sessions with watch/steer.
+    # Falls back to claude -p when tmux is unavailable.
+    if provider == "claude-session":
+        return {
+            "provider": "claude-session",
+            "api_mode": "chat_completions",
+            "base_url": "claude-session://local",
+            "api_key": "claude-session",
+            "source": "claude-session",
+            "requested_provider": requested_provider,
+        }
+
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
         return {

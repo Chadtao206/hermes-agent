@@ -1270,6 +1270,26 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client_kwargs = dict(client_kwargs)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
+    # Claude Session client (Claude Code via tmux)
+    if agent.provider == "claude-session" or str(client_kwargs.get("base_url", "")).startswith("claude-session://"):
+        from agent.claude_session_client import ClaudeSessionClient
+
+        # Pass cwd from client_kwargs or fall back to agent's working dir
+        safe_kwargs = {
+            k: v for k, v in client_kwargs.items()
+            if k in {"api_key", "base_url", "cwd", "max_turns", "max_budget_usd", "model", "oneshot"}
+        }
+        if "cwd" not in safe_kwargs:
+            safe_kwargs["cwd"] = getattr(agent, "_acp_cwd", None)
+        client = ClaudeSessionClient(**safe_kwargs)
+        _ra().logger.info(
+            "Claude Session client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
+
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 

@@ -229,6 +229,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "claude-session": ProviderConfig(
+        id="claude-session",
+        name="Claude Code (tmux)",
+        auth_type="none",
+        inference_base_url="claude-session://local",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
