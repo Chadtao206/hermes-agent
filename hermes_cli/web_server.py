@@ -5237,19 +5237,19 @@ async def get_session_stats():
         active_store = db.session_count(include_archived=False)
         archived = db.session_count(archived_only=True)
         messages = db.message_count()
-        by_source: Dict[str, int] = {}
+        by_source = db.session_counts_by_source(include_archived=True)
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
+            from control_center_store import count_active_sessions
+            live_now = count_active_sessions()
         except Exception:
-            pass
+            live_now = 0
         return {
             "total": total,
             "active_store": active_store,
             "archived": archived,
             "messages": messages,
             "by_source": by_source,
+            "live_now": live_now,
         }
     finally:
         db.close()

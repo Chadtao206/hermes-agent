@@ -1222,10 +1222,16 @@ export default function SessionsPage() {
             <span className="text-xs text-muted-foreground">Total</span>
           </div>
           <div className="flex flex-col">
+            <span className="text-lg font-semibold tabular-nums leading-none text-primary">
+              {stats.live_now}
+            </span>
+            <span className="text-xs text-muted-foreground">Recent (&lt;5m)</span>
+          </div>
+          <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none text-success">
               {stats.active_store}
             </span>
-            <span className="text-xs text-muted-foreground">Active in store</span>
+            <span className="text-xs text-muted-foreground">Unarchived</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">

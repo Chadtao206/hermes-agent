@@ -15264,8 +15264,7 @@ Examples:
             msgs = db.message_count()
             print(f"Total sessions: {total}")
             print(f"Total messages: {msgs}")
-            for src in ["cli", "telegram", "discord", "whatsapp", "slack"]:
-                c = db.session_count(source=src)
+            for src, c in db.session_counts_by_source(include_archived=False).items():
                 if c > 0:
                     print(f"  {src}: {c} sessions")
             db_path = db.db_path

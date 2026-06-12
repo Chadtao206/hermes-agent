@@ -3239,6 +3239,34 @@ class SessionDB:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
             return cursor.fetchone()[0]
 
+    def session_counts_by_source(
+        self,
+        include_archived: bool = True,
+        archived_only: bool = False,
+    ) -> Dict[str, int]:
+        """Return raw session-row counts grouped by source.
+
+        This intentionally mirrors :meth:`session_count`, not
+        :meth:`list_sessions_rich`: dashboard summary badges sit next to the raw
+        total/unarchived/archive counts, so source buckets must include child and
+        continuation rows too. Otherwise the badges do not add up to the displayed
+        total, which makes the store look corrupt when it is only using mixed
+        accounting bases.
+        """
+        where_clauses = []
+        if archived_only:
+            where_clauses.append("archived = 1")
+        elif not include_archived:
+            where_clauses.append("archived = 0")
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT COALESCE(NULLIF(source, ''), 'cli') AS src, COUNT(*) AS count "
+                f"FROM sessions{where_sql} GROUP BY src ORDER BY count DESC, src ASC"
+            )
+            return {str(row["src"] or "cli"): int(row["count"]) for row in cursor.fetchall()}
+
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
         with self._lock:

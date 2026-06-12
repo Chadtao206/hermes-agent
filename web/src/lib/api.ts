@@ -1123,10 +1123,13 @@ export interface DebugShareResponse {
 
 export interface SessionStoreStats {
   total: number;
+  /** Unarchived rows in the session store; not necessarily currently running. */
   active_store: number;
   archived: number;
   messages: number;
   by_source: Record<string, number>;
+  /** Sessions active in the live/recent runtime window. */
+  live_now: number;
 }
 
 export interface SkillHubResult {

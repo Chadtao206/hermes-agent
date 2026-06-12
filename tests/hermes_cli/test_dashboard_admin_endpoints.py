@@ -318,6 +318,7 @@ class TestSessionManagementEndpoints:
 
         db = SessionDB()
         db.create_session(session_id="sess-x", source="cli")
+        db.create_session(session_id="sess-child", source="cli", parent_session_id="sess-x")
         db.close()
 
     def test_stats_not_shadowed_by_session_id_route(self):
@@ -326,8 +327,11 @@ class TestSessionManagementEndpoints:
         r = self.client.get("/api/sessions/stats")
         assert r.status_code == 200
         body = r.json()
-        assert {"total", "active_store", "archived", "messages", "by_source"} <= set(body)
+        assert {"total", "active_store", "archived", "messages", "by_source", "live_now"} <= set(body)
         assert body["total"] >= 1
+        assert sum(body["by_source"].values()) == body["total"]
+        assert body["by_source"].get("cli") == 2
+        assert isinstance(body["live_now"], int)
 
     def test_rename(self):
         r = self.client.patch("/api/sessions/sess-x", json={"title": "Renamed"})

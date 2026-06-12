@@ -1334,6 +1334,12 @@ class TestCounts:
         assert db.session_count(source="cli") == 2
         assert db.session_count(source="telegram") == 1
 
+    def test_session_counts_by_source_uses_raw_rows(self, db):
+        db.create_session(session_id="parent", source="slack")
+        db.create_session(session_id="child", source="slack", parent_session_id="parent")
+        db.create_session(session_id="tg", source="telegram")
+        assert db.session_counts_by_source() == {"slack": 2, "telegram": 1}
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
