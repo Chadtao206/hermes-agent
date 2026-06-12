@@ -23,7 +23,7 @@ class Registry:
 
     @contextmanager
     def _locked(self):
-        with open(self.lock, "w") as fh:
+        with open(self.lock, "w", encoding="utf-8") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)
             try:
                 yield

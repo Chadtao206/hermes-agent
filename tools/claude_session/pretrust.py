@@ -11,7 +11,7 @@ from typing import Optional
 
 @contextmanager
 def _flock(lock_path: str):
-    with open(lock_path, "w") as fh:
+    with open(lock_path, "w", encoding="utf-8") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
             yield
