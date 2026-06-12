@@ -56,12 +56,42 @@ def run_profile(run_row: sqlite3.Row, default: str = "unassigned") -> str:
     return canonical_profile(run_row["profile"], default=default)
 
 
+OPEN_STATUSES = ("todo", "blocked", "claimed", "spawned", "promoted")
+
+WATERMARK_KEY = "kanban_watermark_event_created_at"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync Hermes kanban state into self-improvement telemetry.")
     parser.add_argument("--telemetry-root", help="Override telemetry root path")
     parser.add_argument("--kanban-db", default=str(KANBAN_DB), help="Path to kanban SQLite database")
     parser.add_argument("--task-id", help="Sync only one kanban task id")
+    parser.add_argument("--board", default="default", help="Kanban board to read (Postgres backend)")
+    parser.add_argument("--full", action="store_true", help="Force a full sync, ignoring the watermark")
     return parser.parse_args()
+
+
+def _ensure_sync_state_table(telemetry_conn: sqlite3.Connection) -> None:
+    telemetry_conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+
+
+def _read_watermark(telemetry_conn: sqlite3.Connection) -> int | None:
+    _ensure_sync_state_table(telemetry_conn)
+    row = telemetry_conn.execute(
+        "SELECT value FROM sync_state WHERE key = ?", (WATERMARK_KEY,)
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _write_watermark(telemetry_conn: sqlite3.Connection, value: int) -> None:
+    _ensure_sync_state_table(telemetry_conn)
+    telemetry_conn.execute(
+        "INSERT INTO sync_state(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (WATERMARK_KEY, str(value)),
+    )
 
 
 def iso_from_epoch(value):
@@ -77,9 +107,17 @@ def load_rows(conn: sqlite3.Connection, query: str, params=()):
     return rows
 
 
-def parse_payload(raw: str | None) -> dict:
-    if not raw:
+def parse_payload(raw) -> dict:
+    # PG JSONB columns (task_events.payload, task_runs.metadata) come back from
+    # psycopg dict_row already parsed as Python dicts/lists, NOT JSON strings.
+    # Pass parsed dicts straight through; the sqlite path still hands us strings
+    # and takes the json.loads branch below (byte-identical to prior behavior).
+    if raw is None:
         return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}  # lists/other non-dict JSON values → empty, matching prior behavior
     try:
         parsed = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
@@ -254,7 +292,14 @@ def sync_events(telemetry_conn: sqlite3.Connection, task_row: sqlite3.Row, event
     }
 
     for row in event_rows:
-        payload = row["payload"] or ""
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, (dict, list)):
+            # PG JSONB arrives already parsed; re-serialize so the dedupe key is
+            # hashable and the telemetry payload_json TEXT column gets a string.
+            # (sqlite hands us a string here, so this branch is PG-only.)
+            payload = json_dumps(raw_payload)
+        else:
+            payload = raw_payload or ""
         occurred_at = iso_from_epoch(row["created_at"])
         event_type = kind_map.get(row["kind"], f"kanban_{row['kind']}")
         key = (occurred_at, event_type, payload)
@@ -276,20 +321,14 @@ def sync_events(telemetry_conn: sqlite3.Connection, task_row: sqlite3.Row, event
     created_event = next((row for row in event_rows if row["kind"] == "created"), None)
     initial_owner = task_profile(task_row, "assignee")
     if created_event and created_event["payload"]:
-        try:
-            created_payload = json.loads(created_event["payload"])
-            initial_owner = canonical_profile(created_payload.get("assignee") or initial_owner, default="unassigned")
-        except json.JSONDecodeError:
-            pass
+        # parse_payload handles both PG (dict) and sqlite (JSON string); malformed
+        # sqlite JSON → {} → initial_owner unchanged, same as the prior except-pass.
+        created_payload = parse_payload(created_event["payload"])
+        initial_owner = canonical_profile(created_payload.get("assignee") or initial_owner, default="unassigned")
     for row in event_rows:
         if row["kind"] not in {"assigned", "reassigned"}:
             continue
-        payload = {}
-        if row["payload"]:
-            try:
-                payload = json.loads(row["payload"])
-            except json.JSONDecodeError:
-                payload = {"raw": row["payload"]}
+        payload = parse_payload(row["payload"])
         current_owner = canonical_profile(payload.get("assignee") or payload.get("current_owner") or task_row["assignee"], default="unassigned")
         route_key = (iso_from_epoch(row["created_at"]), initial_owner, current_owner)
         if route_key in existing_route_keys:
@@ -873,9 +912,24 @@ def update_task_hardening_fields(
     )
 
 
-def main() -> int:
-    args = parse_args()
-    telemetry_root = resolve_telemetry_root(args.telemetry_root)
+def _process_task(telemetry_conn, task_row, event_rows, run_rows, link_rows, comment_count) -> None:
+    """Run the full telemetry-upsert pipeline for one kanban task. Backend-agnostic:
+    rows arrive as sqlite3.Row (sqlite) or psycopg dict_row dicts (Postgres), both
+    of which satisfy the row["col"] access these functions use."""
+    ensure_task(telemetry_conn, task_row, run_rows, link_rows, comment_count)
+    sync_events(telemetry_conn, task_row, event_rows, run_rows)
+    sync_terminal_event(telemetry_conn, task_row)
+    finalize_routing_accuracy(telemetry_conn, task_row)
+    apply_kanban_skill_reuse(telemetry_conn, task_row)
+
+    upsert_execution_runs(telemetry_conn, task_row, run_rows)
+    sync_run_state_events(telemetry_conn, task_row, event_rows, run_rows)
+    sync_routing_decisions(telemetry_conn, task_row, event_rows)
+    sync_task_participants(telemetry_conn, task_row, event_rows, run_rows)
+    update_task_hardening_fields(telemetry_conn, task_row, event_rows, run_rows)
+
+
+def _run_sqlite(args: argparse.Namespace, telemetry_root: Path) -> int:
     kanban_db = Path(os.path.expanduser(args.kanban_db)).resolve()
     if not kanban_db.exists():
         raise SystemExit(f"Kanban DB not found: {kanban_db}")
@@ -883,13 +937,38 @@ def main() -> int:
     kanban_conn = sqlite3.connect(kanban_db)
     try:
         kanban_conn.row_factory = sqlite3.Row
-        task_query = "SELECT * FROM tasks"
-        params = ()
-        if args.task_id:
-            task_query += " WHERE id = ?"
-            params = (args.task_id,)
-        task_query += " ORDER BY created_at"
+
+        # Determine watermark for incremental mode (sqlite backend)
+        with events_connection(telemetry_root) as _wm_conn:
+            watermark = None if args.full or args.task_id else _read_watermark(_wm_conn)
+
+        if watermark is not None:
+            # Incremental: tasks with new events, newly created tasks, or open tasks
+            open_placeholders = ",".join("?" * len(OPEN_STATUSES))
+            task_query = f"""
+                SELECT DISTINCT t.* FROM tasks t
+                LEFT JOIN task_events e ON e.task_id = t.id
+                WHERE t.created_at > ? OR e.created_at > ? OR t.status IN ({open_placeholders})
+                ORDER BY t.created_at
+            """
+            params = (watermark, watermark) + OPEN_STATUSES
+        else:
+            task_query = "SELECT * FROM tasks"
+            params = ()
+            if args.task_id:
+                task_query += " WHERE id = ?"
+                params = (args.task_id,)
+            task_query += " ORDER BY created_at"
+
         task_rows = kanban_conn.execute(task_query, params).fetchall()
+
+        # Compute new watermark from max event created_at across all events (not just filtered)
+        if watermark is not None:
+            new_wm_row = kanban_conn.execute("SELECT MAX(created_at) FROM task_events").fetchone()
+            new_watermark = new_wm_row[0] if new_wm_row and new_wm_row[0] is not None else watermark
+        else:
+            new_wm_row = kanban_conn.execute("SELECT MAX(created_at) FROM task_events").fetchone()
+            new_watermark = new_wm_row[0] if new_wm_row and new_wm_row[0] is not None else None
 
         with events_connection(telemetry_root) as telemetry_conn:
             for task_row in task_rows:
@@ -910,22 +989,130 @@ def main() -> int:
                     (task_row["id"],),
                 ).fetchone()[0]
 
-                ensure_task(telemetry_conn, task_row, run_rows, link_rows, comment_count)
-                sync_events(telemetry_conn, task_row, event_rows, run_rows)
-                sync_terminal_event(telemetry_conn, task_row)
-                finalize_routing_accuracy(telemetry_conn, task_row)
-                apply_kanban_skill_reuse(telemetry_conn, task_row)
+                _process_task(telemetry_conn, task_row, event_rows, run_rows, link_rows, comment_count)
 
-                upsert_execution_runs(telemetry_conn, task_row, run_rows)
-                sync_run_state_events(telemetry_conn, task_row, event_rows, run_rows)
-                sync_routing_decisions(telemetry_conn, task_row, event_rows)
-                sync_task_participants(telemetry_conn, task_row, event_rows, run_rows)
-                update_task_hardening_fields(telemetry_conn, task_row, event_rows, run_rows)
+            if new_watermark is not None and not args.task_id:
+                _write_watermark(telemetry_conn, new_watermark)
     finally:
         kanban_conn.close()
 
     print(json.dumps({"synced_task_count": len(task_rows), "task_ids": [row["id"] for row in task_rows]}, indent=2))
     return 0
+
+
+def _run_postgres(args: argparse.Namespace, telemetry_root: Path) -> int:
+    """Read the live Postgres kanban board (board-scoped) and run the same sync
+    pipeline. Preserves sqlite query semantics: per-task event/run/link/comment
+    fetches with identical ORDER BY and the optional --task-id filter. All reads
+    happen up front against a single pool connection; on any PG error we fail
+    loudly with a redacted DSN (never a silent fall-back to the frozen sqlite).
+
+    Incremental mode: on each run we persist a watermark (max task_events.created_at
+    epoch seen so far) in the telemetry sync_state table. Subsequent runs only
+    re-fetch tasks that have new events, were recently created, or are in an open
+    state (todo/blocked/claimed/spawned/promoted — can change without new events).
+    Pass --full to ignore the watermark and sync everything."""
+    from hermes_cli.kanban import pg_pool
+    from psycopg.rows import dict_row
+    from hermes_cli.kanban_board_doctor import _redacted_pg_dsn
+
+    board = args.board
+
+    # Read watermark before opening PG connection (separate telemetry connection)
+    with events_connection(telemetry_root) as _wm_conn:
+        watermark = None if args.full or args.task_id else _read_watermark(_wm_conn)
+
+    try:
+        pool = pg_pool.get_pool()
+        with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+
+            if watermark is not None:
+                # Incremental: tasks with new events, newly created, or open status
+                open_placeholders = ",".join(["%s"] * len(OPEN_STATUSES))
+                task_query = f"""
+                    SELECT DISTINCT t.* FROM tasks t
+                    LEFT JOIN task_events e ON e.board = t.board AND e.task_id = t.id
+                    WHERE t.board = %s
+                      AND (t.created_at > %s OR e.created_at > %s OR t.status IN ({open_placeholders}))
+                    ORDER BY t.created_at
+                """
+                params_list: list = [board, watermark, watermark] + list(OPEN_STATUSES)
+                cur.execute(task_query, tuple(params_list))
+            else:
+                task_query = "SELECT * FROM tasks WHERE board = %s"
+                params_list = [board]
+                if args.task_id:
+                    task_query += " AND id = %s"
+                    params_list.append(args.task_id)
+                task_query += " ORDER BY created_at"
+                cur.execute(task_query, tuple(params_list))
+
+            task_rows = cur.fetchall()
+
+            # Compute new watermark from the global max across all events (full board)
+            cur.execute(
+                "SELECT MAX(created_at) AS max_ts FROM task_events WHERE board = %s",
+                (board,),
+            )
+            wm_row = cur.fetchone()
+            new_watermark = wm_row["max_ts"] if wm_row and wm_row["max_ts"] is not None else watermark
+
+            per_task: dict = {}
+            for task_row in task_rows:
+                tid = task_row["id"]
+                cur.execute(
+                    "SELECT * FROM task_events WHERE board = %s AND task_id = %s ORDER BY created_at, id",
+                    (board, tid),
+                )
+                event_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT * FROM task_runs WHERE board = %s AND task_id = %s ORDER BY started_at, id",
+                    (board, tid),
+                )
+                run_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT * FROM task_links WHERE board = %s AND (parent_id = %s OR child_id = %s)",
+                    (board, tid, tid),
+                )
+                link_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM task_comments WHERE board = %s AND task_id = %s",
+                    (board, tid),
+                )
+                comment_count = cur.fetchone()["n"]
+                per_task[tid] = (event_rows, run_rows, link_rows, comment_count)
+    except Exception as exc:
+        raise SystemExit(
+            "Kanban Postgres read failed "
+            f"({_redacted_pg_dsn()}): {type(exc).__name__}: {exc}"
+        )
+
+    with events_connection(telemetry_root) as telemetry_conn:
+        for task_row in task_rows:
+            event_rows, run_rows, link_rows, comment_count = per_task[task_row["id"]]
+            _process_task(telemetry_conn, task_row, event_rows, run_rows, link_rows, comment_count)
+
+        if new_watermark is not None and not args.task_id:
+            _write_watermark(telemetry_conn, new_watermark)
+
+    print(json.dumps({"synced_task_count": len(task_rows), "task_ids": [row["id"] for row in task_rows]}, indent=2))
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    telemetry_root = resolve_telemetry_root(args.telemetry_root)
+
+    backend = "sqlite"
+    try:
+        from hermes_cli.kanban.store import resolve_backend
+        backend = resolve_backend()
+    except Exception:
+        backend = "sqlite"
+
+    if backend == "postgres":
+        return _run_postgres(args, telemetry_root)
+    return _run_sqlite(args, telemetry_root)
 
 
 if __name__ == "__main__":
