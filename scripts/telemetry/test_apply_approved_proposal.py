@@ -136,7 +136,10 @@ def _init_kanban_db(path: Path) -> None:
                 id TEXT PRIMARY KEY,
                 idempotency_key TEXT,
                 status TEXT,
-                created_at INTEGER
+                created_at INTEGER,
+                completed_at TEXT,
+                consecutive_failures INTEGER,
+                result TEXT
             )
             """
         )
@@ -438,11 +441,91 @@ def case_execute_is_idempotent_and_records_audit_backup() -> None:
             apply_mod.create_kanban_task = original
 
 
+def case_store_mode_execute_skips_kanban_file_backup() -> None:
+    """backend=postgres: apply pre-checks via the store, creates via CLI, no kanban.db.bak."""
+    import kanban_access as ka
+    from types import SimpleNamespace
+
+    class _StubStore:
+        def __init__(self):
+            self.tasks = {}
+
+        def get_task(self, task_id):
+            return self.tasks.get(task_id)
+
+        def list_tasks(self, **kwargs):
+            return [task for task in self.tasks.values() if task.status != "archived"]
+
+        def close(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root = root / "telemetry"
+        proposal_id = "proposal:test-store-apply"
+
+        _run_init(telemetry_root)
+        _write_json(telemetry_root / "proposals" / f"{proposal_id}.json", _packet(proposal_id))
+        _seed_approved_row(telemetry_root / "experiments.db", proposal_id)
+
+        store = _StubStore()
+        access = ka.KanbanAccess(backend="postgres", store=store)
+
+        def fake_create_kanban_task(*, hermes_home: Path, idempotency_key: str, task_payload: dict[str, str]) -> str:
+            task_id = "t_pg_apply"
+            store.tasks[task_id] = SimpleNamespace(
+                id=task_id,
+                status="ready",
+                completed_at=None,
+                consecutive_failures=0,
+                result=None,
+                idempotency_key=idempotency_key,
+                created_at=1,
+            )
+            return task_id
+
+        original_create = apply_mod.create_kanban_task
+        original_resolve = apply_mod.resolve_kanban_access
+        apply_mod.create_kanban_task = fake_create_kanban_task
+        apply_mod.resolve_kanban_access = lambda explicit_db, *, hermes_home: access
+        try:
+            args = _args(
+                proposal_id=proposal_id,
+                telemetry_root=telemetry_root,
+                kanban_db=root / "unused-kanban.db",
+                execute=True,
+                operator="Chad Tao",
+            )
+            args.kanban_db = None
+            payload = apply_mod.apply(args)
+        finally:
+            apply_mod.create_kanban_task = original_create
+            apply_mod.resolve_kanban_access = original_resolve
+
+        assert payload["ok"] is True, payload
+        assert payload["action"] == "applied", payload
+        assert payload["kanban_task_id"] == "t_pg_apply", payload
+        assert payload["kanban_backup_path"] is None, payload
+
+        audit = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT kanban_backup_path, kanban_task_id FROM proposal_apply_audit WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert audit[0] is None, audit
+        assert audit[1] == "t_pg_apply", audit
+
+        manifest = json.loads(Path(payload["manifest_path"]).read_text(encoding="utf-8"))
+        assert manifest["kanban_access"]["backend"] == "postgres", manifest
+        assert manifest["backup_paths"]["kanban_db"] is None, manifest
+
+
 def main() -> int:
     case_dry_run_generates_artifact_without_mutation()
     case_missing_ledger_row_fails_even_with_packet()
     case_execute_requires_decision_audit_provenance()
     case_execute_is_idempotent_and_records_audit_backup()
+    case_store_mode_execute_skips_kanban_file_backup()
     print("OK")
     return 0
 

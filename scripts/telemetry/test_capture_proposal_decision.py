@@ -303,7 +303,7 @@ def _run_digest_main(*, before: dict, after: dict, previous: dict | None = None)
         for name in ("proposal_table_counts", "run_generator", "load_state", "save_state")
     }
     digest.proposal_table_counts = lambda: next(counts_iter)
-    digest.run_generator = lambda: payload
+    digest.run_generator = lambda **kwargs: payload
     digest.load_state = lambda: previous or {}
     digest.save_state = lambda data: saved.update(data) or None
     try:

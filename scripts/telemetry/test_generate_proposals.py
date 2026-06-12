@@ -61,7 +61,7 @@ def _seed_bench_rows(telemetry_root: Path) -> None:
         conn.close()
 
 
-def _run_generator(telemetry_root: Path, output_dir: Path, readiness_json: Path, audit_json: Path, score_json: Path, dry_run: bool = True) -> dict:
+def _run_generator(telemetry_root: Path, output_dir: Path, readiness_json: Path, audit_json: Path, score_json: Path, dry_run: bool = True, extra: list[str] | None = None) -> dict:
     cmd = [
         sys.executable,
         str(GENERATOR_SCRIPT),
@@ -78,6 +78,8 @@ def _run_generator(telemetry_root: Path, output_dir: Path, readiness_json: Path,
     ]
     if dry_run:
         cmd.append("--dry-run")
+    if extra:
+        cmd.extend(extra)
     proc = _run(cmd)
     if proc.returncode != 0:
         raise AssertionError(f"generator failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
@@ -443,6 +445,239 @@ def case_persist_proposals_preserves_human_lifecycle_status() -> None:
             conn.close()
 
 
+def case_regeneration_never_clobbers_outcome_or_touches_progressed_rows() -> None:
+    """A verified row must survive regeneration untouched (incl. outcome/verified_at)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root = root / "telemetry"
+        output_dir = root / "proposals"
+        _run_init(telemetry_root)
+        _seed_bench_rows(telemetry_root)
+
+        readiness = {"overall_verdict": "COMPLETE", "gates": []}
+        audit = {"summary": {"incomplete_tasks": 0}, "tasks": []}
+        score = {"results": []}
+
+        readiness_path = root / "readiness.json"
+        audit_path = root / "audit.json"
+        score_path = root / "score.json"
+        _write_json(readiness_path, readiness)
+        _write_json(audit_path, audit)
+        _write_json(score_path, score)
+
+        first = _run_generator(telemetry_root, output_dir, readiness_path, audit_path, score_path, dry_run=False)
+        proposal_ids = [item["proposal_id"] for item in first.get("proposals", [])]
+        assert len(proposal_ids) >= 2, proposal_ids
+
+        verified_id = proposal_ids[0]
+        proposed_id = proposal_ids[1]
+        frozen_updated_at = "2026-05-26T00:04:28+00:00"
+
+        conn = sqlite3.connect(telemetry_root / "experiments.db")
+        try:
+            conn.execute(
+                """
+                UPDATE proposals
+                SET status = 'verified', outcome = 'success',
+                    approved_at = '2026-05-25T19:35:44+00:00',
+                    applied_at = '2026-05-25T19:36:10+00:00',
+                    verified_at = '1779737928',
+                    approver = 'Chad Tao', updated_at = ?
+                WHERE proposal_id = ?
+                """,
+                (frozen_updated_at, verified_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _run_generator(telemetry_root, output_dir, readiness_path, audit_path, score_path, dry_run=False)
+
+        conn = sqlite3.connect(telemetry_root / "experiments.db")
+        try:
+            verified_row = conn.execute(
+                "SELECT status, outcome, verified_at, updated_at FROM proposals WHERE proposal_id = ?",
+                (verified_id,),
+            ).fetchone()
+            assert verified_row == (
+                "verified",
+                "success",
+                "1779737928",
+                frozen_updated_at,
+            ), verified_row
+
+            proposed_row = conn.execute(
+                "SELECT status, outcome FROM proposals WHERE proposal_id = ?",
+                (proposed_id,),
+            ).fetchone()
+            assert proposed_row == ("proposed", "unknown"), proposed_row
+        finally:
+            conn.close()
+
+
+def _repair_only_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
+    telemetry_root = root / "telemetry"
+    output_dir = root / "proposals"
+    _run_init(telemetry_root)
+    _seed_bench_rows(telemetry_root)
+    readiness = {
+        "overall_verdict": "NOT_COMPLETE",
+        "gates": [
+            {
+                "gate_id": "weekly_report_grounded_in_real_work",
+                "status": "fail",
+                "summary": "Weekly report stale",
+                "reasons": ["Latest report file is stale"],
+                "evidence": {},
+            }
+        ],
+    }
+    readiness_path = root / "readiness.json"
+    audit_path = root / "audit.json"
+    score_path = root / "score.json"
+    _write_json(readiness_path, readiness)
+    _write_json(audit_path, {"summary": {"incomplete_tasks": 0}, "tasks": []})
+    _write_json(score_path, {"results": []})
+    return telemetry_root, output_dir, readiness_path, audit_path, score_path
+
+
+def case_ledger_confidence_floor_keeps_not_ready_file_only() -> None:
+    """not_ready packets render to files but stay out of the ledger by default."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root, output_dir, readiness_path, audit_path, score_path = _repair_only_fixture(root)
+
+        payload = _run_generator(telemetry_root, output_dir, readiness_path, audit_path, score_path, dry_run=False)
+        assert payload["proposal_count"] == 1, payload
+        assert payload["min_ledger_confidence"] == "medium", payload
+        assert payload["ledger_persisted_count"] == 0, payload
+        assert payload["file_only_count"] == 1, payload
+
+        count = sqlite3.connect(telemetry_root / "experiments.db").execute(
+            "SELECT COUNT(*) FROM proposals"
+        ).fetchone()[0]
+        assert count == 0, count
+
+        packet_files = list(output_dir.glob("proposal:*.row.json"))
+        assert len(packet_files) == 1, packet_files
+
+        lowered = _run_generator(
+            telemetry_root, output_dir, readiness_path, audit_path, score_path,
+            dry_run=False, extra=["--min-ledger-confidence", "not_ready"],
+        )
+        assert lowered["ledger_persisted_count"] == 1, lowered
+        count = sqlite3.connect(telemetry_root / "experiments.db").execute(
+            "SELECT COUNT(*) FROM proposals"
+        ).fetchone()[0]
+        assert count == 1, count
+
+
+def case_gap_repair_skips_stale_closed_tasks() -> None:
+    """telemetry_gap_repair proposals are TTL'd: tasks closed long ago are skipped, with a log."""
+    from datetime import datetime, timedelta, timezone
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root = root / "telemetry"
+        output_dir = root / "proposals"
+        _run_init(telemetry_root)
+        _seed_bench_rows(telemetry_root)
+
+        now = datetime.now(timezone.utc)
+        fresh_closed = (now - timedelta(days=1)).isoformat()
+        stale_closed = (now - timedelta(days=30)).isoformat()
+
+        readiness = {"overall_verdict": "COMPLETE", "gates": []}
+        audit = {
+            "summary": {"incomplete_tasks": 2},
+            "tasks": [
+                {
+                    "task_id": "jira:FRESH-1",
+                    "title": "fresh task",
+                    "owner_profile": "engineer",
+                    "telemetry_gaps": ["missing_handoff_sent"],
+                    "closed_at": fresh_closed,
+                },
+                {
+                    "task_id": "jira:STALE-1",
+                    "title": "stale task",
+                    "owner_profile": "engineer",
+                    "telemetry_gaps": ["missing_handoff_sent"],
+                    "closed_at": stale_closed,
+                },
+            ],
+        }
+        readiness_path = root / "readiness.json"
+        audit_path = root / "audit.json"
+        score_path = root / "score.json"
+        _write_json(readiness_path, readiness)
+        _write_json(audit_path, audit)
+        _write_json(score_path, {"results": []})
+
+        payload = _run_generator(telemetry_root, output_dir, readiness_path, audit_path, score_path, dry_run=True)
+        gap_ids = [
+            item["proposal_id"]
+            for item in payload.get("proposals", [])
+            if item["proposal_type"] == "telemetry_gap_repair"
+        ]
+        assert any("fresh-1" in pid for pid in gap_ids), gap_ids
+        assert not any("stale-1" in pid for pid in gap_ids), gap_ids
+        assert payload["skipped_stale_gap_tasks"] == ["jira:STALE-1"], payload
+
+
+def case_stale_packets_archived_only_unledgered() -> None:
+    """Packet files for proposals no longer generated nor ledgered move to archive/."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root, output_dir, readiness_path, audit_path, score_path = _repair_only_fixture(root)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        stale_id = "proposal:telemetry_gap_repair-repair-telemetry-gaps-for-jira-old-99-engineer"
+        for suffix in (".json", ".md", ".row.json"):
+            (output_dir / f"{stale_id}{suffix}").write_text("{}", encoding="utf-8")
+        apply_artifact = output_dir / f"{stale_id}.apply.json"
+        apply_artifact.write_text("{}", encoding="utf-8")
+
+        ledgered_id = "proposal:readiness_gate_fix-repair-readiness-gate-old-gate-ops"
+        (output_dir / f"{ledgered_id}.json").write_text("{}", encoding="utf-8")
+        conn = sqlite3.connect(telemetry_root / "experiments.db")
+        try:
+            conn.execute(
+                """
+                INSERT INTO proposals(
+                    proposal_id, created_at, updated_at, proposal_type, title, status,
+                    owner_profile, confidence_label, confidence_score, confidence_basis_json,
+                    decision_requested, tl_dr, problem_statement, proposed_change,
+                    expected_metric_impact_json, risk_level, risk_notes, rollback_plan,
+                    verification_plan, packet_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ledgered_id, "2026-05-25T00:00:00+00:00", "2026-05-25T00:00:00+00:00",
+                    "readiness_gate_fix", "old gate", "verified", "ops", "high", 0.9, "{}",
+                    "approve", "tl;dr", "problem", "change", "{}", "low", "notes",
+                    "rollback", "verify", "{}",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        payload = _run_generator(telemetry_root, output_dir, readiness_path, audit_path, score_path, dry_run=True)
+        archived = payload.get("archived_stale_packets", [])
+        assert sorted(archived) == sorted(
+            [f"{stale_id}.json", f"{stale_id}.md", f"{stale_id}.row.json"]
+        ), archived
+
+        archive_dir = output_dir / "archive"
+        for suffix in (".json", ".md", ".row.json"):
+            assert not (output_dir / f"{stale_id}{suffix}").exists(), suffix
+            assert (archive_dir / f"{stale_id}{suffix}").exists(), suffix
+        assert apply_artifact.exists(), "apply artifacts must never be archived"
+        assert (output_dir / f"{ledgered_id}.json").exists(), "ledgered packets must never be archived"
+        assert list(output_dir.glob("proposal:*.row.json")), "current packets should remain"
+
+
 def main() -> int:
     case_not_complete_repair_only()
     case_complete_emits_metric_regression()
@@ -450,6 +685,10 @@ def main() -> int:
     case_complete_basis_user_correction_rate()
     case_complete_basis_reopened_task_rate()
     case_persist_proposals_preserves_human_lifecycle_status()
+    case_regeneration_never_clobbers_outcome_or_touches_progressed_rows()
+    case_ledger_confidence_floor_keeps_not_ready_file_only()
+    case_gap_repair_skips_stale_closed_tasks()
+    case_stale_packets_archived_only_unledgered()
     print("OK")
     return 0
 

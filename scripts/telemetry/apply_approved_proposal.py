@@ -13,6 +13,7 @@ from typing import Any
 
 from common import ensure_initialized, resolve_telemetry_root
 from init_self_improvement_db import ensure_directories
+from kanban_access import resolve_kanban_access
 
 APPLY_AUDIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS proposal_apply_audit (
@@ -285,20 +286,9 @@ def write_apply_artifacts(
     return apply_json_path, apply_md_path
 
 
-def existing_task_for_key(kanban_db: Path, idempotency_key: str) -> str | None:
-    if not kanban_db.exists():
-        return None
-    conn = sqlite3.connect(kanban_db)
-    try:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row:
-        return None
-    return str(row[0])
+def existing_task_for_key(kanban_access: Any, idempotency_key: str) -> str | None:
+    match = kanban_access.task_by_idempotency_key(idempotency_key)
+    return str(match["id"]) if match else None
 
 
 def create_kanban_task(
@@ -343,38 +333,40 @@ def capture_execute_backups(
     backup_root: Path,
     proposal_id: str,
     experiments_db: Path,
-    kanban_db: Path,
+    kanban_access: Any,
     operator_source: str,
     approved_row_before: dict[str, Any],
     packet_path: Path,
     idempotency_key: str,
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path | None, Path]:
     run_dir = backup_root / f"{compact_timestamp()}-{safe_name(proposal_id)}"
     run_dir.mkdir(parents=True, exist_ok=False)
     experiments_backup = run_dir / "experiments.db.bak"
-    kanban_backup = run_dir / "kanban.db.bak"
     backup_database(experiments_db, experiments_backup)
-    backup_database(kanban_db, kanban_backup)
+    # Store-backed boards (postgres) are not file-backupable from here; the
+    # manifest's created_task_ids is the rollback handle (archive that task).
+    kanban_backup = kanban_access.backup_to(run_dir)
 
     manifest = {
         "proposal_id": proposal_id,
         "started_at": utc_now(),
+        "kanban_access": kanban_access.describe(),
         "db_paths": {
             "experiments_db": str(experiments_db),
-            "kanban_db": str(kanban_db),
+            "kanban_db": kanban_access.describe()["kanban_db"],
         },
         "backup_paths": {
             "experiments_db": str(experiments_backup),
-            "kanban_db": str(kanban_backup),
+            "kanban_db": str(kanban_backup) if kanban_backup else None,
         },
         "approved_row_before": approved_row_before,
         "packet_paths": [str(packet_path)],
         "planned_idempotency_keys": [idempotency_key],
         "operator_source": operator_source,
         "created_task_ids": [],
-        "preflight_quick_check": {
+        "preflight_health": {
             "experiments_db": "ok",
-            "kanban_db": "ok",
+            "kanban": "ok",
         },
     }
     manifest_path = run_dir / "manifest.json"
@@ -395,14 +387,14 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
     proposal_dir = Path(args.proposal_dir).expanduser().resolve() if args.proposal_dir else telemetry_root / "proposals"
     hermes_home = Path(os.environ.get("HERMES_HOME") or telemetry_root.parent).expanduser().resolve()
     experiments_db = telemetry_root / "experiments.db"
-    kanban_db = Path(args.kanban_db).expanduser().resolve() if args.kanban_db else hermes_home / "kanban.db"
+    kanban = resolve_kanban_access(args.kanban_db, hermes_home=hermes_home)
     backup_root = Path(args.backup_dir).expanduser().resolve() if args.backup_dir else telemetry_root / "backups" / "proposal_applies"
 
     ensure_directories(telemetry_root)
     ensure_initialized(telemetry_root)
 
     require_quick_check_ok(experiments_db, stage="preflight", label="experiments.db")
-    require_quick_check_ok(kanban_db, stage="preflight", label="kanban.db")
+    kanban.verify_health(stage="preflight")
 
     packet_path, packet = find_packet(args.proposal_id, proposal_dir)
 
@@ -425,7 +417,7 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
     mode = "execute" if args.execute else "dry_run"
 
     if row["status"] == "applied" and row["applied_at"]:
-        existing_task = existing_task_for_key(kanban_db, idempotency_key)
+        existing_task = existing_task_for_key(kanban, idempotency_key)
         fallback_json_path, fallback_md_path = apply_artifact_paths(args.proposal_id, proposal_dir, "execute")
         audit_artifact_path = apply_audit["apply_artifact_path"] if apply_audit else None
         apply_json_path = Path(audit_artifact_path) if audit_artifact_path else fallback_json_path
@@ -517,7 +509,7 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
         backup_root=backup_root,
         proposal_id=args.proposal_id,
         experiments_db=experiments_db,
-        kanban_db=kanban_db,
+        kanban_access=kanban,
         operator_source=args.source,
         approved_row_before=approved_row_before,
         packet_path=packet_path,
@@ -596,7 +588,7 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
                 args.source,
                 idempotency_key,
                 str(experiments_backup),
-                str(kanban_backup),
+                str(kanban_backup) if kanban_backup else None,
                 str(apply_json_path),
                 task_id,
                 str(manifest_path),
@@ -610,7 +602,7 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
         conn.close()
 
     require_quick_check_ok(experiments_db, stage="post_apply", label="experiments.db")
-    require_quick_check_ok(kanban_db, stage="post_apply", label="kanban.db")
+    kanban.verify_health(stage="post_apply")
     update_manifest(manifest_path, task_id=task_id)
 
     return {
@@ -625,7 +617,7 @@ def apply(args: argparse.Namespace) -> dict[str, Any]:
         "apply_artifact_path": str(apply_json_path),
         "apply_markdown_path": str(apply_md_path),
         "backup_path": str(experiments_backup),
-        "kanban_backup_path": str(kanban_backup),
+        "kanban_backup_path": str(kanban_backup) if kanban_backup else None,
         "manifest_path": str(manifest_path),
         "mutated": {
             "kanban": True,

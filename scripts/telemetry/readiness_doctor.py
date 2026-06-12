@@ -16,12 +16,15 @@ from common import resolve_telemetry_root
 
 REQUIRED_PROFILES = {"default", "engineer", "researcher", "reviewer", "ops", "designer"}
 ALLOWED_EXTRA_PROFILES = {"Jensen"}
+# 2026-06-07 consolidation: the standalone telemetry/routing/report cron jobs
+# were folded into the two ops digests. Scheduler proof now keys off the jobs
+# that actually carry those duties.
 REQUIRED_CRON_JOBS = {
-    "daily-telemetry-kanban-sync",
-    "daily-telemetry-metric-aggregation",
-    "daily-routing-workflow-audit",
-    "weekly-orchestration-workflow-report",
+    "daily-ops-digest",
+    "weekly-ops-digest",
 }
+WAIVERS_FILENAME = "readiness_waivers.json"
+WAIVER_REQUIRED_FIELDS = ("gate_id", "reason", "waived_by", "expires_at")
 BOOTSTRAP_PATTERN = re.compile(r"\b(bootstrap|synthetic|demo)\b", re.IGNORECASE)
 REPORT_FILENAME_PATTERN = re.compile(r"weekly-report-(\d{4}-\d{2}-\d{2})\.md$")
 REPORT_WINDOW_PATTERN = re.compile(r"^Window:\s*(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})\s+UTC\s*$")
@@ -1025,7 +1028,65 @@ def gate_kanban_telemetry_drift_state(ctx: DoctorContext) -> dict[str, Any]:
 
 
 
-def evaluate(ctx: DoctorContext) -> dict[str, Any]:
+def load_waivers(path: Path) -> list[dict[str, Any]]:
+    """Load gate waivers from JSON ({"waivers": [...]}); missing/malformed -> []."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    waivers = payload.get("waivers") if isinstance(payload, dict) else None
+    if not isinstance(waivers, list):
+        return []
+    return [waiver for waiver in waivers if isinstance(waiver, dict)]
+
+
+def _active_waiver(gate_id: str, waivers: Iterable[dict[str, Any]], now: datetime) -> dict[str, Any] | None:
+    if not gate_id:
+        return None
+    for waiver in waivers:
+        if str(waiver.get("gate_id") or "") != gate_id:
+            continue
+        if any(not str(waiver.get(field) or "").strip() for field in WAIVER_REQUIRED_FIELDS):
+            continue
+        expires_at = parse_dt(str(waiver.get("expires_at")))
+        if expires_at is None:
+            continue
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if now >= expires_at:
+            continue
+        return waiver
+    return None
+
+
+def apply_waivers(gates: list[dict[str, Any]], waivers: Iterable[dict[str, Any]], *, now: datetime | None = None) -> list[str]:
+    """Flip failing gates with an active waiver to status 'waived' (in place).
+
+    Waivers are deliberate, time-bound operator decisions (e.g. a gate that
+    cannot pass while the kanban sync is paused for the Postgres migration).
+    The original failure reasons stay on the gate for auditability; expired or
+    malformed waivers are ignored so a lapsed waiver fails closed.
+    """
+    now = now or datetime.now(timezone.utc)
+    waiver_list = list(waivers)
+    waived: list[str] = []
+    for gate in gates:
+        if gate.get("status") != "fail":
+            continue
+        waiver = _active_waiver(str(gate.get("gate_id") or ""), waiver_list, now)
+        if waiver is None:
+            continue
+        gate["status"] = "waived"
+        gate["evidence"]["waiver"] = {field: waiver[field] for field in WAIVER_REQUIRED_FIELDS}
+        waived.append(str(gate["gate_id"]))
+    return waived
+
+
+def overall_verdict(gates: Iterable[dict[str, Any]]) -> str:
+    return "COMPLETE" if all(gate["status"] in ("pass", "waived") for gate in gates) else "NOT_COMPLETE"
+
+
+def evaluate(ctx: DoctorContext, waivers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     gates = [
         gate_real_substantial_task_coverage(ctx),
         gate_all_profile_rollups_present(ctx),
@@ -1035,11 +1096,14 @@ def evaluate(ctx: DoctorContext) -> dict[str, Any]:
         gate_scheduler_proof_state(ctx),
         gate_kanban_telemetry_drift_state(ctx),
     ]
-    overall_verdict = "COMPLETE" if all(gate["status"] == "pass" for gate in gates) else "NOT_COMPLETE"
+    if waivers is None:
+        waivers = load_waivers(ctx.telemetry_root / WAIVERS_FILENAME)
+    waived_gate_ids = apply_waivers(gates, waivers)
     return {
-        "overall_verdict": overall_verdict,
+        "overall_verdict": overall_verdict(gates),
         "evaluated_at": utc_now_iso(),
         "reporting_day": ctx.reporting_day,
+        "waived_gate_ids": waived_gate_ids,
         "gates": gates,
     }
 
@@ -1047,8 +1111,16 @@ def evaluate(ctx: DoctorContext) -> dict[str, Any]:
 
 def print_human_summary(result: dict[str, Any]) -> None:
     verdict = result["overall_verdict"]
-    failed = [gate for gate in result["gates"] if gate["status"] != "pass"]
+    waived = [gate for gate in result["gates"] if gate["status"] == "waived"]
+    failed = [gate for gate in result["gates"] if gate["status"] not in ("pass", "waived")]
     print(verdict, file=sys.stderr)
+    for gate in waived:
+        waiver = gate.get("evidence", {}).get("waiver", {})
+        print(
+            f"- {gate['gate_id']}: WAIVED — {waiver.get('reason', 'no reason recorded')} "
+            f"(expires {waiver.get('expires_at', 'unknown')})",
+            file=sys.stderr,
+        )
     if not failed:
         print("All readiness gates passed.", file=sys.stderr)
         return

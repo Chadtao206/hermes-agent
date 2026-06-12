@@ -45,7 +45,7 @@ def proposal_table_counts() -> dict[str, int]:
         conn.close()
 
 
-def run_generator() -> dict:
+def run_generator(*, live: bool = False) -> dict:
     env = os.environ.copy()
     env["HOME"] = HOME
     env["HERMES_HOME"] = HERMES_HOME
@@ -60,8 +60,9 @@ def run_generator() -> dict:
         str(KANBAN_DB),
         "--cron-state",
         str(CRON_STATE),
-        "--dry-run",
     ]
+    if not live:
+        cmd.append("--dry-run")
     proc = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=180)
     if proc.returncode != 0:
         if proc.stdout:
@@ -120,22 +121,48 @@ def format_list(items: list[str]) -> str:
     return ", ".join(items) if items else "none"
 
 
-def build_digest(payload: dict, counts: dict[str, int]) -> str:
+def build_digest(payload: dict, counts: dict[str, int], before_counts: dict[str, int] | None = None) -> str:
     proposals = payload.get("proposals") or []
     suppressed = payload.get("suppressed") or []
     overall_verdict = payload.get("overall_verdict") or "unknown"
+    dry_run = bool(payload.get("dry_run", True))
     readiness_fix = entries(proposals, proposal_type="readiness_gate_fix")
     deterministic_gap = entries(proposals, proposal_type="telemetry_gap_repair", owner="ops", decision="approve")
     human_gap = entries(proposals, proposal_type="telemetry_gap_repair", decision="discuss")
     experiment_fix = entries(proposals, proposal_type="experiment_not_scoreable_fix")
     suppressed_titles = entries(suppressed)
 
+    if dry_run:
+        mode_line = "Mode: dry-run only; proposal ledger remains unchanged in experiments.db."
+        title_line = "Self-improvement proposal dry-run digest"
+    else:
+        before = (before_counts or {}).get("proposals", counts.get("proposals", 0))
+        delta = counts.get("proposals", 0) - before
+        mode_line = (
+            f"Mode: LIVE; ledger delta this run: proposals {delta:+d} "
+            f"({before} -> {counts.get('proposals', 0)})"
+        )
+        title_line = "Self-improvement proposal digest"
+
     lines = [
-        "Self-improvement proposal dry-run digest",
+        title_line,
         f"Readiness: {overall_verdict} | proposals: {len(proposals)} | suppressed strategic: {len(suppressed)}",
-        "Mode: dry-run only; proposal ledger remains unchanged in experiments.db.",
+        mode_line,
         f"DB counts after run: proposals={counts['proposals']}, proposal_evidence_links={counts['proposal_evidence_links']}",
     ]
+
+    floor = payload.get("min_ledger_confidence")
+    if floor is not None:
+        lines.append(
+            f"Ledger floor ({floor}): {int(payload.get('ledger_persisted_count') or 0)} persisted, "
+            f"{int(payload.get('file_only_count') or 0)} file-only"
+        )
+    skipped_stale = payload.get("skipped_stale_gap_tasks") or []
+    if skipped_stale:
+        lines.append(f"Gap-repair TTL skipped ({len(skipped_stale)}): {format_list([str(item) for item in skipped_stale])}")
+    archived = payload.get("archived_stale_packets") or []
+    if archived:
+        lines.append(f"Archived stale packets: {len(archived)}")
 
     if overall_verdict == "NOT_COMPLETE":
         lines.append("Repair-only mode confirmed: readiness fixes and gap repairs emitted; strategic metric recommendations suppressed.")
@@ -156,10 +183,11 @@ def build_digest(payload: dict, counts: dict[str, int]) -> str:
 
 
 def main() -> int:
+    live = "--live" in sys.argv[1:]
     before = proposal_table_counts()
-    payload = run_generator()
+    payload = run_generator(live=live)
     after = proposal_table_counts()
-    if after != before:
+    if not live and after != before:
         print(
             "Dry-run mutated proposal ledger unexpectedly: "
             f"before={json.dumps(before, sort_keys=True)} after={json.dumps(after, sort_keys=True)}",
@@ -181,7 +209,7 @@ def main() -> int:
     if previous.get("fingerprint") == current_fingerprint:
         return 0
 
-    print(build_digest(payload, after))
+    print(build_digest(payload, after, before_counts=before))
     return 0
 
 

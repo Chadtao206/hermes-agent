@@ -18,6 +18,7 @@ from apply_approved_proposal import (
 )
 from common import ensure_initialized, resolve_telemetry_root
 from init_self_improvement_db import ensure_directories
+from kanban_access import resolve_kanban_access
 
 OUTCOME_AUDIT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS proposal_outcome_audit (
@@ -110,44 +111,6 @@ def latest_apply_link(conn: sqlite3.Connection, proposal_id: str) -> sqlite3.Row
     ).fetchone()
 
 
-def kanban_task_state(kanban_db: Path, task_id: str) -> sqlite3.Row | None:
-    if not kanban_db.exists():
-        return None
-    conn = sqlite3.connect(f"file:{kanban_db}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        return conn.execute(
-            """
-            SELECT id, status, completed_at, consecutive_failures, result
-            FROM tasks
-            WHERE id = ?
-            """,
-            (task_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-
-def kanban_task_by_idempotency_key(kanban_db: Path, idempotency_key: str) -> sqlite3.Row | None:
-    if not kanban_db.exists() or not idempotency_key:
-        return None
-    conn = sqlite3.connect(f"file:{kanban_db}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        return conn.execute(
-            """
-            SELECT id, status, completed_at, consecutive_failures, result
-            FROM tasks
-            WHERE idempotency_key = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (idempotency_key,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-
 def _status_equal(left: str | None, right: str | None) -> bool:
     return str(left or "").strip().lower() == str(right or "").strip().lower()
 
@@ -156,7 +119,7 @@ def derive_transition(
     *,
     proposal: sqlite3.Row,
     apply_link: sqlite3.Row | None,
-    task: sqlite3.Row | None,
+    task: dict[str, Any] | None,
     resolved_kanban_task_id: str | None = None,
 ) -> dict[str, Any]:
     proposal_id = str(proposal["proposal_id"])
@@ -330,12 +293,12 @@ def capture_execute_backups(
     backup_root: Path,
     proposal_scope: str,
     experiments_db: Path,
-    kanban_db: Path,
+    kanban_access: Any,
     operator: str,
     source: str,
     reason: str,
     observations: list[dict[str, Any]],
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path | None, Path]:
     base_name = f"{compact_timestamp()}-{safe_name(proposal_scope)}"
     run_dir = backup_root / base_name
     if run_dir.exists():
@@ -349,9 +312,10 @@ def capture_execute_backups(
     run_dir.mkdir(parents=True, exist_ok=False)
 
     experiments_backup = run_dir / "experiments.db.bak"
-    kanban_backup = run_dir / "kanban.db.bak"
     backup_database(experiments_db, experiments_backup)
-    backup_database(kanban_db, kanban_backup)
+    # Store-backed boards (postgres) are not file-backupable from here; the
+    # audit rows record the per-task transitions needed for manual rollback.
+    kanban_backup = kanban_access.backup_to(run_dir)
 
     manifest = {
         "started_at": utc_now(),
@@ -359,13 +323,14 @@ def capture_execute_backups(
         "operator": operator,
         "source": source,
         "reason": reason,
+        "kanban_access": kanban_access.describe(),
         "db_paths": {
             "experiments_db": str(experiments_db),
-            "kanban_db": str(kanban_db),
+            "kanban_db": kanban_access.describe()["kanban_db"],
         },
         "backup_paths": {
             "experiments_db": str(experiments_backup),
-            "kanban_db": str(kanban_backup),
+            "kanban_db": str(kanban_backup) if kanban_backup else None,
         },
         "observations": observations,
         "updated_proposals": [],
@@ -386,7 +351,7 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
     telemetry_root = resolve_telemetry_root(args.telemetry_root)
     hermes_home = Path(os.environ.get("HERMES_HOME") or telemetry_root.parent).expanduser().resolve()
     experiments_db = telemetry_root / "experiments.db"
-    kanban_db = Path(args.kanban_db).expanduser().resolve() if args.kanban_db else hermes_home / "kanban.db"
+    kanban = resolve_kanban_access(args.kanban_db, hermes_home=hermes_home)
     backup_root = (
         Path(args.backup_dir).expanduser().resolve()
         if args.backup_dir
@@ -411,12 +376,12 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
             link_task_id = str(link["kanban_task_id"] or "").strip() if link else ""
             link_idempotency_key = str(link["idempotency_key"] or "").strip() if link else ""
 
-            task = kanban_task_state(kanban_db, link_task_id) if link_task_id else None
+            task = kanban.task_state(link_task_id) if link_task_id else None
             resolved_task_id: str | None = link_task_id or None
             link_source: str | None = "apply_audit_id" if task is not None else None
 
             if task is None and link_idempotency_key:
-                fallback_task = kanban_task_by_idempotency_key(kanban_db, link_idempotency_key)
+                fallback_task = kanban.task_by_idempotency_key(link_idempotency_key)
                 if fallback_task is not None:
                     task = fallback_task
                     resolved_task_id = str(fallback_task["id"])
@@ -488,14 +453,14 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--reason is required with --execute")
 
     require_quick_check_ok(experiments_db, stage="preflight", label="experiments.db")
-    require_quick_check_ok(kanban_db, stage="preflight", label="kanban.db")
+    kanban.verify_health(stage="preflight")
 
     proposal_scope = args.proposal_id or "all-applied"
     experiments_backup, kanban_backup, manifest_path = capture_execute_backups(
         backup_root=backup_root,
         proposal_scope=proposal_scope,
         experiments_db=experiments_db,
-        kanban_db=kanban_db,
+        kanban_access=kanban,
         operator=operator,
         source=source,
         reason=reason,
@@ -576,7 +541,7 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
                     transition["new_outcome"],
                     transition["verified_at"] or previous_verified_at,
                     str(experiments_backup),
-                    str(kanban_backup),
+                    str(kanban_backup) if kanban_backup else None,
                     str(manifest_path),
                 ),
             )
@@ -590,7 +555,7 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
         conn.close()
 
     require_quick_check_ok(experiments_db, stage="post_reconcile", label="experiments.db")
-    require_quick_check_ok(kanban_db, stage="post_reconcile", label="kanban.db")
+    kanban.verify_health(stage="post_reconcile")
     update_manifest(manifest_path, updated_proposals)
 
     return {
@@ -602,7 +567,7 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
         "updated": len(updated_proposals),
         "audits_written": audits_written,
         "backup_path": str(experiments_backup),
-        "kanban_backup_path": str(kanban_backup),
+        "kanban_backup_path": str(kanban_backup) if kanban_backup else None,
         "manifest_path": str(manifest_path),
         "updated_proposals": sorted(updated_proposals),
         "observations": observations,

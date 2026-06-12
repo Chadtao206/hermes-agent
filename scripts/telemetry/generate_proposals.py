@@ -30,6 +30,16 @@ CONFIDENCE_SCORES = {
     "not_ready": 0.1,
 }
 
+CONFIDENCE_RANK = {
+    "not_ready": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+}
+
+DEFAULT_MIN_LEDGER_CONFIDENCE = "medium"
+DEFAULT_GAP_REPAIR_MAX_AGE_DAYS = 14
+
 METRIC_DIRECTIONS = {
     "task_success_rate": "higher_is_better",
     "user_correction_rate": "lower_is_better",
@@ -75,6 +85,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-json", help="Optional precomputed audit_telemetry_completeness JSON payload")
     parser.add_argument("--score-json", help="Optional precomputed score_experiment JSON payload")
     parser.add_argument("--dry-run", action="store_true", help="Render packets but do not write proposal rows into experiments.db")
+    parser.add_argument(
+        "--min-ledger-confidence",
+        choices=sorted(CONFIDENCE_RANK, key=CONFIDENCE_RANK.get),
+        default=DEFAULT_MIN_LEDGER_CONFIDENCE,
+        help="Minimum confidence label persisted to the proposals ledger; lower-confidence packets render to files only (default: medium)",
+    )
+    parser.add_argument(
+        "--gap-repair-max-age-days",
+        type=int,
+        default=DEFAULT_GAP_REPAIR_MAX_AGE_DAYS,
+        help="Skip telemetry_gap_repair proposals for tasks closed more than this many days ago (default: 14)",
+    )
+    parser.add_argument(
+        "--keep-stale-packets",
+        action="store_true",
+        help="Skip archiving packet files for proposals that are no longer generated nor ledgered",
+    )
     return parser.parse_args()
 
 
@@ -394,7 +421,8 @@ def render_packet_markdown(proposal: dict[str, Any]) -> str:
 def readiness_gate_proposals(readiness: dict[str, Any], gate_blocked: bool) -> list[dict[str, Any]]:
     proposals: list[dict[str, Any]] = []
     for gate in readiness.get("gates", []):
-        if gate.get("status") == "pass":
+        # Waived gates are deliberate operator decisions, not repairable failures.
+        if gate.get("status") in ("pass", "waived"):
             continue
         gate_id = str(gate.get("gate_id") or "unknown_gate")
         evidence = [
@@ -439,12 +467,43 @@ def classify_gap_task(task: dict[str, Any]) -> str:
     return "historical_gap_candidate"
 
 
-def telemetry_gap_proposals(audit: dict[str, Any], gate_blocked: bool) -> list[dict[str, Any]]:
+def _parse_closed_at(raw: Any) -> datetime | None:
+    if raw in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def telemetry_gap_proposals(
+    audit: dict[str, Any],
+    gate_blocked: bool,
+    *,
+    max_age_days: int = DEFAULT_GAP_REPAIR_MAX_AGE_DAYS,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build gap-repair proposals; TTL out tasks closed more than max_age_days ago.
+
+    Old bookkeeping gaps regenerate forever and drown the digest; a task closed
+    weeks ago is no longer worth a per-task repair card. Skipped task ids are
+    returned so the run summary can log the cap instead of hiding it.
+    """
+    now = now or datetime.now(timezone.utc)
     proposals: list[dict[str, Any]] = []
+    skipped_stale: list[str] = []
     for task in audit.get("tasks", []):
         task_id = str(task.get("task_id") or "unknown_task")
         bucket = classify_gap_task(task)
         if bucket == "historical_gap_candidate":
+            continue
+
+        closed_at = _parse_closed_at(task.get("closed_at"))
+        if closed_at is not None and (now - closed_at).days > max_age_days:
+            skipped_stale.append(task_id)
             continue
 
         deterministic = bucket == "deterministic_safe_repair"
@@ -486,7 +545,7 @@ def telemetry_gap_proposals(audit: dict[str, Any], gate_blocked: bool) -> list[d
                 suppressed_by_gate=gate_blocked,
             )
         )
-    return proposals
+    return proposals, skipped_stale
 
 
 def experiment_not_scoreable_proposals(score_payload: dict[str, Any], gate_blocked: bool) -> list[dict[str, Any]]:
@@ -635,9 +694,6 @@ def persist_proposals(telemetry_root: Path, proposals: list[dict[str, Any]]) -> 
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
                     updated_at=excluded.updated_at,
-                    -- Preserve human-controlled lifecycle state. Status must
-                    -- move only via explicit decision/apply commands, not
-                    -- proposal regeneration upserts.
                     owner_profile=excluded.owner_profile,
                     confidence_label=excluded.confidence_label,
                     confidence_score=excluded.confidence_score,
@@ -651,9 +707,14 @@ def persist_proposals(telemetry_root: Path, proposals: list[dict[str, Any]]) -> 
                     risk_notes=excluded.risk_notes,
                     rollback_plan=excluded.rollback_plan,
                     verification_plan=excluded.verification_plan,
-                    outcome=excluded.outcome,
                     linked_experiment_id=excluded.linked_experiment_id,
                     packet_json=excluded.packet_json
+                -- Regeneration may only refresh rows still awaiting a decision.
+                -- Lifecycle state (status/outcome/verified_at/...) is owned by
+                -- the decision/apply/reconcile commands; once a human has
+                -- progressed the row past 'proposed', regeneration upserts
+                -- must not touch it at all.
+                WHERE proposals.status = 'proposed'
                 """,
                 (
                     proposal["proposal_id"],
@@ -709,6 +770,42 @@ def persist_proposals(telemetry_root: Path, proposals: list[dict[str, Any]]) -> 
                 )
 
 
+def archive_stale_packets(
+    output_dir: Path,
+    current_ids: set[str],
+    ledgered_ids: set[str],
+) -> list[str]:
+    """Move packet files for proposals that are neither current nor ledgered
+    into output_dir/archive/.
+
+    Apply artifacts (``*.apply*``) are never touched: they are pointed at by
+    audit rows and are part of the apply provenance trail. Returns the moved
+    file names so the run summary can report the cleanup.
+    """
+    if not output_dir.exists():
+        return []
+    archive_dir = output_dir / "archive"
+    moved: list[str] = []
+    for path in sorted(output_dir.iterdir()):
+        if not path.is_file() or not path.name.startswith("proposal:"):
+            continue
+        if ".apply" in path.name:
+            continue
+        proposal_id = path.name.split(".", 1)[0]
+        if proposal_id in current_ids or proposal_id in ledgered_ids:
+            continue
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        path.rename(archive_dir / path.name)
+        moved.append(path.name)
+    return moved
+
+
+def ledgered_proposal_ids(telemetry_root: Path) -> set[str]:
+    with experiments_connection(telemetry_root) as conn:
+        rows = conn.execute("SELECT proposal_id FROM proposals").fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def write_packets(output_dir: Path, proposals: list[dict[str, Any]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for proposal in proposals:
@@ -739,15 +836,31 @@ def main() -> int:
 
     proposals: list[dict[str, Any]] = []
     proposals.extend(readiness_gate_proposals(readiness, gate_blocked))
-    proposals.extend(telemetry_gap_proposals(audit, gate_blocked))
+    gap_proposals, skipped_stale_gap_tasks = telemetry_gap_proposals(
+        audit, gate_blocked, max_age_days=args.gap_repair_max_age_days
+    )
+    proposals.extend(gap_proposals)
     proposals.extend(experiment_not_scoreable_proposals(score_payload, gate_blocked))
 
     metric_proposals, suppressed_metric_proposals = metric_change_proposals(telemetry_root, gate_blocked)
     proposals.extend(metric_proposals)
 
     write_packets(output_dir, proposals)
+
+    min_rank = CONFIDENCE_RANK[args.min_ledger_confidence]
+    ledger_eligible = [
+        item for item in proposals
+        if CONFIDENCE_RANK.get(item["confidence_label"], 0) >= min_rank
+    ]
     if not args.dry_run:
-        persist_proposals(telemetry_root, proposals)
+        persist_proposals(telemetry_root, ledger_eligible)
+
+    archived_stale_packets: list[str] = []
+    if not args.keep_stale_packets:
+        current_ids = {item["proposal_id"] for item in proposals}
+        archived_stale_packets = archive_stale_packets(
+            output_dir, current_ids, ledgered_proposal_ids(telemetry_root)
+        )
 
     evaluated_at = utc_now()
     payload = {
@@ -757,6 +870,11 @@ def main() -> int:
         "overall_verdict": readiness.get("overall_verdict"),
         "dry_run": bool(args.dry_run),
         "proposal_count": len(proposals),
+        "min_ledger_confidence": args.min_ledger_confidence,
+        "ledger_persisted_count": len(ledger_eligible) if not args.dry_run else 0,
+        "file_only_count": len(proposals) - len(ledger_eligible),
+        "skipped_stale_gap_tasks": skipped_stale_gap_tasks,
+        "archived_stale_packets": archived_stale_packets,
         "suppressed_count": len(suppressed_metric_proposals),
         "proposals": [
             {

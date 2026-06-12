@@ -574,6 +574,88 @@ def case_execute_is_idempotent_no_duplicate_audit() -> None:
         assert audit_count == 1, audit_count
 
 
+def case_store_mode_execute_reconciles_without_kanban_file() -> None:
+    """backend=postgres: reconcile reads task state via the store and skips kanban file backups."""
+    import kanban_access as ka
+
+    class _StubStore:
+        def __init__(self, tasks):
+            self.tasks = {task.id: task for task in tasks}
+
+        def get_task(self, task_id):
+            return self.tasks.get(task_id)
+
+        def list_tasks(self, **kwargs):
+            return [task for task in self.tasks.values() if task.status != "archived"]
+
+        def close(self):
+            pass
+
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        telemetry_root = root / "telemetry"
+        proposal_id = "proposal:test-store-mode"
+        task_id = "t_pg_done"
+
+        _run_init(telemetry_root)
+        _seed_applied_row(telemetry_root / "experiments.db", proposal_id, task_id)
+
+        store = _StubStore(
+            [
+                SimpleNamespace(
+                    id=task_id,
+                    status="done",
+                    completed_at=1779737928,
+                    consecutive_failures=0,
+                    result="ok",
+                    idempotency_key=f"proposal-apply:{proposal_id}",
+                    created_at=1,
+                )
+            ]
+        )
+        access = ka.KanbanAccess(backend="postgres", store=store)
+
+        original = reconcile_mod.resolve_kanban_access
+        reconcile_mod.resolve_kanban_access = lambda explicit_db, *, hermes_home: access
+        try:
+            args = _args(
+                telemetry_root=telemetry_root,
+                kanban_db=root / "unused-kanban.db",
+                proposal_id=proposal_id,
+                execute=True,
+                operator="Chad Tao",
+                reason="store-mode unit test",
+            )
+            args.kanban_db = None  # backend resolution path, no explicit sqlite file
+            result = reconcile_mod.reconcile(args)
+        finally:
+            reconcile_mod.resolve_kanban_access = original
+
+        assert result["ok"] is True, result
+        assert result["updated"] == 1, result
+        assert result["kanban_backup_path"] is None, result
+
+        row = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT status, outcome FROM proposals WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert row == ("verified", "success"), row
+
+        audit = _query_one(
+            telemetry_root / "experiments.db",
+            "SELECT kanban_backup_path, kanban_task_status FROM proposal_outcome_audit WHERE proposal_id=?",
+            (proposal_id,),
+        )
+        assert audit[0] is None, audit
+        assert audit[1] == "done", audit
+
+        manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+        assert manifest["kanban_access"]["backend"] == "postgres", manifest
+
+
 def main() -> int:
     case_dry_run_has_no_mutation()
     case_execute_done_sets_verified_success()
@@ -584,6 +666,7 @@ def main() -> int:
     case_execute_missing_task_sets_stale_attention()
     case_quick_check_failure_aborts_execute()
     case_execute_is_idempotent_no_duplicate_audit()
+    case_store_mode_execute_reconciles_without_kanban_file()
     print("OK")
     return 0
 
