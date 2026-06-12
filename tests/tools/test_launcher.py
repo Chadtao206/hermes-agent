@@ -42,6 +42,14 @@ def test_send_is_literal_then_enter_then_waits(tmp_path):
     assert "wait-for cs-done-u1" in " ".join(" ".join(c) for c in fake.calls)
 
 
+def test_send_text_is_literal_then_enter_and_does_not_wait(tmp_path):
+    fake = FakeTmux([])
+    Launcher(tmux=fake, projects_dir=tmp_path).send_text(name="t1", text="/compact")
+    assert ["send-keys", "-t", "t1", "-l", "--", "/compact"] in fake.calls
+    assert ["send-keys", "-t", "t1", "Enter"] in fake.calls
+    assert not any(c and c[0] == "wait-for" for c in fake.calls)  # steer/slash don't block
+
+
 def test_ready_timeout_raises(tmp_path):
     fake = FakeTmux([False])
     with pytest.raises(HandshakeTimeout):

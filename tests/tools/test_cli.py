@@ -1,7 +1,7 @@
 import json
 
 from tools.claude_session.cli import build_parser, cmd_send_result_json
-from tools.claude_session.models import TurnResult, SUBTYPE_BUDGET
+from tools.claude_session.models import TurnResult, SUBTYPE_BUDGET, SUBTYPE_MAX_TURNS
 
 
 def test_parser_has_all_verbs():
@@ -22,3 +22,16 @@ def test_budget_exceeded_sets_subtype():
     out = cmd_send_result_json(tr, max_budget_usd=0.50)
     assert out["subtype"] == SUBTYPE_BUDGET
     assert json.loads(json.dumps(out))
+
+
+def test_max_turns_exceeded_sets_subtype():
+    tr = TurnResult(result="r", session_id="s", num_turns=5,
+                    total_cost_usd=0.0, usage={}, subtype="success")
+    assert cmd_send_result_json(tr, max_turns=3)["subtype"] == SUBTYPE_MAX_TURNS
+
+
+def test_session_name_included_only_when_provided():
+    tr = TurnResult(result="r", session_id="s", num_turns=1,
+                    total_cost_usd=0.0, usage={}, subtype="success")
+    assert "session_name" not in cmd_send_result_json(tr)
+    assert cmd_send_result_json(tr, session_name="cs-abc")["session_name"] == "cs-abc"

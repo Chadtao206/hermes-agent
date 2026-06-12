@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any, Dict, Optional
 
-from .models import SUBTYPE_BUDGET, TurnResult
+from .models import SUBTYPE_BUDGET, SUBTYPE_MAX_TURNS, TurnResult
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,12 +40,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_send_result_json(tr: TurnResult, *,
-                         max_budget_usd: Optional[float]) -> Dict[str, Any]:
-    """Apply the external budget cap (interactive ignores --max-budget-usd).
-    Note: cost is an estimate, so this cap is approximate."""
+                         max_budget_usd: Optional[float] = None,
+                         max_turns: Optional[int] = None,
+                         session_name: Optional[str] = None) -> Dict[str, Any]:
+    """Emit the helper's JSON. Enforce the external caps (interactive mode
+    ignores --max-turns/--max-budget-usd) and surface the warm-session `name`
+    so callers can issue follow-up verbs. Cost is an estimate, so the budget cap
+    is approximate."""
+    if max_turns is not None and tr.num_turns > max_turns:
+        tr.subtype = SUBTYPE_MAX_TURNS
     if max_budget_usd is not None and tr.total_cost_usd > max_budget_usd:
         tr.subtype = SUBTYPE_BUDGET
-    return tr.to_dict()
+    out = tr.to_dict()
+    if session_name:
+        out["session_name"] = session_name
+    return out
 
 
 def main(argv=None) -> int:

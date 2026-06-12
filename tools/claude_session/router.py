@@ -23,7 +23,11 @@ def claude_version_ok() -> bool:
                              text=True, timeout=10)
     except (subprocess.SubprocessError, OSError):
         return False
-    return out.returncode == 0 and "2." in out.stdout
+    # The binary exists and responds. Don't pin a major-version prefix: that
+    # would silently force every call onto the -p fallback when Claude bumps to
+    # 3.x. (`--session-id`, the only version-sensitive flag we rely on, has been
+    # stable across 2.x.)
+    return out.returncode == 0
 
 
 def decide_path(*, no_tmux: bool, tmux_available: bool,

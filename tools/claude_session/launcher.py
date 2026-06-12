@@ -45,13 +45,17 @@ class Launcher:
         self.tmux.run(["wait-for", ready_channel(uuid)], timeout=ready_timeout)
 
     def send(self, *, name: str, uuid: str, prompt: str, done_timeout: float) -> str:
-        # -l = literal (no key-name lookup), -- = end of options (prompt may start
-        # with '-'). Submit with a SEPARATE Enter so the prompt text isn't parsed
-        # as a key. Multi-line prompts must not contain submit-newlines.
-        self.tmux.run(["send-keys", "-t", name, "-l", "--", prompt])
-        self.tmux.run(["send-keys", "-t", name, "Enter"])
+        self.send_text(name=name, text=prompt)
         self.tmux.run(["wait-for", done_channel(uuid)], timeout=done_timeout)
         return done_channel(uuid)
+
+    def send_text(self, *, name: str, text: str) -> None:
+        # -l = literal (no key-name lookup), -- = end of options (text may start
+        # with '-'). Submit with a SEPARATE Enter so the text isn't parsed as a
+        # key name. Used for prompts (via send) and for steer/slash input.
+        # Multi-line text must not contain submit-newlines.
+        self.tmux.run(["send-keys", "-t", name, "-l", "--", text])
+        self.tmux.run(["send-keys", "-t", name, "Enter"])
 
     def capture(self, *, name: str, lines: int = 60) -> str:
         return self.tmux.run(["capture-pane", "-t", name, "-p", "-S", f"-{lines}"])
@@ -60,6 +64,10 @@ class Launcher:
         self.tmux.run(["kill-session", "-t", name])
 
     def pane_dead(self, *, name: str) -> bool:
+        # `#{pane_dead}` prints "1" (dead) or "0" (alive). Empty output means tmux
+        # couldn't find the session — treat "gone" as dead so the reaper reclaims
+        # it. A transient tmux error also reads as gone; acceptable, since reaping
+        # a momentarily-unqueryable session is self-healing (relaunched next run).
         out = self.tmux.run(["list-panes", "-t", name, "-F", "#{pane_dead}"])
         return out.strip().startswith("1") if out.strip() else True
 
