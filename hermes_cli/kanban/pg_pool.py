@@ -18,6 +18,24 @@ _SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
 _POOLS: dict[str, ConnectionPool] = {}
 _POOLS_LOCK = threading.Lock()
 _SCHEMA_DONE: set[str] = set()
+_SCHEMA_LOCK_ID = 0x4845524D45534B42  # "HERMESKB"; serialize schema DDL per database.
+_REQUIRED_TABLES = frozenset({
+    "tasks",
+    "task_links",
+    "task_comments",
+    "task_events",
+    "task_runs",
+    "kanban_notify_subs",
+    "kanban_profile_event_subs",
+    "kanban_profile_event_claims",
+    "kanban_profile_wake_events",
+    "kanban_notifier_heartbeats",
+})
+_REQUIRED_TASK_COLUMNS = frozenset({
+    "review_target_pr_head_sha",
+    "goal_mode",
+    "goal_max_turns",
+})
 
 # getconn retry: ride through bursty Supabase-pooler PoolTimeouts. Total wait
 # budget stays comparable to the historical single 30s (ATTEMPTS * per-attempt
@@ -138,12 +156,65 @@ def get_pool(dsn: Optional[str] = None) -> ConnectionPool:
     return pool
 
 
+def _first_col(row) -> str:
+    if isinstance(row, dict):
+        return str(next(iter(row.values())))
+    return str(row[0])
+
+
+def _schema_current(conn) -> bool:
+    """Return True when the live schema already has the known PG kanban shape.
+
+    Read-only commands instantiate ``PostgresKanbanStore`` frequently from fresh
+    processes. Avoid running idempotent DDL on every construction: even
+    ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` takes an AccessExclusiveLock on
+    ``tasks`` and concurrent cron/gateway readers can deadlock while merely
+    trying to list the board.
+    """
+    table_rows = conn.execute(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name = ANY(%s)
+        """,
+        (list(_REQUIRED_TABLES),),
+    ).fetchall()
+    present_tables = {_first_col(row) for row in table_rows}
+    if not _REQUIRED_TABLES.issubset(present_tables):
+        return False
+
+    column_rows = conn.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'tasks'
+          AND column_name = ANY(%s)
+        """,
+        (list(_REQUIRED_TASK_COLUMNS),),
+    ).fetchall()
+    present_columns = {_first_col(row) for row in column_rows}
+    return _REQUIRED_TASK_COLUMNS.issubset(present_columns)
+
+
 def ensure_schema(pool: ConnectionPool) -> None:
-    """Apply pg_schema.sql once per pool (idempotent CREATE ... IF NOT EXISTS)."""
+    """Apply pg_schema.sql once per pool when the live schema is not current.
+
+    The migration path is serialized with a transaction-scoped advisory lock so
+    concurrent fresh processes cannot deadlock on ``tasks`` DDL. Current schemas
+    take the fast path and perform only information_schema reads.
+    """
     key = str(id(pool))
     if key in _SCHEMA_DONE:
         return
     ddl = _SCHEMA_PATH.read_text()
     with pool.connection() as conn:
-        conn.execute(ddl)
+        if _schema_current(conn):
+            _SCHEMA_DONE.add(key)
+            return
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_ID,))
+            if not _schema_current(conn):
+                conn.execute(ddl)  # type: ignore[call-overload]
     _SCHEMA_DONE.add(key)

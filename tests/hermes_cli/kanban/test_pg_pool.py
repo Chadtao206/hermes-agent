@@ -14,7 +14,7 @@ from hermes_cli.kanban.pg_pool import (
     _RetryingConnectionPool,
 )
 
-_DEAD_DSN = "postgresql://u:p@127.0.0.1:1/db"  # port 1 -> connection refused fast
+_DEAD_DSN = "postgresql://u:***@127.0.0.1:1/db"  # port 1 -> connection refused fast
 
 
 def test_getconn_retries_then_succeeds(monkeypatch):
@@ -88,3 +88,102 @@ def test_getconn_with_explicit_timeout_does_not_retry(monkeypatch):
         assert calls["n"] == 1  # exactly one attempt, no retry
     finally:
         pool.close()
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _Tx:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        self.conn.calls.append("tx_enter")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.conn.calls.append("tx_exit")
+        return False
+
+
+class _ConnectionContext:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSchemaConn:
+    def __init__(self, *, current: bool):
+        self.current = current
+        self.calls = []
+
+    def transaction(self):
+        return _Tx(self)
+
+    def execute(self, query, params=None):
+        text = str(query).lower()
+        if "information_schema.tables" in text:
+            self.calls.append("check_tables")
+            rows = [(name,) for name in pg_pool._REQUIRED_TABLES] if self.current else []
+            return _Rows(rows)
+        if "information_schema.columns" in text:
+            self.calls.append("check_columns")
+            rows = [(name,) for name in pg_pool._REQUIRED_TASK_COLUMNS] if self.current else []
+            return _Rows(rows)
+        if "pg_advisory_xact_lock" in text:
+            self.calls.append("advisory_lock")
+            return _Rows([])
+        self.calls.append("ddl")
+        self.current = True
+        return _Rows([])
+
+
+class _FakeSchemaPool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def connection(self):
+        return _ConnectionContext(self.conn)
+
+
+def test_ensure_schema_current_schema_skips_ddl_and_caches_pool():
+    conn = _FakeSchemaConn(current=True)
+    pool = _FakeSchemaPool(conn)
+    pg_pool._SCHEMA_DONE.clear()
+    try:
+        pg_pool.ensure_schema(pool)  # type: ignore[arg-type]
+        pg_pool.ensure_schema(pool)  # type: ignore[arg-type]
+    finally:
+        pg_pool._SCHEMA_DONE.clear()
+
+    assert conn.calls == ["check_tables", "check_columns"]
+
+
+def test_ensure_schema_serializes_ddl_when_schema_not_current():
+    conn = _FakeSchemaConn(current=False)
+    pool = _FakeSchemaPool(conn)
+    pg_pool._SCHEMA_DONE.clear()
+    try:
+        pg_pool.ensure_schema(pool)  # type: ignore[arg-type]
+    finally:
+        pg_pool._SCHEMA_DONE.clear()
+
+    assert conn.calls == [
+        "check_tables",
+        "tx_enter",
+        "advisory_lock",
+        "check_tables",
+        "ddl",
+        "tx_exit",
+    ]
+    assert conn.current is True
