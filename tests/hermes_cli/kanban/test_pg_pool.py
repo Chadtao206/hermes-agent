@@ -123,8 +123,14 @@ class _ConnectionContext:
 
 
 class _FakeSchemaConn:
-    def __init__(self, *, current: bool):
-        self.current = current
+    def __init__(self, *, current: bool | None = None,
+                 tables_current: bool | None = None,
+                 columns_current: bool | None = None):
+        if current is not None:
+            tables_current = current
+            columns_current = current
+        self.tables_current = bool(tables_current)
+        self.columns_current = bool(columns_current)
         self.calls = []
 
     def transaction(self):
@@ -134,17 +140,18 @@ class _FakeSchemaConn:
         text = str(query).lower()
         if "information_schema.tables" in text:
             self.calls.append("check_tables")
-            rows = [(name,) for name in pg_pool._REQUIRED_TABLES] if self.current else []
+            rows = [(name,) for name in pg_pool._REQUIRED_TABLES] if self.tables_current else []
             return _Rows(rows)
         if "information_schema.columns" in text:
             self.calls.append("check_columns")
-            rows = [(name,) for name in pg_pool._REQUIRED_TASK_COLUMNS] if self.current else []
+            rows = [(name,) for name in pg_pool._REQUIRED_TASK_COLUMNS] if self.columns_current else []
             return _Rows(rows)
         if "pg_advisory_xact_lock" in text:
             self.calls.append("advisory_lock")
             return _Rows([])
         self.calls.append("ddl")
-        self.current = True
+        self.tables_current = True
+        self.columns_current = True
         return _Rows([])
 
 
@@ -186,4 +193,28 @@ def test_ensure_schema_serializes_ddl_when_schema_not_current():
         "ddl",
         "tx_exit",
     ]
-    assert conn.current is True
+    assert conn.tables_current is True
+    assert conn.columns_current is True
+
+
+def test_ensure_schema_handles_column_only_drift_under_lock():
+    conn = _FakeSchemaConn(tables_current=True, columns_current=False)
+    pool = _FakeSchemaPool(conn)
+    pg_pool._SCHEMA_DONE.clear()
+    try:
+        pg_pool.ensure_schema(pool)  # type: ignore[arg-type]
+    finally:
+        pg_pool._SCHEMA_DONE.clear()
+
+    assert conn.calls == [
+        "check_tables",
+        "check_columns",
+        "tx_enter",
+        "advisory_lock",
+        "check_tables",
+        "check_columns",
+        "ddl",
+        "tx_exit",
+    ]
+    assert conn.tables_current is True
+    assert conn.columns_current is True
