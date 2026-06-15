@@ -52,6 +52,34 @@ class TestAnthropicDotToHyphen:
         assert result == "claude-sonnet-4-6"
 
 
+# ── claude-session dot-to-hyphen conversion (regression) ───────────────
+
+class TestClaudeSessionDotToHyphen:
+    """claude-session shells out to ``claude --model``.
+
+    The Claude Code CLI accepts the native dash-form ID (claude-opus-4-8)
+    and aliases (opus) but rejects the dot form (claude-opus-4.8) with
+    "model … may not exist". In tmux mode that rejection parks the REPL,
+    the Stop hook never fires, and the task hangs until the dispatch
+    deadline. So the dot→hyphen repair must apply to this provider too.
+    """
+
+    @pytest.mark.parametrize("model,expected", [
+        ("claude-opus-4.8", "claude-opus-4-8"),
+        ("claude-sonnet-4.6", "claude-sonnet-4-6"),
+    ])
+    def test_claude_session_converts_dots(self, model, expected):
+        result = normalize_model_for_provider(model, "claude-session")
+        assert result == expected
+
+    def test_claude_session_in_dot_to_hyphen_set(self):
+        assert "claude-session" in _DOT_TO_HYPHEN_PROVIDERS
+
+    def test_claude_session_preserves_alias(self):
+        # Bare aliases like "opus" have no dots and must pass through.
+        assert normalize_model_for_provider("opus", "claude-session") == "opus"
+
+
 # ── OpenCode Zen regression ────────────────────────────────────────────
 
 class TestOpenCodeZenModelNormalization:

@@ -73,6 +73,12 @@ _AGGREGATOR_PROVIDERS: frozenset[str] = frozenset({
 # Providers that want bare names with dots replaced by hyphens.
 _DOT_TO_HYPHEN_PROVIDERS: frozenset[str] = frozenset({
     "anthropic",
+    # claude-session shells out to the Claude Code CLI, whose --model flag
+    # accepts the same native dash-form IDs as the Anthropic API (e.g.
+    # claude-opus-4-8) and rejects the dot form (claude-opus-4.8) with
+    # "model … may not exist". In tmux mode that rejection parks the REPL
+    # and hangs the task, so the dot->hyphen repair must apply here too.
+    "claude-session",
 })
 
 # Providers that want bare names with dots preserved.
