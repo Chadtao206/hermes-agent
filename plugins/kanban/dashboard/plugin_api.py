@@ -2992,8 +2992,10 @@ async def stream_task_log(ws: WebSocket, task_id: str):
     stdout/stderr is an append-only file stream, so this endpoint tails the log
     file directly and emits small JSON frames without bloating ``task_events``.
     """
-    token = ws.query_params.get("token")
-    if not _check_ws_token(token):
+    # Authorize the upgrade via the dashboard's canonical WS gate, exactly as
+    # the /events stream does, so the right credential is accepted in every
+    # mode (loopback token / gated single-use ticket / server-internal).
+    if not _ws_upgrade_authorized(ws):
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
 

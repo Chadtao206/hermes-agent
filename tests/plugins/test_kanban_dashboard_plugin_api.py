@@ -169,7 +169,7 @@ def test_board_counts_uses_snapshot_reader(monkeypatch, tmp_path):
 
 
 def test_stream_events_uses_snapshot_reader(monkeypatch):
-    monkeypatch.setattr(plugin_api, "_check_ws_token", lambda _token: True)
+    monkeypatch.setattr(plugin_api, "_ws_upgrade_authorized", lambda _ws: True)
 
     calls: list[str | None] = []
 
@@ -203,7 +203,7 @@ def test_stream_events_uses_snapshot_reader(monkeypatch):
 
 
 def test_stream_events_corrupt_db_fail_stops_without_generic_warning(monkeypatch, tmp_path):
-    monkeypatch.setattr(plugin_api, "_check_ws_token", lambda _token: True)
+    monkeypatch.setattr(plugin_api, "_ws_upgrade_authorized", lambda _ws: True)
     db_path = tmp_path / "kanban.db"
     db_path.write_text("not sqlite", encoding="utf-8")
 
@@ -237,6 +237,41 @@ def test_stream_events_corrupt_db_fail_stops_without_generic_warning(monkeypatch
     assert ws.accepted is True
     assert ws.closed is True
     assert ws.close_code == plugin_api.http_status.WS_1011_INTERNAL_ERROR
+
+
+def test_stream_task_log_rejects_unauthorized_upgrade(monkeypatch):
+    """stream_task_log must gate the WS upgrade through the canonical auth
+    helper, then reject cleanly.
+
+    Regression for a NameError: the handler called a since-removed
+    ``_check_ws_token`` (left dangling when kanban WS auth was routed through
+    ``_ws_upgrade_authorized``), so every log-stream connection 500'd at the
+    auth check instead of accepting or cleanly rejecting.
+    """
+    monkeypatch.setattr(plugin_api, "_ws_upgrade_authorized", lambda _ws: False)
+
+    class _FakeWS:
+        def __init__(self):
+            self.query_params = {"token": "nope"}
+            self.accepted = False
+            self.closed = False
+            self.close_code = None
+
+        async def accept(self):
+            self.accepted = True
+
+        async def close(self, code=None):
+            self.closed = True
+            self.close_code = code
+
+    ws = _FakeWS()
+    # An unauthorized upgrade must short-circuit before any DB access, so no
+    # store/conn fixture is needed — only the auth gate runs.
+    asyncio.run(plugin_api.stream_task_log(ws, "task-123"))  # type: ignore[arg-type]
+
+    assert ws.accepted is False
+    assert ws.closed is True
+    assert ws.close_code == plugin_api.http_status.WS_1008_POLICY_VIOLATION
 
 
 def test_get_board_tolerates_non_utf8_metadata(tmp_path, monkeypatch):

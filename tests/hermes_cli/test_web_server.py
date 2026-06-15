@@ -3726,7 +3726,7 @@ class TestPluginAPIAuth:
         from starlette.websockets import WebSocketDisconnect
 
         # Without a token the WS endpoint must close the upgrade itself
-        # (its own _check_ws_token), NOT 401 from the HTTP middleware.
+        # (its own _ws_upgrade_authorized gate), NOT 401 from the HTTP middleware.
         try:
             with self.client.websocket_connect(
                 "/api/plugins/kanban/events"

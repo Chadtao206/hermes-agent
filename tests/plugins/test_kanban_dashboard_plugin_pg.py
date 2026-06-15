@@ -43,13 +43,11 @@ def test_board_running_column_from_postgres(pg_client):
 
 
 def test_events_stream_tails_postgres(pg_client, monkeypatch):
-    # _check_ws_token rejects a missing token even in the test harness
-    # (it only fails-open for a *non-empty* token when web_server isn't
-    # importable). The pg_client router is loaded by path under a synthetic
-    # module name, so monkeypatch _check_ws_token on that exact instance.
+    # The pg_client router is loaded by path under a synthetic module name, so
+    # monkeypatch the WS auth gate on that exact instance to short-circuit it.
     import sys
     plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
-    monkeypatch.setattr(plugin_mod, "_check_ws_token", lambda _token: True)
+    monkeypatch.setattr(plugin_mod, "_ws_upgrade_authorized", lambda _ws: True)
 
     s = pg_client.pg_store
     t = s.create_task(title="evt", assignee="engineer")  # emits task_events rows
