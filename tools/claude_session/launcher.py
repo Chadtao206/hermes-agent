@@ -12,6 +12,28 @@ class HandshakeTimeout(RuntimeError):
     """A tmux wait-for blocked past its timeout (ready/done never signalled)."""
 
 
+class StartupError(RuntimeError):
+    """Claude Code parked on a fatal startup banner (e.g. a rejected --model).
+
+    The REPL printed the error but never ran a turn, so the Stop hook never
+    fires and cs-done never arrives. Raised so the caller can fail fast / fall
+    back instead of blocking for the entire done_timeout.
+    """
+
+
+# Banners Claude Code prints for a fatal startup condition that leaves the REPL
+# idle without running a turn. Matched case-insensitively against the captured
+# pane, and only during the startup grace window after a prompt is sent, so
+# normal turn output that happens to quote one of these never trips the guard.
+_STARTUP_ERROR_PATTERNS: "tuple[str, ...]" = (
+    "issue with the selected model",   # invalid / inaccessible --model
+)
+# How long after sending a prompt to watch for a startup-error banner, and how
+# long each poll slice waits for cs-done before re-checking the pane.
+_STARTUP_GRACE_SECONDS = 15.0
+_STARTUP_POLL_SECONDS = 3.0
+
+
 class TmuxRunner:
     def run(self, args: List[str], timeout: Optional[float] = None) -> str:
         try:
@@ -44,10 +66,49 @@ class Launcher:
         # Block on the SessionStart hook signal (plain wait-for; latched).
         self.tmux.run(["wait-for", ready_channel(uuid)], timeout=ready_timeout)
 
-    def send(self, *, name: str, uuid: str, prompt: str, done_timeout: float) -> str:
+    def send(self, *, name: str, uuid: str, prompt: str, done_timeout: float,
+             startup_grace: float = _STARTUP_GRACE_SECONDS) -> str:
         self.send_text(name=name, text=prompt)
-        self.tmux.run(["wait-for", done_channel(uuid)], timeout=done_timeout)
-        return done_channel(uuid)
+        return self._wait_for_done(
+            name=name, uuid=uuid, done_timeout=done_timeout,
+            startup_grace=startup_grace,
+        )
+
+    def _wait_for_done(self, *, name: str, uuid: str, done_timeout: float,
+                       startup_grace: float) -> str:
+        # During the startup window, wait for cs-done in short slices and scan
+        # the pane between slices. A fatal startup error (e.g. a rejected
+        # --model) parks the REPL so cs-done would otherwise never arrive and we
+        # would block for the full done_timeout. Past the window, a single
+        # blocking wait covers the remaining budget — the cheap path that keeps
+        # healthy long-running turns unaffected. startup_grace=0 disables the
+        # guard (warm re-sends, where startup already succeeded).
+        chan = done_channel(uuid)
+        waited = 0.0
+        grace = min(startup_grace, done_timeout)
+        while waited < grace:
+            slice_ = min(_STARTUP_POLL_SECONDS, grace - waited)
+            try:
+                self.tmux.run(["wait-for", chan], timeout=slice_)
+                return chan
+            except HandshakeTimeout:
+                waited += slice_
+                banner = self._startup_error(name=name)
+                if banner:
+                    raise StartupError(f"{name}: {banner}")
+        remaining = done_timeout - waited
+        if remaining > 0:
+            self.tmux.run(["wait-for", chan], timeout=remaining)
+        return chan
+
+    def _startup_error(self, *, name: str) -> Optional[str]:
+        """Return the matched fatal-startup banner in the pane, or None."""
+        try:
+            pane = self.capture(name=name)
+        except Exception:
+            return None
+        text = " ".join(pane.split()).lower()
+        return next((p for p in _STARTUP_ERROR_PATTERNS if p in text), None)
 
     def send_text(self, *, name: str, text: str) -> None:
         # -l = literal (no key-name lookup), -- = end of options (text may start

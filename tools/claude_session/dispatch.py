@@ -9,7 +9,7 @@ from pathlib import Path
 from . import pretrust
 from .cli import cmd_send_result_json
 from .hooks import build_settings, done_channel, ready_channel
-from .launcher import HandshakeTimeout, Launcher, TmuxRunner
+from .launcher import HandshakeTimeout, Launcher, StartupError, TmuxRunner
 from .models import SUBTYPE_MAX_TURNS, SUBTYPE_NO_TRANSCRIPT, SessionRecord, TurnResult
 from .registry import Registry
 from .router import Decision, claude_version_ok, decide_path, tmux_available
@@ -96,8 +96,12 @@ def _run(args, reg, tmux, lp) -> int:
         ok = True
     except Exception as exc:  # any launch/send failure → drain, clean up, fall back
         _drain(tmux, sid)
-        reason = "handshake" if isinstance(exc, HandshakeTimeout) \
-            else f"launch_error:{type(exc).__name__}"
+        if isinstance(exc, HandshakeTimeout):
+            reason = "handshake"
+        elif isinstance(exc, StartupError):
+            reason = "startup_error"
+        else:
+            reason = f"launch_error:{type(exc).__name__}"
         _emit(_print_fallback(args.task, args.workdir, args.max_turns, reason))
         return 0
     finally:
@@ -171,7 +175,10 @@ def _send(args, reg, tmux, lp) -> int:
                "session_id": rec.uuid, "num_turns": rec.turns,
                "total_cost_usd": rec.cost, "usage": {}, "session_name": rec.name})
         return 0
-    lp.send(name=rec.name, uuid=rec.uuid, prompt=args.prompt, done_timeout=args.timeout)
+    # Warm re-send: startup already succeeded, so the startup-error guard does
+    # not apply — keep the plain blocking wait.
+    lp.send(name=rec.name, uuid=rec.uuid, prompt=args.prompt, done_timeout=args.timeout,
+            startup_grace=0.0)
     tr = _parse_session(lp, rec.uuid)  # transcript num_turns/cost are cumulative
     reg.bump(rec.name, turns=tr.num_turns, cost=tr.total_cost_usd)
     _emit(cmd_send_result_json(tr, max_budget_usd=args.max_budget_usd,

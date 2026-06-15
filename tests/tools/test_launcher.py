@@ -1,6 +1,6 @@
 import pytest
 
-from tools.claude_session.launcher import Launcher, HandshakeTimeout
+from tools.claude_session.launcher import Launcher, HandshakeTimeout, StartupError
 
 
 class FakeTmux:
@@ -15,6 +15,20 @@ class FakeTmux:
             if not self._wait.pop(0):
                 raise HandshakeTimeout(args[-1])
         return ""
+
+
+class FakeTmuxWithPane(FakeTmux):
+    """FakeTmux that also returns a fixed pane for capture-pane calls."""
+
+    def __init__(self, wait_results, pane=""):
+        super().__init__(wait_results)
+        self._pane = pane
+
+    def run(self, args, timeout=None):
+        if args and args[0] == "capture-pane":
+            self.calls.append(args)
+            return self._pane
+        return super().run(args, timeout=timeout)
 
 
 def test_launch_is_dialogfree_and_waits_plain(tmp_path):
@@ -56,6 +70,56 @@ def test_ready_timeout_raises(tmp_path):
         Launcher(tmux=fake, projects_dir=tmp_path).launch(
             name="t1", uuid="u1", workdir="/w", settings_json="{}",
             model="opus", ready_timeout=5)
+
+
+def test_send_fails_fast_on_startup_model_error(tmp_path):
+    # cs-done never fires (every slice times out) but the pane shows the
+    # model-rejection banner → StartupError instead of burning the full
+    # done_timeout. Regression for the 30-min "Initializing agent..." hang.
+    fake = FakeTmuxWithPane(
+        [False] * 8,
+        pane="There's an issue with the selected model (claude-opus-4.8). "
+             "It may not exist or you may not have access to it.",
+    )
+    with pytest.raises(StartupError):
+        Launcher(tmux=fake, projects_dir=tmp_path).send(
+            name="t1", uuid="u1", prompt="do work", done_timeout=300, startup_grace=15)
+    # Bailed during the startup window, not after the whole budget: only one
+    # short poll slice elapsed before the banner was seen.
+    done_waits = [c for c in fake.calls
+                  if c and c[0] == "wait-for" and "-S" not in c]
+    assert done_waits == [["wait-for", "cs-done-u1"]]
+    assert any(c and c[0] == "capture-pane" for c in fake.calls)
+
+
+def test_send_returns_immediately_when_done_fires_first(tmp_path):
+    # Healthy fast turn: cs-done arrives on the first slice → return without
+    # ever scanning the pane (no false-positive surface).
+    fake = FakeTmuxWithPane([True], pane="ignored")
+    chan = Launcher(tmux=fake, projects_dir=tmp_path).send(
+        name="t1", uuid="u1", prompt="do work", done_timeout=300, startup_grace=15)
+    assert chan == "cs-done-u1"
+    assert not any(c and c[0] == "capture-pane" for c in fake.calls)
+
+
+def test_send_clean_pane_waits_past_grace_then_returns(tmp_path):
+    # Slow but healthy turn: the grace window elapses on a clean pane (no
+    # banner), then cs-done fires on the post-grace blocking wait. Must NOT
+    # raise — the guard only trips on a known fatal banner.
+    fake = FakeTmuxWithPane([False] * 5 + [True], pane="✻ Crunching… working")
+    chan = Launcher(tmux=fake, projects_dir=tmp_path).send(
+        name="t1", uuid="u1", prompt="do work", done_timeout=300, startup_grace=15)
+    assert chan == "cs-done-u1"
+
+
+def test_send_startup_grace_zero_does_single_blocking_wait(tmp_path):
+    # Warm re-send path opts out (startup_grace=0): one plain wait, no polling
+    # slices and no pane scan, identical to the pre-guard behaviour.
+    fake = FakeTmuxWithPane([True], pane="There's an issue with the selected model")
+    chan = Launcher(tmux=fake, projects_dir=tmp_path).send(
+        name="t1", uuid="u1", prompt="do work", done_timeout=300, startup_grace=0)
+    assert chan == "cs-done-u1"
+    assert not any(c and c[0] == "capture-pane" for c in fake.calls)
 
 
 def test_turn_allowed_cap():
