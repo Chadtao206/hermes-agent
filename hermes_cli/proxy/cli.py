@@ -119,8 +119,9 @@ def build_proxy_plist(*, python_path: str, hermes_home: str, port: int,
                       proxy_token: str) -> str:
     """Generate a crash-safe launchd plist for the codex proxy.
 
-    KeepAlive={SuccessfulExit: false} restarts only on failure (avoids a
-    crash-loop if the service ever exits cleanly). HERMES_HOME is pinned to the
+    KeepAlive={Crashed: true} restarts only on abnormal crash; a clean
+    auth-failure exit (e.g. ``exit 2`` from the ``is_authenticated()`` gate)
+    leaves the service stopped with no crash-loop. HERMES_HOME is pinned to the
     global root so the proxy reads/writes the global openai-codex pool.
     """
     log_dir = Path(hermes_home) / "logs"
@@ -151,7 +152,7 @@ def build_proxy_plist(*, python_path: str, hermes_home: str, port: int,
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
-  <dict><key>SuccessfulExit</key><false/></dict>
+  <dict><key>Crashed</key><true/></dict>
   <key>StandardOutPath</key><string>{log_dir}/codex-proxy.log</string>
   <key>StandardErrorPath</key><string>{log_dir}/codex-proxy.error.log</string>
 </dict>

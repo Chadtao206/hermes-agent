@@ -1099,10 +1099,12 @@ def test_build_codex_proxy_plist_pins_global_home_and_crash_safe(tmp_path):
     assert "<string>proxy</string>" in plist and "<string>codex</string>" in plist
     assert "/Users/x/.hermes" in plist                 # HERMES_HOME pinned
     assert "HERMES_PROXY_TOKEN" in plist and "tok123" in plist
-    # crash-safe KeepAlive: restart on failure only, not unconditional <true/>
-    assert "SuccessfulExit" in plist
+    # crash-safe KeepAlive: restart only on abnormal crash, not on clean exit
     keepalive_section = plist.split("KeepAlive")[1].split("</dict>")[0]
-    assert "<true/>" not in keepalive_section
+    assert "Crashed" in keepalive_section          # crash-safe form
+    assert "SuccessfulExit" not in keepalive_section
+    # NOT the unconditional bare `<key>KeepAlive</key><true/>` form
+    assert "<key>KeepAlive</key><true/>" not in plist.replace("\n", "").replace(" ", "")
     # I2+I3: WorkingDirectory and LimitLoadToSessionType must be present
     assert "WorkingDirectory" in plist
     assert "LimitLoadToSessionType" in plist
