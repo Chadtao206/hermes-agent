@@ -1009,3 +1009,12 @@ def test_codex_adapter_not_authenticated_when_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": {}}))
     assert not CodexAdapter().is_authenticated()
+
+
+def test_registry_lists_codex():
+    assert "codex" in ADAPTERS
+
+
+def test_get_adapter_returns_codex_instance():
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    assert isinstance(get_adapter("codex"), CodexAdapter)
