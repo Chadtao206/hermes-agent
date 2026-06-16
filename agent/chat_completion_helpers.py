@@ -572,7 +572,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             or base_url_host_matches(agent.base_url, "api.githubcopilot.com")
         )
         is_codex_backend = (
-            agent.provider == "openai-codex"
+            agent.provider in {"openai-codex", "codex-proxy"}
             or (
                 agent._base_url_hostname == "chatgpt.com"
                 and "/backend-api/codex" in agent._base_url_lower
