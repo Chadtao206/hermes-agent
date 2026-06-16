@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 from pathlib import Path
@@ -956,3 +957,55 @@ def test_server_accepts_large_body():
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter
+# ---------------------------------------------------------------------------
+
+
+def _make_codex_jwt(account_id: str = "acct-xyz") -> str:
+    payload = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    b = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"hdr.{b}.sig"
+
+
+def _write_codex_pool_entry(hermes_home: Path, *, access_token=None) -> Path:
+    access_token = access_token or _make_codex_jwt()
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [{
+            "id": "cdx1", "label": "gateway", "auth_type": "oauth", "priority": 0,
+            "source": "manual:device_code", "access_token": access_token,
+            "refresh_token": "cdx-refresh", "base_url": "https://chatgpt.com/backend-api/codex",
+        }]},
+    }))
+    return auth_path
+
+
+def test_codex_adapter_metadata():
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    a = CodexAdapter()
+    assert a.name == "codex"
+    assert a.display_name == "OpenAI Codex (ChatGPT)"
+    assert "/responses" in a.allowed_paths
+
+
+def test_codex_adapter_get_credential_injects_cloudflare_headers(tmp_path, monkeypatch):
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entry(tmp_path, access_token=_make_codex_jwt("acct-xyz"))
+    assert CodexAdapter().is_authenticated()
+    cred = CodexAdapter().get_credential()
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.extra_headers["originator"] == "codex_cli_rs"
+    assert cred.extra_headers["User-Agent"].startswith("codex_cli_rs/")
+    assert cred.extra_headers["ChatGPT-Account-ID"] == "acct-xyz"
+
+
+def test_codex_adapter_not_authenticated_when_empty(tmp_path, monkeypatch):
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": {}}))
+    assert not CodexAdapter().is_authenticated()

@@ -467,6 +467,11 @@ def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
     return headers
 
 
+# Public alias: the hermes_cli.proxy CodexAdapter needs these headers, but must
+# not import a private name across the agent/cli layer boundary.
+codex_cloudflare_headers = _codex_cloudflare_headers
+
+
 def _to_openai_base_url(base_url: str) -> str:
     """Normalize an Anthropic-style base URL to OpenAI-compatible format.
 
