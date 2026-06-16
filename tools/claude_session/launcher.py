@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -33,6 +36,22 @@ _STARTUP_ERROR_PATTERNS: "tuple[str, ...]" = (
 _STARTUP_GRACE_SECONDS = 15.0
 _STARTUP_POLL_SECONDS = 3.0
 
+# First-prompt submission can race claude's startup: the cs-ready SessionStart
+# hook fires before the TUI input handler is mounted, so the prompt (or its
+# Enter) can be dropped → no turn ever runs → cs-done never fires → 30-min
+# deadline → task auto-blocks. The robust fix: wait for an input-ready indicator
+# in the pane ("bypass permissions on" / "for shortcuts"), send the full prompt,
+# then check the transcript for a user record and re-send the FULL prompt if not
+# present (gated on "no turn started" → can never double-submit).
+_SUBMIT_RETRIES = 2
+_SUBMIT_RETRY_DELAY = 1.2
+# Worker sessions launch with MCP DISABLED: they use built-in tools + gh, not
+# claude's MCP servers, and the (remote) MCP startup init is what widens the
+# submit race above. --strict-mcp-config + an empty config file = zero servers.
+_EMPTY_MCP_CONFIG = Path.home() / ".hermes" / "state" / "claude_session" / "empty_mcp.json"
+_INPUT_READY_TIMEOUT = 12.0   # max wait for the TUI input box after cs-ready
+_INPUT_READY_POLL = 0.5
+
 
 class TmuxRunner:
     def run(self, args: List[str], timeout: Optional[float] = None) -> str:
@@ -57,9 +76,11 @@ class Launcher:
         self.tmux.run(["new-session", "-d", "-s", name, "-x", "200", "-y", "50"])
         if log_path:
             self.tmux.run(["pipe-pane", "-t", name, f"cat >> {shlex.quote(log_path)}"])
+        self._ensure_empty_mcp_config()
         claude_cmd = (
             f"cd {shlex.quote(workdir)} && claude --session-id {uuid} "
             f"--permission-mode bypassPermissions --model {shlex.quote(model)} "
+            f"--strict-mcp-config --mcp-config {shlex.quote(str(_EMPTY_MCP_CONFIG))} "
             f"--settings {shlex.quote(settings_json)}"
         )
         self.tmux.run(["send-keys", "-t", name, claude_cmd, "Enter"])
@@ -67,8 +88,16 @@ class Launcher:
         self.tmux.run(["wait-for", ready_channel(uuid)], timeout=ready_timeout)
 
     def send(self, *, name: str, uuid: str, prompt: str, done_timeout: float,
-             startup_grace: float = _STARTUP_GRACE_SECONDS) -> str:
-        self.send_text(name=name, text=prompt)
+             startup_grace: float = _STARTUP_GRACE_SECONDS,
+             workdir=None,
+             submit_retries: int = _SUBMIT_RETRIES,
+             submit_retry_delay: float = _SUBMIT_RETRY_DELAY) -> str:
+        if workdir is not None:
+            # first prompt: races startup → input-ready wait + verify/resend
+            self._submit_first_prompt(name=name, uuid=uuid, prompt=prompt, workdir=workdir,
+                                      retries=submit_retries, delay=submit_retry_delay)
+        else:
+            self.send_text(name=name, text=prompt)   # warm re-send: TUI already ready
         return self._wait_for_done(
             name=name, uuid=uuid, done_timeout=done_timeout,
             startup_grace=startup_grace,
@@ -101,6 +130,53 @@ class Launcher:
             self.tmux.run(["wait-for", chan], timeout=remaining)
         return chan
 
+    def _submit_first_prompt(self, *, name, uuid, prompt, workdir, retries, delay):
+        # SessionStart fires before the input handler is mounted, so input sent
+        # immediately can be dropped entirely. Wait for input-ready, send, then
+        # verify a turn started and re-send the FULL prompt if not. The re-send is
+        # GATED on "no turn started yet" → it can never double-submit.
+        self._await_input_ready(name=name)
+        self.send_text(name=name, text=prompt)
+        for _ in range(max(0, retries)):
+            if delay > 0:
+                time.sleep(delay)
+            if self._turn_started(uuid=uuid, workdir=workdir):
+                return
+            self.send_text(name=name, text=prompt)
+
+    def _await_input_ready(self, *, name, timeout=_INPUT_READY_TIMEOUT, poll=_INPUT_READY_POLL):
+        waited = 0.0
+        while waited < timeout:
+            try:
+                pane = self.capture(name=name, lines=40)
+            except Exception:
+                pane = ""
+            s = " ".join(pane.split()).lower()
+            if "bypass permissions on" in s or "for shortcuts" in s:
+                return
+            time.sleep(poll)
+            waited += poll
+        # proceed best-effort even if not detected
+
+    def _turn_started(self, *, uuid, workdir) -> bool:
+        # A submitted prompt writes a 'user' record to the session transcript
+        # (projects_dir/<encoded-workdir>/<uuid>.jsonl). Reliable, no double-submit.
+        try:
+            proj = re.sub(r"[/.]", "-", str(workdir))
+            path = self.projects_dir / proj / f"{uuid}.jsonl"
+            if not path.exists():
+                return False
+            for line in path.read_text(errors="replace").splitlines():
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if (o.get("type") or o.get("role")) == "user":
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _startup_error(self, *, name: str) -> Optional[str]:
         """Return the matched fatal-startup banner in the pane, or None."""
         try:
@@ -111,10 +187,7 @@ class Launcher:
         return next((p for p in _STARTUP_ERROR_PATTERNS if p in text), None)
 
     def send_text(self, *, name: str, text: str) -> None:
-        # -l = literal (no key-name lookup), -- = end of options (text may start
-        # with '-'). Submit with a SEPARATE Enter so the text isn't parsed as a
-        # key name. Used for prompts (via send) and for steer/slash input.
-        # Multi-line text must not contain submit-newlines.
+        # -l literal, -- end-of-opts; SEPARATE Enter to submit.
         self.tmux.run(["send-keys", "-t", name, "-l", "--", text])
         self.tmux.run(["send-keys", "-t", name, "Enter"])
 
@@ -131,6 +204,18 @@ class Launcher:
         # a momentarily-unqueryable session is self-healing (relaunched next run).
         out = self.tmux.run(["list-panes", "-t", name, "-F", "#{pane_dead}"])
         return out.strip().startswith("1") if out.strip() else True
+
+    @staticmethod
+    def _ensure_empty_mcp_config() -> None:
+        # Idempotently materialize the empty MCP config the launch command points
+        # at, so --mcp-config never references a missing file. Best-effort: if the
+        # write fails, claude surfaces its own config error rather than us hanging.
+        try:
+            if not _EMPTY_MCP_CONFIG.exists():
+                _EMPTY_MCP_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+                _EMPTY_MCP_CONFIG.write_text('{"mcpServers": {}}')
+        except OSError:
+            pass
 
     @staticmethod
     def turn_allowed(turns_used: int, *, max_turns: Optional[int]) -> bool:

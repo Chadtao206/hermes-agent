@@ -17,19 +17,42 @@ from .transcript import parse_transcript
 
 STATE_DIR = Path.home() / ".hermes" / "state" / "claude_session"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
-POOL_CAP = 3
+POOL_CAP = 8  # bumped 3→8 (2026-06-16): 3 was too small for pr-review LIVE (orchestrator + its dispatched fix workers + north-star/Boris all share this pool → pool_full collisions). Cap is re-read per `claude_session run` process (flock registry), so this takes effect on the next reservation — no gateway restart.
 
 
 def _emit(payload: dict) -> None:
     print(json.dumps(payload))
 
 
-def _print_fallback(task: str, workdir: str, max_turns, reason: str) -> dict:
+_EMPTY_MCP = STATE_DIR / "empty_mcp.json"
+
+
+def _ensure_empty_mcp() -> str:
+    # Idempotently materialize the empty MCP config; return its path.
+    try:
+        if not _EMPTY_MCP.exists():
+            _EMPTY_MCP.parent.mkdir(parents=True, exist_ok=True)
+            _EMPTY_MCP.write_text('{"mcpServers": {}}')
+    except OSError:
+        pass
+    return str(_EMPTY_MCP)
+
+
+def _print_fallback(task: str, workdir: str, max_turns, reason: str, timeout: float = 600.0) -> dict:
+    # Disable MCP here too (same as the interactive launcher): without it, the
+    # daemon's `claude -p` blocks on remote-MCP startup init (the "N setup issues:
+    # MCP" path) and TimeoutExpires before processing the prompt. This is the
+    # cron-agent hang — pr-review's agent runs via this print path when tmux isn't
+    # on the daemon PATH.
     cmd = ["claude", "-p", task, "--output-format", "json",
-           "--permission-mode", "bypassPermissions"]
+           "--permission-mode", "bypassPermissions",
+           "--strict-mcp-config", "--mcp-config", _ensure_empty_mcp()]
     if max_turns:
         cmd += ["--max-turns", str(max_turns)]
-    out = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=600)
+    # Honor the caller's timeout (≥60s floor) — a hardcoded 600s killed heavy
+    # cron-agent tasks (e.g. pr-review across 14 PRs) before they could finish.
+    out = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True,
+                         timeout=max(60.0, timeout))
     result = json.loads(out.stdout) if out.stdout.strip() else {}
     result["_fallback_reason"] = reason
     return result
@@ -68,7 +91,8 @@ def _parse_session(lp, sid: str, *, attempts: int = 6, interval: float = 0.05) -
 def _run(args, reg, tmux, lp) -> int:
     if decide_path(no_tmux=args.no_tmux, tmux_available=tmux_available(),
                    claude_version_ok=claude_version_ok()) is Decision.PRINT:
-        _emit(_print_fallback(args.task, args.workdir, args.max_turns, "preflight"))
+        _emit(_print_fallback(args.task, args.workdir, args.max_turns, "preflight",
+                              timeout=args.timeout))
         return 0
     reg.reap(now=time.time(), pane_dead=lambda n: lp.pane_dead(name=n),
              kill=lambda n: tmux.run(["kill-session", "-t", n]))
@@ -92,7 +116,8 @@ def _run(args, reg, tmux, lp) -> int:
                   settings_json=json.dumps(build_settings(sid, input_flag=flag)),
                   model=args.model, ready_timeout=min(60.0, args.timeout),
                   log_path=log_path)
-        lp.send(name=name, uuid=sid, prompt=args.task, done_timeout=args.timeout)
+        lp.send(name=name, uuid=sid, prompt=args.task, done_timeout=args.timeout,
+                workdir=args.workdir)
         ok = True
     except Exception as exc:  # any launch/send failure → drain, clean up, fall back
         _drain(tmux, sid)
@@ -102,7 +127,8 @@ def _run(args, reg, tmux, lp) -> int:
             reason = "startup_error"
         else:
             reason = f"launch_error:{type(exc).__name__}"
-        _emit(_print_fallback(args.task, args.workdir, args.max_turns, reason))
+        _emit(_print_fallback(args.task, args.workdir, args.max_turns, reason,
+                              timeout=args.timeout))
         return 0
     finally:
         if not ok:

@@ -30,6 +30,30 @@ class FakeTmux:
         return ""
 
 
+def test_print_fallback_disables_mcp(monkeypatch):
+    # The print/`claude -p` fallback (used when tmux isn't on the daemon PATH —
+    # the pr-review cron-agent path) must ALSO disable MCP, else it hangs on
+    # remote-MCP startup and TimeoutExpires.
+    captured = {}
+
+    class _R:
+        stdout = ('{"type":"result","subtype":"success","result":"ok",'
+                  '"session_id":"","num_turns":1,"total_cost_usd":0.0,"usage":{}}')
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["timeout"] = kw.get("timeout")
+        return _R()
+
+    monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
+    dispatch._print_fallback("do work", "/w", None, "preflight", timeout=1800)
+    cmd = captured["cmd"]
+    assert "--strict-mcp-config" in cmd
+    assert cmd[cmd.index("--mcp-config") + 1].endswith("empty_mcp.json")
+    # honors the caller's timeout instead of the old hardcoded 600s
+    assert captured["timeout"] == 1800
+
+
 def _args(*argv):
     return build_parser().parse_args(list(argv))
 

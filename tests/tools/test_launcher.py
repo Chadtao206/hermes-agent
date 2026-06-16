@@ -31,6 +31,13 @@ class FakeTmuxWithPane(FakeTmux):
         return super().run(args, timeout=timeout)
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    # The first-prompt submit-retry uses time.sleep between confirmation Enters;
+    # neutralize it so the suite stays fast and deterministic.
+    monkeypatch.setattr("tools.claude_session.launcher.time.sleep", lambda *a, **k: None)
+
+
 def test_launch_is_dialogfree_and_waits_plain(tmp_path):
     fake = FakeTmux([True])
     Launcher(tmux=fake, projects_dir=tmp_path).launch(
@@ -120,6 +127,73 @@ def test_send_startup_grace_zero_does_single_blocking_wait(tmp_path):
         name="t1", uuid="u1", prompt="do work", done_timeout=300, startup_grace=0)
     assert chan == "cs-done-u1"
     assert not any(c and c[0] == "capture-pane" for c in fake.calls)
+
+
+def test_launch_disables_mcp(tmp_path):
+    # Fix A: worker sessions launch with MCP off (--strict-mcp-config + empty
+    # config) so the remote-MCP startup init can't widen the submit race.
+    fake = FakeTmux([True])
+    Launcher(tmux=fake, projects_dir=tmp_path).launch(
+        name="t1", uuid="u1", workdir="/w", settings_json="{}",
+        model="opus", ready_timeout=5)
+    flat = " ".join(" ".join(c) for c in fake.calls)
+    assert "--strict-mcp-config" in flat
+    assert "--mcp-config" in flat
+    assert "empty_mcp.json" in flat
+
+
+def test_first_prompt_waits_for_input_ready(tmp_path):
+    # send(..., workdir=) triggers the robust first-prompt path: must call
+    # capture-pane to detect the ready indicator ("bypass permissions on")
+    # and then send the literal prompt.
+    fake = FakeTmuxWithPane([True], pane="bypass permissions on")
+    Launcher(tmux=fake, projects_dir=tmp_path).send(
+        name="t1", uuid="u1", prompt="do work", done_timeout=5,
+        workdir="/w", submit_retries=0)
+    assert any(c and c[0] == "capture-pane" for c in fake.calls)
+    assert ["send-keys", "-t", "t1", "-l", "--", "do work"] in fake.calls
+
+
+def test_first_prompt_resends_full_prompt_until_turn_starts(tmp_path):
+    # No transcript → _turn_started is False for every retry check → the full
+    # prompt is re-sent on each retry (initial + 2 retries = 3 literal sends).
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    fake = FakeTmuxWithPane([True], pane="bypass permissions on")
+    Launcher(tmux=fake, projects_dir=tmp_path).send(
+        name="t1", uuid="u1", prompt="do work", done_timeout=5,
+        workdir=str(wd), submit_retries=2)
+    literal_sends = [c for c in fake.calls
+                     if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
+    assert len(literal_sends) > 1  # initial + at least one resend
+
+
+def test_first_prompt_stops_once_turn_started(tmp_path):
+    # If the transcript already has a 'user' record, _turn_started returns True
+    # and the resend loop exits immediately → the literal prompt is sent EXACTLY
+    # ONCE (no double-submit). This is the critical safety invariant.
+    import re as _re
+    workdir = str(tmp_path / "wd")
+    proj_key = _re.sub(r"[/.]", "-", workdir)
+    proj_dir = tmp_path / "projects" / proj_key
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "u1.jsonl").write_text('{"type":"user","message":{}}\n')
+
+    fake = FakeTmuxWithPane([True], pane="bypass permissions on")
+    Launcher(tmux=fake, projects_dir=tmp_path / "projects").send(
+        name="t1", uuid="u1", prompt="do work", done_timeout=5,
+        workdir=workdir, submit_retries=2)
+    literal_sends = [c for c in fake.calls
+                     if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
+    assert len(literal_sends) == 1  # turn already started → no resend
+
+
+def test_send_text_default_is_single_enter(tmp_path):
+    # Steer/slash path (send_text directly) runs on a warm TUI → no retry, one Enter.
+    fake = FakeTmux([])
+    Launcher(tmux=fake, projects_dir=tmp_path).send_text(name="t1", text="/compact")
+    enters = [c for c in fake.calls if c == ["send-keys", "-t", "t1", "Enter"]]
+    assert len(enters) == 1
 
 
 def test_turn_allowed_cap():
