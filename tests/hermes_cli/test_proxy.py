@@ -1087,3 +1087,53 @@ def test_server_no_token_check_when_unset(monkeypatch):
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
     asyncio.run(run())
+
+
+def test_build_codex_proxy_plist_pins_global_home_and_crash_safe(tmp_path):
+    from hermes_cli.proxy.cli import build_proxy_plist
+    plist = build_proxy_plist(
+        python_path="/venv/bin/python", hermes_home="/Users/x/.hermes",
+        port=8645, proxy_token="tok123",
+    )
+    assert "ai.hermes.codex-proxy" in plist
+    assert "<string>proxy</string>" in plist and "<string>codex</string>" in plist
+    assert "/Users/x/.hermes" in plist                 # HERMES_HOME pinned
+    assert "HERMES_PROXY_TOKEN" in plist and "tok123" in plist
+    # crash-safe KeepAlive: restart on failure only, not unconditional <true/>
+    assert "SuccessfulExit" in plist
+    keepalive_section = plist.split("KeepAlive")[1].split("</dict>")[0]
+    assert "<true/>" not in keepalive_section
+    # I2+I3: WorkingDirectory and LimitLoadToSessionType must be present
+    assert "WorkingDirectory" in plist
+    assert "LimitLoadToSessionType" in plist
+    assert "Aqua" in plist and "Background" in plist
+
+
+def test_proxy_install_writes_plist_and_bootstraps(tmp_path, monkeypatch):
+    import hermes_cli.proxy.cli as pcli
+    from unittest.mock import MagicMock, patch
+    # Make guard pass: current home == global root
+    monkeypatch.setattr(pcli, "_global_hermes_root", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.auth.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))  # plist writes under tmp_path/Library/LaunchAgents
+    args = MagicMock(); args.port = 8645; args.token = "fixed-tok"
+    with patch.object(pcli.subprocess, "run",
+                      return_value=MagicMock(returncode=0, stderr=b"")) as mrun:
+        rc = pcli.cmd_proxy_install(args)
+    assert rc == 0
+    plist_file = tmp_path / "Library" / "LaunchAgents" / "ai.hermes.codex-proxy.plist"
+    assert plist_file.exists()
+    text = plist_file.read_text()
+    assert "fixed-tok" in text and "WorkingDirectory" in text
+    # bootstrap was invoked (bootout + bootstrap = 2 calls)
+    assert mrun.call_count >= 1
+    assert any("bootstrap" in " ".join(map(str, c.args[0])) for c in mrun.call_args_list)
+
+
+def test_proxy_install_refuses_named_profile(monkeypatch, tmp_path, capsys):
+    from unittest.mock import MagicMock
+    from hermes_cli.proxy.cli import cmd_proxy_install
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "ops"))
+    rc = cmd_proxy_install(MagicMock())
+    assert rc == 2
+    assert "global" in capsys.readouterr().err.lower()
