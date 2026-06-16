@@ -930,3 +930,29 @@ def test_server_injects_adapter_extra_headers():
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
     asyncio.run(run())
+
+
+def test_server_accepts_large_body():
+    async def run():
+        # Build a fake upstream that also accepts large bodies so we can
+        # isolate the proxy's client_max_size as the variable under test.
+        async def echo_large(request):
+            body = await request.read()
+            return web.json_response({"size": len(body)})
+
+        upstream_app = web.Application(client_max_size=64 * 1024 * 1024)
+        upstream_app.router.add_post("/v1/chat/completions", echo_large)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        big = "x" * (3 * 1024 * 1024)  # 3 MB, over aiohttp's 1 MB default
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions", json={"blob": big},
+                ) as resp:
+                    assert resp.status == 200, f"large body rejected: {resp.status}"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())

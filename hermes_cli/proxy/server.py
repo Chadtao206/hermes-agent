@@ -89,7 +89,9 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             "pip install 'hermes-agent[messaging]' or `pip install aiohttp`."
         )
 
-    app = web.Application()
+    # Codex Responses bodies (full conversation + encrypted-reasoning replay)
+    # routinely exceed aiohttp's 1 MB default client_max_size.
+    app = web.Application(client_max_size=64 * 1024 * 1024)
     # AppKey ensures forward-compat with future aiohttp versions that strip
     # bare-string keys.
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
