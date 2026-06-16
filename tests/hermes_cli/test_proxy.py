@@ -1018,3 +1018,72 @@ def test_registry_lists_codex():
 def test_get_adapter_returns_codex_instance():
     from hermes_cli.proxy.adapters.codex import CodexAdapter
     assert isinstance(get_adapter("codex"), CodexAdapter)
+
+
+def test_server_requires_token_when_configured(monkeypatch):
+    async def run():
+        monkeypatch.setenv("HERMES_PROXY_TOKEN", "s3cret")
+        adapter = FakeAdapter("http://unused.example/v1")
+        runner, base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base}/v1/chat/completions", json={},
+                                        headers={"Authorization": "Bearer wrong"}) as resp:
+                    assert resp.status == 401
+                    body = await resp.json()
+                    assert body["error"]["type"] == "proxy_unauthorized"
+        finally:
+            await runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_allows_matching_token(monkeypatch):
+    async def run():
+        monkeypatch.setenv("HERMES_PROXY_TOKEN", "s3cret")
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={},
+                                        headers={"Authorization": "Bearer s3cret"}) as resp:
+                    assert resp.status == 200
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_rejects_missing_auth_when_token_configured(monkeypatch):
+    async def run():
+        monkeypatch.setenv("HERMES_PROXY_TOKEN", "s3cret")
+        adapter = FakeAdapter("http://unused.example/v1")
+        runner, base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base}/v1/chat/completions", json={}) as resp:
+                    assert resp.status == 401
+                    body = await resp.json()
+                    assert body["error"]["type"] == "proxy_unauthorized"
+        finally:
+            await runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_no_token_check_when_unset(monkeypatch):
+    async def run():
+        monkeypatch.delenv("HERMES_PROXY_TOKEN", raising=False)
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={},
+                                        headers={"Authorization": "Bearer anything"}) as resp:
+                    assert resp.status == 200
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())

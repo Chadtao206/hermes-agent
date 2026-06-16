@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from typing import Optional
 
@@ -119,6 +120,16 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 f"Allowed: {allowed}",
                 code="path_not_allowed",
             )
+
+        required = os.environ.get("HERMES_PROXY_TOKEN", "").strip()
+        if required:
+            presented = (request.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if presented != required:
+                return _json_error(
+                    401,
+                    "Proxy bearer token missing or incorrect.",
+                    code="proxy_unauthorized",
+                )
 
         try:
             cred = adapter.get_credential()
