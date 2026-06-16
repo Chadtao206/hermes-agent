@@ -1,6 +1,7 @@
 import pytest
 
-from tools.claude_session.launcher import Launcher, HandshakeTimeout, StartupError
+from tools.claude_session.launcher import (
+    Launcher, HandshakeTimeout, StartupError, PromptNotAccepted)
 
 
 class FakeTmux:
@@ -142,36 +143,67 @@ def test_launch_disables_mcp(tmp_path):
     assert "empty_mcp.json" in flat
 
 
-def test_first_prompt_waits_for_input_ready(tmp_path):
+def test_first_prompt_waits_for_input_ready(tmp_path, monkeypatch):
     # send(..., workdir=) triggers the robust first-prompt path: must call
     # capture-pane to detect the ready indicator ("bypass permissions on")
-    # and then send the literal prompt.
+    # and then send the literal prompt. With the turn registering immediately,
+    # exactly one literal send happens.
     fake = FakeTmuxWithPane([True], pane="bypass permissions on")
-    Launcher(tmux=fake, projects_dir=tmp_path).send(
-        name="t1", uuid="u1", prompt="do work", done_timeout=5,
-        workdir="/w", submit_retries=0)
+    lp = Launcher(tmux=fake, projects_dir=tmp_path)
+    monkeypatch.setattr(lp, "_turn_started", lambda **k: True)
+    lp.send(name="t1", uuid="u1", prompt="do work", done_timeout=5, workdir="/w")
     assert any(c and c[0] == "capture-pane" for c in fake.calls)
     assert ["send-keys", "-t", "t1", "-l", "--", "do work"] in fake.calls
 
 
-def test_first_prompt_resends_full_prompt_until_turn_starts(tmp_path):
-    # No transcript → _turn_started is False for every retry check → the full
-    # prompt is re-sent on each retry (initial + 2 retries = 3 literal sends).
-    wd = tmp_path / "wd"
-    wd.mkdir()
+def test_first_prompt_resends_until_turn_starts(tmp_path, monkeypatch):
+    # The TUI input handler can stay unready for seconds under host load, so the
+    # first keystrokes are dropped. The submit loop must KEEP re-sending the full
+    # prompt every interval until the transcript shows a started turn — not just a
+    # fixed 2-3 tries. Here the turn registers on the 3rd check → 3 literal sends.
     fake = FakeTmuxWithPane([True], pane="bypass permissions on")
-    Launcher(tmux=fake, projects_dir=tmp_path).send(
-        name="t1", uuid="u1", prompt="do work", done_timeout=5,
-        workdir=str(wd), submit_retries=2)
-    literal_sends = [c for c in fake.calls
-                     if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
-    assert len(literal_sends) > 1  # initial + at least one resend
+    lp = Launcher(tmux=fake, projects_dir=tmp_path)
+    seen = {"n": 0}
+
+    def _started(**k):
+        seen["n"] += 1
+        return seen["n"] >= 3
+
+    monkeypatch.setattr(lp, "_turn_started", _started)
+    lp.send(name="t1", uuid="u1", prompt="do work", done_timeout=5, workdir="/w",
+            submit_deadline=60, submit_interval=2)
+    literal = [c for c in fake.calls
+               if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
+    assert len(literal) == 3  # initial + 2 resends, then the turn registered
+
+
+def test_first_prompt_clears_input_before_each_resend(tmp_path, monkeypatch):
+    # A dropped send can leave partial text in the box; each RESEND must clear the
+    # input (C-u) first so retries can't concatenate into a garbled prompt. The
+    # first send is NOT preceded by a clear.
+    fake = FakeTmuxWithPane([True], pane="bypass permissions on")
+    lp = Launcher(tmux=fake, projects_dir=tmp_path)
+    seen = {"n": 0}
+
+    def _started(**k):
+        seen["n"] += 1
+        return seen["n"] >= 2  # one resend before the turn registers
+
+    monkeypatch.setattr(lp, "_turn_started", _started)
+    lp.send(name="t1", uuid="u1", prompt="do work", done_timeout=5, workdir="/w",
+            submit_deadline=60, submit_interval=2)
+    seq = [tuple(c) for c in fake.calls if c[:3] == ["send-keys", "-t", "t1"]]
+    clear = ("send-keys", "-t", "t1", "C-u")
+    literal = ("send-keys", "-t", "t1", "-l", "--", "do work")
+    assert clear in seq
+    assert seq.index(clear) > seq.index(literal)   # not before the first send
+    assert seq.index(clear) < len(seq) - 1         # followed by the resend
 
 
 def test_first_prompt_stops_once_turn_started(tmp_path):
     # If the transcript already has a 'user' record, _turn_started returns True
-    # and the resend loop exits immediately → the literal prompt is sent EXACTLY
-    # ONCE (no double-submit). This is the critical safety invariant.
+    # and the loop exits after the FIRST send — exactly one literal send, no
+    # clears, no double-submit. Critical safety invariant.
     import re as _re
     workdir = str(tmp_path / "wd")
     proj_key = _re.sub(r"[/.]", "-", workdir)
@@ -181,11 +213,28 @@ def test_first_prompt_stops_once_turn_started(tmp_path):
 
     fake = FakeTmuxWithPane([True], pane="bypass permissions on")
     Launcher(tmux=fake, projects_dir=tmp_path / "projects").send(
-        name="t1", uuid="u1", prompt="do work", done_timeout=5,
-        workdir=workdir, submit_retries=2)
-    literal_sends = [c for c in fake.calls
-                     if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
-    assert len(literal_sends) == 1  # turn already started → no resend
+        name="t1", uuid="u1", prompt="do work", done_timeout=5, workdir=workdir)
+    literal = [c for c in fake.calls
+               if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
+    clears = [c for c in fake.calls if c == ["send-keys", "-t", "t1", "C-u"]]
+    assert len(literal) == 1  # turn already started → no resend
+    assert clears == []       # and no clear before the single send
+
+
+def test_first_prompt_raises_when_never_ingested(tmp_path, monkeypatch):
+    # If no turn ever starts within the submit deadline (TUI never accepted the
+    # prompt — e.g. host too loaded), raise PromptNotAccepted so the caller falls
+    # back to print mode promptly instead of blocking on cs-done for the whole
+    # done_timeout.
+    fake = FakeTmuxWithPane([], pane="bypass permissions on")
+    lp = Launcher(tmux=fake, projects_dir=tmp_path)
+    monkeypatch.setattr(lp, "_turn_started", lambda **k: False)
+    with pytest.raises(PromptNotAccepted):
+        lp.send(name="t1", uuid="u1", prompt="do work", done_timeout=300,
+                workdir="/w", submit_deadline=4, submit_interval=2)
+    literal = [c for c in fake.calls
+               if c == ["send-keys", "-t", "t1", "-l", "--", "do work"]]
+    assert len(literal) >= 2  # kept retrying before giving up
 
 
 def test_send_text_default_is_single_enter(tmp_path):

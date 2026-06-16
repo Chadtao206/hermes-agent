@@ -9,7 +9,7 @@ from pathlib import Path
 from . import pretrust
 from .cli import cmd_send_result_json
 from .hooks import build_settings, done_channel, ready_channel
-from .launcher import HandshakeTimeout, Launcher, StartupError, TmuxRunner
+from .launcher import HandshakeTimeout, Launcher, PromptNotAccepted, StartupError, TmuxRunner
 from .models import SUBTYPE_MAX_TURNS, SUBTYPE_NO_TRANSCRIPT, SessionRecord, TurnResult
 from .registry import Registry
 from .router import Decision, claude_version_ok, decide_path, tmux_available
@@ -121,7 +121,9 @@ def _run(args, reg, tmux, lp) -> int:
         ok = True
     except Exception as exc:  # any launch/send failure → drain, clean up, fall back
         _drain(tmux, sid)
-        if isinstance(exc, HandshakeTimeout):
+        if isinstance(exc, PromptNotAccepted):
+            reason = "prompt_not_accepted"
+        elif isinstance(exc, HandshakeTimeout):
             reason = "handshake"
         elif isinstance(exc, StartupError):
             reason = "startup_error"

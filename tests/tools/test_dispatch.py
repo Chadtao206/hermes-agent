@@ -30,6 +30,14 @@ class FakeTmux:
         return ""
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    # The first-prompt submit loop and transcript settle-poll use time.sleep;
+    # neutralize so the suite stays fast and deterministic.
+    monkeypatch.setattr("tools.claude_session.launcher.time.sleep", lambda *a, **k: None)
+    monkeypatch.setattr("tools.claude_session.dispatch.time.sleep", lambda *a, **k: None)
+
+
 def test_print_fallback_disables_mcp(monkeypatch):
     # The print/`claude -p` fallback (used when tmux isn't on the daemon PATH —
     # the pr-review cron-agent path) must ALSO disable MCP, else it hangs on
@@ -181,16 +189,27 @@ def test_start_reserves_and_launches(tmp_path, capsys, monkeypatch):
     assert reg.get("warm1") is not None
 
 
-def test_run_oneshot_no_transcript_cleans_up(tmp_path, capsys, monkeypatch):
+def test_run_oneshot_no_transcript_falls_back_and_cleans_up(tmp_path, capsys, monkeypatch):
+    # First prompt never produces a transcript (turn never starts) → the submit
+    # loop exhausts its deadline → PromptNotAccepted → print fallback (reason
+    # 'prompt_not_accepted'), and the oneshot session is torn down. The fallback
+    # subprocess is mocked so no real `claude -p` runs.
     monkeypatch.setattr(dispatch, "tmux_available", lambda: True)
     monkeypatch.setattr(dispatch, "claude_version_ok", lambda: True)
     monkeypatch.setattr(dispatch.pretrust, "ensure_trusted", lambda *a, **k: True)
-    fake, reg, lp = _deps(tmp_path, wait_results=[True, True])  # ready + done
+
+    class _R:
+        stdout = ('{"type":"result","subtype":"success","result":"fb",'
+                  '"session_id":"","num_turns":1,"total_cost_usd":0.0,"usage":{}}')
+
+    monkeypatch.setattr(dispatch.subprocess, "run", lambda *a, **k: _R())
+
+    fake, reg, lp = _deps(tmp_path, wait_results=[True])  # cs-ready fires; no transcript ever
     rc = dispatch.run(
         _args("run", "--task", "hi", "--workdir", str(tmp_path),
               "--oneshot", "--timeout", "5"),
         reg=reg, tmux=fake, lp=lp)
     out = json.loads(capsys.readouterr().out)
-    assert out["subtype"] == "error_transcript_unavailable"  # no real transcript
-    assert reg.list() == []   # oneshot tore it down
+    assert out["_fallback_reason"] == "prompt_not_accepted"
+    assert reg.list() == []   # session torn down on the failure path
     assert rc == 0

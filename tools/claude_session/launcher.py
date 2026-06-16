@@ -24,6 +24,18 @@ class StartupError(RuntimeError):
     """
 
 
+class PromptNotAccepted(RuntimeError):
+    """The first prompt never produced a started turn within the submit deadline.
+
+    Claude Code's TUI input handler can stay unready to ingest keystrokes for
+    seconds-to-tens-of-seconds after the SessionStart hook fires — and that
+    window scales with host CPU load. The submit loop re-sends the full prompt
+    until the transcript shows a started turn; if that never happens within the
+    deadline, this is raised so the caller falls back to print mode promptly
+    instead of blocking on cs-done for the entire done_timeout.
+    """
+
+
 # Banners Claude Code prints for a fatal startup condition that leaves the REPL
 # idle without running a turn. Matched case-insensitively against the captured
 # pane, and only during the startup grace window after a prompt is sent, so
@@ -36,15 +48,20 @@ _STARTUP_ERROR_PATTERNS: "tuple[str, ...]" = (
 _STARTUP_GRACE_SECONDS = 15.0
 _STARTUP_POLL_SECONDS = 3.0
 
-# First-prompt submission can race claude's startup: the cs-ready SessionStart
-# hook fires before the TUI input handler is mounted, so the prompt (or its
-# Enter) can be dropped → no turn ever runs → cs-done never fires → 30-min
-# deadline → task auto-blocks. The robust fix: wait for an input-ready indicator
-# in the pane ("bypass permissions on" / "for shortcuts"), send the full prompt,
-# then check the transcript for a user record and re-send the FULL prompt if not
-# present (gated on "no turn started" → can never double-submit).
-_SUBMIT_RETRIES = 2
-_SUBMIT_RETRY_DELAY = 1.2
+# First-prompt submission races claude's startup: the cs-ready SessionStart hook
+# fires BEFORE the TUI input handler can ingest keystrokes, so an early prompt (or
+# its Enter) is dropped → no turn → cs-done never fires → 30-min deadline → block.
+# The "bypass permissions on" pane marker appears within ~50ms but is NOT a
+# reliable ingestion signal: under host CPU load the handler can stay unready for
+# seconds-to-tens-of-seconds (measured: a manual keystroke landed only ~57s into a
+# loaded daemon-launched session). So a fixed 2-3 retries over ~2.4s is far too
+# short. The robust fix: re-send the FULL prompt every interval — clearing the
+# input first so a partial prior send can't concatenate — until the transcript
+# shows a started 'user' record (the authoritative ingestion signal, so we can
+# never double-submit a started turn), up to a generous deadline. If the deadline
+# elapses with no turn, raise PromptNotAccepted so the caller falls back to print.
+_SUBMIT_READY_DEADLINE = 60.0   # keep re-sending the first prompt up to this long
+_SUBMIT_RESEND_INTERVAL = 2.0   # seconds between resends / transcript checks
 # Worker sessions launch with MCP DISABLED: they use built-in tools + gh, not
 # claude's MCP servers, and the (remote) MCP startup init is what widens the
 # submit race above. --strict-mcp-config + an empty config file = zero servers.
@@ -90,12 +107,12 @@ class Launcher:
     def send(self, *, name: str, uuid: str, prompt: str, done_timeout: float,
              startup_grace: float = _STARTUP_GRACE_SECONDS,
              workdir=None,
-             submit_retries: int = _SUBMIT_RETRIES,
-             submit_retry_delay: float = _SUBMIT_RETRY_DELAY) -> str:
+             submit_deadline: float = _SUBMIT_READY_DEADLINE,
+             submit_interval: float = _SUBMIT_RESEND_INTERVAL) -> str:
         if workdir is not None:
-            # first prompt: races startup → input-ready wait + verify/resend
+            # first prompt: races startup → input-ready wait + resend-until-ingested
             self._submit_first_prompt(name=name, uuid=uuid, prompt=prompt, workdir=workdir,
-                                      retries=submit_retries, delay=submit_retry_delay)
+                                      deadline=submit_deadline, interval=submit_interval)
         else:
             self.send_text(name=name, text=prompt)   # warm re-send: TUI already ready
         return self._wait_for_done(
@@ -130,19 +147,36 @@ class Launcher:
             self.tmux.run(["wait-for", chan], timeout=remaining)
         return chan
 
-    def _submit_first_prompt(self, *, name, uuid, prompt, workdir, retries, delay):
-        # SessionStart fires before the input handler is mounted, so input sent
-        # immediately can be dropped entirely. Wait for input-ready, send, then
-        # verify a turn started and re-send the FULL prompt if not. The re-send is
-        # GATED on "no turn started yet" → it can never double-submit.
+    def _submit_first_prompt(self, *, name, uuid, prompt, workdir, deadline, interval):
+        # SessionStart fires before the input handler can ingest keystrokes, and
+        # that unready window scales with host load (the pane marker is not a
+        # reliable signal). So re-send the FULL prompt every `interval`, clearing
+        # any partially-landed input first, until the transcript shows a started
+        # turn (authoritative → never double-submits a started turn) or `deadline`
+        # elapses. On deadline, raise so the caller falls back to print mode fast.
         self._await_input_ready(name=name)
-        self.send_text(name=name, text=prompt)
-        for _ in range(max(0, retries)):
-            if delay > 0:
-                time.sleep(delay)
+        elapsed = 0.0
+        attempts = 0
+        while True:
+            if attempts > 0:
+                self._clear_input(name=name)
+            self.send_text(name=name, text=prompt)
+            attempts += 1
+            time.sleep(interval)
             if self._turn_started(uuid=uuid, workdir=workdir):
                 return
-            self.send_text(name=name, text=prompt)
+            elapsed += interval
+            if elapsed >= deadline:
+                raise PromptNotAccepted(
+                    f"{name}: no turn after {attempts} submits in ~{elapsed:.0f}s")
+
+    def _clear_input(self, *, name: str) -> None:
+        # Drop any partially-landed keystrokes from a prior dropped send before
+        # retyping, so resends can't concatenate into a garbled prompt. C-u kills
+        # the input line in Claude Code's TUI; a no-op when the box is already
+        # empty (and itself dropped when the TUI is unready — but so is the resend
+        # that follows, so they stay consistent).
+        self.tmux.run(["send-keys", "-t", name, "C-u"])
 
     def _await_input_ready(self, *, name, timeout=_INPUT_READY_TIMEOUT, poll=_INPUT_READY_POLL):
         waited = 0.0
