@@ -166,6 +166,36 @@ class TestClaudeSessionClientIntegration:
         from tools.claude_session.cli import build_parser
         assert build_parser is not None
 
+    def test_to_cli_model_normalizes_dot_form(self):
+        """dot->dash for Claude ids; aliases and None pass through unchanged."""
+        assert ClaudeSessionClient._to_cli_model("claude-opus-4.8") == "claude-opus-4-8"
+        assert ClaudeSessionClient._to_cli_model("opus") == "opus"
+        assert ClaudeSessionClient._to_cli_model(None) is None
+
+    @pytest.mark.skipif(
+        not _can_import_claude_session(),
+        reason="claude_session module not available"
+    )
+    def test_run_task_passes_normalized_model_to_dispatch(self, monkeypatch):
+        """A dot-form config model is repaired to the dash form `claude --model`
+        accepts before reaching dispatch. Regression for cron-dispatched agents
+        that bypass the CLI's model normalization and would otherwise park the
+        REPL on a "model may not exist" error."""
+        captured = {}
+
+        def fake_dispatch_run(args):
+            captured["model"] = getattr(args, "model", None)
+            print(json.dumps({
+                "type": "result", "subtype": "ok", "result": "done",
+                "session_id": "s", "num_turns": 1, "total_cost_usd": 0.0,
+                "usage": {},
+            }))
+
+        monkeypatch.setattr("tools.claude_session.dispatch.run", fake_dispatch_run)
+        client = ClaudeSessionClient(model="claude-opus-4.8", cwd="/tmp")
+        client._run_task("do work", timeout=10)
+        assert captured["model"] == "claude-opus-4-8"
+
     @pytest.mark.integration
     @pytest.mark.timeout(0)
     def test_run_task_live(self):

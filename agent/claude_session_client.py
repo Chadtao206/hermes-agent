@@ -151,6 +151,25 @@ class ClaudeSessionClient:
         numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
         return max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
 
+    @staticmethod
+    def _to_cli_model(model: str | None) -> str | None:
+        """Translate a configured model id into the form ``claude --model`` accepts.
+
+        Claude Code takes Anthropic's native dash-form ids (``claude-opus-4-8``)
+        or aliases (``opus``), not the dot form (``claude-opus-4.8``). The CLI
+        normalizes this for interactive/chat-driven agents, but callers that
+        bypass that path (e.g. cron-dispatched agents) would otherwise pass the
+        dot form straight through, parking the REPL on a "model may not exist"
+        error. Normalizing here covers every caller that reaches dispatch.
+        """
+        if not model:
+            return model
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            return normalize_model_for_provider(model, "claude-session")
+        except Exception:
+            return model
+
     def _run_task(self, task: str, timeout: float, model: str | None = None) -> dict:
         """Run a task via claude_session dispatch.
 
@@ -184,7 +203,7 @@ class ClaudeSessionClient:
             args_list.extend(["--max-turns", str(self._max_turns)])
         if self._max_budget_usd:
             args_list.extend(["--max-budget-usd", str(self._max_budget_usd)])
-        effective_model = model or self._model
+        effective_model = self._to_cli_model(model or self._model)
         if effective_model:
             args_list.extend(["--model", effective_model])
 
