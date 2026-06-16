@@ -309,6 +309,12 @@ def _resolve_runtime_from_pool_entry(
     if provider == "openai-codex":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_CODEX_BASE_URL
+    elif provider == "codex-proxy":
+        # Local Codex proxy: speaks the Responses API to chatgpt.com via the
+        # proxy on localhost. Must be codex_responses (not the chat_completions
+        # default) or the proxy 404s /v1/chat/completions.
+        api_mode = "codex_responses"
+        base_url = base_url or "http://127.0.0.1:8645/v1"
     elif provider == "xai-oauth":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_XAI_OAUTH_BASE_URL
