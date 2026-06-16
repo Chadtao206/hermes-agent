@@ -140,6 +140,11 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
             fwd_headers = _filter_request_headers(request.headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            if active_cred.extra_headers:
+                fwd_headers.update({
+                    k: v for k, v in active_cred.extra_headers.items()
+                    if k.lower() not in _HOP_BY_HOP_HEADERS
+                })
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s (body=%d bytes)",

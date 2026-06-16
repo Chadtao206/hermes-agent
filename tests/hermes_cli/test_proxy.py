@@ -642,6 +642,8 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "path": request.path,
             "auth": request.headers.get("Authorization"),
             "body": body.decode("utf-8") if body else "",
+            "originator": request.headers.get("originator"),
+            "acct": request.headers.get("ChatGPT-Account-ID"),
         })
         return web.json_response({"echoed": True, "path": request.path})
 
@@ -704,6 +706,7 @@ def test_server_forwards_chat_completions():
             req = captured["requests"][0]
             assert req["auth"] == "Bearer real-portal-key"
             assert "Hermes-4-70B" in req["body"]
+            assert req.get("originator") is None
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
@@ -899,3 +902,31 @@ def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypa
     assert rc == 2
     err = capsys.readouterr().err
     assert "hermes auth add nous" in err
+
+
+def test_server_injects_adapter_extra_headers():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+
+        class HeaderAdapter(FakeAdapter):
+            def get_credential(self):
+                return UpstreamCredential(
+                    bearer="real", base_url=f"{upstream_base}/v1",
+                    extra_headers={"originator": "codex_cli_rs", "ChatGPT-Account-ID": "acct-1"},
+                )
+
+        adapter = HeaderAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={}) as resp:
+                    assert resp.status == 200
+            req = captured["requests"][0]
+            assert req["auth"] == "Bearer real"
+            assert req["originator"] == "codex_cli_rs"
+            assert req["acct"] == "acct-1"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())
