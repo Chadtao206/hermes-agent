@@ -4011,6 +4011,10 @@ def _resolve_strict_vision_backend(
         # model is used.  There is no safe default Codex model (shifting
         # allow-list); callers must specify via auxiliary.<task>.model.
         return resolve_provider_client("openai-codex", model, is_vision=True)
+    if provider == "codex-proxy":
+        # codex-proxy shares the same Codex backend as openai-codex; route
+        # through the proxy client so the real OAuth token is injected server-side.
+        return resolve_provider_client("codex-proxy", model, is_vision=True)
     if provider == "anthropic":
         return _try_anthropic()
     if provider == "custom":

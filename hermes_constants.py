@@ -469,3 +469,8 @@ FINISH_REASON_LENGTH = "length"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
+
+# Default base URL for the local Codex proxy (hermes proxy).
+# The proxy forwards Responses API requests to chatgpt.com's Codex backend
+# and attaches the real OpenAI Codex OAuth token server-side.
+DEFAULT_CODEX_PROXY_BASE_URL = "http://127.0.0.1:8645/v1"

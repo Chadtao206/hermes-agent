@@ -1642,7 +1642,9 @@ def get_model_context_length(
     # /models endpoint may report a provider-imposed limit (e.g. Copilot
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
-    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
+    # codex-proxy is excluded: its localhost URL looks like a custom endpoint
+    # but context must be resolved via the Codex /models probe at step 5c.
+    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url) and provider != "codex-proxy":
         context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if context_length is not None:
             return context_length
@@ -1727,6 +1729,23 @@ def get_model_context_length(
             if base_url:
                 save_context_length(model, base_url, codex_ctx)
             return codex_ctx
+    elif effective_provider == "codex-proxy":
+        # codex-proxy shares the same Codex backend as openai-codex (same token,
+        # same /models endpoint, same ~272K context cap). The caller's api_key is
+        # only the dummy HERMES_PROXY_TOKEN bearer — not an OAuth token — so we
+        # must resolve the real global openai-codex access token separately.
+        try:
+            from hermes_cli.auth import resolve_codex_runtime_credentials
+            _creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
+            _real_token = _creds.get("api_key") or ""
+            if _real_token:
+                codex_ctx = _resolve_codex_oauth_context_length(model, access_token=_real_token)
+                if codex_ctx:
+                    if base_url:
+                        save_context_length(model, base_url, codex_ctx)
+                    return codex_ctx
+        except Exception:
+            pass  # Fall through to models.dev if credential resolution fails
     if effective_provider == "gmi" and base_url:
         # GMI exposes authoritative context_length via /models, but it is not
         # in models.dev yet. Preserve that higher-fidelity endpoint lookup.

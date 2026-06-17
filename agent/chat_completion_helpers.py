@@ -1105,6 +1105,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
         if fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
+        elif fb_provider == "codex-proxy":
+            # codex-proxy shares the Codex Responses API backend; use the
+            # same api_mode as openai-codex or the proxy 404s on /chat/completions.
+            fb_api_mode = "codex_responses"
         elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
             fb_api_mode = "anthropic_messages"
         elif _fb_is_azure:
