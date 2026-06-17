@@ -406,6 +406,59 @@ class TestTickProfilePartition:
         assert os.environ["HERMES_HOME"] == str(root)
         assert sched._get_hermes_home() == root
 
+    def test_profile_home_does_not_leak_to_concurrent_thread(
+        self, isolated_cron_profile_home, monkeypatch
+    ):
+        """A profile job's home override must stay thread-local.
+
+        Regression: ``_job_profile_context`` used to also mutate the
+        process-global ``cron.scheduler._hermes_home``. A profile cron
+        (cron-seq pool) running concurrently with a profile-less cron
+        (cron-parallel pool) then leaked the profile home into the parallel
+        job, which resolved its *model* from the profile config
+        (e.g. ``claude-opus-4-8``) while its *provider* stayed at the root
+        default (e.g. ``codex-proxy``) — an incompatible pair the Codex/ChatGPT
+        proxy rejects with HTTP 400. The home override must only be visible in
+        the job's own thread (via the context-local ``set_hermes_home_override``),
+        never to concurrently-running jobs on another thread.
+        """
+        import threading
+        import cron.scheduler as sched
+
+        root, profile_home = isolated_cron_profile_home
+        monkeypatch.setattr(sched, "_hermes_home", None)
+
+        entered = threading.Event()
+        release = threading.Event()
+        observed: dict = {}
+
+        def profile_thread():
+            with sched._job_profile_context("job-a", "support") as resolved:
+                observed["resolved_profile"] = resolved
+                # Inside its own thread the profile home is active.
+                observed["same_thread_home"] = str(sched._get_hermes_home())
+                entered.set()
+                release.wait(timeout=5)
+
+        def parallel_thread():
+            # Run concurrently *while* the profile context is still open.
+            entered.wait(timeout=5)
+            observed["other_thread_home"] = str(sched._get_hermes_home())
+            release.set()
+
+        t_seq = threading.Thread(target=profile_thread, name="cron-seq_0")
+        t_par = threading.Thread(target=parallel_thread, name="cron-parallel_0")
+        t_seq.start()
+        t_par.start()
+        t_par.join(timeout=5)
+        t_seq.join(timeout=5)
+
+        assert observed["resolved_profile"] == "support"
+        # The profile job sees its own profile home in its own thread.
+        assert observed["same_thread_home"] == str(profile_home.resolve())
+        # A concurrent job on a different thread must NOT see the profile home.
+        assert observed["other_thread_home"] == str(root)
+
     def test_profile_jobs_run_sequentially(self, isolated_cron_profile_home, monkeypatch):
         import threading
         import cron.scheduler as sched

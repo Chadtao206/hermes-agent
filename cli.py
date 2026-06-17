@@ -2799,18 +2799,63 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
     return message, deduped
 
 
+# Final-response/result signatures of an INFRA/transient abort (the agent loop
+# failed or never did real work) as opposed to a genuine did-work-but-no-closeout
+# protocol violation. Matched case-insensitively against the worker's final text.
+_WORKER_INFRA_ABORT_SIGNATURES = (
+    "claude session error", "pool_full", "api call failed", "authentication",
+    "token_invalidated", "rate limit", "http 401", "http 429",
+    "billing or credits", "credits exhausted", "invalid api response",
+    "provider error", "connection error",
+)
+
+
+def _worker_turn_is_infra_abort(
+    response: str,
+    result: Optional[dict[str, Any]],
+) -> bool:
+    """True when an unclosed worker turn reflects an INFRA/transient abort rather
+    than a genuine closeout protocol violation.
+
+    A worker that completes a task always makes tool calls and closes out; if we
+    reach the guard with the task still running AND the loop failed / produced no
+    usable output (empty response, ``failed``/``partial`` result, or a known
+    provider/session error signature), the worker never did real work. Those are
+    RETRYABLE infra failures (provider 401, pool_full, a launch race, a timeout)
+    and must NOT be recorded as the sticky ``protocol_violation_clean_exit`` —
+    which is reserved for a worker that DID work but forgot to call
+    kanban_complete/kanban_block.
+    """
+    result = result or {}
+    if result.get("failed") or result.get("partial"):
+        return True
+    if (result.get("error") or "").strip():
+        return True
+    text = (response or "").strip()
+    if not text:
+        return True
+    low = text.lower()
+    return any(sig in low for sig in _WORKER_INFRA_ABORT_SIGNATURES)
+
+
 def _auto_block_unclosed_kanban_worker_turn(
     response: str,
     result: Optional[dict[str, Any]],
 ) -> bool:
-    """Auto-block a one-shot kanban worker that returned prose without closeout.
+    """Close out a one-shot kanban worker whose task is still running at exit.
 
-    This is a CLI-side guardrail for dispatched workers.  Normal successful
-    workers call ``kanban_complete``/``kanban_block`` during the turn, leaving
-    nothing for this helper to do.  If the model returns a final answer while
-    the task is still running, block it now with a protocol-violation event so
-    the dispatcher does not later classify the same run as a vague ``pid not
-    alive`` crash.
+    CLI-side guardrail for dispatched workers.  Normal successful workers call
+    ``kanban_complete``/``kanban_block`` during the turn, leaving nothing to do.
+    If the worker exits with the task still running, classify WHY:
+
+    * **infra/transient abort** (the loop failed or never did real work) → record
+      a RETRYABLE failure with the real cause via ``record_task_failure`` so a
+      transient provider 401 / ``pool_full`` / launch race / timeout recovers
+      instead of becoming a sticky, diagnostic-free protocol-violation block.
+    * **genuine closeout violation** (did real work, returned prose, but no
+      terminal tool call) → the sticky ``protocol_violation_clean_exit`` block, so
+      the dispatcher does not later classify the run as a vague ``pid not alive``
+      crash.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
@@ -2827,11 +2872,29 @@ def _auto_block_unclosed_kanban_worker_turn(
         os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or ""
     ).strip() or None
 
+    infra = _worker_turn_is_infra_abort(response, result)
     try:
         from hermes_cli.kanban.store import kanban_store as _kanban_store
 
         store = _kanban_store(board=None)
         try:
+            if infra:
+                err = (
+                    (result or {}).get("error")
+                    or (response or "").strip()[:500]
+                    or "worker exited without progress or closeout"
+                )
+                return bool(
+                    store.record_task_failure(
+                        task_id,
+                        f"worker exited without closeout after an aborted turn: {err}",
+                        outcome="worker_clean_exit_no_progress",
+                        event_payload_extra={
+                            "source": "cli_closeout_guard",
+                            "classification": "infra_abort_no_closeout",
+                        },
+                    )
+                )
             return bool(
                 store.auto_block_unclosed_worker_turn(
                     task_id,
@@ -2847,7 +2910,7 @@ def _auto_block_unclosed_kanban_worker_turn(
                 pass
     except Exception as exc:
         logging.warning("kanban closeout guard failed for %s: %s", task_id, exc)
-        return False
+    return False
 
 
 class ChatConsole:

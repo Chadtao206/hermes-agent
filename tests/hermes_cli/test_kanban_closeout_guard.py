@@ -120,8 +120,10 @@ def test_cli_guard_auto_blocks_from_kanban_worker_env(kanban_home, monkeypatch):
         assert task.status == "blocked"
 
 
-def test_cli_guard_routes_through_backend_store(monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_backend_store")
+def test_cli_guard_genuine_no_closeout_routes_to_sticky_block(monkeypatch):
+    # A worker that DID real work (real prose, no failure signal) but forgot the
+    # terminal closeout is the genuine protocol violation → sticky block.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_genuine")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claimer:42")
 
@@ -136,14 +138,99 @@ def test_cli_guard_routes_through_backend_store(monkeypatch):
     from cli import _auto_block_unclosed_kanban_worker_turn
 
     assert _auto_block_unclosed_kanban_worker_turn(
-        "API call failed after 3 retries: Connection error.",
-        {"completed": False, "failed": True},
+        "Implemented the feature, added tests, pushed the branch — all green.",
+        {"completed": True},
     ) is True
 
     fake_store.auto_block_unclosed_worker_turn.assert_called_once_with(
-        "t_backend_store",
-        final_response="API call failed after 3 retries: Connection error.",
+        "t_genuine",
+        final_response="Implemented the feature, added tests, pushed the branch — all green.",
         expected_run_id=42,
         expected_claim_lock="claimer:42",
     )
+    fake_store.record_task_failure.assert_not_called()
     fake_store.close.assert_called_once_with()
+
+
+def test_cli_guard_infra_abort_routes_to_retryable_failure(monkeypatch):
+    # A failed/aborted worker turn (the worker never did real work) must be
+    # recorded as a RETRYABLE failure carrying the real cause — NOT the sticky,
+    # misleading protocol_violation_clean_exit block.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_backend_store")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claimer:42")
+
+    fake_store = MagicMock()
+    fake_store.record_task_failure.return_value = False  # re-queued (retry), not exhausted
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban.store.kanban_store",
+        lambda board=None: fake_store,
+    )
+
+    from cli import _auto_block_unclosed_kanban_worker_turn
+
+    assert _auto_block_unclosed_kanban_worker_turn(
+        "API call failed after 3 retries: Connection error.",
+        {"completed": False, "failed": True},
+    ) is False
+
+    fake_store.record_task_failure.assert_called_once()
+    args, kwargs = fake_store.record_task_failure.call_args
+    assert args[0] == "t_backend_store"
+    assert "Connection error" in args[1] and "aborted turn" in args[1]
+    assert kwargs["outcome"] == "worker_clean_exit_no_progress"
+    fake_store.auto_block_unclosed_worker_turn.assert_not_called()
+    fake_store.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("response,result", [
+    ("", {"completed": False}),                                  # empty exit, no work done
+    ("some partial text", {"error": "Operation interrupted during retry"}),  # error field set
+    ("Claude session error: pool_full", {"completed": True}),    # session pool exhausted
+    ("Error code: 401 - token_invalidated", {"completed": True}),  # provider auth (no failed flag)
+    ("API call failed after 3 retries", {"partial": True}),      # partial/truncated
+])
+def test_cli_guard_classifies_infra_aborts_as_retryable(monkeypatch, response, result):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "c:1")
+
+    fake_store = MagicMock()
+    fake_store.record_task_failure.return_value = False
+    monkeypatch.setattr(
+        "hermes_cli.kanban.store.kanban_store", lambda board=None: fake_store
+    )
+
+    from cli import _auto_block_unclosed_kanban_worker_turn
+
+    _auto_block_unclosed_kanban_worker_turn(response, result)
+    fake_store.record_task_failure.assert_called_once()
+    fake_store.auto_block_unclosed_worker_turn.assert_not_called()
+
+
+def test_cli_guard_infra_abort_not_labeled_protocol_violation(kanban_home, monkeypatch):
+    # End-to-end on the real (sqlite) store: an infra abort must NOT emit a
+    # protocol_violation event and must NOT leave the task running.
+    with kb.connect() as conn:
+        tid, run_id, claim_lock = _claimed_task(conn)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+
+    from cli import _auto_block_unclosed_kanban_worker_turn
+
+    _auto_block_unclosed_kanban_worker_turn(
+        "", {"failed": True, "error": "Error code: 401 - token_invalidated"}
+    )
+
+    with kb.connect() as conn:
+        pv = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_events WHERE task_id=? AND kind='protocol_violation'",
+            (tid,),
+        ).fetchone()
+        assert pv["c"] == 0  # not mislabeled as a protocol violation
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status != "running"  # the retry-aware path acted (re-queued/failed), not left hanging
