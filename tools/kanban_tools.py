@@ -33,6 +33,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import subprocess
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
@@ -398,6 +400,84 @@ def _task_summary_dict_store(store, task) -> dict[str, Any]:
         "child_count": len(children),
         "rollup_child_count": len(rollup_children),
     }
+
+
+# ---------------------------------------------------------------------------
+# Third-party PR write guard
+# ---------------------------------------------------------------------------
+
+_EXPECTED_PR_AUTHOR = os.environ.get("HERMES_PR_GUARD_EXPECTED_AUTHOR", "Chadtao206")
+_PR_WRITE_ASSIGNEES = {"engineer", "andrej"}
+_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+_PR_SHORTHAND_RE = re.compile(r"\b([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)\b")
+_PR_AUTHOR_CACHE: dict[tuple[str, str, str], str] = {}
+
+
+def _extract_github_pr_refs(*parts: object) -> list[tuple[str, str, str]]:
+    seen: set[tuple[str, str, str]] = set()
+    refs: list[tuple[str, str, str]] = []
+    for part in parts:
+        for owner, repo, num in _PR_URL_RE.findall(str(part or "")):
+            ref = (owner, repo, num)
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+        for owner, repo, num in _PR_SHORTHAND_RE.findall(str(part or "")):
+            ref = (owner, repo, num)
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+    return refs
+
+
+def _github_pr_author(owner: str, repo: str, num: str) -> str:
+    """Return PR author login using the daemon-safe gh wrapper.
+
+    This guard is intentionally fail-closed: if automation cannot prove the PR
+    is Chad-owned, it must not create an engineer lane that may push to it.
+    """
+    key = (owner, repo, num)
+    if key in _PR_AUTHOR_CACHE:
+        return _PR_AUTHOR_CACHE[key]
+    ghx = os.environ.get("HERMES_PR_GUARD_GH") or "/Users/ctao/.hermes/scripts/pr/ghx.sh"
+    if not os.path.exists(ghx):
+        raise RuntimeError(f"GitHub wrapper unavailable at {ghx}")
+    cp = subprocess.run(
+        [ghx, "pr", "view", num, "-R", f"{owner}/{repo}", "--json", "author", "--jq", ".author.login"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError((cp.stderr or cp.stdout or "gh pr view failed").strip()[:300])
+    author = (cp.stdout or "").strip()
+    if not author:
+        raise RuntimeError("GitHub returned an empty PR author")
+    _PR_AUTHOR_CACHE[key] = author
+    return author
+
+
+def _third_party_pr_write_guard(title: object, body: object, assignee: object) -> Optional[str]:
+    if str(assignee or "").lower() not in _PR_WRITE_ASSIGNEES:
+        return None
+    refs = _extract_github_pr_refs(title, body)
+    if not refs:
+        return None
+    problems: list[str] = []
+    for owner, repo, num in refs:
+        try:
+            author = _github_pr_author(owner, repo, num)
+        except Exception as exc:
+            problems.append(f"{owner}/{repo}#{num}: author could not be verified ({exc})")
+            continue
+        if author != _EXPECTED_PR_AUTHOR:
+            problems.append(f"{owner}/{repo}#{num}: author={author}, expected={_EXPECTED_PR_AUTHOR}")
+    if not problems:
+        return None
+    return (
+        "third-party-pr-write-guard: refusing to create an engineer/remediation task because "
+        "it could push to a PR not proven to be Chad-owned. " + "; ".join(problems)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -908,6 +988,9 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    guard_error = _third_party_pr_write_guard(title, body, assignee)
+    if guard_error:
+        return tool_error(guard_error)
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under

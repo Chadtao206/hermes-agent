@@ -15,6 +15,54 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# PR ownership guard
+# ---------------------------------------------------------------------------
+
+
+def test_third_party_pr_write_guard_blocks_engineer_lane(monkeypatch):
+    import tools.kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_github_pr_author", lambda owner, repo, num: "barwin")
+
+    err = kt._third_party_pr_write_guard(
+        "Remediate Ylopo/newlead-processor#2627",
+        "No URL, only shorthand in the title.",
+        "engineer",
+    )
+
+    assert err is not None
+    assert "third-party-pr-write-guard" in err
+    assert "author=barwin" in err
+
+
+def test_third_party_pr_write_guard_allows_reviewer_lane(monkeypatch):
+    import tools.kanban_tools as kt
+
+    def fail_if_called(owner, repo, num):  # pragma: no cover - assertion helper
+        raise AssertionError("review/read-only lanes should not query or block")
+
+    monkeypatch.setattr(kt, "_github_pr_author", fail_if_called)
+
+    assert kt._third_party_pr_write_guard(
+        "Review PR #2627",
+        "PR: https://github.com/Ylopo/newlead-processor/pull/2627",
+        "reviewer",
+    ) is None
+
+
+def test_third_party_pr_write_guard_allows_chad_owned_engineer_lane(monkeypatch):
+    import tools.kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_github_pr_author", lambda owner, repo, num: "Chadtao206")
+
+    assert kt._third_party_pr_write_guard(
+        "Fix Chad PR",
+        "PR: https://github.com/Ylopo/internal_strypes/pull/2000",
+        "engineer",
+    ) is None
+
+
+# ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
 
