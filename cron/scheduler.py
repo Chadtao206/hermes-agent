@@ -240,24 +240,31 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
     """Temporarily run a job under a specific Hermes profile.
 
     Cron jobs are stored and scheduled by the profile running the scheduler, but
-    an individual job can opt into a different runtime profile. While active,
-    the scheduler's test/override hook and a context-local Hermes home override
-    both point at the resolved profile directory so _get_hermes_home(),
-    .env/config loading, script resolution, AIAgent construction, and downstream
-    get_hermes_home() callers agree on the same home.
+    an individual job can opt into a different runtime profile. While active, a
+    context-local Hermes home override points at the resolved profile directory
+    so _get_hermes_home(), .env/config loading, script resolution, AIAgent
+    construction, and downstream get_hermes_home() callers — all running in this
+    job's own thread — agree on the same home.
+
+    The override is deliberately context-local (thread-scoped) and NOT a
+    process-global. tick() runs profile jobs on a single-thread sequential pool
+    while profile-less jobs run on a concurrent parallel pool; if this routine
+    mutated a process-wide home it would leak into those concurrently-running
+    parallel jobs. A leaked profile home made a profile-less job resolve its
+    *model* from the profile config (e.g. ``claude-opus-4-8``) while its
+    *provider* stayed at the root default (e.g. ``codex-proxy``) — an
+    incompatible pair the Codex/ChatGPT proxy rejects with HTTP 400.
 
     Some existing provider/config paths still load profile .env values through
     os.environ, so profile jobs also snapshot and restore the process
     environment on exit. tick() runs profile jobs sequentially to keep that
-    temporary mutation isolated from other scheduled jobs.
+    temporary os.environ mutation isolated from other scheduled jobs.
     """
     raw_profile = str(profile or "").strip()
     if not raw_profile:
         yield None
         return
 
-    global _hermes_home
-    prior_override = _hermes_home
     env_snapshot = os.environ.copy()
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
@@ -278,7 +285,6 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
     override_token = None
     try:
         override_token = set_hermes_home_override(profile_home)
-        _hermes_home = profile_home
         logger.info(
             "Job '%s': using Hermes profile '%s' (%s)",
             job_id,
@@ -287,7 +293,6 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
         )
         yield normalized_profile
     finally:
-        _hermes_home = prior_override
         if override_token is not None:
             reset_hermes_home_override(override_token)
         # Delta-based restore: remove added keys, restore changed keys.
