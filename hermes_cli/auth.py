@@ -44,7 +44,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
-from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_constants import OPENROUTER_BASE_URL, DEFAULT_CODEX_PROXY_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, is_truthy_value
 
@@ -213,6 +213,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="http://127.0.0.1:1234/v1",
         api_key_env_vars=("LM_API_KEY",),
         base_url_env_var="LM_BASE_URL",
+    ),
+    "codex-proxy": ProviderConfig(
+        id="codex-proxy",
+        name="Codex Proxy (local)",
+        auth_type="api_key",
+        # No api_key_env_vars: the bearer is a pool-derived shared secret;
+        # the proxy attaches the real Codex OAuth token server-side.
+        inference_base_url=DEFAULT_CODEX_PROXY_BASE_URL,
+        base_url_env_var="HERMES_CODEX_PROXY_BASE_URL",
     ),
     "copilot": ProviderConfig(
         id="copilot",

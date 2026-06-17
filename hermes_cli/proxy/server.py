@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from typing import Optional
 
@@ -89,7 +90,9 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             "pip install 'hermes-agent[messaging]' or `pip install aiohttp`."
         )
 
-    app = web.Application()
+    # Codex Responses bodies (full conversation + encrypted-reasoning replay)
+    # routinely exceed aiohttp's 1 MB default client_max_size.
+    app = web.Application(client_max_size=64 * 1024 * 1024)
     # AppKey ensures forward-compat with future aiohttp versions that strip
     # bare-string keys.
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
@@ -118,8 +121,19 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 code="path_not_allowed",
             )
 
+        required = os.environ.get("HERMES_PROXY_TOKEN", "").strip()
+        if required:
+            presented = (request.headers.get("Authorization", "") or "").removeprefix("Bearer ").strip()
+            if presented != required:
+                return _json_error(
+                    401,
+                    "Proxy bearer token missing or incorrect.",
+                    code="proxy_unauthorized",
+                )
+
+        loop = asyncio.get_running_loop()
         try:
-            cred = adapter.get_credential()
+            cred = await loop.run_in_executor(None, adapter.get_credential)
         except Exception as exc:
             logger.warning("proxy: credential resolution failed: %s", exc)
             return _json_error(401, str(exc), code="upstream_auth_failed")
@@ -140,6 +154,11 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
             fwd_headers = _filter_request_headers(request.headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            if active_cred.extra_headers:
+                fwd_headers.update({
+                    k: v for k, v in active_cred.extra_headers.items()
+                    if k.lower() not in _HOP_BY_HOP_HEADERS
+                })
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s (body=%d bytes)",
@@ -196,9 +215,14 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
         if upstream_resp.status in {401, 429}:
             try:
-                retry_cred = adapter.get_retry_credential(
-                    failed_credential=cred,
-                    status_code=upstream_resp.status,
+                _failed_cred = cred
+                _status_code = upstream_resp.status
+                retry_cred = await loop.run_in_executor(
+                    None,
+                    lambda: adapter.get_retry_credential(
+                        failed_credential=_failed_cred,
+                        status_code=_status_code,
+                    ),
                 )
             except Exception as exc:
                 logger.warning("proxy: retry credential resolution failed: %s", exc)

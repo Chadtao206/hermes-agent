@@ -3477,8 +3477,12 @@ def run_conversation(
                             "Nous model access",
                         ):
                             pass
-                        elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
-                            if _provider == "openai-codex":
+                        elif _provider in {"openai-codex", "codex-proxy", "xai-oauth", "nous"} and status_code == 401:
+                            if _provider == "codex-proxy":
+                                agent._vprint(f"{agent.log_prefix}   💡 The local Codex proxy (hermes proxy) returned HTTP 401. Check:", force=True)
+                                agent._vprint(f"{agent.log_prefix}      • Is the proxy service running? Run: hermes proxy status", force=True)
+                                agent._vprint(f"{agent.log_prefix}      • Does HERMES_PROXY_TOKEN match the client bearer configured for the proxy?", force=True)
+                            elif _provider == "openai-codex":
                                 agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
                                 agent._vprint(f"{agent.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
                                 agent._vprint(f"{agent.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)

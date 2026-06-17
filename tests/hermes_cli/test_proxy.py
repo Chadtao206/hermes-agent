@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 from pathlib import Path
@@ -642,6 +643,8 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "path": request.path,
             "auth": request.headers.get("Authorization"),
             "body": body.decode("utf-8") if body else "",
+            "originator": request.headers.get("originator"),
+            "acct": request.headers.get("ChatGPT-Account-ID"),
         })
         return web.json_response({"echoed": True, "path": request.path})
 
@@ -704,6 +707,7 @@ def test_server_forwards_chat_completions():
             req = captured["requests"][0]
             assert req["auth"] == "Bearer real-portal-key"
             assert "Hermes-4-70B" in req["body"]
+            assert req.get("originator") is None
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
@@ -899,3 +903,239 @@ def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypa
     assert rc == 2
     err = capsys.readouterr().err
     assert "hermes auth add nous" in err
+
+
+def test_server_injects_adapter_extra_headers():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+
+        class HeaderAdapter(FakeAdapter):
+            def get_credential(self):
+                return UpstreamCredential(
+                    bearer="real", base_url=f"{upstream_base}/v1",
+                    extra_headers={"originator": "codex_cli_rs", "ChatGPT-Account-ID": "acct-1"},
+                )
+
+        adapter = HeaderAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={}) as resp:
+                    assert resp.status == 200
+            req = captured["requests"][0]
+            assert req["auth"] == "Bearer real"
+            assert req["originator"] == "codex_cli_rs"
+            assert req["acct"] == "acct-1"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_accepts_large_body():
+    async def run():
+        # Build a fake upstream that also accepts large bodies so we can
+        # isolate the proxy's client_max_size as the variable under test.
+        async def echo_large(request):
+            body = await request.read()
+            return web.json_response({"size": len(body)})
+
+        upstream_app = web.Application(client_max_size=64 * 1024 * 1024)
+        upstream_app.router.add_post("/v1/chat/completions", echo_large)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        big = "x" * (3 * 1024 * 1024)  # 3 MB, over aiohttp's 1 MB default
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions", json={"blob": big},
+                ) as resp:
+                    assert resp.status == 200, f"large body rejected: {resp.status}"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# CodexAdapter
+# ---------------------------------------------------------------------------
+
+
+def _make_codex_jwt(account_id: str = "acct-xyz") -> str:
+    payload = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    b = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"hdr.{b}.sig"
+
+
+def _write_codex_pool_entry(hermes_home: Path, *, access_token=None) -> Path:
+    access_token = access_token or _make_codex_jwt()
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [{
+            "id": "cdx1", "label": "gateway", "auth_type": "oauth", "priority": 0,
+            "source": "manual:device_code", "access_token": access_token,
+            "refresh_token": "cdx-refresh", "base_url": "https://chatgpt.com/backend-api/codex",
+        }]},
+    }))
+    return auth_path
+
+
+def test_codex_adapter_metadata():
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    a = CodexAdapter()
+    assert a.name == "codex"
+    assert a.display_name == "OpenAI Codex (ChatGPT)"
+    assert "/responses" in a.allowed_paths
+
+
+def test_codex_adapter_get_credential_injects_cloudflare_headers(tmp_path, monkeypatch):
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entry(tmp_path, access_token=_make_codex_jwt("acct-xyz"))
+    assert CodexAdapter().is_authenticated()
+    cred = CodexAdapter().get_credential()
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.extra_headers["originator"] == "codex_cli_rs"
+    assert cred.extra_headers["User-Agent"].startswith("codex_cli_rs/")
+    assert cred.extra_headers["ChatGPT-Account-ID"] == "acct-xyz"
+
+
+def test_codex_adapter_not_authenticated_when_empty(tmp_path, monkeypatch):
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": {}}))
+    assert not CodexAdapter().is_authenticated()
+
+
+def test_registry_lists_codex():
+    assert "codex" in ADAPTERS
+
+
+def test_get_adapter_returns_codex_instance():
+    from hermes_cli.proxy.adapters.codex import CodexAdapter
+    assert isinstance(get_adapter("codex"), CodexAdapter)
+
+
+def test_server_requires_token_when_configured(monkeypatch):
+    async def run():
+        monkeypatch.setenv("HERMES_PROXY_TOKEN", "s3cret")
+        adapter = FakeAdapter("http://unused.example/v1")
+        runner, base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base}/v1/chat/completions", json={},
+                                        headers={"Authorization": "Bearer wrong"}) as resp:
+                    assert resp.status == 401
+                    body = await resp.json()
+                    assert body["error"]["type"] == "proxy_unauthorized"
+        finally:
+            await runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_allows_matching_token(monkeypatch):
+    async def run():
+        monkeypatch.setenv("HERMES_PROXY_TOKEN", "s3cret")
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={},
+                                        headers={"Authorization": "Bearer s3cret"}) as resp:
+                    assert resp.status == 200
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_rejects_missing_auth_when_token_configured(monkeypatch):
+    async def run():
+        monkeypatch.setenv("HERMES_PROXY_TOKEN", "s3cret")
+        adapter = FakeAdapter("http://unused.example/v1")
+        runner, base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{base}/v1/chat/completions", json={}) as resp:
+                    assert resp.status == 401
+                    body = await resp.json()
+                    assert body["error"]["type"] == "proxy_unauthorized"
+        finally:
+            await runner.cleanup()
+    asyncio.run(run())
+
+
+def test_server_no_token_check_when_unset(monkeypatch):
+    async def run():
+        monkeypatch.delenv("HERMES_PROXY_TOKEN", raising=False)
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={},
+                                        headers={"Authorization": "Bearer anything"}) as resp:
+                    assert resp.status == 200
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+    asyncio.run(run())
+
+
+def test_build_codex_proxy_plist_pins_global_home_and_crash_safe(tmp_path):
+    from hermes_cli.proxy.cli import build_proxy_plist
+    plist = build_proxy_plist(
+        python_path="/venv/bin/python", hermes_home="/Users/x/.hermes",
+        port=8645, proxy_token="tok123",
+    )
+    assert "ai.hermes.codex-proxy" in plist
+    assert "<string>proxy</string>" in plist and "<string>codex</string>" in plist
+    assert "/Users/x/.hermes" in plist                 # HERMES_HOME pinned
+    assert "HERMES_PROXY_TOKEN" in plist and "tok123" in plist
+    # crash-safe KeepAlive: restart only on abnormal crash, not on clean exit
+    keepalive_section = plist.split("KeepAlive")[1].split("</dict>")[0]
+    assert "Crashed" in keepalive_section          # crash-safe form
+    assert "SuccessfulExit" not in keepalive_section
+    # NOT the unconditional bare `<key>KeepAlive</key><true/>` form
+    assert "<key>KeepAlive</key><true/>" not in plist.replace("\n", "").replace(" ", "")
+    # I2+I3: WorkingDirectory and LimitLoadToSessionType must be present
+    assert "WorkingDirectory" in plist
+    assert "LimitLoadToSessionType" in plist
+    assert "Aqua" in plist and "Background" in plist
+
+
+def test_proxy_install_writes_plist_and_bootstraps(tmp_path, monkeypatch):
+    import hermes_cli.proxy.cli as pcli
+    from unittest.mock import MagicMock, patch
+    # Make guard pass: current home == global root
+    monkeypatch.setattr(pcli, "_global_hermes_root", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.auth.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))  # plist writes under tmp_path/Library/LaunchAgents
+    args = MagicMock(); args.port = 8645; args.token = "fixed-tok"
+    with patch.object(pcli.subprocess, "run",
+                      return_value=MagicMock(returncode=0, stderr=b"")) as mrun:
+        rc = pcli.cmd_proxy_install(args)
+    assert rc == 0
+    plist_file = tmp_path / "Library" / "LaunchAgents" / "ai.hermes.codex-proxy.plist"
+    assert plist_file.exists()
+    text = plist_file.read_text()
+    assert "fixed-tok" in text and "WorkingDirectory" in text
+    # bootstrap was invoked (bootout + bootstrap = 2 calls)
+    assert mrun.call_count >= 1
+    assert any("bootstrap" in " ".join(map(str, c.args[0])) for c in mrun.call_args_list)
+
+
+def test_proxy_install_refuses_named_profile(monkeypatch, tmp_path, capsys):
+    from unittest.mock import MagicMock
+    from hermes_cli.proxy.cli import cmd_proxy_install
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "ops"))
+    rc = cmd_proxy_install(MagicMock())
+    assert rc == 2
+    assert "global" in capsys.readouterr().err.lower()

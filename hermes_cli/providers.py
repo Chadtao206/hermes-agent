@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_constants import DEFAULT_CODEX_PROXY_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="codex_responses",
         auth_type="oauth_external",
         base_url_override="https://chatgpt.com/backend-api/codex",
+    ),
+    "codex-proxy": HermesOverlay(
+        transport="codex_responses",
+        auth_type="api_key",
+        base_url_override=DEFAULT_CODEX_PROXY_BASE_URL,
+        base_url_env_var="HERMES_CODEX_PROXY_BASE_URL",
     ),
     "openai-api": HermesOverlay(
         transport="codex_responses",

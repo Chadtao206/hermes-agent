@@ -8,12 +8,14 @@ token. See :class:`UpstreamAdapter` for the contract.
 from typing import Dict, Type
 
 from hermes_cli.proxy.adapters.base import UpstreamAdapter
+from hermes_cli.proxy.adapters.codex import CodexAdapter
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 # Registry of available adapter classes keyed by provider name as used on
 # the ``hermes proxy start --provider <name>`` CLI flag.
 ADAPTERS: Dict[str, Type[UpstreamAdapter]] = {
+    "codex": CodexAdapter,
     "nous": NousPortalAdapter,
     "xai": XAIGrokAdapter,
 }

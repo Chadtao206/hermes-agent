@@ -30,7 +30,7 @@ from hermes_cli.auth import (
     has_usable_secret,
 )
 from hermes_cli.config import get_compatible_custom_providers, load_config
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, DEFAULT_CODEX_PROXY_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
 
@@ -309,6 +309,12 @@ def _resolve_runtime_from_pool_entry(
     if provider == "openai-codex":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_CODEX_BASE_URL
+    elif provider == "codex-proxy":
+        # Local Codex proxy: speaks the Responses API to chatgpt.com via the
+        # proxy on localhost. Must be codex_responses (not the chat_completions
+        # default) or the proxy 404s /v1/chat/completions.
+        api_mode = "codex_responses"
+        base_url = base_url or DEFAULT_CODEX_PROXY_BASE_URL
     elif provider == "xai-oauth":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_XAI_OAUTH_BASE_URL

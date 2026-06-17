@@ -13258,7 +13258,7 @@ def main():
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.",
+        help="Upstream provider: nous, xai, or codex (default: nous). See `hermes proxy providers`.",
     )
     proxy_start.add_argument(
         "--host",
@@ -13278,6 +13278,16 @@ def main():
     proxy_subparsers.add_parser(
         "providers", help="List available proxy upstream providers"
     )
+    proxy_install = proxy_subparsers.add_parser(
+        "install", help="Install the codex proxy as a launchd service")
+    proxy_install.add_argument("--port", type=int, default=None)
+    proxy_install.add_argument(
+        "--token",
+        default=None,
+        help="Reuse a specific proxy bearer token instead of generating one",
+    )
+    proxy_subparsers.add_parser(
+        "uninstall", help="Uninstall the codex proxy launchd service")
     proxy_parser.set_defaults(func=cmd_proxy)
     gateway_parser.set_defaults(func=cmd_gateway)
 

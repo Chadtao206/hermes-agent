@@ -572,7 +572,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             or base_url_host_matches(agent.base_url, "api.githubcopilot.com")
         )
         is_codex_backend = (
-            agent.provider == "openai-codex"
+            agent.provider in {"openai-codex", "codex-proxy"}
             or (
                 agent._base_url_hostname == "chatgpt.com"
                 and "/backend-api/codex" in agent._base_url_lower
@@ -1104,6 +1104,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
         if fb_provider == "openai-codex":
+            fb_api_mode = "codex_responses"
+        elif fb_provider == "codex-proxy":
+            # codex-proxy shares the Codex Responses API backend; use the
+            # same api_mode as openai-codex or the proxy 404s on /chat/completions.
             fb_api_mode = "codex_responses"
         elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
             fb_api_mode = "anthropic_messages"
