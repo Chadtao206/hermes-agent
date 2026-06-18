@@ -102,3 +102,40 @@ def test_codex_proxy_context_window_branch_in_model_metadata():
     assert "codex-proxy" in src, (
         "get_model_context_length must contain a codex-proxy branch"
     )
+
+
+def test_codex_proxy_runtime_provider_uses_responses_api(tmp_path, monkeypatch):
+    """Primary codex-proxy resolution must not fall back to chat_completions."""
+    import json
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  default: gpt-5.5\n"
+        "  provider: codex-proxy\n"
+        f"  base_url: {DEFAULT_CODEX_PROXY_BASE_URL}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {"codex-proxy": [{
+            "id": "cp1",
+            "label": "proxy-token",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "tok-abc123",
+        }]},
+    }), encoding="utf-8")
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime = resolve_runtime_provider(
+        requested="codex-proxy",
+        explicit_base_url=DEFAULT_CODEX_PROXY_BASE_URL,
+    )
+
+    assert runtime["provider"] == "codex-proxy"
+    assert runtime["base_url"] == DEFAULT_CODEX_PROXY_BASE_URL
+    assert runtime["api_mode"] == "codex_responses"

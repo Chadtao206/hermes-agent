@@ -1204,7 +1204,12 @@ def _resolve_explicit_runtime(
                 base_url = creds.get("base_url", "").rstrip("/")
 
         api_mode = "chat_completions"
-        if provider == "copilot":
+        if provider == "codex-proxy":
+            # The proxy forwards the OpenAI Responses surface, not Chat
+            # Completions. Explicit cron/job base_url overrides still need
+            # the provider's native transport.
+            api_mode = "codex_responses"
+        elif provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
             api_mode = "codex_responses"
@@ -1657,7 +1662,12 @@ def resolve_runtime_provider(
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
         api_mode = "chat_completions"
-        if provider == "copilot":
+        if provider == "codex-proxy":
+            # The local ChatGPT/Codex proxy forwards only /models and
+            # /responses. Treat it like openai-codex on the wire; otherwise
+            # agent-backed cron jobs hit /v1/chat/completions and 404.
+            api_mode = "codex_responses"
+        elif provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         elif provider == "xai":
             api_mode = "codex_responses"
