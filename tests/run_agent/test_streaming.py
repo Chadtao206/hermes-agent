@@ -1573,3 +1573,75 @@ class TestCopilotACPStreamingDecision:
             _use_streaming = False
 
         assert _use_streaming is True
+
+
+class TestNonStreamingClientStreamingDecision:
+    """Regression for dispatched-worker closeout failures (protocol_violation_
+    clean_exit) on the claude-session provider.
+
+    ClaudeSessionClient (Claude Code via tmux) — like CopilotACPClient — ignores
+    ``stream=True`` and returns a plain SimpleNamespace from
+    ``chat.completions.create()``.  When the conversation loop chose the
+    streaming path for it, ``for chunk in stream`` raised
+    ``TypeError: 'types.SimpleNamespace' object is not iterable``, which is
+    non-retryable, so the engineer-profile worker aborted on its first API call
+    with 0 tool calls — never reaching kanban_complete/kanban_block — and the
+    CLI closeout guard auto-blocked the task.
+
+    These tests call the production decision helper directly (single source of
+    truth used by the conversation loop), so they cannot silently drift from the
+    real routing logic the way an inline copy of the if/elif can.
+    """
+
+    def test_claude_session_provider_routes_non_streaming(self):
+        """provider='claude-session' → non-streaming (was streaming = the bug)."""
+        from agent.conversation_loop import _client_returns_noniterable_response
+
+        assert _client_returns_noniterable_response(
+            "claude-session", "claude-session://local"
+        ) is True
+
+    def test_claude_session_base_url_routes_non_streaming(self):
+        """base_url marker alone (any provider name) → non-streaming."""
+        from agent.conversation_loop import _client_returns_noniterable_response
+
+        assert _client_returns_noniterable_response(
+            "custom", "claude-session://local"
+        ) is True
+
+    def test_copilot_acp_still_routes_non_streaming(self):
+        """Existing ACP exclusion must keep working after the refactor."""
+        from agent.conversation_loop import _client_returns_noniterable_response
+
+        assert _client_returns_noniterable_response("copilot-acp", "") is True
+        assert _client_returns_noniterable_response("custom", "acp://copilot") is True
+        assert _client_returns_noniterable_response("custom", "acp+tcp://h:1") is True
+
+    def test_normal_providers_keep_streaming(self):
+        """Streamable providers must still take the streaming path."""
+        from agent.conversation_loop import _client_returns_noniterable_response
+
+        assert _client_returns_noniterable_response(
+            "openai", "https://api.openai.com/v1"
+        ) is False
+        assert _client_returns_noniterable_response(
+            "openrouter", "https://openrouter.ai/api/v1"
+        ) is False
+        assert _client_returns_noniterable_response("anthropic", "") is False
+        assert _client_returns_noniterable_response(None, None) is False
+
+    def test_claude_session_response_is_not_iterable_as_stream(self):
+        """Document the root cause: the claude-session response object is a
+        SimpleNamespace, so the streaming consumer's ``for chunk in stream``
+        raises the exact production TypeError.  Uses the real response builder
+        (``_to_openai_response``) but never dispatches Claude, so it is safe and
+        deterministic."""
+        from agent.claude_session_client import ClaudeSessionClient
+
+        client = ClaudeSessionClient(cwd="/tmp")
+        response = client._to_openai_response(
+            {"result": "done", "subtype": "success", "usage": {}},
+            "claude-fable-5",
+        )
+        with pytest.raises(TypeError, match="not iterable"):
+            iter(response)  # mirrors `for chunk in stream` in chat_completion_helpers

@@ -271,6 +271,31 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
+def _client_returns_noniterable_response(provider: Any, base_url: Any) -> bool:
+    """Whether the active provider's ``chat.completions.create()`` returns a
+    plain non-iterable response object instead of a streamable iterator.
+
+    ``CopilotACPClient`` (subprocess stdio) and ``ClaudeSessionClient`` (Claude
+    Code via tmux) both implement ``chat.completions.create()`` but ignore
+    ``stream=True`` and always return a single ``SimpleNamespace`` response.
+    Driving them through the streaming path makes ``for chunk in stream`` raise
+    ``TypeError: 'types.SimpleNamespace' object is not iterable`` — which the
+    main retry loop classifies as a non-retryable internal error and aborts on
+    the first attempt (the "stream not supported" auto-fallback only triggers on
+    that exact error text, never on this TypeError). Such calls MUST take the
+    non-streaming path.
+
+    Detection mirrors ``create_openai_client`` (agent_runtime_helpers): match on
+    provider name or base_url marker so a single source of truth governs both
+    client construction and the streaming decision.
+    """
+    provider_name = str(provider or "").strip().lower()
+    base = str(base_url or "").strip().lower()
+    if provider_name in ("copilot-acp", "claude-session"):
+        return True
+    return base.startswith(("acp://copilot", "acp+tcp://", "claude-session://"))
+
+
 def _billing_or_entitlement_message(
     *,
     capability: str,
@@ -1464,15 +1489,13 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider == "copilot-acp"
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
+                # CopilotACPClient / ClaudeSessionClient communicate
+                # out-of-band and return a plain SimpleNamespace — not an
+                # iterable stream.  Iterating one raises
+                # "'types.SimpleNamespace' object is not iterable", so force
+                # the non-streaming path.  See
+                # _client_returns_noniterable_response for the full rationale.
+                elif _client_returns_noniterable_response(agent.provider, agent.base_url):
                     _use_streaming = False
                 elif not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
