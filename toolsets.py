@@ -362,18 +362,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "ylopo_kg": {
-        "description": "Ylopo local repository knowledge graph tools (stats, dependencies, repo drilldown, search, ingest)",
-        "tools": [
-            "ylopo_kg_stats",
-            "ylopo_kg_deps",
-            "ylopo_kg_repo",
-            "ylopo_kg_search",
-            "ylopo_kg_ingest",
-        ],
-        "includes": []
-    },
-
 
     # Scenario-specific toolsets
     
