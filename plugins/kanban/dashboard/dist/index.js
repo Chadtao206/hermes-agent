@@ -334,6 +334,48 @@
     );
     return html;
   }
+  const MARKDOWN_ALLOWED_TAGS = new Set([
+    "a",
+    "code",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "li",
+    "p",
+    "pre",
+    "strong",
+    "ul",
+  ]);
+  function escapeAttribute(value) {
+    return escapeHtml(value).replace(/`/g, "&#96;");
+  }
+  function sanitizeMarkdownAttrs(tag, attrs) {
+    if (tag === "a") {
+      const hrefMatch =
+        /\shref=(["'])(.*?)\1/i.exec(attrs) ||
+        /\shref=([^\s>]+)/i.exec(attrs);
+      const href = hrefMatch ? (hrefMatch[2] || hrefMatch[1] || "").trim() : "";
+      if (!/^(https?:\/\/|mailto:)/i.test(href)) return "";
+      return ` href="${escapeAttribute(href)}" target="_blank" rel="noopener noreferrer"`;
+    }
+    if (tag === "pre" && /\sclass=(["'])hermes-kanban-md-code\1/i.test(attrs)) {
+      return ' class="hermes-kanban-md-code"';
+    }
+    return "";
+  }
+  function sanitizeMarkdownHtml(html) {
+    return String(html || "").replace(
+      /<\/?([a-zA-Z][A-Za-z0-9-]*)([^>]*)>/g,
+      (match, rawTag, attrs) => {
+        const tag = rawTag.toLowerCase();
+        if (!MARKDOWN_ALLOWED_TAGS.has(tag)) return "";
+        if (/^<\s*\//.test(match)) return `</${tag}>`;
+        return `<${tag}${sanitizeMarkdownAttrs(tag, attrs || "")}>`;
+      },
+    );
+  }
 
   function MarkdownBlock(props) {
     const enabled = props.enabled !== false;
@@ -342,7 +384,7 @@
     }
     return h("div", {
       className: "hermes-kanban-md",
-      dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || "") },
+      dangerouslySetInnerHTML: { __html: sanitizeMarkdownHtml(renderMarkdown(props.source || "")) },
     });
   }
 
@@ -458,45 +500,6 @@
     }
   }
 
-  function normalizeWakeHealth(raw) {
-    const w = raw || {};
-    return {
-      subscription_count: Number(w.subscription_count || 0),
-      failing_count: Number(w.failing_count || 0),
-      stale_count: Number(w.stale_count || 0),
-      severity: w.severity || "none",
-      as_of: Number(w.as_of || 0),
-    };
-  }
-
-  function wakeHealthPillText(wakeHealth) {
-    const w = normalizeWakeHealth(wakeHealth);
-    if (w.subscription_count <= 0) return "";
-    if (w.failing_count > 0 && w.stale_count > 0) return `${w.failing_count} failing • ${w.stale_count} stale`;
-    if (w.failing_count > 0) return `${w.failing_count} failing`;
-    if (w.stale_count > 0) return `${w.stale_count} stale`;
-    return "Wakes healthy";
-  }
-
-  function wakeHealthTitle(wakeHealth) {
-    const w = normalizeWakeHealth(wakeHealth);
-    if (w.subscription_count <= 0) return "";
-    const stale = w.stale_count === 1 ? "1 stale" : `${w.stale_count} stale`;
-    const failing = w.failing_count === 1 ? "1 failing" : `${w.failing_count} failing`;
-    let summary = "all healthy";
-    if (w.failing_count > 0 && w.stale_count > 0) summary = `${failing}, ${stale}`;
-    else if (w.failing_count > 0) summary = failing;
-    else if (w.stale_count > 0) summary = stale;
-    return `Wake health: ${summary}. Failing = last wake errored. Stale = no successful wake yet.`;
-  }
-
-  function wakeHealthPillClass(wakeHealth) {
-    const w = normalizeWakeHealth(wakeHealth);
-    if (w.failing_count > 0) return "hermes-kanban-wake-health--failing";
-    if (w.stale_count > 0) return "hermes-kanban-wake-health--stale";
-    return "hermes-kanban-wake-health--healthy";
-  }
-
   // -------------------------------------------------------------------------
   // Root page
   // -------------------------------------------------------------------------
@@ -539,10 +542,8 @@
     // own task's counter so it reloads itself on live events instead of
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
-    const [profileWakeTick, setProfileWakeTick] = useState({});
 
     const cursorRef = useRef(0);
-    const wakeCursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
@@ -629,66 +630,62 @@
       wsClosedRef.current = false;
       function openWs() {
         if (wsClosedRef.current) return;
-        const token = window.__HERMES_SESSION_TOKEN__ || "";
-        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const qsParams = {
-          since: String(cursorRef.current || 0),
-          wake_since: String(wakeCursorRef.current || 0),
-          token: token,
-        };
+        // Build the WS URL via the host SDK so the correct auth param is used
+        // in BOTH modes: single-use ?ticket= in gated OAuth mode, ?token= in
+        // loopback. Reading window.__HERMES_SESSION_TOKEN__ directly (the old
+        // path) sends an empty token and is rejected in gated mode. buildWsUrl
+        // also applies the dashboard base-path prefix for reverse-proxied
+        // deployments, which the old inline URL did not. It's async (gated
+        // mode mints a fresh ticket per connect), so resolve then open.
+        const wsParams = { since: String(cursorRef.current || 0) };
         // Pin the WS stream to the currently-selected board so events
         // from other boards don't bleed in. Includes "default" so the
         // dashboard's own board pin always wins over the server-side
         // ``current`` file — same rationale as ``withBoard()`` above.
         // Regression: #20879.
-        if (board) qsParams.board = board;
-        const qs = new URLSearchParams(qsParams);
-        const url = `${proto}//${window.location.host}${API}/events?${qs}`;
-        let ws;
-        try { ws = new WebSocket(url); } catch (_e) { return; }
-        wsRef.current = ws;
-        ws.onopen = function () { wsBackoffRef.current = 1000; };
-        ws.onmessage = function (ev) {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
-              cursorRef.current = msg.cursor || cursorRef.current;
-              // Stamp per-task signal so the TaskDrawer can reload itself.
-              setTaskEventTick(function (prev) {
-                const next = Object.assign({}, prev);
-                for (const e of msg.events) {
-                  if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
-                }
-                return next;
-              });
-              scheduleReload();
-            }
-            if (msg && Array.isArray(msg.wake_events) && msg.wake_events.length > 0) {
-              wakeCursorRef.current = msg.wake_cursor || wakeCursorRef.current;
-              // Keep drawer-level wake rows fresh, and also refresh board-level
-              // wake-health rollup (toolbar pill + attention summary).
-              setProfileWakeTick(function (prev) {
-                const next = Object.assign({}, prev);
-                for (const e of msg.wake_events) {
-                  if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
-                }
-                return next;
-              });
-              scheduleReload();
-            }
-          } catch (_e) { /* ignore */ }
-        };
-        ws.onclose = function (ev) {
+        if (board) wsParams.board = board;
+        SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
           if (wsClosedRef.current) return;
-          if (ev && ev.code === 1008) {
-            setError(tx(t, "wsAuthFailed",
-              "WebSocket auth failed — reload the page to refresh the session token."));
-            return;
-          }
+          let ws;
+          try { ws = new WebSocket(url); } catch (_e) { return; }
+          wsRef.current = ws;
+          ws.onopen = function () { wsBackoffRef.current = 1000; };
+          ws.onmessage = function (ev) {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
+                cursorRef.current = msg.cursor || cursorRef.current;
+                // Stamp per-task signal so the TaskDrawer can reload itself.
+                setTaskEventTick(function (prev) {
+                  const next = Object.assign({}, prev);
+                  for (const e of msg.events) {
+                    if (e && e.task_id) next[e.task_id] = (next[e.task_id] || 0) + 1;
+                  }
+                  return next;
+                });
+                scheduleReload();
+              }
+            } catch (_e) { /* ignore */ }
+          };
+          ws.onclose = function (ev) {
+            if (wsClosedRef.current) return;
+            if (ev && ev.code === 1008) {
+              setError(tx(t, "wsAuthFailed",
+                "WebSocket auth failed — reload the page to refresh the session token."));
+              return;
+            }
+            const delay = Math.min(wsBackoffRef.current, 30000);
+            wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
+            setTimeout(openWs, delay);
+          };
+        }).catch(function () {
+          // Ticket mint / URL build failed (e.g. session expired). Back off
+          // and retry; a hard auth failure surfaces via the 1008 close path.
+          if (wsClosedRef.current) return;
           const delay = Math.min(wsBackoffRef.current, 30000);
           wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
           setTimeout(openWs, delay);
-        };
+        });
       }
       openWs();
       return function () {
@@ -1052,14 +1049,11 @@
         }),
         h(BoardToolbar, {
           board: boardData,
-          boardSlug: board,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
-          onOpenTask: setSelectedTaskId,
-          wakeTick: Object.values(profileWakeTick).reduce(function (sum, n) { return sum + (n || 0); }, 0),
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
               .then(loadBoard)
@@ -1103,7 +1097,6 @@
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
-          wakeTick: profileWakeTick[selectedTaskId] || 0,
         }) : null,
       ),
     );
@@ -1152,12 +1145,7 @@
       function () { return collectDiagTasks(props.boardData); },
       [props.boardData]
     );
-    const wakeHealth = normalizeWakeHealth(props.boardData && props.boardData.wake_health);
-    const wakeFailingCount = wakeHealth.failing_count;
-    const wakeStaleCount = wakeHealth.stale_count;
-    const showWakeFailureSummary = wakeFailingCount > 0;
-    if (dismissed || (diagTasks.length === 0 && !showWakeFailureSummary)) return null;
-
+    if (dismissed || diagTasks.length === 0) return null;
     // Pick the highest severity present so we can colour the strip.
     let topSev = "warning";
     for (const td of diagTasks) {
@@ -1165,15 +1153,6 @@
       if (s === "critical") { topSev = "critical"; break; }
       if (s === "error" && topSev !== "critical") topSev = "error";
     }
-    if (showWakeFailureSummary && topSev === "warning") topSev = "error";
-
-    const diagSummary = diagTasks.length === 1
-      ? tx(t, "taskNeedsAttention", "1 task needs attention")
-      : tx(t, "tasksNeedAttention", "{n} tasks need attention", { n: diagTasks.length });
-    const wakeSummary = wakeFailingCount === 1
-      ? "1 profile wake failing"
-      : `${wakeFailingCount} profile wakes failing`;
-
     return h("div", {
       className: cn(
         "hermes-kanban-attention",
@@ -1184,11 +1163,11 @@
         h("span", { className: "hermes-kanban-attention-icon" },
           topSev === "critical" ? "!!!" : topSev === "error" ? "!!" : "⚠"),
         h("span", { className: "hermes-kanban-attention-text" },
-          diagTasks.length > 0 ? diagSummary : wakeSummary,
+          diagTasks.length === 1
+            ? tx(t, "taskNeedsAttention", "1 task needs attention")
+            : tx(t, "tasksNeedAttention", "{n} tasks need attention",
+                { n: diagTasks.length }),
         ),
-        (diagTasks.length > 0 && showWakeFailureSummary)
-          ? h("span", { className: "hermes-kanban-attention-wake" }, wakeSummary)
-          : null,
         h("button", {
           className: "hermes-kanban-attention-toggle",
           onClick: function () { setExpanded(function (x) { return !x; }); },
@@ -1203,19 +1182,6 @@
       ),
       expanded
         ? h("div", { className: "hermes-kanban-attention-list" },
-            showWakeFailureSummary ? h("div", {
-              key: "wake-health-summary",
-              className: "hermes-kanban-attention-row hermes-kanban-attention-row--error",
-            },
-              h("span", { className: "hermes-kanban-attention-row-sev" }, "!!"),
-              h("span", { className: "hermes-kanban-attention-row-id" }, "wake"),
-              h("span", { className: "hermes-kanban-attention-row-title" }, wakeSummary),
-              h("span", { className: "hermes-kanban-attention-row-meta" },
-                wakeStaleCount > 0
-                  ? `${wakeStaleCount} stale wake path${wakeStaleCount === 1 ? "" : "s"}`
-                  : "check profile wake routes",
-              ),
-            ) : null,
             diagTasks.map(function (task) {
               const sev = (task.warnings && task.warnings.highest_severity) || "warning";
               const kinds = task.warnings && task.warnings.kinds ? Object.keys(task.warnings.kinds) : [];
@@ -1730,6 +1696,8 @@
             ),
             h("div", { className: "text-[10px] text-muted-foreground" },
               "Resolved: " + (settings.resolved_orchestrator_profile || "default")),
+            h("div", { className: "text-[10px] text-muted-foreground" },
+              "Owns the root task after fan-out (wakes back up to judge completion). Does not drive how tasks split — configure the decomposer model under auxiliary.kanban_decomposer."),
           ),
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },
@@ -1771,7 +1739,7 @@
           h(Label, { className: "text-xs text-muted-foreground" },
             "Profile descriptions"),
           h("div", { className: "text-[10px] text-muted-foreground pb-2" },
-            "Descriptions guide the orchestrator's routing. Click ⚗ to auto-generate, or edit and save."),
+            "Descriptions guide the decomposer's routing. Click ⚗ to auto-generate, or edit and save."),
           profiles.length === 0
             ? h("div", { className: "text-xs text-muted-foreground" }, "No profiles installed.")
             : h("div", { className: "flex flex-col gap-2" },
@@ -2039,159 +2007,10 @@
   // Toolbar
   // -------------------------------------------------------------------------
 
-  // Anchored read-only popover that drills into the wake-health pill: lists
-  // failing rows first (last_wake_error sanitized), then stale rows ("no
-  // successful wake yet"). Scope params mirror the active /board fetch so
-  // the rows reflect what the user is looking at.
-  function WakeHealthDetailsPopover(props) {
-    const { t } = useI18n();
-    const [state, setState] = useState({ phase: "loading", data: null, error: null });
-    const load = useCallback(function () {
-      const qs = new URLSearchParams();
-      if (props.tenantFilter) qs.set("tenant", props.tenantFilter);
-      if (props.includeArchived) qs.set("include_archived", "true");
-      const base = `${API}/wake-health/details`;
-      const url = qs.toString() ? `${base}?${qs}` : base;
-      setState(function (prev) {
-        return prev.data
-          ? { phase: "refreshing", data: prev.data, error: null }
-          : { phase: "loading", data: null, error: null };
-      });
-      SDK.fetchJSON(withBoard(url, props.boardSlug))
-        .then(function (data) { setState({ phase: "loaded", data: data, error: null }); })
-        .catch(function (err) {
-          setState({
-            phase: "error",
-            data: null,
-            error: parseApiErrorMessage(err),
-          });
-        });
-    }, [props.tenantFilter, props.includeArchived, props.boardSlug]);
-
-    useEffect(function () { load(); }, [load, props.wakeTick]);
-
-    const rows = (state.data && state.data.rows) || [];
-    const overflow = (state.data && state.data.overflow_count) || 0;
-    const notifierHealth = (state.data && state.data.notifier_health) || {};
-    const notifierSeverity = notifierHealth.severity || "";
-    const showNotifierWarning = (state.phase === "loaded" || state.phase === "refreshing")
-      && (notifierSeverity === "no_notifier" || notifierSeverity === "overlap");
-    const failing = rows.filter(function (r) { return r.kind === "failing"; });
-    const stale = rows.filter(function (r) { return r.kind === "stale"; });
-
-    function renderRow(row) {
-      const when = row.kind === "failing"
-        ? (row.last_wake_error_at || row.last_wake_at || 0)
-        : (row.last_wake_at || 0);
-      const rel = (when && timeAgo) ? timeAgo(when) : "";
-      const fullMessage = row.message || "";
-      return h("div", {
-        key: row.task_id + "::" + row.profile + "::" + row.name,
-        className: cn(
-          "hermes-kanban-wake-health-row",
-          "hermes-kanban-wake-health-row--" + row.kind,
-        ),
-      },
-        h("div", { className: "hermes-kanban-wake-health-row-head" },
-          h("span", { className: "hermes-kanban-wake-health-row-title" },
-            row.task_title || row.task_id),
-          h("span", { className: "hermes-kanban-wake-health-row-id" }, row.task_id),
-        ),
-        h("div", { className: "hermes-kanban-wake-health-row-meta" },
-          h("span", { className: "hermes-kanban-wake-health-row-profile" },
-            row.profile + (row.name ? " · " + row.name : "")),
-          rel ? h("span", { className: "hermes-kanban-wake-health-row-time" }, rel) : null,
-        ),
-        h("div", {
-          className: "hermes-kanban-wake-health-row-msg",
-          title: fullMessage,
-        }, fullMessage),
-        h("div", { className: "hermes-kanban-wake-health-row-actions" },
-          h(Button, {
-            size: "sm",
-            onClick: function () { props.onOpenTask(row.task_id); },
-            title: "Open this task in the drawer",
-          }, tx(t, "open", "Open")),
-        ),
-      );
-    }
-
-    return h("div", {
-      className: "hermes-kanban-wake-health-popover",
-      role: "dialog",
-      "aria-label": "Wake health detail",
-    },
-      h("div", { className: "hermes-kanban-wake-health-popover-head" },
-        h("span", { className: "hermes-kanban-wake-health-popover-title" },
-          tx(t, "wakeHealth", "Wake health")),
-        props.boardSlug
-          ? h("span", { className: "hermes-kanban-wake-health-popover-scope" },
-              tx(t, "board", "Board"), ": ", props.boardSlug,
-              props.tenantFilter
-                ? " · " + tx(t, "tenant", "Tenant") + ": " + props.tenantFilter
-                : "")
-          : (props.tenantFilter
-              ? h("span", { className: "hermes-kanban-wake-health-popover-scope" },
-                  tx(t, "tenant", "Tenant"), ": ", props.tenantFilter)
-              : null),
-        h("button", {
-          type: "button",
-          className: "hermes-kanban-wake-health-popover-close",
-          onClick: props.onClose,
-          title: tx(t, "close", "Close"),
-          "aria-label": tx(t, "close", "Close"),
-        }, "✕"),
-      ),
-      state.phase === "loading" ? h("div", {
-        className: "hermes-kanban-wake-health-popover-empty",
-      }, tx(t, "loading", "Loading…")) : null,
-      state.phase === "error" ? h("div", {
-        className: "hermes-kanban-wake-health-popover-error",
-      }, state.error || tx(t, "loadFailed", "Failed to load")) : null,
-      showNotifierWarning ? h("div", {
-        className: "hermes-kanban-wake-health-notifier-warning",
-        title: notifierHealth.message || "",
-      }, notifierHealth.message || (
-        notifierSeverity === "no_notifier"
-          ? "No active notifier heartbeat for this board"
-          : "Active notifier overlap; duplicate wake races possible"
-      )) : null,
-      (state.phase === "loaded" || state.phase === "refreshing") && rows.length === 0
-        ? h("div", { className: "hermes-kanban-wake-health-popover-empty" },
-            tx(t, "wakeHealthAllHealthy", "No failing or stale wakes."))
-        : null,
-      failing.length > 0 ? h("div", { className: "hermes-kanban-wake-health-section" },
-        h("div", { className: "hermes-kanban-wake-health-section-head" },
-          tx(t, "failing", "Failing"), " · ", failing.length),
-        failing.map(renderRow),
-      ) : null,
-      stale.length > 0 ? h("div", { className: "hermes-kanban-wake-health-section" },
-        h("div", { className: "hermes-kanban-wake-health-section-head" },
-          tx(t, "stale", "Stale"), " · ", stale.length),
-        stale.map(renderRow),
-      ) : null,
-      overflow > 0 ? h("div", { className: "hermes-kanban-wake-health-popover-overflow" },
-        tx(t, "wakeHealthOverflow", "+{n} more", { n: overflow })) : null,
-    );
-  }
-
   function BoardToolbar(props) {
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
     const assignees = (props.board && props.board.assignees) || [];
-    const wakeHealth = normalizeWakeHealth(props.board && props.board.wake_health);
-    const wakeHealthText = wakeHealthPillText(wakeHealth);
-    const wakeHealthLabel = wakeHealthTitle(wakeHealth);
-    const [wakeDetailsOpen, setWakeDetailsOpen] = useState(false);
-    const closeWakeDetails = useCallback(function () { setWakeDetailsOpen(false); }, []);
-    // Close on ESC anywhere in the document while the popover is open so
-    // the toolbar's button doesn't need to retain focus to dismiss.
-    useEffect(function () {
-      if (!wakeDetailsOpen) return undefined;
-      function onKey(e) { if (e.key === "Escape") setWakeDetailsOpen(false); }
-      document.addEventListener("keydown", onKey);
-      return function () { document.removeEventListener("keydown", onKey); };
-    }, [wakeDetailsOpen]);
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "flex flex-col gap-1",
                  title: "Fuzzy-match tasks by id, title, or description. Matches across all columns." },
@@ -2246,36 +2065,6 @@
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
       h("div", { className: "flex-1" }),
-      wakeHealth.subscription_count > 0 ? h("div", {
-        className: "hermes-kanban-wake-health-wrap",
-      },
-        h("button", {
-          type: "button",
-          className: cn(
-            "hermes-kanban-wake-health",
-            "hermes-kanban-wake-health-btn",
-            wakeHealthPillClass(wakeHealth),
-            wakeDetailsOpen ? "hermes-kanban-wake-health--open" : "",
-          ),
-          title: wakeHealthLabel,
-          "aria-label": wakeHealthLabel,
-          "aria-expanded": wakeDetailsOpen ? "true" : "false",
-          "aria-haspopup": "dialog",
-          onClick: function () { setWakeDetailsOpen(function (x) { return !x; }); },
-        }, wakeHealthText),
-        wakeDetailsOpen ? h(WakeHealthDetailsPopover, {
-          boardSlug: props.boardSlug,
-          tenantFilter: props.tenantFilter,
-          includeArchived: props.includeArchived,
-          wakeTick: props.wakeTick || 0,
-          summary: wakeHealth,
-          onClose: closeWakeDetails,
-          onOpenTask: function (taskId) {
-            if (props.onOpenTask) props.onOpenTask(taskId);
-            closeWakeDetails();
-          },
-        }) : null,
-      ) : null,
       h(Button, {
         onClick: props.onNudgeDispatch,
         size: "sm",
@@ -2865,6 +2654,13 @@
     // input here to save vertical space in the common `scratch` case.
     const [workspaceKind, setWorkspaceKind] = useState("scratch");
     const [workspacePath, setWorkspacePath] = useState("");
+    // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
+    // loop — a judge re-checks the card after each turn and the worker keeps
+    // going in the same session until done, or the turn budget runs out
+    // (which blocks the card for review). goalMaxTurns is optional; blank
+    // = backend default.
+    const [goalMode, setGoalMode] = useState(false);
+    const [goalMaxTurns, setGoalMaxTurns] = useState("");
 
     const submit = function () {
       const trimmed = title.trim();
@@ -2891,9 +2687,17 @@
       }
       const wpTrim = workspacePath.trim();
       if (wpTrim) body.workspace_path = wpTrim;
+      // Goal-mode toggle. Only send the keys when enabled so the request
+      // shape stays small and old dispatchers ignore it cleanly.
+      if (goalMode) {
+        body.goal_mode = true;
+        const gmt = parseInt(goalMaxTurns, 10);
+        if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
+      }
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
       setWorkspaceKind("scratch"); setWorkspacePath("");
+      setGoalMode(false); setGoalMaxTurns("");
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -2950,6 +2754,29 @@
         title: "Force-load these skills into the worker (in addition to the built-in kanban-worker).",
         className: "h-7 text-xs",
       }),
+      h("div", { className: "flex gap-2 items-center" },
+        h("label", {
+          className: "flex items-center gap-1.5 text-xs cursor-pointer select-none",
+          title: "Goal mode: the worker keeps going in the same session until a judge agrees the card is done (or the turn budget runs out, which blocks it for review). Best for open-ended cards one shot rarely finishes.",
+        },
+          h("input", {
+            type: "checkbox",
+            checked: goalMode,
+            onChange: function (e) { setGoalMode(!!e.target.checked); },
+            className: "h-3.5 w-3.5 accent-current",
+          }),
+          tx(t, "goalMode", "goal mode"),
+        ),
+        goalMode ? h(Input, {
+          type: "number",
+          value: goalMaxTurns,
+          onChange: function (e) { setGoalMaxTurns(e.target.value); },
+          placeholder: tx(t, "goalMaxTurns", "max turns (default 20)"),
+          className: "h-7 text-xs w-40",
+          title: "Turn budget for the goal loop. Blank = backend default (20).",
+          min: 1,
+        }) : null,
+      ),
       h("div", { className: "flex gap-2" },
         h(Select, Object.assign({
           value: workspaceKind,
@@ -3006,18 +2833,14 @@
     // Ready/Block/Complete buttons feel like no-ops.  See #26744.
     const [patchErr, setPatchErr] = useState(null);
     const [newComment, setNewComment] = useState("");
+    const [uploadBusy, setUploadBusy] = useState(false);
+    const [uploadErr, setUploadErr] = useState(null);
     const [editing, setEditing] = useState(false);
     // Home-channel notification toggles. homeChannels is the list of platforms
     // the user has a /sethome on; each entry has a `subscribed` bool telling
     // us whether this task is currently subscribed via that platform's home.
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
-    // Profile wake subscriptions (per-task rows in kanban_profile_event_subs).
-    // The UI renders these in a dedicated section between HomeSubsSection and
-    // the body editor; the gateway wakes ``profile`` when matching events land.
-    const [profileSubs, setProfileSubs] = useState([]);
-    const [defaultEventKinds, setDefaultEventKinds] = useState([]);
-    const [profileSubsErr, setProfileSubsErr] = useState(null);
     const boardSlug = props.boardSlug;
 
     const load = useCallback(function () {
@@ -3035,73 +2858,11 @@
         .catch(function () { /* silent — endpoint optional on older gateways */ });
     }, [props.taskId, boardSlug]);
 
-    const loadProfileSubs = useCallback(function () {
-      const url = withBoard(
-        `${API}/tasks/${encodeURIComponent(props.taskId)}/profile-subs`,
-        boardSlug,
-      );
-      return SDK.fetchJSON(url)
-        .then(function (d) {
-          setProfileSubs(d.profile_subs || []);
-          setDefaultEventKinds(d.default_event_kinds || []);
-          setProfileSubsErr(null);
-        })
-        .catch(function (e) {
-          // Older gateways pre-dating /profile-subs surface 404 here.
-          // Suppress only that compatibility case. Other failures should
-          // keep prior rows visible and surface an error instead of showing
-          // a false "no subscriptions" empty state.
-          const rawProfileSubErr = (e && e.message) ? String(e.message) : String(e || "");
-          if (/^404:/.test(rawProfileSubErr)) {
-            setProfileSubs([]);
-            setDefaultEventKinds([]);
-            setProfileSubsErr(null);
-            return;
-          }
-          setProfileSubsErr(parseApiErrorMessage(e));
-        });
-    }, [props.taskId, boardSlug]);
-
-    const upsertProfileSub = function (payload) {
-      const url = withBoard(
-        `${API}/tasks/${encodeURIComponent(props.taskId)}/profile-subs`,
-        boardSlug,
-      );
-      setProfileSubsErr(null);
-      return SDK.fetchJSON(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      })
-        .then(function () { return loadProfileSubs(); })
-        .catch(function (e) {
-          setProfileSubsErr(parseApiErrorMessage(e));
-          throw e;
-        });
-    };
-
-    const removeProfileSub = function (profile, name) {
-      const qs = name ? `?name=${encodeURIComponent(name)}` : "";
-      const url = withBoard(
-        `${API}/tasks/${encodeURIComponent(props.taskId)}` +
-          `/profile-subs/${encodeURIComponent(profile)}${qs}`,
-        boardSlug,
-      );
-      setProfileSubsErr(null);
-      return SDK.fetchJSON(url, { method: "DELETE" })
-        .then(function () { return loadProfileSubs(); })
-        .catch(function (e) {
-          setProfileSubsErr(parseApiErrorMessage(e));
-          throw e;
-        });
-    };
-
     // Reload when the WS stream reports new events for this task id
     // (completion, block, crash, etc. — anything that'd make the drawer
     // show stale data if we only loaded on mount).
     useEffect(function () { load(); }, [load, props.eventTick]);
     useEffect(function () { loadHomeChannels(); }, [loadHomeChannels]);
-    useEffect(function () { loadProfileSubs(); }, [loadProfileSubs, props.eventTick, props.wakeTick]);
     useEffect(function () {
       function onKey(e) { if (e.key === "Escape" && !editing) props.onClose(); }
       window.addEventListener("keydown", onKey);
@@ -3120,6 +2881,51 @@
         load();
         props.onRefresh();
       }).catch(function (e) { setErr(String(e.message || e)); });
+    };
+
+    // File upload uses raw fetch (not SDK.fetchJSON, which JSON-encodes)
+    // so the browser sets the multipart boundary. Auth rides the session
+    // cookie + bearer token, matching the rest of the dashboard.
+    const handleUpload = function (fileList) {
+      const files = Array.prototype.slice.call(fileList || []);
+      if (!files.length) return;
+      setUploadBusy(true);
+      setUploadErr(null);
+      const url = withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/attachments`, boardSlug);
+      // Upload sequentially so a partial failure leaves a clear state.
+      let chain = Promise.resolve();
+      files.forEach(function (f) {
+        chain = chain.then(function () {
+          const fd = new FormData();
+          fd.append("file", f, f.name);
+          // SDK.authedFetch handles auth in BOTH modes (loopback token header /
+          // gated cookie) and applies the dashboard base-path prefix. The old
+          // hand-rolled Authorization:Bearer + credentials:'same-origin' sent
+          // an empty token and 401'd in gated mode.
+          return SDK.authedFetch(url, { method: "POST", body: fd })
+            .then(function (resp) {
+              if (!resp.ok) {
+                return resp.text().then(function (txt) {
+                  throw new Error(parseApiErrorMessage(new Error(resp.status + ": " + txt)));
+                });
+              }
+            });
+        });
+      });
+      chain.then(function () {
+        load();
+        props.onRefresh();
+      }).catch(function (e) {
+        setUploadErr(String(e.message || e));
+      }).finally(function () {
+        setUploadBusy(false);
+      });
+    };
+
+    const handleDeleteAttachment = function (attachmentId) {
+      return SDK.fetchJSON(withBoard(`${API}/attachments/${attachmentId}`, boardSlug), { method: "DELETE" })
+        .then(function () { load(); props.onRefresh(); })
+        .catch(function (e) { setUploadErr(String(e.message || e)); });
     };
 
     const doPatch = function (patch, opts) {
@@ -3278,12 +3084,11 @@
           homeChannels: homeChannels,
           homeBusy: homeBusy,
           onToggleHomeSub: toggleHomeSubscription,
-          profileSubs: profileSubs,
-          defaultEventKinds: defaultEventKinds,
-          profileSubsErr: profileSubsErr,
-          onUpsertProfileSub: upsertProfileSub,
-          onRemoveProfileSub: removeProfileSub,
           onRefresh: props.onRefresh,
+          onUpload: handleUpload,
+          onDeleteAttachment: handleDeleteAttachment,
+          uploadBusy: uploadBusy,
+          uploadErr: uploadErr,
         }) : null,
         data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
           h(Input, {
@@ -3306,11 +3111,119 @@
     );
   }
 
+  function _fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  // Attachments section in the task drawer (#35338). Upload button +
+  // list with download links and a delete (×) per row. The download
+  // link hits GET /attachments/:id which streams the file; the worker
+  // context surfaces the same files' absolute paths so a kanban worker
+  // can read them with the file/terminal tools.
+  function AttachmentsSection(props) {
+    const i18n = props.i18n;
+    const atts = props.attachments || [];
+    const fileRef = useRef(null);
+    const [dlErr, setDlErr] = useState(null);
+    // Download via authenticated fetch → blob → synthetic anchor click.
+    // A plain <a href> can't carry the auth the dashboard middleware requires,
+    // so fetch authenticated and hand the browser a blob URL instead.
+    function downloadAttachment(a) {
+      // SDK.authedFetch handles auth in BOTH modes (loopback token header /
+      // gated cookie) and applies the dashboard base-path prefix. The old
+      // hand-rolled Authorization:Bearer + credentials:'same-origin' sent an
+      // empty token and 401'd in gated mode.
+      const url = withBoard(`${API}/attachments/${a.id}`, props.boardSlug);
+      setDlErr(null);
+      SDK.authedFetch(url)
+        .then(function (resp) {
+          if (!resp.ok) {
+            return resp.text().then(function (txt) {
+              throw new Error(parseApiErrorMessage(new Error(resp.status + ": " + txt)));
+            });
+          }
+          return resp.blob();
+        })
+        .then(function (blob) {
+          const objUrl = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = objUrl;
+          link.download = a.filename || "attachment";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          setTimeout(function () { URL.revokeObjectURL(objUrl); }, 10000);
+        })
+        .catch(function (e) { setDlErr(String(e.message || e)); });
+    }
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" },
+        `${tx(i18n, "attachments", "Attachments")} (${atts.length})`),
+      h("input", {
+        ref: fileRef,
+        type: "file",
+        multiple: true,
+        style: { display: "none" },
+        onChange: function (e) {
+          if (props.onUpload) props.onUpload(e.target.files);
+          // Reset so selecting the same file again re-triggers onChange.
+          try { e.target.value = ""; } catch (_e) { /* ignore */ }
+        },
+      }),
+      h("div", { className: "flex items-center gap-2 mb-2" },
+        h(Button, {
+          size: "sm",
+          variant: "outline",
+          disabled: !!props.uploadBusy,
+          onClick: function () { if (fileRef.current) fileRef.current.click(); },
+        }, props.uploadBusy
+            ? tx(i18n, "uploading", "Uploading…")
+            : tx(i18n, "uploadFile", "Upload file")),
+      ),
+      (props.uploadErr || dlErr)
+        ? h("div", { className: "text-xs text-destructive mb-2" }, props.uploadErr || dlErr)
+        : null,
+      atts.length === 0
+        ? h("div", { className: "text-xs text-muted-foreground" },
+            tx(i18n, "noAttachments", "— no attachments —"))
+        : atts.map(function (a) {
+            return h("div", {
+              key: a.id,
+              className: "flex items-center justify-between gap-2 py-1 text-sm",
+            },
+              h("button", {
+                type: "button",
+                className: "hermes-kanban-attachment-link truncate",
+                title: a.filename,
+                onClick: function () { downloadAttachment(a); },
+              }, a.filename),
+              h("span", { className: "text-xs text-muted-foreground whitespace-nowrap" },
+                _fmtBytes(a.size)),
+              h("button", {
+                type: "button",
+                className: "hermes-kanban-drawer-close",
+                title: tx(i18n, "removeAttachment", "Remove attachment"),
+                onClick: function () {
+                  if (window.confirm(tx(i18n, "confirmRemoveAttachment",
+                      "Remove this attachment?"))) {
+                    if (props.onDelete) props.onDelete(a.id);
+                  }
+                },
+              }, "×"),
+            );
+          }),
+    );
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
     const comments = props.data.comments || [];
     const events = props.data.events || [];
+    const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
 
     return h("div", { className: "hermes-kanban-drawer-body" },
@@ -3343,6 +3256,12 @@
           label: tx(i18n, "skills", "Skills"),
           value: t.skills.join(", "),
         }) : null,
+        t.goal_mode ? h(MetaRow, {
+          label: tx(i18n, "goalMode", "Goal mode"),
+          value: t.goal_max_turns
+            ? `on (max ${t.goal_max_turns} turns)`
+            : "on",
+        }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
       h(StatusActions, {
@@ -3363,14 +3282,6 @@
         homeBusy: props.homeBusy || {},
         onToggle: props.onToggleHomeSub,
       }),
-      h(ProfileSubsSection, {
-        subs: props.profileSubs || [],
-        defaultEventKinds: props.defaultEventKinds || [],
-        assignees: props.assignees || [],
-        err: props.profileSubsErr,
-        onUpsert: props.onUpsertProfileSub,
-        onRemove: props.onRemoveProfileSub,
-      }),
       h(BodyEditor, {
         task: t,
         renderMarkdown: props.renderMarkdown,
@@ -3388,6 +3299,15 @@
         h("div", { className: "hermes-kanban-section-head" }, tx(i18n, "result", "Result")),
         h(MarkdownBlock, { source: t.result, enabled: props.renderMarkdown }),
       ) : null,
+      h(AttachmentsSection, {
+        attachments: attachments,
+        boardSlug: props.boardSlug,
+        onUpload: props.onUpload,
+        onDelete: props.onDeleteAttachment,
+        uploadBusy: props.uploadBusy,
+        uploadErr: props.uploadErr,
+        i18n: i18n,
+      }),
       h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" },
           `${tx(i18n, "comments", "Comments")} (${comments.length})`),
@@ -3526,124 +3446,20 @@
     );
   }
 
-  // Worker log: loads lazily, then tails appended chunks over a WebSocket.
+  // Worker log: loads lazily (one GET on mount), refresh button, tail cap.
   function WorkerLogSection(props) {
     const { t } = useI18n();
-    const [state, setState] = useState({ loading: false, data: null, err: null, streaming: false });
-    const [content, setContent] = useState("");
-    const wsRef = useRef(null);
-    const offsetRef = useRef(0);
-    const preRef = useRef(null);
-    const nearBottomRef = useRef(true);
-    const maxLogChars = 500000;
-
-    const trimContent = useCallback(function (text) {
-      const s = String(text || "");
-      return s.length > maxLogChars ? s.slice(s.length - maxLogChars) : s;
-    }, []);
-
+    const [state, setState] = useState({ loading: false, data: null, err: null });
     const load = useCallback(function () {
-      try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
-      wsRef.current = null;
-      setState({ loading: true, data: null, err: null, streaming: false });
-      setContent("");
+      setState({ loading: true, data: null, err: null });
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/log?tail=100000`, props.boardSlug))
-        .then(function (d) {
-          offsetRef.current = Number(d && d.size_bytes ? d.size_bytes : 0);
-          setContent(trimContent(d && d.content ? d.content : ""));
-          setState({ loading: false, data: d, err: null, streaming: false });
-        })
-        .catch(function (e) {
-          setState({ loading: false, data: null, err: String(e.message || e), streaming: false });
-        });
-    }, [props.taskId, props.boardSlug, trimContent]);
+        .then(function (d) { setState({ loading: false, data: d, err: null }); })
+        .catch(function (e) { setState({ loading: false, data: null, err: String(e.message || e) }); });
+    }, [props.taskId, props.boardSlug]);
 
     // Auto-load when the section mounts; the user opened the drawer so the
     // cost is one small HTTP round-trip.
     useEffect(function () { load(); }, [load]);
-
-    useEffect(function () {
-      const data = state.data;
-      if (!data || state.loading) return undefined;
-      const token = window.__HERMES_SESSION_TOKEN__ || "";
-      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const qsParams = {
-        token: token,
-        offset: String(offsetRef.current || 0),
-      };
-      if (props.boardSlug) qsParams.board = props.boardSlug;
-      const qs = new URLSearchParams(qsParams);
-      const url = `${proto}//${window.location.host}${API}/tasks/${encodeURIComponent(props.taskId)}/log/stream?${qs}`;
-      let ws;
-      try { ws = new WebSocket(url); } catch (_e) { return undefined; }
-      wsRef.current = ws;
-      ws.onopen = function () {
-        setState(function (prev) { return Object.assign({}, prev, { streaming: true }); });
-      };
-      ws.onmessage = function (ev) {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (!msg || !msg.type) return;
-          if (msg.type === "snapshot" || msg.type === "rotated") {
-            offsetRef.current = Number(msg.offset || 0);
-            setContent(trimContent(msg.content || ""));
-            setState(function (prev) {
-              const nextData = Object.assign({}, prev.data || {}, {
-                exists: true,
-                path: msg.path || (prev.data && prev.data.path) || "",
-                size_bytes: Number(msg.size_bytes || msg.offset || 0),
-                truncated: !!msg.truncated,
-              });
-              return Object.assign({}, prev, { data: nextData, err: null, streaming: true });
-            });
-          } else if (msg.type === "append") {
-            offsetRef.current = Number(msg.offset || offsetRef.current || 0);
-            setContent(function (prev) { return trimContent(String(prev || "") + String(msg.chunk || "")); });
-            setState(function (prev) {
-              const nextData = Object.assign({}, prev.data || {}, {
-                exists: true,
-                path: msg.path || (prev.data && prev.data.path) || "",
-                size_bytes: Number(msg.size_bytes || msg.offset || 0),
-              });
-              return Object.assign({}, prev, { data: nextData, err: null, streaming: true });
-            });
-          } else if (msg.type === "missing") {
-            offsetRef.current = 0;
-            setState(function (prev) {
-              const nextData = Object.assign({}, prev.data || {}, {
-                exists: false,
-                path: msg.path || (prev.data && prev.data.path) || "",
-                size_bytes: 0,
-              });
-              return Object.assign({}, prev, { data: nextData, streaming: true });
-            });
-          }
-        } catch (_e) { /* ignore malformed stream frames */ }
-      };
-      ws.onerror = function () {
-        setState(function (prev) { return Object.assign({}, prev, { streaming: false }); });
-      };
-      ws.onclose = function (ev) {
-        setState(function (prev) {
-          const next = Object.assign({}, prev, { streaming: false });
-          if (ev && ev.code === 1008) {
-            next.err = tx(t, "wsAuthFailed",
-              "WebSocket auth failed — reload the page to refresh the session token.");
-          }
-          return next;
-        });
-      };
-      return function () {
-        try { ws.close(); } catch (_e) { /* noop */ }
-        if (wsRef.current === ws) wsRef.current = null;
-      };
-    }, [state.data && state.data.task_id, state.loading, props.taskId, props.boardSlug, trimContent]);
-
-    useEffect(function () {
-      const el = preRef.current;
-      if (!el || !nearBottomRef.current) return;
-      try { el.scrollTop = el.scrollHeight; } catch (_e) { /* noop */ }
-    }, [content]);
 
     const data = state.data;
     let body;
@@ -3652,27 +3468,19 @@
         tx(t, "loadingLog", "Loading log…"));
     } else if (state.err) {
       body = h("div", { className: "text-xs text-destructive" }, state.err);
-    } else if (!data || (!data.exists && !content)) {
+    } else if (!data || !data.exists) {
       body = h("div", { className: "text-xs text-muted-foreground italic" },
         tx(t, "noWorkerLog",
           "— no worker log yet (task hasn't spawned or log was rotated away) —"));
     } else {
-      body = h("pre", {
-        ref: preRef,
-        className: "hermes-kanban-pre hermes-kanban-log",
-        onScroll: function (e) {
-          const el = e.currentTarget;
-          nearBottomRef.current = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 16);
-        },
-      }, content || "(empty)");
+      body = h("pre", { className: "hermes-kanban-pre hermes-kanban-log" },
+        data.content || "(empty)");
     }
 
-    const sizeLabel = data && data.size_bytes ? ` (${data.size_bytes} B)` : "";
-    const liveLabel = state.streaming ? " · live" : "";
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head-row" },
         h("span", { className: "hermes-kanban-section-head" },
-          tx(t, "workerLog", "Worker log") + sizeLabel + liveLabel),
+          tx(t, "workerLog", "Worker log") + (data && data.size_bytes ? ` (${data.size_bytes} B)` : "")),
         h("button", {
           type: "button",
           onClick: load,
@@ -3681,10 +3489,6 @@
         }, "refresh"),
       ),
       body,
-      content && content.length >= maxLogChars
-        ? h("div", { className: "text-xs text-muted-foreground" },
-            tx(t, "logClientTrimmed", "(showing latest in-browser log content — use refresh/full path for older output)"))
-        : null,
       data && data.truncated
         ? h("div", { className: "text-xs text-muted-foreground" },
             tx(t, "logTruncated", "(showing last 100 KB — full log at "),
@@ -3984,9 +3788,9 @@
         }, specifyBusy ? "Specifying…" : "✨ Specify")
       : null;
 
-    // "Decompose" is the orchestrator-driven fan-out. Like Specify, only
+    // "Decompose" is the built-in decomposer fan-out. Like Specify, only
     // makes sense on triage-column tasks — elsewhere the backend short-
-    // circuits with ok:false. When the orchestrator returns fanout:false
+    // circuits with ok:false. When the decomposer returns fanout:false
     // we render the same single-task message as Specify; when it fans
     // out we report the child count for quick at-a-glance verification.
     const decomposeButton = (task.status === "triage" && props.onDecompose)
@@ -4102,401 +3906,6 @@
       )
     );
   }
-
-  // -------------------------------------------------------------------------
-  // ProfileSubsSection — per-task profile wake subscriptions
-  // -------------------------------------------------------------------------
-  //
-  // Native UI for ``kanban_profile_event_subs``. Each row tells the gateway
-  // notifier to wake a Hermes profile via ``hermes -p <profile> chat -q
-  // <prompt>`` when matching kanban events land on this task (or its
-  // dependency subtree). Sits inside TaskDrawer between HomeSubsSection and
-  // the body editor per the Iris design handoff — not a board-level surface.
-  //
-  // Defaults mirror the kanban_db helper:
-  //   enabled=true, wake_agent=true, include_children=false,
-  //   event_kinds=null (gateway uses DEFAULT_NOTIFY_TERMINAL_KINDS),
-  //   wake_prompt empty.
-
-  const PROFILE_SUB_CUSTOM_EVENT_OPTIONS = [
-    "completed", "blocked", "gave_up", "crashed", "timed_out", "archived",
-  ];
-
-  function summarizeProfileSubEvents(sub) {
-    const kinds = sub.event_kinds;
-    if (!kinds || kinds.length === 0) {
-      return "Default terminal events";
-    }
-    if (kinds.length <= 3) return kinds.join(", ");
-    return `${kinds.slice(0, 3).join(", ")} +${kinds.length - 3}`;
-  }
-
-  function ProfileSubsSection(props) {
-    const { t } = useI18n();
-    const subs = props.subs || [];
-    const [adding, setAdding] = useState(false);
-    const [editingKey, setEditingKey] = useState(null);
-    const [pendingRemove, setPendingRemove] = useState(null);
-    const [busy, setBusy] = useState(false);
-
-    function rowKey(sub) { return `${sub.profile}::${sub.name || ""}`; }
-
-    const closeForms = function () {
-      setAdding(false);
-      setEditingKey(null);
-    };
-
-    const handleSubmit = function (payload) {
-      setBusy(true);
-      return props.onUpsert(payload)
-        .then(function () { closeForms(); })
-        .catch(function () { /* err already surfaced via props.err */ })
-        .finally(function () { setBusy(false); });
-    };
-
-    const handleToggle = function (sub, field, value) {
-      const payload = { profile: sub.profile, name: sub.name || "" };
-      payload[field] = value;
-      setBusy(true);
-      return props.onUpsert(payload)
-        .catch(function () { /* err surfaced via props.err */ })
-        .finally(function () { setBusy(false); });
-    };
-
-    const confirmRemove = function (sub) {
-      setBusy(true);
-      return props.onRemove(sub.profile, sub.name || "")
-        .then(function () { setPendingRemove(null); })
-        .catch(function () { /* err surfaced via props.err */ })
-        .finally(function () { setBusy(false); });
-    };
-
-    return h("div", { className: "hermes-kanban-section hermes-kanban-profile-subs" },
-      h("div", { className: "hermes-kanban-section-head-row" },
-        h("span", { className: "hermes-kanban-section-head" },
-          tx(t, "profileWakeSubs", "Profile wake subscriptions")),
-        !adding && !editingKey
-          ? h(Button, {
-              size: "sm",
-              className: "hermes-kanban-profile-subs-add-btn",
-              onClick: function () { setAdding(true); setPendingRemove(null); },
-            }, tx(t, "addProfileSub", "Add"))
-          : null,
-      ),
-      h("div", { className: "hermes-kanban-profile-subs-help" },
-        tx(t, "profileWakeSubsHelp",
-           "Wake Hermes profiles when this task reaches selected events.")),
-      props.err
-        ? h("div", { className: "hermes-kanban-msg-err" }, props.err)
-        : null,
-      subs.length === 0 && !adding
-        ? h("div", { className: "hermes-kanban-profile-subs-empty" },
-            tx(t, "profileWakeSubsEmpty",
-               "No profiles wake on this task’s events. Add one to wake an agent when this task changes state."))
-        : null,
-      h("div", { className: "hermes-kanban-profile-subs-list" },
-        subs.map(function (sub) {
-          const key = rowKey(sub);
-          if (editingKey === key) {
-            return h(ProfileSubForm, {
-              key: key,
-              initial: sub,
-              assignees: props.assignees,
-              defaultEventKinds: props.defaultEventKinds,
-              busy: busy,
-              submitLabel: tx(t, "save", "Save"),
-              lockProfile: true,
-              onSubmit: handleSubmit,
-              onCancel: closeForms,
-            });
-          }
-          return h(ProfileSubRow, {
-            key: key,
-            sub: sub,
-            pendingRemove: pendingRemove === key,
-            busy: busy,
-            onEdit: function () { setAdding(false); setEditingKey(key); },
-            onRequestRemove: function () { setPendingRemove(key); },
-            onConfirmRemove: function () { return confirmRemove(sub); },
-            onCancelRemove: function () { setPendingRemove(null); },
-            onToggle: function (field, value) { return handleToggle(sub, field, value); },
-          });
-        }),
-        adding
-          ? h(ProfileSubForm, {
-              key: "__new__",
-              initial: null,
-              assignees: props.assignees,
-              defaultEventKinds: props.defaultEventKinds,
-              busy: busy,
-              submitLabel: tx(t, "create", "Create"),
-              lockProfile: false,
-              onSubmit: handleSubmit,
-              onCancel: closeForms,
-            })
-          : null,
-      ),
-    );
-  }
-
-  function ProfileSubRow(props) {
-    const { t } = useI18n();
-    const sub = props.sub;
-    const wakeFailed = !!sub.last_wake_error_at;
-    const wakeAge = wakeFailed
-      ? (timeAgo ? timeAgo(sub.last_wake_error_at) : "")
-      : (sub.last_wake_at ? (timeAgo ? timeAgo(sub.last_wake_at) : "") : "");
-    const lastWake = wakeFailed
-      ? `${tx(t, "wakeFailed", "Failed")} ${wakeAge}`.trim()
-      : (sub.last_wake_at
-          ? `${tx(t, "woke", "Woke")} ${wakeAge}`.trim()
-          : tx(t, "neverWoke", "Never"));
-    const wakeTitle = wakeFailed && sub.last_wake_error
-      ? `${lastWake}: ${sub.last_wake_error}`
-      : lastWake;
-    return h("div", { className: "hermes-kanban-profile-sub-row" },
-      h("div", { className: "hermes-kanban-profile-sub-head" },
-        h("span", { className: "hermes-kanban-profile-sub-name" }, sub.profile),
-        sub.name
-          ? h("span", { className: "hermes-kanban-profile-sub-label" },
-              `· ${sub.name}`)
-          : null,
-        h("span", { className: "hermes-kanban-profile-sub-events" },
-          summarizeProfileSubEvents(sub)),
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-toggles" },
-        h("label", { className: "hermes-kanban-profile-sub-toggle" },
-          h(Checkbox, {
-            checked: !!sub.enabled,
-            disabled: props.busy,
-            onCheckedChange: function (v) { props.onToggle("enabled", !!v); },
-          }),
-          h("span", null, tx(t, "enabled", "Enabled")),
-        ),
-        h("label", { className: "hermes-kanban-profile-sub-toggle" },
-          h(Checkbox, {
-            checked: !!sub.wake_agent,
-            disabled: props.busy,
-            onCheckedChange: function (v) { props.onToggle("wake_agent", !!v); },
-          }),
-          h("span", null, tx(t, "wakeProfile", "Wake profile")),
-        ),
-        h("label", { className: "hermes-kanban-profile-sub-toggle" },
-          h(Checkbox, {
-            checked: !!sub.include_children,
-            disabled: props.busy,
-            onCheckedChange: function (v) { props.onToggle("include_children", !!v); },
-          }),
-          h("span", null, tx(t, "includeSubtree", "Include dependency subtree")),
-        ),
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-foot" },
-        h("span", {
-          className: "hermes-kanban-profile-sub-last" + (wakeFailed ? " hermes-kanban-profile-sub-last-failed" : ""),
-          title: wakeTitle,
-          "aria-label": wakeTitle,
-        }, lastWake),
-        props.pendingRemove
-          ? h("span", { className: "hermes-kanban-profile-sub-confirm" },
-              h("span", null, tx(t, "removeProfileSubConfirm", "Remove this subscription?")),
-              h(Button, {
-                size: "sm",
-                disabled: props.busy,
-                className: "hermes-kanban-profile-sub-remove-yes",
-                onClick: props.onConfirmRemove,
-              }, tx(t, "yesRemove", "Yes, remove")),
-              h(Button, {
-                size: "sm",
-                disabled: props.busy,
-                onClick: props.onCancelRemove,
-              }, tx(t, "cancel", "Cancel")),
-            )
-          : h("span", { className: "hermes-kanban-profile-sub-actions" },
-              h(Button, {
-                size: "sm",
-                disabled: props.busy,
-                onClick: props.onEdit,
-              }, tx(t, "edit", "Edit")),
-              h(Button, {
-                size: "sm",
-                disabled: props.busy,
-                className: "hermes-kanban-profile-sub-remove",
-                onClick: props.onRequestRemove,
-              }, tx(t, "remove", "Remove")),
-            ),
-      ),
-    );
-  }
-
-  function ProfileSubForm(props) {
-    const { t } = useI18n();
-    const initial = props.initial || {};
-    const initialCustom = !!(initial.event_kinds && initial.event_kinds.length);
-    const [profile, setProfile] = useState(initial.profile || "");
-    const [name, setName] = useState(initial.name || "");
-    const [useCustomEvents, setUseCustomEvents] = useState(initialCustom);
-    const [customEvents, setCustomEvents] = useState(
-      initialCustom ? initial.event_kinds : (props.defaultEventKinds || []).slice(),
-    );
-    const [includeChildren, setIncludeChildren] = useState(
-      !!initial.include_children,
-    );
-    const [wakeAgent, setWakeAgent] = useState(
-      initial.wake_agent === undefined ? true : !!initial.wake_agent,
-    );
-    const [wakePrompt, setWakePrompt] = useState(initial.wake_prompt || "");
-    const [showAdvanced, setShowAdvanced] = useState(!!(initial.wake_prompt));
-
-    const toggleCustomKind = function (kind) {
-      setCustomEvents(function (prev) {
-        if (prev.indexOf(kind) >= 0) return prev.filter(function (k) { return k !== kind; });
-        return prev.concat([kind]);
-      });
-    };
-
-    const onSave = function () {
-      const trimmedProfile = (profile || "").trim();
-      if (!trimmedProfile) return;
-      const payload = {
-        profile: trimmedProfile,
-        name: (name || "").trim(),
-        include_children: !!includeChildren,
-        wake_agent: !!wakeAgent,
-        // New subs default enabled; edits preserve the existing enabled state
-        // so changing events/prompt does not accidentally re-enable a muted row.
-        enabled: initial.profile ? !!initial.enabled : true,
-      };
-      if (useCustomEvents) {
-        payload.event_kinds = customEvents;
-      } else {
-        payload.use_default_events = true;
-      }
-      const promptText = (wakePrompt || "").trim();
-      if (promptText) {
-        payload.wake_prompt = promptText;
-      } else {
-        payload.clear_wake_prompt = true;
-      }
-      props.onSubmit(payload);
-    };
-
-    const assigneeNames = (props.assignees || [])
-      .map(function (a) { return typeof a === "string" ? a : a.name; })
-      .filter(Boolean);
-
-    return h("div", { className: "hermes-kanban-profile-sub-form" },
-      h("div", { className: "hermes-kanban-profile-sub-form-row" },
-        h(Label, { className: "hermes-kanban-profile-sub-form-label" },
-          tx(t, "profile", "Profile")),
-        props.lockProfile
-          ? h("span", { className: "hermes-kanban-profile-sub-form-locked" }, profile)
-          : h(Input, {
-              value: profile,
-              onChange: function (e) { setProfile(e.target.value); },
-              list: "hermes-kanban-profile-sub-assignees",
-              placeholder: tx(t, "profilePlaceholder", "profile name"),
-              className: "h-8 text-sm",
-            }),
-        !props.lockProfile && assigneeNames.length > 0
-          ? h("datalist", { id: "hermes-kanban-profile-sub-assignees" },
-              assigneeNames.map(function (n) {
-                return h("option", { key: n, value: n });
-              }))
-          : null,
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-form-row" },
-        h(Label, { className: "hermes-kanban-profile-sub-form-label" },
-          tx(t, "label", "Label")),
-        props.lockProfile
-          ? h("span", { className: "hermes-kanban-profile-sub-form-locked" },
-              name || tx(t, "defaultLabel", "(default)"))
-          : h(Input, {
-              value: name,
-              onChange: function (e) { setName(e.target.value); },
-              placeholder: tx(t, "labelPlaceholder", "optional"),
-              className: "h-8 text-sm",
-            }),
-        props.lockProfile
-          ? h("div", { className: "hermes-kanban-profile-sub-form-help" },
-              tx(t, "profileSubLabelImmutable",
-                 "Label is part of this subscription’s identity; remove and re-add to rename."))
-          : null,
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-form-events" },
-        h("label", { className: "hermes-kanban-profile-sub-toggle" },
-          h(Checkbox, {
-            checked: !useCustomEvents,
-            onCheckedChange: function (v) { setUseCustomEvents(!v); },
-          }),
-          h("span", null, tx(t, "defaultEventsLabel", "Default terminal events")),
-        ),
-        useCustomEvents
-          ? h("div", { className: "hermes-kanban-profile-sub-form-custom-events" },
-              PROFILE_SUB_CUSTOM_EVENT_OPTIONS.map(function (kind) {
-                return h("label", {
-                  key: kind,
-                  className: "hermes-kanban-profile-sub-toggle",
-                },
-                  h(Checkbox, {
-                    checked: customEvents.indexOf(kind) >= 0,
-                    onCheckedChange: function () { toggleCustomKind(kind); },
-                  }),
-                  h("span", null, kind),
-                );
-              }),
-            )
-          : null,
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-form-flags" },
-        h("label", { className: "hermes-kanban-profile-sub-toggle" },
-          h(Checkbox, {
-            checked: includeChildren,
-            onCheckedChange: function (v) { setIncludeChildren(!!v); },
-          }),
-          h("span", null, tx(t, "includeSubtree", "Include dependency subtree")),
-        ),
-        h("label", { className: "hermes-kanban-profile-sub-toggle" },
-          h(Checkbox, {
-            checked: wakeAgent,
-            onCheckedChange: function (v) { setWakeAgent(!!v); },
-          }),
-          h("span", null, tx(t, "wakeProfile", "Wake profile")),
-        ),
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-form-advanced" },
-        h("button", {
-          type: "button",
-          className: "hermes-kanban-section-toggle",
-          onClick: function () { setShowAdvanced(function (x) { return !x; }); },
-        }, showAdvanced
-            ? tx(t, "hideAdvanced", "Hide advanced")
-            : tx(t, "showAdvanced", "Advanced")),
-        showAdvanced
-          ? h("textarea", {
-              className: "hermes-kanban-profile-sub-form-prompt",
-              value: wakePrompt,
-              onChange: function (e) { setWakePrompt(e.target.value); },
-              placeholder: tx(t, "customWakePromptPlaceholder",
-                "Optional custom wake prompt"),
-              rows: 3,
-            })
-          : null,
-      ),
-      h("div", { className: "hermes-kanban-profile-sub-form-buttons" },
-        h(Button, {
-          size: "sm",
-          disabled: props.busy || !(profile || "").trim(),
-          onClick: onSave,
-        }, props.submitLabel),
-        h(Button, {
-          size: "sm",
-          onClick: props.onCancel,
-          disabled: props.busy,
-        }, tx(t, "cancel", "Cancel")),
-      ),
-    );
-  }
-
 
   // -------------------------------------------------------------------------
   // Register

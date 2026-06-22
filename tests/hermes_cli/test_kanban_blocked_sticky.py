@@ -13,11 +13,9 @@ These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
-* Direct/manual DB triage blocks without durable sticky evidence can still
-  auto-recover — the original intent of #40c1decb3 is preserved for
-  non-terminal legacy states.
-* Structured ``gave_up`` rows emitted after retry-budget exhaustion are
-  sticky and require explicit operator action.
+* Circuit-breaker blocks (``gave_up`` event, status flipped via
+  ``_record_task_failure``) still auto-recover — the original intent
+  of #40c1decb3 is preserved.
 * An explicit ``kanban_unblock`` clears the sticky state.
 * The full block → promote → crash → ``gave_up`` loop is broken after
   this fix: subsequent ticks leave the task blocked.
@@ -101,78 +99,6 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         assert kb.get_task(conn, child).status == "blocked"
 
 
-def test_initial_status_blocked_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
-    """Tasks created with ``initial_status='blocked'`` are explicit
-    operator gates and must stay blocked until unblocked."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ops gate", initial_status="blocked")
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == "blocked"
-
-        for _ in range(5):
-            promoted = kb.recompute_ready(conn)
-            assert promoted == 0
-            task = kb.get_task(conn, tid)
-            assert task is not None
-            assert task.status == "blocked"
-
-
-def test_initial_status_blocked_with_done_parent_is_still_sticky(kanban_home: Path) -> None:
-    """Even when parent gates are already open, an initial blocked gate
-    remains sticky until explicit unblock."""
-    with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        kb.complete_task(conn, parent, result="ok")
-
-        child = kb.create_task(
-            conn,
-            title="ops-gated child",
-            parents=[parent],
-            initial_status="blocked",
-        )
-        task = kb.get_task(conn, child)
-        assert task is not None
-        assert task.status == "blocked"
-
-        assert kb.recompute_ready(conn) == 0
-        task = kb.get_task(conn, child)
-        assert task is not None
-        assert task.status == "blocked"
-
-
-def test_initial_status_blocked_emits_blocked_event(kanban_home: Path) -> None:
-    """Create-time blocked tasks should emit a blocked event so the
-    sticky-block guard has durable provenance."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="gate", initial_status="blocked")
-        events = kb.list_events(conn, tid)
-
-    blocked_events = [e for e in events if e.kind == "blocked"]
-    assert blocked_events
-    assert blocked_events[-1].payload == {"reason": "initial_status=blocked"}
-
-
-def test_unblock_clears_initial_status_blocked_gate(kanban_home: Path) -> None:
-    """An explicit unblock should clear create-time gates so later
-    non-sticky blocked states can auto-recover."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="gate", initial_status="blocked")
-        assert kb.unblock_task(conn, tid) is True
-
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == "ready"
-
-        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
-        conn.commit()
-
-        assert kb.recompute_ready(conn) == 1
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == "ready"
-
-
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
@@ -217,15 +143,18 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         assert task.consecutive_failures == 1
 
 
-def test_payloadless_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
-    """Legacy/payloadless ``gave_up`` rows do not prove the retry budget
-    was exhausted by ``_record_task_failure``. Keep them non-sticky unless
-    an earlier explicit block remains uncleared."""
+def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
+    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
+    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
+    as sticky — otherwise we'd regress the safety net for genuinely
+    transient crashes."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
         kb.complete_task(conn, parent, result="ok")
 
+        # Status + event match what _record_task_failure writes when
+        # the breaker trips.
         conn.execute(
             "UPDATE tasks SET status='blocked' WHERE id=?", (child,),
         )
@@ -239,50 +168,6 @@ def test_payloadless_gave_up_event_alone_does_not_make_block_sticky(kanban_home:
         promoted = kb.recompute_ready(conn)
         assert promoted == 1
         assert kb.get_task(conn, child).status == "ready"
-
-
-def test_exhausted_failure_gave_up_event_is_sticky(kanban_home: Path) -> None:
-    """A structured ``gave_up`` emitted when retry budget is exhausted
-    must not be auto-promoted by the next dispatcher tick."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="repro", assignee="worker", max_retries=1)
-        kb.claim_task(conn, tid)
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status='ready', claim_lock=NULL, "
-                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
-                (tid,),
-            )
-            run_id = kb._end_run(
-                conn,
-                tid,
-                outcome="crashed",
-                status="crashed",
-                error="pid 12345 not alive",
-                metadata={"pid": 12345},
-            )
-            kb._append_event(conn, tid, "crashed", {"pid": 12345}, run_id=run_id)
-
-        blocked = kb._record_task_failure(
-            conn,
-            tid,
-            error="pid 12345 not alive",
-            outcome="crashed",
-            release_claim=False,
-            end_run=False,
-            event_payload_extra={"pid": 12345},
-        )
-        assert blocked is True
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == "blocked"
-        assert task.consecutive_failures == 1
-
-        assert kb.recompute_ready(conn) == 0
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == "blocked"
-        assert task.consecutive_failures == 1
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -72,43 +71,12 @@ def test_board_empty(client):
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
     assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in kb.VALID_STATUSES - {"archived"}:
+    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
-
-
-def test_reconcile_endpoint_exposes_decision_actions(client):
-    with kb.connect() as conn:
-        parent = kb.create_task(conn, title="implementation", assignee="engineer")
-        assert kb.complete_task(conn, parent, summary="done")
-        child = kb.create_task(conn, title="parked review", assignee="reviewer", parents=[parent])
-        assert kb.schedule_task(conn, child, reason="park until operator reviews")
-        conn.execute("UPDATE tasks SET created_at = created_at - 10 WHERE id = ?", (child,))
-
-    r = client.get("/api/plugins/kanban/reconcile?ready_age_seconds=1&max_examples=2")
-
-    assert r.status_code == 200
-    data = r.json()
-    assert data["wake_triage"]["mode"] == "jensen_decision_required"
-    assert any(
-        action["kind"] == "scheduled_with_completed_parents_decision"
-        and action["task_id"] == child
-        for action in data["actions"]
-    )
-    assert "scheduled_with_completed_parents_decision" in data["text_preview"]
-
-
-def test_doctor_endpoint_exposes_board_health(client):
-    r = client.get("/api/plugins/kanban/doctor")
-
-    assert r.status_code == 200
-    data = r.json()
-    assert data["ok"] is True
-    assert data["issues"] == []
-    assert "Kanban board doctor: ok" in data["text_preview"]
 
 
 # ---------------------------------------------------------------------------
@@ -183,328 +151,6 @@ def test_tenant_filter(client):
     r = client.get("/api/plugins/kanban/board?tenant=t2")
     total = sum(len(c["tasks"]) for c in r.json()["columns"])
     assert total == 1
-
-
-
-
-def test_board_degrades_when_notifier_heartbeat_table_is_unreadable(client, monkeypatch):
-    """Notifier heartbeat corruption must not take down the board payload."""
-    client.post("/api/plugins/kanban/tasks", json={"title": "visible task"})
-
-    def boom(*args, **kwargs):
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    monkeypatch.setattr(kb, "list_notifier_heartbeats", boom)
-
-    r = client.get("/api/plugins/kanban/board")
-    assert r.status_code == 200
-    data = r.json()
-    assert sum(len(c["tasks"]) for c in data["columns"]) == 1
-    assert data["notifier_health"]["severity"] == "unavailable"
-    assert "DatabaseError" in data["notifier_health"]["error"]
-
-
-def test_board_wake_health_rollup_and_tenant_scope(client):
-    """/board includes wake_health and scopes counts to visible board tasks."""
-    t_healthy = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "healthy", "tenant": "t1"},
-    ).json()["task"]
-    t_stale = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "stale", "tenant": "t1"},
-    ).json()["task"]
-    t_failing = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "failing", "tenant": "t1"},
-    ).json()["task"]
-    t_other = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "other", "tenant": "t2"},
-    ).json()["task"]
-
-    for task in (t_healthy, t_stale, t_failing, t_other):
-        r = client.post(
-            f"/api/plugins/kanban/tasks/{task['id']}/profile-subs",
-            json={"profile": "jensen"},
-        )
-        assert r.status_code == 200, r.text
-
-    conn = kb.connect()
-    try:
-        now = int(time.time())
-        kb.record_profile_wake_success(
-            conn,
-            task_id=t_healthy["id"],
-            profile="jensen",
-            new_cursor=5,
-            last_wake_at=now,
-        )
-        kb.record_profile_wake_failure(
-            conn,
-            task_id=t_failing["id"],
-            profile="jensen",
-            claimed_cursor=9,
-            old_cursor=0,
-            error=RuntimeError("spawn refused"),
-        )
-        kb.record_profile_wake_failure(
-            conn,
-            task_id=t_other["id"],
-            profile="jensen",
-            claimed_cursor=10,
-            old_cursor=0,
-            error=RuntimeError("spawn refused"),
-        )
-    finally:
-        conn.close()
-
-    all_board = client.get("/api/plugins/kanban/board").json()
-    assert all_board["wake_health"]["subscription_count"] == 4
-    assert all_board["wake_health"]["failing_count"] == 2
-    assert all_board["wake_health"]["stale_count"] == 1
-    assert all_board["wake_health"]["severity"] == "failing"
-    assert all_board["wake_health"]["as_of"] > 0
-    assert all_board["notifier_health"]["severity"] == "no_notifier"
-    assert all_board["notifier_health"]["active_count"] == 0
-
-    conn = kb.connect()
-    try:
-        now = int(time.time())
-        db_path = str(kb.kanban_db_path().expanduser().resolve())
-        kb.record_notifier_heartbeat(
-            conn,
-            notifier_id="host-a:111:1",
-            board_slug="default",
-            db_path=db_path,
-            notifier_profile="default",
-            host="host-a",
-            pid=111,
-            started_at=1,
-            now=now,
-        )
-        kb.record_notifier_heartbeat(
-            conn,
-            notifier_id="host-b:222:2",
-            board_slug="default",
-            db_path=db_path,
-            notifier_profile="ops",
-            host="host-b",
-            pid=222,
-            started_at=2,
-            now=now,
-        )
-    finally:
-        conn.close()
-
-    overlap_board = client.get("/api/plugins/kanban/board").json()
-    assert overlap_board["notifier_health"]["severity"] == "overlap"
-    assert overlap_board["notifier_health"]["active_count"] == 2
-    assert overlap_board["notifier_health"]["overlap_count"] == 1
-
-    scoped = client.get("/api/plugins/kanban/board?tenant=t1").json()
-    assert scoped["wake_health"]["subscription_count"] == 3
-    assert scoped["wake_health"]["failing_count"] == 1
-    assert scoped["wake_health"]["stale_count"] == 1
-    assert scoped["wake_health"]["severity"] == "failing"
-
-    none_visible = client.get("/api/plugins/kanban/board?tenant=missing").json()
-    assert none_visible["wake_health"]["subscription_count"] == 0
-    assert none_visible["wake_health"]["failing_count"] == 0
-    assert none_visible["wake_health"]["stale_count"] == 0
-    assert none_visible["wake_health"]["severity"] == "none"
-    assert none_visible["notifier_health"]["severity"] == "no_subscriptions"
-
-
-def test_notifier_health_uses_db_path_for_pinned_board_aliases(client, tmp_path, monkeypatch):
-    """Pinned HERMES_KANBAN_DB boards share one notifier heartbeat by DB path."""
-    shared_db = tmp_path / "shared-board.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(shared_db))
-    kb.init_db(db_path=shared_db)
-    kb.create_board("alpha", name="Alpha")
-
-    conn = kb.connect(board="alpha")
-    try:
-        task_id = kb.create_task(conn, title="alpha wake", assignee="worker")
-        kb.add_profile_event_sub(conn, task_id=task_id, profile="jensen")
-        kb.record_notifier_heartbeat(
-            conn,
-            notifier_id="host-a:111:1",
-            board_slug="default",
-            db_path=str(shared_db.resolve()),
-            notifier_profile="default",
-            host="host-a",
-            pid=111,
-            started_at=1,
-            now=int(time.time()),
-        )
-    finally:
-        conn.close()
-
-    resp = client.get("/api/plugins/kanban/board?board=alpha").json()
-    assert resp["wake_health"]["subscription_count"] == 1
-    assert resp["notifier_health"]["severity"] == "healthy"
-    assert resp["notifier_health"]["active_count"] == 1
-
-
-def test_notifier_health_no_notifier_reports_latest_stale_row(client):
-    """Operator diagnostics include active/stale counts plus latest stale owner."""
-    task = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "stale notifier diag"},
-    ).json()["task"]
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{task['id']}/profile-subs",
-        json={"profile": "jensen"},
-    )
-    assert r.status_code == 200, r.text
-
-    conn = kb.connect()
-    try:
-        stale_seen = int(time.time()) - kb.NOTIFIER_HEARTBEAT_ACTIVE_WINDOW_SECONDS - 5
-        kb.record_notifier_heartbeat(
-            conn,
-            notifier_id="diag-host:999:1",
-            board_slug="default",
-            db_path=str(kb.kanban_db_path().expanduser().resolve()),
-            notifier_profile="default",
-            host="diag-host",
-            pid=999,
-            started_at=1,
-            now=stale_seen,
-        )
-    finally:
-        conn.close()
-
-    resp = client.get("/api/plugins/kanban/wake-health/details").json()
-    health = resp["notifier_health"]
-    assert health["severity"] == "no_notifier"
-    assert health["active_count"] == 0
-    assert health["stale_count"] == 1
-    assert health["latest_notifier"]["host"] == "diag-host"
-    assert "last seen default on diag-host" in health["message"]
-
-
-def test_wake_health_details_returns_failing_and_stale_rows(client):
-    """/wake-health/details surfaces per-row drilldown for the pill popover.
-
-    - Healthy rows are omitted.
-    - Failing rows come before stale rows.
-    - Sanitized last_wake_error appears as the row message.
-    - Scope mirrors /board (tenant filter, no rows beyond visible tasks).
-    - overflow_count counts rows beyond ``limit``.
-    """
-    t_healthy = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "healthy", "tenant": "t1"},
-    ).json()["task"]
-    t_stale = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "stale", "tenant": "t1"},
-    ).json()["task"]
-    t_failing = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "failing", "tenant": "t1"},
-    ).json()["task"]
-    t_other = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "other", "tenant": "t2"},
-    ).json()["task"]
-
-    for task in (t_healthy, t_stale, t_failing, t_other):
-        r = client.post(
-            f"/api/plugins/kanban/tasks/{task['id']}/profile-subs",
-            json={"profile": "jensen"},
-        )
-        assert r.status_code == 200, r.text
-
-    conn = kb.connect()
-    try:
-        now = int(time.time())
-        kb.record_profile_wake_success(
-            conn,
-            task_id=t_healthy["id"],
-            profile="jensen",
-            new_cursor=5,
-            last_wake_at=now,
-        )
-        kb.record_profile_wake_failure(
-            conn,
-            task_id=t_failing["id"],
-            profile="jensen",
-            claimed_cursor=9,
-            old_cursor=0,
-            error=RuntimeError("spawn refused"),
-            at=now,
-        )
-        kb.record_profile_wake_failure(
-            conn,
-            task_id=t_other["id"],
-            profile="jensen",
-            claimed_cursor=10,
-            old_cursor=0,
-            error=RuntimeError("other tenant"),
-            at=now - 5,
-        )
-    finally:
-        conn.close()
-
-    # No scope: both failing rows + the t1 stale row, no healthy row.
-    all_resp = client.get("/api/plugins/kanban/wake-health/details").json()
-    assert all_resp["wake_health"]["subscription_count"] == 4
-    assert all_resp["wake_health"]["failing_count"] == 2
-    assert all_resp["wake_health"]["stale_count"] == 1
-    assert all_resp["notifier_health"]["severity"] == "no_notifier"
-    rows = all_resp["rows"]
-    kinds = [r["kind"] for r in rows]
-    # Failing first, then stale.
-    assert kinds == ["failing", "failing", "stale"], kinds
-    failing_ids = [r["task_id"] for r in rows if r["kind"] == "failing"]
-    # Most recent failure wins ordering.
-    assert failing_ids[0] == t_failing["id"]
-    assert failing_ids[1] == t_other["id"]
-    stale_row = next(r for r in rows if r["kind"] == "stale")
-    assert stale_row["task_id"] == t_stale["id"]
-    assert stale_row["message"] == "No successful wake yet"
-    failing_row = next(r for r in rows if r["task_id"] == t_failing["id"])
-    assert "spawn refused" in failing_row["message"]
-    assert failing_row["task_title"] == "failing"
-    assert failing_row["profile"] == "jensen"
-    assert failing_row["wake_failure_count"] == 1
-    # Healthy task must not surface.
-    assert all(r["task_id"] != t_healthy["id"] for r in rows)
-    assert all_resp["overflow_count"] == 0
-    assert all_resp["as_of"] > 0
-
-    # Tenant scope: t2 task is filtered out → only t1 rows remain.
-    scoped = client.get("/api/plugins/kanban/wake-health/details?tenant=t1").json()
-    scoped_ids = {r["task_id"] for r in scoped["rows"]}
-    assert t_other["id"] not in scoped_ids
-    assert t_failing["id"] in scoped_ids
-    assert t_stale["id"] in scoped_ids
-    assert scoped["wake_health"]["subscription_count"] == 3
-
-    # Tenant with no tasks → empty.
-    empty = client.get("/api/plugins/kanban/wake-health/details?tenant=missing").json()
-    assert empty["rows"] == []
-    assert empty["overflow_count"] == 0
-    assert empty["wake_health"]["subscription_count"] == 0
-
-    # Limit / overflow.
-    capped = client.get(
-        "/api/plugins/kanban/wake-health/details?limit=1"
-    ).json()
-    assert len(capped["rows"]) == 1
-    assert capped["rows"][0]["kind"] == "failing"
-    assert capped["overflow_count"] == 2  # 2 failing + 1 stale - 1 visible
-
-
-def test_wake_health_details_pill_button_is_in_bundle():
-    """Dashboard pill must be a real button wired to the popover fetch route.
-
-    Without a render harness we still want a check that the toolbar bundle
-    stays in sync with the backend route added for Phase 5.
-    """
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
-    assert "hermes-kanban-wake-health-btn" in bundle
-    assert "WakeHealthDetailsPopover" in bundle
-    assert "/wake-health/details" in bundle
-    assert "No active notifier heartbeat for this board" in bundle
-    assert "duplicate wake races possible" in bundle
 
 
 def test_board_query_param_default_overrides_current_board_pointer(client):
@@ -599,6 +245,19 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     assert "if (!storedBoard && !board && data && data.current)" in js
     assert "setBoard(data.current);" in js
     assert 'readSelectedBoard() || "default"' not in js
+
+
+def test_dashboard_markdown_html_is_sanitized_before_render():
+    """Markdown rendering must sanitize HTML before dangerouslySetInnerHTML."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "function sanitizeMarkdownHtml(html)" in js
+    assert "MARKDOWN_ALLOWED_TAGS" in js
+    assert "sanitizeMarkdownHtml(renderMarkdown(props.source || \"\"))" in js
+    assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
 
 
 # ---------------------------------------------------------------------------
@@ -1139,26 +798,28 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         assert ws is not None  # handshake succeeded
 
 
-def test_ws_task_log_stream_rejects_when_token_required(tmp_path, monkeypatch):
-    """Worker-log streaming uses the same dashboard token gate as /events."""
+def test_ws_events_accepts_gated_ticket(tmp_path, monkeypatch):
+    """Gated OAuth mode: the WS must accept a single-use ?ticket= (and reject
+    a bare ?token=, even one matching _SESSION_TOKEN). This is the regression
+    for the hosted-dashboard bug where the kanban live-events WS 1008'd on
+    every gated deployment because its bespoke check only knew _SESSION_TOKEN.
+    We stub _ws_auth_ok with the real gated semantics (ticket-only)."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
 
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="log-auth")
-    finally:
-        conn.close()
-
     import hermes_cli
     import types
 
+    def _fake_ws_auth_ok(ws):
+        # Gated mode: only a known ticket is accepted; token path rejected.
+        return ws.query_params.get("ticket", "") == "good-ticket"
+
     stub = types.SimpleNamespace(
         _SESSION_TOKEN="secret-xyz",
-        _ws_auth_ok=lambda ws: ws.query_params.get("token", "") == "secret-xyz",
+        _ws_auth_ok=_fake_ws_auth_ok,
     )
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
     monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
@@ -1168,111 +829,18 @@ def test_ws_task_log_stream_rejects_when_token_required(tmp_path, monkeypatch):
     c = TestClient(app)
 
     from starlette.websockets import WebSocketDisconnect
+
+    # Legacy token is rejected in gated mode, even if it's the real one.
     with pytest.raises(WebSocketDisconnect) as exc:
-        with c.websocket_connect(f"/api/plugins/kanban/tasks/{tid}/log/stream"):
+        with c.websocket_connect("/api/plugins/kanban/events?token=secret-xyz"):
             pass
     assert exc.value.code == 1008
 
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with c.websocket_connect(f"/api/plugins/kanban/tasks/{tid}/log/stream?token=nope"):
-            pass
-    assert exc.value.code == 1008
-
-
-
-def test_ws_task_log_stream_sends_snapshot_and_appended_chunks(tmp_path, monkeypatch):
-    """The dashboard drawer can receive worker stdout/stderr without refresh."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="log-live")
-    finally:
-        conn.close()
-
-    log_path = kb.worker_log_path(tid)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("first\n", encoding="utf-8")
-
-    import hermes_cli
-    import types
-
-    stub = types.SimpleNamespace(
-        _SESSION_TOKEN="secret-xyz",
-        _ws_auth_ok=lambda ws: ws.query_params.get("token", "") == "secret-xyz",
-    )
-    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
-    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
-
-    app = FastAPI()
-    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    c = TestClient(app)
-
+    # A valid ticket is accepted.
     with c.websocket_connect(
-        f"/api/plugins/kanban/tasks/{tid}/log/stream?token=secret-xyz&offset=0"
+        "/api/plugins/kanban/events?ticket=good-ticket"
     ) as ws:
-        snapshot = ws.receive_json()
-        assert snapshot["type"] == "snapshot"
-        assert snapshot["task_id"] == tid
-        assert snapshot["content"] == "first\n"
-        assert snapshot["offset"] == log_path.stat().st_size
-
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write("second\n")
-
-        appended = ws.receive_json()
-        assert appended["type"] == "append"
-        assert appended["task_id"] == tid
-        assert appended["chunk"] == "second\n"
-        assert appended["offset"] == log_path.stat().st_size
-
-
-
-def test_ws_task_log_stream_reports_rotation_when_offset_exceeds_size(tmp_path, monkeypatch):
-    """A rotated/truncated log is resynced instead of appending from a bad offset."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="log-rotated")
-    finally:
-        conn.close()
-
-    log_path = kb.worker_log_path(tid)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("after-rotation\n", encoding="utf-8")
-
-    import hermes_cli
-    import types
-
-    stub = types.SimpleNamespace(
-        _SESSION_TOKEN="secret-xyz",
-        _ws_auth_ok=lambda ws: ws.query_params.get("token", "") == "secret-xyz",
-    )
-    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
-    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
-
-    app = FastAPI()
-    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    c = TestClient(app)
-
-    with c.websocket_connect(
-        f"/api/plugins/kanban/tasks/{tid}/log/stream?token=secret-xyz&offset=9999"
-    ) as ws:
-        payload = ws.receive_json()
-
-    assert payload["type"] == "rotated"
-    assert payload["content"] == "after-rotation\n"
-    assert payload["offset"] == log_path.stat().st_size
-
+        assert ws is not None
 
 
 def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp_path, monkeypatch):
@@ -1326,62 +894,6 @@ def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp
     task_ids = {event["task_id"] for event in payload["events"]}
     assert default_task in task_ids
     assert other_task not in task_ids
-
-
-def test_ws_events_streams_profile_wake_events_without_task_events(tmp_path, monkeypatch):
-    """The existing /events websocket keeps its task ``events`` contract but
-    can also carry profile-wake rows for the TaskDrawer health refresh path."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="wake-live")
-        kb.add_profile_event_sub(conn, task_id=tid, profile="jensen")
-        kb.record_profile_wake_failure(
-            conn,
-            task_id=tid,
-            profile="jensen",
-            claimed_cursor=123,
-            old_cursor=0,
-            error=RuntimeError("spawn refused"),
-        )
-    finally:
-        conn.close()
-
-    import hermes_cli
-    import types
-
-    stub = types.SimpleNamespace(
-        _SESSION_TOKEN="secret-xyz",
-        _ws_auth_ok=lambda ws: ws.query_params.get("token", "") == "secret-xyz",
-    )
-    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
-    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
-
-    app = FastAPI()
-    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    c = TestClient(app)
-
-    # since=999 suppresses create_task/profile-sub task_events so this asserts
-    # wake_events can independently drive a drawer-only refresh.
-    with c.websocket_connect(
-        "/api/plugins/kanban/events?token=secret-xyz&since=999&wake_since=0"
-    ) as ws:
-        payload = ws.receive_json()
-
-    assert payload["events"] == []
-    assert payload["cursor"] == 999
-    assert payload["wake_cursor"] >= 1
-    assert len(payload["wake_events"]) == 1
-    wake = payload["wake_events"][0]
-    assert wake["task_id"] == tid
-    assert wake["profile"] == "jensen"
-    assert wake["status"] == "failed"
-    assert "RuntimeError" in wake["error"]
 
 
 def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
@@ -1491,12 +1003,10 @@ def test_bulk_status_done_forwards_completion_summary(client):
         for tid in (a["id"], b["id"]):
             task = kb.get_task(conn, tid)
             run = kb.latest_run(conn, tid)
-            assert run is not None
             assert task.status == "done"
             assert task.result == "DECIDED: ship it"
             assert run.summary == "DECIDED: ship it"
-            assert run.metadata["source"] == "dashboard"
-            assert run.metadata["closeout_packet"]["metadata_keys"] == ["source"]
+            assert run.metadata == {"source": "dashboard"}
     finally:
         conn.close()
 
@@ -1723,8 +1233,7 @@ def test_task_detail_includes_runs(client):
     assert run["outcome"] == "completed"
     assert run["profile"] == "worker"
     assert run["summary"] == "tested on rate limiter"
-    assert run["metadata"]["changed_files"] == ["limiter.py"]
-    assert run["metadata"]["closeout_packet"]["metadata_keys"] == ["changed_files"]
+    assert run["metadata"] == {"changed_files": ["limiter.py"]}
     assert run["ended_at"] is not None
 
 
@@ -1763,12 +1272,9 @@ def test_patch_status_done_with_summary_and_metadata(client):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, tid)
-        assert run is not None
         assert run.outcome == "completed"
         assert run.summary == "shipped the thing"
-        assert run.metadata["changed_files"] == ["a.py", "b.py"]
-        assert run.metadata["tests_run"] == 7
-        assert run.metadata["closeout_packet"]["metadata_keys"] == ["changed_files", "tests_run"]
+        assert run.metadata == {"changed_files": ["a.py", "b.py"], "tests_run": 7}
     finally:
         conn.close()
 
@@ -1791,7 +1297,6 @@ def test_patch_status_done_without_summary_still_works(client):
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, tid)
-        assert run is not None
         assert run.outcome == "completed"
         assert run.summary == "legacy shape"  # falls back to result
     finally:
@@ -2760,356 +2265,3 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
-
-
-# ---------------------------------------------------------------------------
-# Profile wake subscriptions — per-task dashboard CRUD
-# ---------------------------------------------------------------------------
-#
-# Native UI for ``kanban_profile_event_subs`` (the same rows the
-# ``hermes kanban profile-subs`` CLI writes). The dashboard exposes them
-# inside the TaskDrawer so operators can wake a Hermes profile when this
-# task hits selected events without dropping back to a terminal.
-
-
-def test_profile_subs_list_empty_for_task(client):
-    """GET .../profile-subs returns an empty list and surfaces the
-    default event kinds so the UI can render the 'Default terminal
-    events' summary without a second round-trip.
-    """
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
-    assert r.status_code == 200, r.text
-    data = r.json()
-    assert data["profile_subs"] == []
-    assert data["default_event_kinds"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
-
-
-def test_profile_subs_add_creates_row_with_defaults(client):
-    """POSTing only profile creates a row carrying the Iris-handoff defaults:
-    enabled=true, wake_agent=true, include_children=false, default event kinds,
-    empty wake_prompt."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen"},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    sub = body["sub"]
-    assert sub["task_id"] == t["id"]
-    assert sub["profile"] == "jensen"
-    assert sub["name"] == ""
-    assert sub["enabled"] == 1
-    assert sub["wake_agent"] == 1
-    assert sub["include_children"] == 0
-    # event_kinds NULL ⇒ resolved equals DEFAULT_NOTIFY_TERMINAL_KINDS
-    assert sub["event_kinds"] is None
-    assert sub["event_kinds_resolved"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
-    assert sub["wake_prompt"] in (None, "")
-    assert sub["last_wake_error_at"] in (None, 0)
-    assert sub["last_wake_error"] in (None, "")
-    assert sub["wake_failure_count"] == 0
-
-    # Round-trip via GET.
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
-    assert r.status_code == 200
-    rows = r.json()["profile_subs"]
-    assert len(rows) == 1
-    assert rows[0]["profile"] == "jensen"
-
-
-def test_profile_subs_list_includes_wake_failure_health(client):
-    """TaskDrawer GET includes durable wake-health fields written by gateway."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen"},
-    )
-    conn = kb.connect()
-    try:
-        kb.record_profile_wake_failure(
-            conn,
-            task_id=t["id"],
-            profile="jensen",
-            claimed_cursor=12,
-            old_cursor=0,
-            error=RuntimeError("spawn refused"),
-        )
-    finally:
-        conn.close()
-
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/profile-subs")
-    assert r.status_code == 200, r.text
-    sub = r.json()["profile_subs"][0]
-    assert sub["last_wake_error_at"] > 0
-    assert "RuntimeError" in sub["last_wake_error"]
-    assert sub["wake_failure_count"] == 1
-
-
-def test_profile_subs_add_with_custom_events_and_subtree(client):
-    """Custom event_kinds + include_children + wake_prompt round-trip."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={
-            "profile": "jensen",
-            "name": "lane-a",
-            "event_kinds": ["completed", "blocked"],
-            "include_children": True,
-            "wake_prompt": "Pick up the work",
-        },
-    )
-    assert r.status_code == 200, r.text
-    sub = r.json()["sub"]
-    assert sub["event_kinds"] == ["completed", "blocked"]
-    assert sub["event_kinds_resolved"] == ["completed", "blocked"]
-    assert sub["include_children"] == 1
-    assert sub["wake_prompt"] == "Pick up the work"
-    assert sub["name"] == "lane-a"
-
-
-def test_profile_subs_default_events_explicit_reset(client):
-    """Sending use_default_events=true after a custom list resets event_kinds
-    to NULL so the gateway falls back to DEFAULT_NOTIFY_TERMINAL_KINDS."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "event_kinds": ["completed"]},
-    )
-
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "use_default_events": True},
-    )
-    assert r.status_code == 200, r.text
-    sub = r.json()["sub"]
-    assert sub["event_kinds"] is None
-    assert sub["event_kinds_resolved"] == list(kb.DEFAULT_NOTIFY_TERMINAL_KINDS)
-
-
-def test_profile_subs_update_toggle_enabled_preserves_other_fields(client):
-    """Toggling ``enabled`` via POST must preserve event_kinds, wake_prompt,
-    include_children and wake_agent — same semantics as the kanban_db helper
-    (omitted = preserve)."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={
-            "profile": "jensen",
-            "event_kinds": ["completed"],
-            "include_children": True,
-            "wake_prompt": "do it",
-        },
-    )
-
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "enabled": False},
-    )
-    assert r.status_code == 200, r.text
-    sub = r.json()["sub"]
-    assert sub["enabled"] == 0
-    assert sub["event_kinds"] == ["completed"]
-    assert sub["include_children"] == 1
-    assert sub["wake_prompt"] == "do it"
-
-
-def test_profile_subs_clear_wake_prompt(client):
-    """Explicit clear_wake_prompt=true must NULL out the stored wake_prompt."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "wake_prompt": "first"},
-    )
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "clear_wake_prompt": True},
-    )
-    assert r.status_code == 200
-    assert r.json()["sub"]["wake_prompt"] in (None, "")
-
-
-def test_profile_subs_remove(client):
-    """DELETE removes the row and returns ok=true; second DELETE returns 404."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen"},
-    )
-    r = client.delete(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs/jensen"
-    )
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
-
-    # Gone from list.
-    rows = client.get(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs"
-    ).json()["profile_subs"]
-    assert rows == []
-
-    # Second delete reports not found.
-    r = client.delete(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs/jensen"
-    )
-    assert r.status_code == 404
-
-
-def test_profile_subs_remove_named(client):
-    """DELETE on (profile, name) only removes the specific named row."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "name": "lane-a"},
-    )
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "name": "lane-b"},
-    )
-
-    r = client.delete(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs/jensen?name=lane-a"
-    )
-    assert r.status_code == 200
-
-    rows = client.get(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs"
-    ).json()["profile_subs"]
-    assert [r["name"] for r in rows] == ["lane-b"]
-
-
-def test_profile_subs_unknown_task_returns_404_on_post(client):
-    r = client.post(
-        "/api/plugins/kanban/tasks/t_nonexistent/profile-subs",
-        json={"profile": "jensen"},
-    )
-    assert r.status_code == 404
-
-
-def test_profile_subs_post_requires_profile(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    # Missing profile.
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"name": "lane-a"},
-    )
-    assert r.status_code == 422
-    # Empty profile.
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": ""},
-    )
-    assert r.status_code == 400
-
-
-def test_profile_subs_list_returns_disabled_rows_too(client):
-    """The dashboard renders disabled subs (greyed out), so the list
-    endpoint must NOT filter on ``enabled``."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs",
-        json={"profile": "jensen", "enabled": False},
-    )
-    rows = client.get(
-        f"/api/plugins/kanban/tasks/{t['id']}/profile-subs"
-    ).json()["profile_subs"]
-    assert len(rows) == 1
-    assert rows[0]["enabled"] == 0
-
-
-# ---------------------------------------------------------------------------
-# Profile wake subscriptions — frontend dist bundle smoke checks
-# ---------------------------------------------------------------------------
-
-
-def test_dashboard_renders_profile_wake_subscriptions_section():
-    """The TaskDrawer must include a 'Profile wake subscriptions' section
-    with Iris' empty-state copy and key field labels so operators can
-    add/edit/remove rows from the drawer."""
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-
-    assert "ProfileSubsSection" in js
-    assert "Profile wake subscriptions" in js
-    assert "Wake Hermes profiles when this task reaches selected events" in js
-    assert "No profiles wake on this task" in js
-    # Field labels per Iris handoff.
-    assert "Default terminal events" in js
-    assert "Include dependency subtree" in js
-
-
-def test_dashboard_wake_health_toolbar_and_attention_echo_present():
-    """Board toolbar renders wake-health pill copy and attention echoes failures."""
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
-
-    assert "wake_health" in js
-    assert "Wakes healthy" in js
-    assert "failing •" in js
-    assert "hermes-kanban-wake-health" in js
-    assert "Wake health:" in js
-    assert "profile wakes failing" in js
-    assert "hermes-kanban-wake-health--failing" in css
-
-
-def test_dashboard_wake_events_trigger_rollup_reload():
-    """wake_events path should refresh board-level wake rollup as well."""
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-
-    assert "msg.wake_events" in js
-    assert "wake-health rollup" in js
-    assert "scheduleReload();" in js
-
-
-def test_dashboard_profile_subs_uses_backend_routes():
-    """The drawer must call the new REST surface for list/add/remove."""
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-
-    assert "/profile-subs" in js
-    # POST upsert + DELETE row.
-    assert "method: \"DELETE\"" in js  # generic, but combined with /profile-subs proves usage
-    assert "use_default_events" in js
-    assert "clear_wake_prompt" in js
-
-
-def test_dashboard_profile_sub_edit_preserves_disabled_state():
-    """Editing a disabled row must not silently re-enable it.
-
-    Enabled is managed by the row toggle. The edit form may save event/prompt
-    fields, but it must carry forward the current enabled value rather than
-    forcing ``enabled: true`` for every edit.
-    """
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-
-    assert "enabled: initial.profile ? !!initial.enabled : true" in js
-    assert "enabled: true,\n      };" not in js
-
-
-def test_dashboard_profile_sub_edit_locks_identity_fields():
-    """Edit mode must not allow profile/name identity changes.
-
-    The backend key is (task_id, profile, name). Until rename semantics exist,
-    the edit form should lock those identity fields so changing a label cannot
-    accidentally create a second subscription row.
-    """
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-
-    assert "lockProfile: true" in js
-    assert "Label is part of this subscription’s identity" in js
-    assert "remove and re-add to rename" in js
-
-
-def test_dashboard_profile_sub_load_errors_only_suppress_legacy_404():
-    """A real load failure must not masquerade as an empty subscription list."""
-    repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-
-    assert "if (/^404:/.test(rawProfileSubErr))" in js
-    assert "setProfileSubsErr(parseApiErrorMessage(e));" in js
-    assert "false \"no subscriptions\" empty state" in js

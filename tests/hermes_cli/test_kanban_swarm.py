@@ -1,10 +1,5 @@
 
-from pathlib import Path
-
-import pytest
-
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban.store_sqlite import SqliteKanbanStore
 from hermes_cli.kanban_swarm import (
     SwarmWorkerSpec,
     create_swarm,
@@ -13,24 +8,11 @@ from hermes_cli.kanban_swarm import (
 )
 
 
-@pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "sqlite")
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(kb, "single_writer_enabled", lambda: False)
-    kb.init_db()
-    return home
-
-
-def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(kanban_home):
-    store = SqliteKanbanStore(board=None)
+def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
     try:
         created = create_swarm(
-            store,
+            conn,
             goal="Map the target market and produce a decision memo.",
             workers=[
                 SwarmWorkerSpec(profile="researcher-a", title="Market scan", body="Find competitors"),
@@ -41,10 +23,7 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(kanban_ho
             tenant="intel",
             created_by="orchestrator",
         )
-    finally:
-        store.close()
 
-    with kb.connect() as conn:
         root = kb.get_task(conn, created.root_id)
         workers = [kb.get_task(conn, tid) for tid in created.worker_ids]
         verifier = kb.get_task(conn, created.verifier_id)
@@ -59,13 +38,15 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(kanban_ho
         assert set(kb.parent_ids(conn, created.verifier_id)) == set(created.worker_ids)
         assert kb.parent_ids(conn, created.synthesizer_id) == [created.verifier_id]
         assert all(created.root_id in (task.body or "") for task in workers)
+    finally:
+        conn.close()
 
 
-def test_swarm_blackboard_merges_structured_updates(kanban_home):
-    store = SqliteKanbanStore(board=None)
+def test_swarm_blackboard_merges_structured_updates(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
     try:
         created = create_swarm(
-            store,
+            conn,
             goal="Collect evidence.",
             workers=[SwarmWorkerSpec(profile="researcher", title="Evidence", body="Find proof")],
             verifier_assignee="reviewer",
@@ -73,33 +54,33 @@ def test_swarm_blackboard_merges_structured_updates(kanban_home):
         )
 
         post_blackboard_update(
-            store,
+            conn,
             created.root_id,
             author="researcher",
             key="sources",
             value=["https://example.com/a"],
         )
         post_blackboard_update(
-            store,
+            conn,
             created.root_id,
             author="reviewer",
             key="risks",
             value={"missing_primary_source": True},
         )
 
-        board = latest_blackboard(store, created.root_id)
+        board = latest_blackboard(conn, created.root_id)
         assert board["sources"] == ["https://example.com/a"]
         assert board["risks"] == {"missing_primary_source": True}
         assert board["_authors"]["sources"] == "researcher"
     finally:
-        store.close()
+        conn.close()
 
 
-def test_swarm_verifier_and_synthesis_are_dependency_gated(kanban_home):
-    store = SqliteKanbanStore(board=None)
+def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
     try:
         created = create_swarm(
-            store,
+            conn,
             goal="Research two branches then verify and synthesize.",
             workers=[
                 SwarmWorkerSpec(profile="a", title="Branch A", body="A"),
@@ -108,10 +89,7 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(kanban_home):
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
         )
-    finally:
-        store.close()
 
-    with kb.connect() as conn:
         kb.complete_task(
             conn,
             created.worker_ids[0],
@@ -135,3 +113,5 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(kanban_home):
         )
         kb.recompute_ready(conn)
         assert kb.get_task(conn, created.synthesizer_id).status == "ready"
+    finally:
+        conn.close()

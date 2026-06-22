@@ -11,7 +11,6 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import subprocess
@@ -202,8 +201,8 @@ def test_reassign_resets_failure_counter_for_new_profile(kanban_home, all_assign
 
 
 def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assignees_spawnable):
-    """Per-task ``max_retries`` overrides the caller-supplied
-    ``failure_limit`` for ordinary failures.
+    """Per-task ``max_retries`` overrides both the caller-supplied
+    ``failure_limit`` (gateway config) and the hardcoded default.
 
     Three-tier resolution order:
       1. ``task.max_retries`` (set via ``create_task(max_retries=N)`` /
@@ -242,45 +241,6 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
         assert gave_up, f"expected gave_up event, got {[e.kind for e in events]}"
         assert gave_up[-1].payload.get("limit_source") == "task"
         assert gave_up[-1].payload.get("effective_limit") == 1
-    finally:
-        conn.close()
-
-
-def test_dispatcher_failure_limit_cap_can_force_task_max_retries(kanban_home, all_assignees_spawnable):
-    """Deterministic callers may explicitly cap task-level retries.
-
-    Deterministic failure classes (e.g. protocol_violation_clean_exit)
-    route through ``_record_task_failure(..., failure_limit=1,
-    failure_limit_is_cap=True)``. The cap ensures they block on first
-    occurrence even if ``task.max_retries`` is higher.
-    """
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(
-            conn, title="deterministic", assignee="worker", max_retries=5,
-        )
-        kb.claim_task(conn, tid)
-        tripped = kb._record_task_failure(
-            conn, tid,
-            error="protocol violation",
-            outcome="crashed",
-            failure_limit=1,
-            failure_limit_is_cap=True,
-            release_claim=True,
-            end_run=False,
-        )
-        assert tripped is True
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == "blocked"
-        assert task.consecutive_failures == 1
-
-        events = kb.list_events(conn, tid)
-        gave_up = [e for e in events if e.kind == "gave_up"]
-        assert gave_up, f"expected gave_up event, got {[e.kind for e in events]}"
-        payload = gave_up[-1].payload or {}
-        assert payload.get("effective_limit") == 1
-        assert payload.get("limit_source") == "dispatcher"
     finally:
         conn.close()
 
@@ -672,110 +632,6 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn2.close()
 
 
-def test_notify_claim_idle_path_does_not_open_write_transaction(kanban_home, monkeypatch):
-    """Quiet notifier polls should not take a SQLite writer lock."""
-    conn = kb.connect()
-    calls = {"write_txn": 0}
-
-    @contextlib.contextmanager
-    def counted_write_txn(db):
-        calls["write_txn"] += 1
-        with original_write_txn(db) as tx:
-            yield tx
-
-    original_write_txn = kb.write_txn
-    monkeypatch.setattr(kb, "write_txn", counted_write_txn)
-    try:
-        tid = kb.create_task(conn, title="idle notify", assignee="w")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
-        calls["write_txn"] = 0
-
-        old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-
-        assert events == []
-        assert new_cursor == old_cursor
-        assert calls["write_txn"] == 0
-    finally:
-        conn.close()
-
-
-def test_profile_event_claim_idle_path_does_not_open_write_transaction(
-    kanban_home, monkeypatch,
-):
-    """Quiet profile-event subscriptions should be read-only until events exist."""
-    conn = kb.connect()
-    calls = {"write_txn": 0}
-
-    @contextlib.contextmanager
-    def counted_write_txn(db):
-        calls["write_txn"] += 1
-        with original_write_txn(db) as tx:
-            yield tx
-
-    original_write_txn = kb.write_txn
-    monkeypatch.setattr(kb, "write_txn", counted_write_txn)
-    try:
-        tid = kb.create_task(conn, title="idle profile event", assignee="w")
-        kb.add_profile_event_sub(
-            conn, task_id=tid, profile="default", event_kinds=["completed"],
-        )
-        calls["write_txn"] = 0
-
-        old_cursor, new_cursor, events = kb.claim_unseen_events_for_profile_sub(
-            conn,
-            task_id=tid,
-            profile="default",
-        )
-
-        assert events == []
-        assert new_cursor == old_cursor
-        assert calls["write_txn"] == 0
-    finally:
-        conn.close()
-
-
-def test_profile_event_claim_still_uses_write_transaction_when_events_exist(
-    kanban_home, monkeypatch,
-):
-    """The optimization must not weaken single-owner claiming for real events."""
-    conn = kb.connect()
-    calls = {"write_txn": 0}
-
-    @contextlib.contextmanager
-    def counted_write_txn(db):
-        calls["write_txn"] += 1
-        with original_write_txn(db) as tx:
-            yield tx
-
-    original_write_txn = kb.write_txn
-    monkeypatch.setattr(kb, "write_txn", counted_write_txn)
-    try:
-        tid = kb.create_task(conn, title="active profile event", assignee="w")
-        kb.add_profile_event_sub(
-            conn, task_id=tid, profile="default", event_kinds=["completed"],
-        )
-        kb.complete_task(conn, tid, result="ok")
-        calls["write_txn"] = 0
-
-        old_cursor, new_cursor, events = kb.claim_unseen_events_for_profile_sub(
-            conn,
-            task_id=tid,
-            profile="default",
-        )
-
-        assert [ev.kind for ev in events] == ["completed"]
-        assert new_cursor > old_cursor
-        assert calls["write_txn"] == 1
-    finally:
-        conn.close()
-
-
 # ---------------------------------------------------------------------------
 # GC + retention
 # ---------------------------------------------------------------------------
@@ -923,7 +779,7 @@ def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
         assert kb.archive_task(conn, tid)
     finally:
         conn.close()
-    out = run_slash(f"archive --rm {tid} --confirm")
+    out = run_slash(f"archive --rm {tid}")
     assert f"Deleted {tid}" in out
     conn = kb.connect()
     try:
@@ -1073,18 +929,6 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
         out = run_slash(cmd)
         assert out is not None
         assert out.strip() != "", f"empty output for `/kanban {cmd}`"
-
-
-def test_dispatch_dry_run_json_preview_format(kanban_home):
-    """dispatch --dry-run --json returns a read-only preview payload."""
-    with kb.connect() as conn:
-        kb.create_task(conn, title="needs assignment")
-
-    payload = json.loads(run_slash("dispatch --dry-run --json"))
-
-    # New preview format: preview=True, candidates list (empty — task has no assignee)
-    assert payload["preview"] is True
-    assert payload["candidates"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1309,35 +1153,6 @@ def test_heartbeat_refused_when_not_running(kanban_home):
         conn.close()
 
 
-def test_heartbeat_events_are_throttled_but_liveness_updates(kanban_home, monkeypatch):
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.claim_task(conn, tid)
-        monkeypatch.setattr(kb.time, "time", lambda: 1_000)
-        assert kb.heartbeat_worker(conn, tid, note="first") is True
-        first_task = kb.get_task(conn, tid)
-        assert first_task is not None
-        assert first_task.last_heartbeat_at == 1_000
-
-        monkeypatch.setattr(kb.time, "time", lambda: 1_010)
-        assert kb.heartbeat_worker(conn, tid, note="chatty") is True
-        second_task = kb.get_task(conn, tid)
-        assert second_task is not None
-        assert second_task.last_heartbeat_at == 1_010
-        events = [e for e in kb.list_events(conn, tid) if e.kind == "heartbeat"]
-        assert len(events) == 1
-        assert events[0].payload == {"note": "first"}
-
-        monkeypatch.setattr(kb.time, "time", lambda: 1_061)
-        assert kb.heartbeat_worker(conn, tid, note="later") is True
-        events = [e for e in kb.list_events(conn, tid) if e.kind == "heartbeat"]
-        assert len(events) == 2
-        assert events[-1].payload == {"note": "later"}
-    finally:
-        conn.close()
-
-
 def test_cli_heartbeat_verb(kanban_home):
     conn = kb.connect()
     try:
@@ -1348,17 +1163,14 @@ def test_cli_heartbeat_verb(kanban_home):
     out = run_slash(f"heartbeat {tid}")
     assert "Heartbeat recorded" in out
 
-    # With --note. The second call may be event-throttled, but the command must
-    # still update authoritative liveness state and report success.
+    # With --note.
     out = run_slash(f"heartbeat {tid} --note 'step 42'")
     assert "Heartbeat recorded" in out
     conn = kb.connect()
     try:
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.last_heartbeat_at is not None
-        events = [e for e in kb.list_events(conn, tid) if e.kind == "heartbeat"]
-        assert len(events) >= 1
+        events = kb.list_events(conn, tid)
+        notes = [e.payload.get("note") for e in events if e.kind == "heartbeat" and e.payload]
+        assert "step 42" in notes
     finally:
         conn.close()
 
@@ -1636,10 +1448,7 @@ def test_run_closed_on_complete_with_summary(kanban_home):
         assert r.status == "done"
         assert r.outcome == "completed"
         assert r.summary == "implemented rate limiter, tests pass"
-        assert isinstance(r.metadata, dict)
-        assert r.metadata["changed_files"] == ["limiter.py"]
-        assert r.metadata["tests_run"] == 12
-        assert "closeout_packet" in r.metadata
+        assert r.metadata == {"changed_files": ["limiter.py"], "tests_run": 12}
         assert r.ended_at is not None
     finally:
         conn.close()
@@ -1985,8 +1794,7 @@ def test_cli_runs_json(kanban_home):
     data = json.loads(out)
     assert len(data) == 1
     assert data[0]["outcome"] == "completed"
-    assert data[0]["metadata"]["files"] == 1
-    assert "closeout_packet" in data[0]["metadata"]
+    assert data[0]["metadata"] == {"files": 1}
 
 
 def test_cli_complete_with_summary_and_metadata(kanban_home):
@@ -2007,11 +1815,8 @@ def test_cli_complete_with_summary_and_metadata(kanban_home):
         r = kb.latest_run(conn, tid)
     finally:
         conn.close()
-    assert r is not None
     assert r.summary == "done it"
-    assert isinstance(r.metadata, dict)
-    assert r.metadata["files"] == 3
-    assert "closeout_packet" in r.metadata
+    assert r.metadata == {"files": 3}
 
 
 def test_cli_edit_backfills_result_on_done_task(kanban_home):
@@ -2114,7 +1919,6 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
     Importing _set_status_direct directly to simulate the PATCH handler
     without spinning up FastAPI.
     """
-    pytest.importorskip("fastapi")
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
     conn = kb.connect()
@@ -2140,7 +1944,6 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
 
 def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanban_home):
     """todo -> ready on an unclaimed task must not create any run rows."""
-    pytest.importorskip("fastapi")
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
     conn = kb.connect()
@@ -2255,9 +2058,7 @@ def test_complete_never_claimed_task_synthesizes_run(kanban_home):
         r = runs[0]
         assert r.outcome == "completed"
         assert r.summary == "did it manually"
-        assert isinstance(r.metadata, dict)
-        assert r.metadata["reason"] == "human intervention"
-        assert "closeout_packet" in r.metadata
+        assert r.metadata == {"reason": "human intervention"}
         # Zero-duration synthetic run.
         assert r.started_at == r.ended_at
         # Task pointer still NULL (we never claimed, never opened a run).
@@ -2902,20 +2703,17 @@ def test_build_worker_context_caps_huge_summary(kanban_home):
         conn.close()
 
 
-def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
-    """The dispatcher's _default_spawn must include --skills kanban-worker
-    in its argv so every worker loads the skill automatically, even if
-    the profile hasn't wired it into its default skills config.
+def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+    """The dispatcher no longer auto-loads a bundled kanban skill.
+
+    The kanban lifecycle (formerly the kanban-worker/kanban-orchestrator
+    skills) is now injected into every worker's system prompt via
+    KANBAN_GUIDANCE, so _default_spawn must NOT append a `--skills` flag
+    when the task carries no per-task skills.
 
     We intercept Popen to capture the argv without actually spawning a
     hermes subprocess (which would hang trying to call an LLM).
     """
-    # Pretend the bundled kanban-worker skill resolves for this isolated
-    # HERMES_HOME — the fixture creates an empty tmpdir without the
-    # devops/kanban-worker tree, and _default_spawn gates the --skills
-    # flag on actual resolvability.
-    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
-
     captured = {}
 
     class FakeProc:
@@ -2941,10 +2739,8 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
         conn.close()
 
     cmd = captured["cmd"]
-    assert "--skills" in cmd, f"spawn argv missing --skills: {cmd}"
-    idx = cmd.index("--skills")
-    assert cmd[idx + 1] == "kanban-worker", (
-        f"expected 'kanban-worker', got {cmd[idx + 1]!r}"
+    assert "--skills" not in cmd, (
+        f"spawn argv should not auto-load any skill: {cmd}"
     )
     assert "--accept-hooks" in cmd, f"spawn argv missing --accept-hooks: {cmd}"
     assert cmd.index("--accept-hooks") < cmd.index("chat"), (
@@ -2955,42 +2751,6 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
-
-
-def test_kanban_worker_skill_available_ignores_archived_copy(tmp_path):
-    home = tmp_path / ".hermes"
-    archived = (
-        home / "skills" / ".archive" / "curator-pass"
-        / "devops" / "kanban-worker"
-    )
-    archived.mkdir(parents=True)
-    (archived / "SKILL.md").write_text("---\nname: kanban-worker\n---\n", encoding="utf-8")
-
-    assert kb._kanban_worker_skill_available(str(home)) is False
-
-    active = home / "skills" / "devops" / "kanban-worker"
-    active.mkdir(parents=True)
-    (active / "SKILL.md").write_text("---\nname: kanban-worker\n---\n", encoding="utf-8")
-
-    assert kb._kanban_worker_skill_available(str(home)) is True
-
-
-def test_forced_skill_available_for_home_ignores_archived_copy(tmp_path):
-    home = tmp_path / ".hermes"
-    archived = (
-        home / "skills" / ".archive" / "curator-pass"
-        / "software-development" / "ticket-hub"
-    )
-    archived.mkdir(parents=True)
-    (archived / "SKILL.md").write_text("---\nname: ticket-hub\n---\n", encoding="utf-8")
-
-    assert kb._skill_available_for_home("ticket-hub", str(home)) is False
-
-    active = home / "skills" / "software-development" / "ticket-hub"
-    active.mkdir(parents=True)
-    (active / "SKILL.md").write_text("---\nname: ticket-hub\n---\n", encoding="utf-8")
-
-    assert kb._skill_available_for_home("ticket-hub", str(home)) is True
 
 
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
@@ -3220,8 +2980,7 @@ def test_create_task_skills_lists_all_toolset_typos(kanban_home):
 
 def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     """Dispatcher argv must carry one `--skills X` pair per task skill,
-    in addition to the built-in kanban-worker."""
-    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+    in declared order. No skill is auto-loaded anymore."""
     captured = {}
 
     class FakeProc:
@@ -3254,10 +3013,8 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     for i, tok in enumerate(cmd):
         if tok == "--skills" and i + 1 < len(cmd):
             skill_names.append(cmd[i + 1])
-    # kanban-worker first (built-in), then per-task extras in order.
-    assert skill_names[0] == "kanban-worker", skill_names
-    assert "translation" in skill_names
-    assert "github-code-review" in skill_names
+    # Only the per-task skills, in declared order — nothing auto-loaded.
+    assert skill_names == ["translation", "github-code-review"], skill_names
     # --skills must appear BEFORE the `chat` subcommand so argparse
     # attaches them to the top-level parser, not the subcommand.
     chat_idx = cmd.index("chat")
@@ -3269,9 +3026,9 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     )
 
 
-def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monkeypatch):
-    """If a task explicitly lists 'kanban-worker', we don't double-pass it."""
-    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
+    """Per-task skills are passed through verbatim — there is no built-in
+    kanban skill to dedupe against anymore."""
     captured = {}
 
     class FakeProc:
@@ -3287,7 +3044,7 @@ def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monke
     try:
         tid = kb.create_task(
             conn, title="dup", assignee="x",
-            skills=["kanban-worker", "translation"],
+            skills=["translation", "github-code-review"],
         )
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
@@ -3296,12 +3053,14 @@ def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monke
         conn.close()
 
     cmd = captured["cmd"]
-    worker_pairs = [
-        i for i, tok in enumerate(cmd)
-        if tok == "--skills" and i + 1 < len(cmd) and cmd[i + 1] == "kanban-worker"
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
     ]
-    assert len(worker_pairs) == 1, (
-        f"kanban-worker appeared {len(worker_pairs)} times in argv: {cmd}"
+    # Exactly the task's skills, once each, in order — no auto-loaded extras.
+    assert skill_names == ["translation", "github-code-review"], (
+        f"unexpected --skills in argv: {cmd}"
     )
 
 
@@ -3785,54 +3544,6 @@ def test_cli_daemon_help_marks_deprecated():
 # Gateway embedded dispatcher watcher
 # ---------------------------------------------------------------------------
 
-def test_format_kanban_dispatch_summary_includes_guard_counts():
-    from gateway.run import _format_kanban_dispatch_summary
-
-    summary = {
-        "ready_count": 2,
-        "spawnable_ready": 1,
-        "spawned": 0,
-        "spawn_attempts": 1,
-        "spawn_failures": 1,
-        "respawn_guarded": 2,
-        "respawn_guarded_by_reason": {"blocker_auth": 2},
-        "respawn_guarded_examples": {"blocker_auth": ["t_a", "t_b"]},
-        "skipped_nonspawnable": 3,
-        "skipped_unassigned": 1,
-        "auto_blocked": 0,
-        "max_in_progress_blocked": False,
-    }
-    line = _format_kanban_dispatch_summary("default", summary)
-    assert "kanban dispatcher [default]" in line
-    assert "spawn_failures=1" in line
-    assert "respawn_guarded=2" in line
-    assert "respawn_guarded_by_reason={'blocker_auth': 2}" in line
-    assert "examples=['t_a:blocker_auth']" in line
-
-
-def test_collect_kanban_dispatch_warning_details_caps_examples():
-    from gateway.run import _collect_kanban_dispatch_warning_details
-
-    reasons, examples = _collect_kanban_dispatch_warning_details(
-        {
-            "default": {
-                "respawn_guarded_by_reason": {"blocker_auth": 2, "active_pr": 1},
-                "respawn_guarded_examples": {
-                    "blocker_auth": ["t_1", "t_2"],
-                    "active_pr": ["t_3"],
-                },
-            },
-            "staging": {
-                "respawn_guarded_by_reason": {"blocker_auth": 3},
-                "respawn_guarded_examples": {"blocker_auth": ["t_9"]},
-            },
-        },
-        example_cap=2,
-    )
-    assert reasons == {"blocker_auth": 5, "active_pr": 1}
-    assert examples == ["default:t_1:blocker_auth", "default:t_3:active_pr"]
-
-
 def test_gateway_dispatcher_watcher_respects_config_flag_off(monkeypatch):
     """dispatch_in_gateway=false -> watcher exits fast, no loop."""
     import asyncio
@@ -3949,11 +3660,16 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # Allow enough full loops for 3 confirmed corruption detections:
-        # two warning confirmations plus final hard-disable/error log.
+        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
+        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
+        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
+        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
+        # so this counter must reach 6 to allow the same 2 dispatch ticks the
+        # pre-reaper test expected at 4. Connect counts in the assertion below
+        # are unchanged.
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 12:
+        if calls["to_thread"] >= 6:
             runner._running = False
         return result
 
@@ -3964,7 +3680,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
         asyncio.run(
             asyncio.wait_for(
                 runner._kanban_dispatcher_watcher(),
@@ -3974,872 +3690,15 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 
     messages = [record.getMessage() for record in caplog.records]
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
-    assert any("until the gateway restarts" in msg for msg in messages)
-    assert not any("until the file changes" in msg for msg in messages)
-    assert not any("database changed; retrying dispatch" in msg for msg in messages)
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    assert "confirmation 1/3 signaled corruption" in caplog.text
-    assert "confirmation 2/3 signaled corruption" in caplog.text
-    # Repeated retries occur before hard-disable; once the confirmation streak
-    # hits threshold, in-process retries stop for that DB path.
-    assert calls["connect"] >= 3
-
-
-
-def test_gateway_dispatcher_transient_malformed_is_not_disabled(
-    monkeypatch, tmp_path, caplog
-):
-    """A connection-local malformed error is retried if confirmation is healthy."""
-    import asyncio
-    import logging
-    import sqlite3
-
-    import gateway.run as gateway_run
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(
-        _kb,
-        "read_board_metadata",
-        lambda slug: {"slug": slug},
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-    monkeypatch.setattr(
-        gateway_run,
-        "_confirm_board_db_corruption",
-        lambda _path: (False, "ok"),
-    )
-
-    calls = {"connect": 0, "to_thread": 0}
-
-    def _connect(*args, **kwargs):
-        calls["connect"] += 1
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 8:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("treating as transient" in msg for msg in messages)
-    assert not any("not a valid SQLite database" in msg for msg in messages)
-    assert calls["connect"] >= 4
-
-
-def test_gateway_dispatcher_live_readonly_malformed_snapshot_ok_never_hard_disables(
-    monkeypatch, tmp_path, caplog
-):
-    """Dispatcher should not disable when immutable snapshot contradicts live churn."""
-    import asyncio
-    import logging
-    import sqlite3
-
-    import gateway.run as gateway_run
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(
-        _kb,
-        "read_board_metadata",
-        lambda slug: {"slug": slug},
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-
-    class _Cursor:
-        def fetchone(self):
-            return ("ok",)
-
-    class _LiveProbeConn:
-        def execute(self, sql):
-            if "quick_check" in sql:
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            raise AssertionError(f"unexpected SQL: {sql}")
-
-        def close(self):
-            return None
-
-    class _BackupSourceConn:
-        def backup(self, dst):
-            return None
-
-        def close(self):
-            return None
-
-    class _BackupDestConn:
-        def close(self):
-            return None
-
-    class _SnapshotProbeConn:
-        def execute(self, sql):
-            if "quick_check" in sql:
-                return _Cursor()
-            raise AssertionError(f"unexpected SQL: {sql}")
-
-        def close(self):
-            return None
-
-    calls = {"connect": 0, "to_thread": 0}
-    probe_connects = []
-
-    def _connect(*args, **kwargs):
-        calls["connect"] += 1
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    def _probe_connect(database, *args, **kwargs):
-        probe_connects.append(str(database))
-        if "immutable=1" in str(database):
-            return _SnapshotProbeConn()
-        live_ro_calls = [
-            uri for uri in probe_connects
-            if "mode=ro" in uri and "immutable=1" not in uri
-        ]
-        if "mode=ro" in str(database) and len(live_ro_calls) % (gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS + 1) != 0:
-            return _LiveProbeConn()
-        if "mode=ro" in str(database):
-            return _BackupSourceConn()
-        return _BackupDestConn()
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 8:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr(gateway_run.sqlite3, "connect", _probe_connect)
-    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("sqlite backup snapshot quick_check ok" in msg for msg in messages)
-    assert any("treating as transient" in msg for msg in messages)
-    assert not any("not a valid SQLite database" in msg for msg in messages)
-    assert calls["connect"] >= 4
-
-
-def test_gateway_dispatcher_live_readonly_malformed_snapshot_backup_transient_then_ok(
-    monkeypatch, tmp_path, caplog
-):
-    """Dispatcher should not disable when snapshot backup transiently fails then recovers."""
-    import asyncio
-    import logging
-    import sqlite3
-
-    import gateway.run as gateway_run
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(
-        _kb,
-        "read_board_metadata",
-        lambda slug: {"slug": slug},
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-
-    class _Cursor:
-        def fetchone(self):
-            return ("ok",)
-
-    class _LiveProbeConn:
-        def execute(self, sql):
-            if "quick_check" in sql:
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            raise AssertionError(f"unexpected SQL: {sql}")
-
-        def close(self):
-            return None
-
-    class _BackupSourceConn:
-        def __init__(self, attempt):
-            self._attempt = attempt
-
-        def backup(self, dst):
-            if self._attempt == 1:
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            return None
-
-        def close(self):
-            return None
-
-    class _BackupDestConn:
-        def close(self):
-            return None
-
-    class _SnapshotProbeConn:
-        def execute(self, sql):
-            if "quick_check" in sql:
-                return _Cursor()
-            raise AssertionError(f"unexpected SQL: {sql}")
-
-        def close(self):
-            return None
-
-    calls = {"connect": 0, "to_thread": 0}
-    probe_state = {"ro_in_cycle": 0}
-
-    def _connect(*args, **kwargs):
-        calls["connect"] += 1
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    def _probe_connect(database, *args, **kwargs):
-        uri = str(database)
-        if "immutable=1" in uri:
-            probe_state["ro_in_cycle"] = 0
-            return _SnapshotProbeConn()
-        if "mode=ro" in uri:
-            probe_state["ro_in_cycle"] += 1
-            if probe_state["ro_in_cycle"] <= gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS:
-                return _LiveProbeConn()
-            snapshot_attempt = (
-                probe_state["ro_in_cycle"]
-                - gateway_run._KANBAN_DB_CORRUPTION_PROBE_ATTEMPTS
-            )
-            return _BackupSourceConn(snapshot_attempt)
-        return _BackupDestConn()
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 8:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr(gateway_run.sqlite3, "connect", _probe_connect)
-    monkeypatch.setattr(gateway_run.time, "sleep", lambda _sec: None)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("sqlite backup snapshot quick_check ok on attempt 2" in msg for msg in messages)
-    assert any("treating as transient" in msg for msg in messages)
-    assert not any("not a valid SQLite database" in msg for msg in messages)
-    assert calls["connect"] >= 4
-
-
-def test_gateway_dispatcher_confirmation_streak_resets_when_probe_turns_healthy(
-    monkeypatch, tmp_path, caplog
-):
-    """Confirmed corruption must be consecutive; healthy confirmation resets streak."""
-    import asyncio
-    import logging
-    import sqlite3
-
-    import gateway.run as gateway_run
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(
-        _kb,
-        "read_board_metadata",
-        lambda slug: {"slug": slug},
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-    confirmations = iter(
-        [
-            (True, "test confirmed corruption #1"),
-            (False, "confirmation probe quick_check/integrity_check ok"),
-            (True, "test confirmed corruption #2"),
-            (True, "test confirmed corruption #3"),
-        ]
-    )
-    monkeypatch.setattr(
-        gateway_run,
-        "_confirm_board_db_corruption",
-        lambda db_path: next(
-            confirmations,
-            (False, "confirmation probe quick_check/integrity_check ok"),
-        ),
-    )
-
-    calls = {"connect": 0, "to_thread": 0}
-
-    def _connect(*args, **kwargs):
-        calls["connect"] += 1
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        # The dispatcher loop now issues 4 to_thread calls per iteration
-        # (reap_zombies + auto_decompose + _tick_once + _ready_nonempty), so
-        # ~16 to_thread calls are needed to drive the 4 ticks this scenario
-        # requires (confirm #1 → reset → confirm #2 → confirm #3 = streak 2/3).
-        if calls["to_thread"] >= 16:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert not any("not a valid SQLite database" in msg for msg in messages)
-    assert "confirmation 1/3 signaled corruption" in caplog.text
-    assert "confirmation 2/3 signaled corruption" in caplog.text
-    assert any("treating as transient" in msg for msg in messages)
-    assert calls["connect"] >= 8
-
-
-def test_gateway_dispatcher_post_connect_dispatch_corruption_progresses_to_hard_disable(
-    monkeypatch, tmp_path, caplog
-):
-    """Corruption from dispatch_once after connect should accumulate confirmation streak."""
-    import asyncio
-    import logging
-    import sqlite3
-
-    import gateway.run as gateway_run
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(
-        _kb,
-        "read_board_metadata",
-        lambda slug: {"slug": slug},
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-    monkeypatch.setattr(
-        gateway_run,
-        "_confirm_board_db_corruption",
-        lambda db_path: (True, "test confirmed corruption"),
-    )
-
-    calls = {"dispatch": 0, "to_thread": 0}
-
-    def _dispatch_once(*args, **kwargs):
-        calls["dispatch"] += 1
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 12:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert "confirmation 1/3 signaled corruption" in caplog.text
-    assert "confirmation 2/3 signaled corruption" in caplog.text
-    assert any("not a valid SQLite database" in msg for msg in messages)
-    assert calls["dispatch"] >= 3
-
-
-def test_gateway_dispatcher_same_tick_alias_corruption_dedupes_confirmation_streak(
-    monkeypatch, tmp_path, caplog
-):
-    """Aliases pointing at one DB advance the confirmation streak once per tick."""
-    import asyncio
-    import logging
-    import sqlite3
-
-    import gateway.run as gateway_run
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    aliases = [
-        {"slug": "alpha", "db_path": str(board_db)},
-        {"slug": "beta", "db_path": str(board_db)},
-        {"slug": "gamma", "db_path": str(board_db)},
-    ]
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [dict(a) for a in aliases],
-    )
-    monkeypatch.setattr(
-        _kb,
-        "read_board_metadata",
-        lambda slug: next(dict(a) for a in aliases if a["slug"] == slug),
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-    monkeypatch.setattr(
-        gateway_run,
-        "_confirm_board_db_corruption",
-        lambda db_path: (True, "test confirmed corruption"),
-    )
-
-    calls = {"connect": 0, "to_thread": 0}
-
-    def _connect(*args, **kwargs):
-        calls["connect"] += 1
-        raise sqlite3.DatabaseError("database disk image is malformed")
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 12:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    # Three aliases per tick, but the streak advances exactly once per tick.
-    assert caplog.text.count("confirmation 1/3 signaled corruption") == 1
-    assert caplog.text.count("confirmation 2/3 signaled corruption") == 1
-    idx_1 = next(
-        i for i, m in enumerate(messages)
-        if "confirmation 1/3 signaled corruption" in m
-    )
-    idx_2 = next(
-        i for i, m in enumerate(messages)
-        if "confirmation 2/3 signaled corruption" in m
-    )
-    # No hard-disable on the first two ticks — only after the 3/3 threshold.
-    assert not any(
-        "not a valid SQLite database" in m for m in messages[: idx_2 + 1]
-    )
-    idx_disable = next(
-        i for i, m in enumerate(messages) if "not a valid SQLite database" in m
-    )
-    assert idx_1 < idx_2 < idx_disable
-    assert any("until the gateway restarts" in m for m in messages)
-
-
-def test_gateway_dispatcher_disables_hot_replaced_board_until_restart(
-    monkeypatch, tmp_path, caplog
-):
-    """An atomic board DB replacement mid-run triggers a one-time hard disable."""
-    import asyncio
-    import logging
-    import os
-
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    class _DispatchResult:
-        def summary(self):
-            return {}
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-                "auto_decompose": False,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-
-    calls = {"tick": 0, "dispatch": 0, "to_thread": 0}
-
-    def _dispatch_once(*args, **kwargs):
-        calls["dispatch"] += 1
-        return _DispatchResult()
-
-    async def _to_thread(fn, *args, **kwargs):
-        calls["to_thread"] += 1
-        name = getattr(fn, "__name__", "")
-        result = fn(*args, **kwargs)
-        if name == "_tick_once":
-            calls["tick"] += 1
-            if calls["tick"] == 1:
-                swapped_db = tmp_path / "kanban-swapped.db"
-                _kb.init_db(db_path=swapped_db)
-                os.replace(swapped_db, board_db)
-            elif calls["tick"] >= 3:
-                runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    hot_swap_logs = [msg for msg in messages if "hot-replaced" in msg]
-    assert len(hot_swap_logs) == 1
-    assert "until gateway restart" in hot_swap_logs[0]
-    assert "repair-db" in hot_swap_logs[0]
-    assert "previous_fingerprint=(dev=" in hot_swap_logs[0]
-    assert "current_fingerprint=(dev=" in hot_swap_logs[0]
-    assert calls["dispatch"] == 1
-    assert calls["tick"] >= 3
-
-
-def test_gateway_dispatcher_first_open_transition_is_not_flagged_hot_replacement(
-    monkeypatch, tmp_path, caplog
-):
-    """Missing->present DB file transition should not trigger hot-replacement alerts."""
-    import asyncio
-    import logging
-
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    class _DispatchResult:
-        def summary(self):
-            return {}
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-                "auto_decompose": False,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-
-    calls = {"tick": 0, "dispatch": 0}
-
-    def _dispatch_once(*args, **kwargs):
-        calls["dispatch"] += 1
-        return _DispatchResult()
-
-    async def _to_thread(fn, *args, **kwargs):
-        name = getattr(fn, "__name__", "")
-        result = fn(*args, **kwargs)
-        if name == "_tick_once":
-            calls["tick"] += 1
-            if calls["tick"] >= 2:
-                runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert not any("hot-replaced" in msg for msg in messages)
-    assert not any("database changed; retrying dispatch" in msg for msg in messages)
-    assert calls["dispatch"] == 2
-
-
-def test_gateway_dispatcher_does_not_disable_on_normal_sqlite_write_between_ticks(
-    monkeypatch, tmp_path, caplog
-):
-    """Ordinary between-tick SQLite writes must not trigger hot-replacement disable."""
-    import asyncio
-    import logging
-
-    from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
-
-    class _DispatchResult:
-        def summary(self):
-            return {}
-
-    runner = object.__new__(GatewayRunner)
-    runner._running = True
-    board_db = tmp_path / "kanban.db"
-    _kb.init_db(db_path=board_db)
-
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-                "auto_decompose": False,
-            }
-        },
-    )
-    monkeypatch.setattr(
-        _kb,
-        "list_boards",
-        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
-    )
-    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: board_db)
-
-    calls = {"tick": 0, "dispatch": 0}
-
-    def _dispatch_once(conn, *args, **kwargs):
-        calls["dispatch"] += 1
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS gateway_tick_touch ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)"
-        )
-        conn.execute(
-            "INSERT INTO gateway_tick_touch(note) VALUES (?)",
-            (f"tick-{calls['dispatch']}",),
-        )
-        conn.commit()
-        return _DispatchResult()
-
-    async def _to_thread(fn, *args, **kwargs):
-        name = getattr(fn, "__name__", "")
-        result = fn(*args, **kwargs)
-        if name == "_tick_once":
-            calls["tick"] += 1
-            if calls["tick"] >= 3:
-                runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
-    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
-
-    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
-        asyncio.run(
-            asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
-                timeout=3.0,
-            )
-        )
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert not any("hot-replaced" in msg for msg in messages)
-    assert calls["dispatch"] == 3
-    assert calls["tick"] >= 3
+    # First tick connect (dispatch) + two probes per `_has_ready_work` call
+    # (ready then review, both via _kb.connect). The second dispatch tick
+    # skips the dispatch connect because the corrupt board fingerprint is
+    # disabled, but the ready/review probes still each connect. PR f55d94a1e
+    # added the review-column probe alongside the existing ready-column
+    # probe, bumping this from 3 → 5.
+    assert calls["connect"] == 5
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
@@ -4889,11 +3748,15 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         caller = inspect.currentframe().f_back  # type: ignore[union-attr]
         code = caller.f_code if caller is not None else None
         filename = code.co_filename if code is not None else ""
-        if filename.endswith("gateway/run.py"):
+        # The kanban dispatcher/notifier watcher loops were extracted from
+        # gateway/run.py into gateway/kanban_watchers.py (god-file Phase 3),
+        # so accept either filename for the time-travel mock.
+        if filename.endswith("gateway/run.py") or filename.endswith("gateway/kanban_watchers.py"):
             return next(time_values, 1301.0)
         return real_monotonic()
 
     monkeypatch.setattr("gateway.run.time.monotonic", _monotonic_for_gateway_dispatcher)
+    monkeypatch.setattr("gateway.kanban_watchers.time.monotonic", _monotonic_for_gateway_dispatcher)
 
     calls = {"tick": 0}
 
@@ -4924,10 +3787,8 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         )
 
     messages = [record.getMessage() for record in caplog.records]
-    # Corruption confirmation now hard-disables this DB path in-process once the
-    # streak threshold is reached; no quarantine retry-on-unchanged-path loop.
-    assert sum("not a valid SQLite database" in msg for msg in messages) == 1
-    assert not any("database fingerprint unchanged" in msg for msg in messages)
+    assert sum("not a valid SQLite database" in msg for msg in messages) == 2
+    assert any("database fingerprint unchanged" in msg for msg in messages)
     assert calls["tick"] == 3
 
 

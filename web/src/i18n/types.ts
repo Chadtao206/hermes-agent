@@ -111,6 +111,10 @@ export interface Translations {
     statusOverview: string;
     system: string;
     webUi: string;
+    /** Optional — fall back to English literals until translated. */
+    managingProfile?: string;
+    currentProfileOption?: string;
+    managingProfileBanner?: string;
   };
 
   // ── Status page ──
@@ -178,6 +182,7 @@ export interface Translations {
     selectedSessionsDeleted: string;
     failedToDeleteSelected: string;
     resumeInChat: string;
+    newChat: string;
     previousPage: string;
     nextPage: string;
     roles: {
@@ -351,7 +356,8 @@ export interface Translations {
     nameRequired: string;
     nameRule: string;
     invalidName: string;
-    cloneFromDefault: string;
+    cloneFrom: string;
+    cloneFromNone: string;
     allProfiles: string;
     noProfiles: string;
     defaultBadge: string;
@@ -405,6 +411,8 @@ export interface Translations {
     modelSaved?: string;
     modelSelect?: string;
     actions?: string;
+    manageSkills?: string;
+    activeSetHint?: string;
   };
 
   // ── Skills page ──
@@ -426,6 +434,10 @@ export interface Translations {
     setupNeeded: string;
     disabledForCli: string;
     more: string;
+    /** Optional — fall back to English literals until translated. */
+    profileSelector?: string;
+    currentProfile?: string;
+    managingProfile?: string;
   };
 
   // ── Config page ──
@@ -540,6 +552,13 @@ export interface Translations {
   theme: {
     title: string;
     switchTheme: string;
+    /** Font-override section (optional — locales fall back to English). */
+    fontTitle?: string;
+    fontDefault?: string;
+    fontDefaultHint?: string;
+    fontSans?: string;
+    fontSerif?: string;
+    fontMono?: string;
   };
 
   // ── Achievements plugin (plugins/hermes-achievements) ──

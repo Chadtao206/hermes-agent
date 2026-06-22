@@ -13,10 +13,12 @@ import {
   $updateStatus,
   checkUpdates,
   openUpdatesWindow,
-  refreshDesktopVersion
+  refreshDesktopVersion,
+  startActiveUpdate
 } from '@/store/updates'
 
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { UninstallSection } from './uninstall-section'
 
 const RELEASE_NOTES_URL = 'https://github.com/NousResearch/hermes-agent/releases'
 
@@ -140,9 +142,14 @@ export function AboutSettings() {
             </Button>
 
             {behind > 0 && supported && !applying && (
-              <Button onClick={() => openUpdatesWindow()} size="sm">
-                {a.seeWhatsNew}
-              </Button>
+              <>
+                <Button onClick={() => startActiveUpdate()} size="sm">
+                  {a.updateNow}
+                </Button>
+                <Button onClick={() => openUpdatesWindow()} size="sm" variant="textStrong">
+                  {a.seeWhatsNew}
+                </Button>
+              </>
             )}
 
             <Button asChild className="ml-auto" size="sm" variant="text">
@@ -167,6 +174,8 @@ export function AboutSettings() {
           hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
           title={a.automaticUpdates}
         />
+
+        <UninstallSection />
       </div>
     </SettingsContent>
   )

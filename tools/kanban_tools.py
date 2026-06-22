@@ -10,11 +10,9 @@ Why tools instead of just shelling out to ``hermes kanban``?
 
 1. **Backend portability.** A worker whose terminal tool points at Docker
    / Modal / Singularity / SSH would run ``hermes kanban complete …``
-   inside the container, where ``hermes`` isn't installed and the board
-   backend may not be reachable. Tools run in the agent's Python process,
-   so they reach the configured Kanban store (Postgres on current shared
-   deployments; SQLite only for legacy/local compatibility) regardless of
-   terminal backend.
+   inside the container, where ``hermes`` isn't installed and the DB
+   isn't mounted. Tools run in the agent's Python process, so they
+   always reach ``~/.hermes/kanban.db`` regardless of terminal backend.
 
 2. **No shell-quoting footguns.** Passing ``--metadata '{"x": [...]}'``
    through shlex+argparse is fragile. Structured tool args skip it.
@@ -33,11 +31,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
-import subprocess
 from typing import Any, Optional
 
+from agent.redact import redact_sensitive_text
 from tools.registry import registry, tool_error
+from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -169,35 +167,15 @@ def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
 
-    When ``board`` is provided it's forwarded to the Kanban backend adapter for
-    that board. ``None`` preserves the standard board resolution chain
-    (``HERMES_KANBAN_BOARD`` env → current symlink → ``default``; legacy
-    SQLite-only ``HERMES_KANBAN_DB`` applies only when the SQLite backend is in
-    use). Per-tool ``board`` lets a Telegram-side agent override the env-pinned
-    active board without restarting Hermes.
+    When ``board`` is provided it's forwarded to :func:`kb.connect`, which
+    routes the connection to that board's sqlite file. ``None`` (the
+    default) preserves the legacy resolution chain
+    (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
+    → ``default``). Per-tool ``board`` lets a Telegram-side agent override
+    the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
-    # Under the single-writer daemon, client processes (workers, CLI) must not
-    # open a writable connection — the guard raises DirectWriteForbidden. Reads
-    # use a SNAPSHOT (copy of the live DB + WAL/SHM sidecars), not a live
-    # ``mode=ro`` open: a ``mode=ro`` connection can miss freshly-committed
-    # WAL-resident writes during WAL/SHM churn, which caused read-after-write
-    # "task not found" right after a successful create → duplicate task creation.
-    # snapshot_connect copies the sidecars, so it sees committed writes. Writes go
-    # through ``kb.write_session``. Flag off → unchanged (writable connect, which
-    # also first-creates/initialises the DB).
-    if kb.single_writer_enabled():
-        from hermes_cli.kanban.store_sqlite import _SnapshotReadConn
-        return kb, _SnapshotReadConn(kb.snapshot_connect(board=board))
     return kb, kb.connect(board=board)
-
-
-def _store(board=None):
-    """Return a KanbanStore for board, routing reads/writes through the
-    store's connection-lifecycle management (snapshot reads + write_session
-    writes under the single-writer flag, plain connect otherwise)."""
-    from hermes_cli.kanban.store import kanban_store
-    return kanban_store(board=board)
 
 
 # ---------------------------------------------------------------------------
@@ -256,38 +234,28 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
     _auto_heartbeat_last_attempt = now
     try:
-        run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-        run_id: Optional[int]
+        kb, conn = _connect()
         try:
-            run_id = int(run_id_raw) if run_id_raw else None
-        except (TypeError, ValueError):
-            run_id = None
-        from hermes_cli.kanban.store import resolve_backend
-        if resolve_backend() == "postgres":
-            # PG: only refresh last_heartbeat_at via the store. Claim-TTL
-            # extension for a live worker is handled dispatcher-side by
-            # _pg_release_stale_claims' live-pid extension, so the worker
-            # does not self-extend the claim (no heartbeat_claim on PG).
-            _board = os.environ.get("HERMES_KANBAN_BOARD") or None
-            store = _store(board=_board)
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
             try:
-                store.heartbeat_worker(task_id=tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
             except Exception:
-                logger.debug("auto-heartbeat: store heartbeat_worker failed", exc_info=True)
-            finally:
-                store.close()
-        else:
-            from hermes_cli import kanban_db as kb
-            with kb.write_session() as w:
-                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-                try:
-                    w.heartbeat_claim(task_id=tid, claimer=claim_lock)
-                except Exception:
-                    logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-                try:
-                    w.heartbeat_worker(task_id=tid, note=None, expected_run_id=run_id)
-                except Exception:
-                    logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+            run_id: Optional[int]
+            try:
+                run_id = int(run_id_raw) if run_id_raw else None
+            except (TypeError, ValueError):
+                run_id = None
+            try:
+                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+            except Exception:
+                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
         return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
@@ -344,7 +312,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
-    rollup_children = kb.child_ids(conn, task.id, relation_type=kb.LINK_RELATION_ROLLUP)
     return {
         "id": task.id,
         "title": task.title,
@@ -360,124 +327,11 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
-        "review_target_pr_head_sha": task.review_target_pr_head_sha,
         "parents": parents,
         "children": children,
-        "rollup_children": rollup_children,
         "parent_count": len(parents),
         "child_count": len(children),
-        "rollup_child_count": len(rollup_children),
     }
-
-
-def _task_summary_dict_store(store, task) -> dict[str, Any]:
-    """Compact task shape for board-listing tools (backend-agnostic via store)."""
-    # Keep the returned key set in sync with _task_summary_dict (sqlite path).
-    from hermes_cli.kanban_db import LINK_RELATION_ROLLUP
-    parents = store.parent_ids(task.id)
-    children = store.child_ids(task.id)
-    rollup_children = store.child_ids(task.id, relation_type=LINK_RELATION_ROLLUP)
-    return {
-        "id": task.id,
-        "title": task.title,
-        "assignee": task.assignee,
-        "status": task.status,
-        "priority": task.priority,
-        "tenant": task.tenant,
-        "workspace_kind": task.workspace_kind,
-        "workspace_path": task.workspace_path,
-        "created_by": task.created_by,
-        "created_at": task.created_at,
-        "started_at": task.started_at,
-        "completed_at": task.completed_at,
-        "current_run_id": task.current_run_id,
-        "model_override": task.model_override,
-        "review_target_pr_head_sha": task.review_target_pr_head_sha,
-        "parents": parents,
-        "children": children,
-        "rollup_children": rollup_children,
-        "parent_count": len(parents),
-        "child_count": len(children),
-        "rollup_child_count": len(rollup_children),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Third-party PR write guard
-# ---------------------------------------------------------------------------
-
-_EXPECTED_PR_AUTHOR = os.environ.get("HERMES_PR_GUARD_EXPECTED_AUTHOR", "Chadtao206")
-_PR_WRITE_ASSIGNEES = {"engineer", "andrej"}
-_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
-_PR_SHORTHAND_RE = re.compile(r"\b([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)\b")
-_PR_AUTHOR_CACHE: dict[tuple[str, str, str], str] = {}
-
-
-def _extract_github_pr_refs(*parts: object) -> list[tuple[str, str, str]]:
-    seen: set[tuple[str, str, str]] = set()
-    refs: list[tuple[str, str, str]] = []
-    for part in parts:
-        for owner, repo, num in _PR_URL_RE.findall(str(part or "")):
-            ref = (owner, repo, num)
-            if ref not in seen:
-                seen.add(ref)
-                refs.append(ref)
-        for owner, repo, num in _PR_SHORTHAND_RE.findall(str(part or "")):
-            ref = (owner, repo, num)
-            if ref not in seen:
-                seen.add(ref)
-                refs.append(ref)
-    return refs
-
-
-def _github_pr_author(owner: str, repo: str, num: str) -> str:
-    """Return PR author login using the daemon-safe gh wrapper.
-
-    This guard is intentionally fail-closed: if automation cannot prove the PR
-    is Chad-owned, it must not create an engineer lane that may push to it.
-    """
-    key = (owner, repo, num)
-    if key in _PR_AUTHOR_CACHE:
-        return _PR_AUTHOR_CACHE[key]
-    ghx = os.environ.get("HERMES_PR_GUARD_GH") or "/Users/ctao/.hermes/scripts/pr/ghx.sh"
-    if not os.path.exists(ghx):
-        raise RuntimeError(f"GitHub wrapper unavailable at {ghx}")
-    cp = subprocess.run(
-        [ghx, "pr", "view", num, "-R", f"{owner}/{repo}", "--json", "author", "--jq", ".author.login"],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    if cp.returncode != 0:
-        raise RuntimeError((cp.stderr or cp.stdout or "gh pr view failed").strip()[:300])
-    author = (cp.stdout or "").strip()
-    if not author:
-        raise RuntimeError("GitHub returned an empty PR author")
-    _PR_AUTHOR_CACHE[key] = author
-    return author
-
-
-def _third_party_pr_write_guard(title: object, body: object, assignee: object) -> Optional[str]:
-    if str(assignee or "").lower() not in _PR_WRITE_ASSIGNEES:
-        return None
-    refs = _extract_github_pr_refs(title, body)
-    if not refs:
-        return None
-    problems: list[str] = []
-    for owner, repo, num in refs:
-        try:
-            author = _github_pr_author(owner, repo, num)
-        except Exception as exc:
-            problems.append(f"{owner}/{repo}#{num}: author could not be verified ({exc})")
-            continue
-        if author != _EXPECTED_PR_AUTHOR:
-            problems.append(f"{owner}/{repo}#{num}: author={author}, expected={_EXPECTED_PR_AUTHOR}")
-    if not problems:
-        return None
-    return (
-        "third-party-pr-write-guard: refusing to create an engineer/remediation task because "
-        "it could push to a PR not proven to be Chad-owned. " + "; ".join(problems)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -494,41 +348,45 @@ def _handle_show(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        from hermes_cli.kanban.store import resolve_backend
-        from hermes_cli.kanban_db import LINK_RELATION_ROLLUP
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            comments = kb.list_comments(conn, tid)
+            events = kb.list_events(conn, tid)
+            runs = kb.list_runs(conn, tid)
+            parents = kb.parent_ids(conn, tid)
+            children = kb.child_ids(conn, tid)
 
-        def _task_dict(t):
-            return {
-                "id": t.id, "title": t.title, "body": t.body,
-                "assignee": t.assignee, "status": t.status,
-                "tenant": t.tenant, "priority": t.priority,
-                "workspace_kind": t.workspace_kind,
-                "workspace_path": t.workspace_path,
-                "created_by": t.created_by, "created_at": t.created_at,
-                "started_at": t.started_at,
-                "completed_at": t.completed_at,
-                "result": t.result,
-                "current_run_id": t.current_run_id,
-                "model_override": t.model_override,
-            }
+            def _task_dict(t):
+                return {
+                    "id": t.id, "title": t.title, "body": t.body,
+                    "assignee": t.assignee, "status": t.status,
+                    "tenant": t.tenant, "priority": t.priority,
+                    "workspace_kind": t.workspace_kind,
+                    "workspace_path": t.workspace_path,
+                    "created_by": t.created_by, "created_at": t.created_at,
+                    "started_at": t.started_at,
+                    "completed_at": t.completed_at,
+                    "result": t.result,
+                    "current_run_id": t.current_run_id,
+                    "model_override": t.model_override,
+                }
 
-        def _run_dict(r):
-            return {
-                "id": r.id, "profile": r.profile,
-                "status": r.status, "outcome": r.outcome,
-                "summary": r.summary, "error": r.error,
-                "metadata": r.metadata,
-                "started_at": r.started_at, "ended_at": r.ended_at,
-            }
+            def _run_dict(r):
+                return {
+                    "id": r.id, "profile": r.profile,
+                    "status": r.status, "outcome": r.outcome,
+                    "summary": r.summary, "error": r.error,
+                    "metadata": r.metadata,
+                    "started_at": r.started_at, "ended_at": r.ended_at,
+                }
 
-        def _payload(task, comments, events, runs, parents, children,
-                     rollup_parents, rollup_children, worker_context):
             return json.dumps({
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
-                "rollup_parents": rollup_parents,
-                "rollup_children": rollup_children,
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
@@ -544,48 +402,8 @@ def _handle_show(args: dict, **kw) -> str:
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
-                "worker_context": worker_context,
+                "worker_context": kb.build_worker_context(conn, tid),
             })
-
-        if resolve_backend() == "postgres":
-            store = _store(board=board)
-            try:
-                task = store.get_task(tid)
-                if task is None:
-                    return tool_error(f"task {tid} not found")
-                return _payload(
-                    task,
-                    store.list_comments(tid),
-                    store.list_events(tid),
-                    store.list_runs(tid),
-                    store.parent_ids(tid),
-                    store.child_ids(tid),
-                    store.parent_ids(tid, relation_type=LINK_RELATION_ROLLUP),
-                    store.child_ids(tid, relation_type=LINK_RELATION_ROLLUP),
-                    store.build_worker_context(tid),
-                )
-            finally:
-                store.close()
-
-        # sqlite — Multi-read aggregation: one shared snapshot conn for
-        # consistency + to avoid N snapshot copies (the store opens a fresh
-        # conn per call). Byte-identical to the original implementation.
-        _kb, conn = _connect(board=board)
-        try:
-            task = _kb.get_task(conn, tid)
-            if task is None:
-                return tool_error(f"task {tid} not found")
-            return _payload(
-                task,
-                _kb.list_comments(conn, tid),
-                _kb.list_events(conn, tid),
-                _kb.list_runs(conn, tid),
-                _kb.parent_ids(conn, tid),
-                _kb.child_ids(conn, tid),
-                _kb.parent_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP),
-                _kb.child_ids(conn, tid, relation_type=_kb.LINK_RELATION_ROLLUP),
-                _kb.build_worker_context(conn, tid),
-            )
         finally:
             conn.close()
     except ValueError as e:
@@ -620,19 +438,15 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
     board = args.get("board")
     try:
-        from hermes_cli import kanban_db as kb
-        from hermes_cli.kanban.store import resolve_backend
-        rows = []
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            # Match CLI list: dependencies that cleared since the last dispatcher
-            # tick should be visible to orchestrators immediately. recompute_ready
-            # routes through write_session (daemon under the single-writer flag),
-            # then list_tasks reads via snapshot — so promoted tasks are visible.
-            promoted = store.recompute_ready()
+            # Match CLI list: dependencies that cleared since the last
+            # dispatcher tick should be visible to orchestrators immediately.
+            promoted = kb.recompute_ready(conn)
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
-            rows = store.list_tasks(
+            rows = kb.list_tasks(
+                conn,
                 assignee=assignee,
                 status=status,
                 tenant=tenant,
@@ -641,29 +455,6 @@ def _handle_list(args: dict, **kw) -> str:
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
-
-            if resolve_backend() == "postgres":
-                # Under postgres the store is already open — build summary
-                # dicts while the store connection is live, then close.
-                return json.dumps({
-                    "tasks": [_task_summary_dict_store(store, t) for t in tasks],
-                    "count": len(tasks),
-                    "limit": limit,
-                    "truncated": truncated,
-                    "next_limit": (
-                        min(limit * 2, KANBAN_LIST_MAX_LIMIT)
-                        if truncated and limit < KANBAN_LIST_MAX_LIMIT else None
-                    ),
-                    "promoted": promoted,
-                })
-        finally:
-            store.close()
-
-        # sqlite — _task_summary_dict uses relation_type (rollup), which is
-        # not a store method; open a short-lived read connection for the
-        # summary dicts only. Byte-identical to the original implementation.
-        _, conn = _connect(board=board)
-        try:
             return json.dumps({
                 "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
                 "count": len(tasks),
@@ -697,6 +488,17 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    if summary:
+        summary = redact_sensitive_text(str(summary), force=True)
+    if result:
+        result = redact_sensitive_text(str(result), force=True)
+    if metadata is not None and isinstance(metadata, dict):
+        meta_json = json.dumps(metadata)
+        meta_json = redact_sensitive_text(meta_json, force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -762,40 +564,14 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
-        from hermes_cli import kanban_db as kb  # kb used only for the typed-gate exception classes below
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            # The write routes through write_session → the daemon under the flag;
-            # typed write-gate exceptions are reconstructed across the boundary so
-            # these `except` clauses still match (see kb.serialize_kanban_error).
             try:
-                ok = store.complete_task(
-                    task_id=tid,
+                ok = kb.complete_task(
+                    conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
-                )
-            except kb.PRHeadGateError as pr_err:
-                reviewed = pr_err.reviewed_sha or "missing"
-                if getattr(pr_err, "target_source", "parent") == "task":
-                    target_desc = (
-                        f"Explicit review target is {pr_err.expected_sha} "
-                        "from review_target_pr_head_sha"
-                    )
-                else:
-                    target_desc = (
-                        f"Current parent PR head is {pr_err.expected_sha} "
-                        f"from parent task {pr_err.parent_task_id}"
-                    )
-                return tool_error(
-                    f"kanban_complete blocked: final-review PR-head gate failed. "
-                    f"{target_desc}; your reviewed_pr_head_sha was {reviewed}. "
-                    f"Your task is still in-flight (no state change). If you "
-                    f"reviewed the expected head, retry kanban_complete with "
-                    f"the same summary and metadata.reviewed_pr_head_sha="
-                    f"{pr_err.expected_sha}. If the PR changed or you cannot "
-                    f"verify that SHA, call kanban_block with the exact "
-                    f"verification gap instead."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -821,11 +597,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
-            # Read-after-write: the cursor/run is committed; read it back.
-            run = store.latest_run(tid)
+            run = kb.latest_run(conn, tid)
+            return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
-            store.close()
-        return _ok(task_id=tid, run_id=run.id if run else None)
+            conn.close()
     except ValueError as e:
         return tool_error(f"kanban_complete: {e}")
     except Exception as e:
@@ -846,12 +621,13 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    reason = redact_sensitive_text(str(reason), force=True)
     board = args.get("board")
     try:
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            ok = store.block_task(
-                task_id=tid,
+            ok = kb.block_task(
+                conn, tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
             )
@@ -860,10 +636,10 @@ def _handle_block(args: dict, **kw) -> str:
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
-            run = store.latest_run(tid)
+            run = kb.latest_run(conn, tid)
+            return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
-            store.close()
-        return _ok(task_id=tid, run_id=run.id if run else None)
+            conn.close()
     except ValueError as e:
         return tool_error(f"kanban_block: {e}")
     except Exception as e:
@@ -880,11 +656,6 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
-
-    Note: ``heartbeat_claim`` (claim-TTL extension) is the SQLITE path only;
-    under postgres, only ``last_heartbeat_at`` is refreshed here — claim
-    extension is handled dispatcher-side by ``_pg_release_stale_claims``'
-    live-pid extension logic.
     """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
@@ -897,38 +668,29 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     note = args.get("note")
     board = args.get("board")
     try:
-        from hermes_cli.kanban.store import resolve_backend
-        ok = False
-        if resolve_backend() == "postgres":
-            # PG: refresh last_heartbeat_at via the store; claim-TTL extension
-            # is dispatcher-side (live-pid extension in _pg_release_stale_claims).
-            store = _store(board=board)
-            try:
-                ok = store.heartbeat_worker(
-                    task_id=tid, note=note, expected_run_id=_worker_run_id(tid))
-            finally:
-                store.close()
-        else:
-            from hermes_cli import kanban_db as kb
-            with kb.write_session(board=board) as w:
-                # Extend the claim TTL first. The dispatcher pins
-                # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-                # (see _default_spawn in kanban_db.py); falling back to the
-                # default _claimer_id() covers locally-driven workers that
-                # never went through the dispatcher path.
-                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-                w.heartbeat_claim(task_id=tid, claimer=claim_lock)
+        kb, conn = _connect(board=board)
+        try:
+            # Extend the claim TTL first. The dispatcher pins
+            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
+            # (see _default_spawn in kanban_db.py); falling back to the
+            # default _claimer_id() covers locally-driven workers that
+            # never went through the dispatcher path.
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
 
-                ok = w.heartbeat_worker(
-                    task_id=tid,
-                    note=note,
-                    expected_run_id=_worker_run_id(tid),
-                )
-        if not ok:
-            return tool_error(
-                f"could not heartbeat {tid} (unknown id or not running)"
+            ok = kb.heartbeat_worker(
+                conn,
+                tid,
+                note=note,
+                expected_run_id=_worker_run_id(tid),
             )
-        return _ok(task_id=tid)
+            if not ok:
+                return tool_error(
+                    f"could not heartbeat {tid} (unknown id or not running)"
+                )
+            return _ok(task_id=tid)
+        finally:
+            conn.close()
     except ValueError as e:
         return tool_error(f"kanban_heartbeat: {e}")
     except Exception as e:
@@ -947,6 +709,7 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
+    body = redact_sensitive_text(str(body), force=True)
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
     # into the next worker's system prompt by ``build_worker_context``
@@ -959,12 +722,12 @@ def _handle_comment(args: dict, **kw) -> str:
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
     try:
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            cid = store.add_comment(task_id=tid, author=author, body=str(body))
+            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            return _ok(task_id=tid, comment_id=cid)
         finally:
-            store.close()
-        return _ok(task_id=tid, comment_id=cid)
+            conn.close()
     except ValueError as e:
         return tool_error(f"kanban_comment: {e}")
     except Exception as e:
@@ -988,9 +751,6 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
-    guard_error = _third_party_pr_write_guard(title, body, assignee)
-    if guard_error:
-        return tool_error(guard_error)
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
@@ -1016,7 +776,6 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
-    review_target_pr_head_sha = args.get("review_target_pr_head_sha")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1037,18 +796,19 @@ def _handle_create(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            # Inherit the spawning worker's own task workspace when the caller
-            # didn't specify one (upstream #272c2f30a, adapted to our store API).
+            # Inherit the spawning worker's own task workspace when the
+            # caller didn't specify one (see resolution note above).
             if _inherit_workspace:
                 _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
-                    _self_task = store.get_task(_self_tid)
+                    _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.workspace_kind:
                         workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
-            new_tid = store.create_task(
+            new_tid = kb.create_task(
+                conn,
                 title=str(title).strip(),
                 body=body,
                 assignee=str(assignee),
@@ -1069,22 +829,119 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                review_target_pr_head_sha=review_target_pr_head_sha,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
-            new_task = store.get_task(new_tid)
+            new_task = kb.get_task(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            return _ok(
+                task_id=new_tid,
+                status=new_task.status if new_task else None,
+                subscribed=subscribed,
+            )
         finally:
-            store.close()
-        return _ok(
-            task_id=new_tid,
-            status=new_task.status if new_task else None,
-        )
+            conn.close()
     except ValueError as e:
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+    """Auto-subscribe the calling session to task completion / block events.
+
+    Returns True if a subscription row was written, False otherwise (no
+    session context, config gate disabled, or best-effort failure). The
+    caller surfaces this in the ``subscribed`` field of the kanban_create
+    response so an orchestrator can decide whether to fall back to an
+    explicit ``kanban_notify-subscribe`` or to polling.
+
+    Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
+    True). Disable to mirror pre-feature behaviour, e.g. when the
+    originating user/chat opted out via the per-platform notification
+    toggle (see ``hermes dashboard``).
+
+    Subscription paths:
+
+    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
+      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
+      messaging gateway before agent dispatch. The notification poller
+      already keys off these, so we just register a row.
+
+    - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
+      are intentionally cleared (TUI is a single-channel local UI, not
+      a multi-tenant chat surface), but the agent subprocess inherits
+      ``HERMES_SESSION_KEY`` from the parent session. We subscribe with
+      ``platform="tui"`` and ``chat_id=<key>``; the TUI notification
+      poller (``tui_gateway/server.py``) reads ``kanban_notify_subs``
+      for these rows and posts the completion message into the running
+      session.
+
+    - **CLI / cron / test / unattached**: no persistent delivery channel,
+      no-op.
+
+    Failure mode: any exception inside the function is logged at WARNING
+    with the offending exception + diagnostic env vars and swallowed.
+    We never want a notification bookkeeping failure to fail the
+    kanban_create that the agent is mid-conversation about.
+    """
+    try:
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            return False
+    except Exception:
+        # If config can't load we still default to True — this is the
+        # user-friendly behaviour that mirrors the pre-gate implementation.
+        pass
+
+    platform = ""
+    chat_id = ""
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if not platform or not chat_id:
+            # TUI / desktop fallback: platform/chat_id ContextVars are
+            # cleared for TUI sessions, but the parent process exports
+            # HERMES_SESSION_KEY into the subprocess env. Treat that
+            # as a "tui" subscription so the TUI notification poller
+            # (tui_gateway/server.py) can pick it up.
+            #
+            # HERMES_SESSION_ID is intentionally NOT a fallback here:
+            # it is set by ACP / the agent subprocess for telemetry
+            # regardless of whether the parent is a TUI or a CLI, so
+            # treating it as a notification target would auto-subscribe
+            # every CLI invocation, which is exactly the over-eager
+            # behaviour that got #19718 reverted upstream. The TUI
+            # poller keys on HERMES_SESSION_KEY.
+            session_key = (
+                get_session_env("HERMES_SESSION_KEY", "")
+                or os.environ.get("HERMES_SESSION_KEY", "")
+            )
+            if not session_key:
+                return False  # CLI / cron / test — no persistent channel
+            platform = "tui"
+            chat_id = session_key
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        notifier_profile = os.environ.get("HERMES_PROFILE")
+
+        # Lazy-import to keep the module-level dependency light
+        from hermes_cli import kanban_db as _kb
+        _kb.add_notify_sub(
+            conn, task_id=task_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id, user_id=user_id,
+            notifier_profile=notifier_profile,
+        )
+        return True
+    except Exception as _exc:
+        logger.warning(
+            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
+            _exc, platform, bool(chat_id),
+        )
+        return False
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -1100,14 +957,14 @@ def _handle_unblock(args: dict, **kw) -> str:
         return ownership_err
     board = args.get("board")
     try:
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            ok = store.unblock_task(task_id=str(tid))
+            ok = kb.unblock_task(conn, str(tid))
+            if not ok:
+                return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+            return _ok(task_id=str(tid), status="ready")
         finally:
-            store.close()
-        if not ok:
-            return tool_error(f"could not unblock {tid} (not blocked or unknown)")
-        return _ok(task_id=str(tid), status="ready")
+            conn.close()
     except ValueError as e:
         return tool_error(f"kanban_unblock: {e}")
     except Exception as e:
@@ -1116,136 +973,25 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 
 def _handle_link(args: dict, **kw) -> str:
-    """Add a parent→child relation after the fact."""
+    """Add a parent→child dependency edge after the fact."""
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
-    relation_type = args.get("relation_type") or "dependency"
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
     try:
-        store = _store(board=board)
+        kb, conn = _connect(board=board)
         try:
-            store.link_tasks(
-                parent_id=parent_id,
-                child_id=child_id,
-                relation_type=relation_type,
-            )
+            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+            return _ok(parent_id=parent_id, child_id=child_id)
         finally:
-            store.close()
-        return _ok(parent_id=parent_id, child_id=child_id, relation_type=relation_type)
+            conn.close()
     except ValueError as e:
         # Covers cycle + self-parent rejections
         return tool_error(f"kanban_link: {e}")
     except Exception as e:
         logger.exception("kanban_link failed")
         return tool_error(f"kanban_link: {e}")
-
-
-# --- kanban_reconcile (orchestrator) ---------------------------------------
-# Thin seams over kanban_reconciler so the handler stays testable without a
-# live board, and so the apply path reuses the CLI's exact entry points (which
-# already re-validate the packet signature against a fresh reconcile pass).
-
-_RECONCILE_DEFAULT_AUTO_OPTIONS = ("unblock", "keep_blocked", "keep_parked")
-
-
-def _reconcile_collect(board: Optional[str] = None) -> dict:
-    """Return the current decision packets (+ wake mode) for ``board``."""
-    from hermes_cli import kanban_reconciler as krec
-    result = krec.run_reconciler(board=board)
-    wake = result.get("wake_triage") or {}
-    return {
-        "packets": wake.get("decision_packets", []),
-        "mode": wake.get("mode"),
-        "wake_agent": bool(wake.get("wake_agent", False)),
-        "board": result.get("board"),
-    }
-
-
-def _reconcile_apply(**kwargs) -> dict:
-    """Apply one gated reconcile decision (re-validates the packet signature)."""
-    from hermes_cli import kanban_reconciler as krec
-    return krec.apply_reconcile_decision(**kwargs)
-
-
-def _reconcile_auto_options() -> set:
-    """Options the tool may auto-apply (config ``kanban.reconcile_tool_auto_options``).
-
-    Defaults to the safe, reversible set. Anything outside it returns
-    ``needs_human`` so risky transitions still escalate to a person.
-    """
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
-    except Exception:
-        kanban_cfg = {}
-    opts = kanban_cfg.get("reconcile_tool_auto_options")
-    if not isinstance(opts, (list, tuple)):
-        opts = _RECONCILE_DEFAULT_AUTO_OPTIONS
-    return {str(o).strip() for o in opts if str(o).strip()}
-
-
-def _handle_reconcile(args: dict, **kw) -> str:
-    """Orchestrator tool: list reconcile decision packets, or apply an
-    allowlisted option (with packet-signature re-validation)."""
-    guard = _require_orchestrator_tool("kanban_reconcile")
-    if guard:
-        return guard
-    action = str(args.get("action") or "list").strip().lower()
-    board = args.get("board")
-    try:
-        if action == "list":
-            data = _reconcile_collect(board=board)
-            return _ok(
-                action="list",
-                packets=data.get("packets", []),
-                mode=data.get("mode"),
-                wake_agent=data.get("wake_agent", False),
-            )
-        if action == "apply":
-            task_id = str(args.get("task_id") or "").strip()
-            option = str(args.get("option") or "").strip()
-            packet_signature = str(args.get("packet_signature") or "").strip()
-            missing = [
-                n for n, v in (
-                    ("task_id", task_id), ("option", option),
-                    ("packet_signature", packet_signature),
-                ) if not v
-            ]
-            if missing:
-                return tool_error(
-                    "kanban_reconcile apply requires: " + ", ".join(missing)
-                    + " (get task_id, option, and packet_signature from action='list')"
-                )
-            if option not in _reconcile_auto_options():
-                return json.dumps({
-                    "needs_human": True,
-                    "task_id": task_id,
-                    "option": option,
-                    "reason": (
-                        f"option '{option}' is not in the auto-apply allowlist "
-                        "(kanban.reconcile_tool_auto_options); escalate to a human "
-                        "to apply it via `hermes kanban reconcile --apply-option`."
-                    ),
-                }, ensure_ascii=False)
-            result = _reconcile_apply(
-                task_id=task_id,
-                option=option,
-                packet_signature=packet_signature,
-                confirm_dry_run=True,
-                board=board,
-                author="jensen",
-                pr_head_sha=str(args.get("pr_head_sha") or ""),
-            )
-            return json.dumps(result, ensure_ascii=False, default=str)
-        return tool_error(
-            f"unknown action '{action}'; expected 'list' or 'apply'"
-        )
-    except Exception as e:
-        logger.exception("kanban_reconcile failed")
-        return tool_error(f"kanban_reconcile: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1259,12 +1005,11 @@ _DESC_TASK_ID_DEFAULT = (
 
 _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_BOARD env → the 'current' "
-    "symlink under the kanban home → 'default'. HERMES_KANBAN_DB is a "
-    "legacy SQLite-only override and is not authoritative on Postgres-backed "
-    "installs. Pass an explicit slug only when the caller (e.g. a Telegram "
-    "routing layer) needs to override the env-pinned active board for this one "
-    "call."
+    "active board the usual way: HERMES_KANBAN_DB env → "
+    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
+    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
+    "a Telegram routing layer) needs to override the env-pinned active "
+    "board for this one call."
 )
 
 
@@ -1383,10 +1128,7 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. For implementation PR handoffs, "
-                    "include pr_url, pull_request_head_sha, and branch_name; "
-                    "for final-review closeouts, include reviewed_pr_head_sha "
-                    "matching the current parent PR head. Surfaced to downstream "
+                    "\"findings\": [...]}. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
             },
@@ -1635,22 +1377,13 @@ KANBAN_CREATE_SCHEMA = {
                     "'running', which preserves the usual dispatch path."
                 ),
             },
-            "review_target_pr_head_sha": {
-                "type": "string",
-                "description": (
-                    "Optional explicit PR head SHA that a final-review task "
-                    "must verify via metadata.reviewed_pr_head_sha. Use for "
-                    "superseding exact-head review cards when the dependency "
-                    "parent's recorded pull_request_head_sha is stale."
-                ),
-            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
                     "Skill names to force-load into the dispatched "
-                    "worker (in addition to the built-in kanban-worker "
-                    "skill). Use this to pin a task to a specialist "
+                    "worker. The kanban lifecycle is already injected "
+                    "automatically; use this to pin a task to a specialist "
                     "context — e.g. ['translation'] for a translation "
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
@@ -1706,79 +1439,18 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
-KANBAN_RECONCILE_SCHEMA = {
-    "name": "kanban_reconcile",
-    "description": (
-        "Resolve kanban reconcile decision packets (orchestrator-only). "
-        "action='list' returns the current jensen_decision_required packets, "
-        "each with a packet_signature and suggested_options. action='apply' "
-        "applies one option for a task — the reconciler re-validates the "
-        "packet_signature against a fresh pass before mutating, so stale wake "
-        "output is never applied blindly. Options outside the configured "
-        "auto-apply allowlist return needs_human (escalate to a person). Pass "
-        "the task_id, option, and packet_signature exactly as returned by "
-        "action='list'."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["list", "apply"],
-                "default": "list",
-                "description": "'list' the packets, or 'apply' one option.",
-            },
-            "task_id": {
-                "type": "string",
-                "description": "Task id to apply a decision to (required for apply).",
-            },
-            "option": {
-                "type": "string",
-                "description": (
-                    "Decision option to apply (required for apply), e.g. "
-                    "'unblock'/'keep_blocked'/'keep_parked'. Must be one of the "
-                    "packet's suggested_options and in the auto-apply allowlist."
-                ),
-            },
-            "packet_signature": {
-                "type": "string",
-                "description": (
-                    "packet_signature from action='list' (required for apply); "
-                    "re-validated against a fresh reconcile pass before any write."
-                ),
-            },
-            "pr_head_sha": {
-                "type": "string",
-                "description": (
-                    "Verified current PR head SHA — only needed for the "
-                    "remediate_parent_closeout option."
-                ),
-            },
-            "board": _board_schema_prop(),
-        },
-        "required": ["action"],
-    },
-}
-
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
-        "Add a parent→child relation after both tasks already exist. "
-        "relation_type='dependency' gates dispatch; relation_type='rollup' "
-        "is observability-only for orchestration root cards. Cycles and "
-        "self-links are rejected."
+        "Add a parent→child dependency edge after both tasks already "
+        "exist. The child won't promote to 'ready' until all parents "
+        "are 'done'. Cycles and self-links are rejected."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
-            "relation_type": {
-                "type": "string",
-                "enum": ["dependency", "related", "rollup", "supersedes"],
-                "default": "dependency",
-                "description": "dependency gates dispatch; rollup is observability-only.",
-            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
@@ -1869,13 +1541,4 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
-)
-
-registry.register(
-    name="kanban_reconcile",
-    toolset="kanban",
-    schema=KANBAN_RECONCILE_SCHEMA,
-    handler=_handle_reconcile,
-    check_fn=_check_kanban_orchestrator_mode,
-    emoji="🧭",
 )

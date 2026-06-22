@@ -20,7 +20,7 @@ Design notes
 
 * The system prompt sees the *configured* profile roster — names plus
   descriptions plus the default fallback. Profiles without a
-  description are still listed (with a note) so the orchestrator can
+  description are still listed (with a note) so the decomposer can
   match on name as a fallback, but the user has an obvious incentive
   to describe them.
 
@@ -47,23 +47,6 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_backend() -> str:
-    try:
-        from hermes_cli.kanban.store import resolve_backend
-        return resolve_backend()
-    except Exception:
-        return "sqlite"
-
-
-def _pg_store():
-    # NOTE: single-board ('default') only on Postgres. kb.get_current_board()/
-    # board_exists() are sqlite-filesystem-coupled, so a non-default PG-only board
-    # would mis-resolve to 'default' (Phase-6 multi-board blocker). Safe for the
-    # live single-'default' board.
-    from hermes_cli.kanban.store_postgres import PostgresKanbanStore
-    return PostgresKanbanStore(board=kb.get_current_board())
 
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
@@ -195,7 +178,7 @@ def _load_config() -> dict:
 
 
 def _resolve_orchestrator_profile(cfg: dict) -> str:
-    """Resolve which profile owns decomposition.
+    """Resolve which profile owns the root/orchestration task after fan-out.
 
     Falls back to the active default profile when ``kanban.orchestrator_profile``
     is unset, so a task is never stranded for lack of an orchestrator.
@@ -298,20 +281,8 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
-    backend = _resolve_backend()
-    _pg = None
-    if backend == "postgres":
-        try:
-            _pg = _pg_store()
-            task = _pg.get_task(task_id)
-        except Exception as exc:
-            logger.info("decompose: postgres read failed for %s (%s)",
-                        task_id, type(exc).__name__)
-            return DecomposeOutcome(
-                task_id, False, f"kanban store error: {type(exc).__name__}")
-    else:
-        with kb.connect_closing() as conn:          # EXISTING verbatim
-            task = kb.get_task(conn, task_id)
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
@@ -399,26 +370,15 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        if backend == "postgres":
-            try:
-                ok = _pg.specify_triage_task(
-                    task_id, title=title_val, body=body_val,
-                    assignee=assignee_val, author=audit_author)
-            except Exception as exc:
-                logger.info("decompose: postgres specify failed for %s (%s)",
-                            task_id, type(exc).__name__)
-                return DecomposeOutcome(
-                    task_id, False, f"kanban store error: {type(exc).__name__}")
-        else:
-            with kb.connect_closing() as conn:      # EXISTING verbatim
-                ok = kb.specify_triage_task(
-                    conn,
-                    task_id,
-                    title=title_val,
-                    body=body_val,
-                    assignee=assignee_val,
-                    author=audit_author,
-                )
+        with kb.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=title_val,
+                body=body_val,
+                assignee=assignee_val,
+                author=audit_author,
+            )
         if not ok:
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
@@ -479,20 +439,15 @@ def decompose_task(
         })
 
     try:
-        if backend == "postgres":
-            child_ids = _pg.decompose_triage_task(
-                task_id, root_assignee=orchestrator, children=children,
-                author=audit_author, auto_promote=auto_promote)
-        else:
-            with kb.connect_closing() as conn:      # EXISTING verbatim
-                child_ids = kb.decompose_triage_task(
-                    conn,
-                    task_id,
-                    root_assignee=orchestrator,
-                    children=children,
-                    author=audit_author,
-                    auto_promote=auto_promote,
-                )
+        with kb.connect_closing() as conn:
+            child_ids = kb.decompose_triage_task(
+                conn,
+                task_id,
+                root_assignee=orchestrator,
+                children=children,
+                author=audit_author,
+                auto_promote=auto_promote,
+            )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
@@ -512,10 +467,7 @@ def decompose_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
-    if _resolve_backend() == "postgres":
-        rows = _pg_store().list_tasks(status="triage", tenant=tenant, limit=1000)
-        return [r.id for r in rows]
-    with kb.connect_closing() as conn:               # EXISTING verbatim
+    with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
             status="triage",

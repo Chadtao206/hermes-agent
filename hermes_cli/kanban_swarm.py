@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+import sqlite3
+from typing import Any, Iterable, Optional
 
-if TYPE_CHECKING:
-    from hermes_cli.kanban.store import KanbanStore
+from hermes_cli import kanban_db as kb
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -75,7 +75,7 @@ def _swarm_context(root_id: str, goal: str) -> str:
 
 
 def create_swarm(
-    store: KanbanStore,
+    conn: sqlite3.Connection,
     *,
     goal: str,
     workers: Iterable[SwarmWorkerSpec],
@@ -108,7 +108,8 @@ def create_swarm(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
-    root = store.create_task(
+    root = kb.create_task(
+        conn,
         title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
         body=(
             "Kanban Swarm v1 planning/root card. This card is completed "
@@ -123,13 +124,12 @@ def create_swarm(
         idempotency_key=idempotency_key,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["kanban-orchestrator"],
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the
     # swarm graph. Recover the topology from the root's latest blackboard, if it
     # was created by this helper previously.
-    existing = latest_blackboard(store, root).get("topology")
+    existing = latest_blackboard(conn, root).get("topology")
     if isinstance(existing, dict):
         worker_ids = [str(x) for x in existing.get("worker_ids", []) if x]
         verifier_id = existing.get("verifier_id")
@@ -142,7 +142,8 @@ def create_swarm(
                 synthesizer_id=str(synthesizer_id),
             )
 
-    store.complete_task(
+    kb.complete_task(
+        conn,
         root,
         summary="Swarm topology planned; root remains the shared blackboard.",
         metadata={
@@ -155,7 +156,8 @@ def create_swarm(
     context_suffix = _swarm_context(root, goal)
     worker_ids: list[str] = []
     for spec in worker_specs:
-        worker_id = store.create_task(
+        worker_id = kb.create_task(
+            conn,
             title=spec.title,
             body=(spec.body or "") + context_suffix,
             assignee=spec.profile,
@@ -176,7 +178,8 @@ def create_swarm(
         "sufficient; otherwise block with exact missing work."
         + context_suffix
     )
-    verifier = store.create_task(
+    verifier = kb.create_task(
+        conn,
         title=verifier_title,
         body=verifier_body,
         assignee=verifier_assignee,
@@ -194,7 +197,8 @@ def create_swarm(
         "Do not start until the verifier has passed the gate."
         + context_suffix
     )
-    synthesizer = store.create_task(
+    synthesizer = kb.create_task(
+        conn,
         title=synthesizer_title,
         body=synthesizer_body,
         assignee=synthesizer_assignee,
@@ -209,7 +213,7 @@ def create_swarm(
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
     post_blackboard_update(
-        store,
+        conn,
         root,
         author=created_by,
         key="topology",
@@ -219,7 +223,7 @@ def create_swarm(
 
 
 def post_blackboard_update(
-    store: KanbanStore,
+    conn: sqlite3.Connection,
     root_id: str,
     *,
     author: str,
@@ -232,10 +236,10 @@ def post_blackboard_update(
     author = _require_text(author, "author")
     key = _require_text(key, "key")
     payload = json.dumps({"key": key, "value": value}, ensure_ascii=False, sort_keys=True)
-    return store.add_comment(root_id, author=author, body=BLACKBOARD_PREFIX + payload)
+    return kb.add_comment(conn, root_id, author=author, body=BLACKBOARD_PREFIX + payload)
 
 
-def latest_blackboard(store: "KanbanStore", root_id: str) -> dict[str, Any]:
+def latest_blackboard(conn: sqlite3.Connection, root_id: str) -> dict[str, Any]:
     """Merge structured blackboard comments on a root card.
 
     Later comments replace earlier values for the same key. ``_authors`` records
@@ -244,7 +248,7 @@ def latest_blackboard(store: "KanbanStore", root_id: str) -> dict[str, Any]:
 
     merged: dict[str, Any] = {}
     authors: dict[str, str] = {}
-    for comment in store.list_comments(root_id):
+    for comment in kb.list_comments(conn, root_id):
         body = comment.body or ""
         if not body.startswith(BLACKBOARD_PREFIX):
             continue

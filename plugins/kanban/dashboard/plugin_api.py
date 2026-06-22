@@ -48,10 +48,8 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, Web
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from hermes_cli import kanban_board_doctor
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
-from hermes_cli import kanban_reconciler
 
 log = logging.getLogger(__name__)
 
@@ -118,111 +116,7 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
-def _is_corrupt_db_error(exc: BaseException) -> bool:
-    """Return True for SQLite corruption/invalid-image failures."""
-    if isinstance(exc, kanban_db.KanbanDbCorruptError):
-        return True
-    if not isinstance(exc, sqlite3.DatabaseError):
-        return False
-    msg = str(exc).lower()
-    return (
-        "file is not a database" in msg
-        or "database disk image is malformed" in msg
-        or "quick_check failed" in msg
-        or "integrity_check failed" in msg
-    )
-
-
-def _raise_kanban_db_unavailable(exc: BaseException, board: Optional[str]) -> None:
-    """Convert known DB-corruption failures into a controlled API response."""
-    path = kanban_db.kanban_db_path(board=board)
-    log.error(
-        "kanban dashboard: board %s database %s is unavailable/corrupt; "
-        "serve 503 and require quiesced repair",
-        board or kanban_db.DEFAULT_BOARD,
-        path,
-        exc_info=(type(exc), exc, exc.__traceback__),
-    )
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "Kanban database is unavailable or corrupt. Dispatch/repair must "
-            "fail closed; use the guarded quiesced repair path before retrying."
-        ),
-    ) from exc
-
-
-def _raise_pg_read_unavailable(exc: BaseException, board: Optional[str]) -> None:
-    """Convert a Postgres read failure into a controlled 503 without leaking the DSN.
-
-    Only the exception *type* is logged (psycopg connection/pool errors can carry
-    connection info in their message/args; the DSN/password must never be logged)."""
-    try:
-        slug = _pg_reads().slug(board)
-    except Exception:
-        slug = board or "default"
-    log.error("kanban dashboard: postgres read failed for board %s (%s)",
-              slug, type(exc).__name__)
-    raise HTTPException(
-        status_code=503,
-        detail="Kanban Postgres backend is temporarily unavailable; please retry.",
-    )
-
-
-def _lenient_text_factory(value: bytes) -> str:
-    """Decode SQLite TEXT columns tolerantly for the read-only dashboard.
-
-    A torn write (e.g. during a corruption episode) can leave a single column —
-    seen in the wild on ``task_runs.metadata`` — holding bytes that aren't valid
-    UTF-8. ``quick_check``/``integrity_check`` still pass (the b-tree is sound),
-    but the default ``str`` text factory raises ``OperationalError: Could not
-    decode to UTF-8`` the moment such a row is fetched, which surfaced as a board
-    -wide HTTP 500. The dashboard is a display surface, so decode with
-    replacement instead of letting one damaged row take down the whole board.
-    Valid UTF-8 (the overwhelming majority) round-trips identically.
-    """
-    return value.decode("utf-8", "replace")
-
-
-class _SnapshotConn:
-    """Connection-like wrapper that keeps a snapshot tempdir alive until close()."""
-
-    def __init__(self, cm):
-        self._cm = cm
-        self._conn = cm.__enter__()
-        self._conn.text_factory = _lenient_text_factory
-        self._closed = False
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-        return False
-
-    def close(self):
-        if not self._closed:
-            self._closed = True
-            return self._cm.__exit__(None, None, None)
-        return None
-
-
-def _readonly_snapshot_conn(board: Optional[str] = None):
-    """Open a non-mutating snapshot reader for dashboard observational paths.
-
-    SQLite read-only opens against a WAL-mode DB can fail when the live
-    ``-wal``/``-shm`` files have just been checkpointed away because a
-    mode=ro connection cannot create replacement sidecars. Snapshot reads copy
-    the main DB and any sidecars into a temp directory, then let SQLite do
-    bookkeeping there instead of touching the hot board.
-    """
-    return _SnapshotConn(kanban_db.snapshot_connect(board=board))
-
-
-def _conn(board: Optional[str] = None, *, readonly: bool = False):
+def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
     Every handler that mutates the DB goes through this so the plugin
@@ -235,77 +129,10 @@ def _conn(board: Optional[str] = None, *, readonly: bool = False):
     via the resolution chain (env var → ``current`` file → ``default``).
     """
     try:
-        if readonly:
-            try:
-                path = kanban_db.kanban_db_path(board=board)
-                if not path.exists():
-                    kanban_db.init_db(board=board)
-            except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
-                if _is_corrupt_db_error(exc):
-                    _raise_kanban_db_unavailable(exc, board)
-                log.warning("kanban readonly init preflight failed: %s", exc)
-            except Exception as exc:
-                log.warning("kanban readonly init preflight failed: %s", exc)
-            return _readonly_snapshot_conn(board=board)
-        try:
-            kanban_db.init_db(board=board)
-        except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
-            if _is_corrupt_db_error(exc):
-                _raise_kanban_db_unavailable(exc, board)
-            log.warning("kanban init_db failed: %s", exc)
-        except Exception as exc:
-            log.warning("kanban init_db failed: %s", exc)
-        conn = kanban_db.connect(board=board)
-        conn.text_factory = _lenient_text_factory
-        return conn
-    except (sqlite3.DatabaseError, kanban_db.KanbanDbCorruptError) as exc:
-        if _is_corrupt_db_error(exc):
-            _raise_kanban_db_unavailable(exc, board)
-        raise
-
-
-def _store(board: Optional[str] = None):
-    """Return a KanbanStore for the given board.
-
-    The store owns connection lifecycle; callers MUST call store.close()
-    in a finally block. Behavior-identical to the existing _conn / write_session
-    paths for operations that have a 1:1 store method.
-    """
-    from hermes_cli.kanban.store import kanban_store
-    return kanban_store(board=board)
-
-
-def _pg_reads():
-    """Lazily load the sibling pg_reads.py by path.
-
-    plugin_api.py is loaded via spec_from_file_location (no package context)
-    and plugins/kanban/dashboard is not a package, so a normal package import
-    of pg_reads is unavailable. Load it the same way, cached in sys.modules.
-    """
-    import importlib.util
-    import os
-    import sys
-    name = "hermes_dashboard_plugin_kanban_pg_reads"
-    cached = sys.modules.get(name)
-    if cached is not None:
-        return cached
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pg_reads.py")
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"pg_reads.py not found at {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _backend() -> str:
-    """resolve_backend() with a defensive sqlite fallback (never raises)."""
-    try:
-        from hermes_cli.kanban.store import resolve_backend
-        return resolve_backend()
-    except Exception:
-        return "sqlite"
+        kanban_db.init_db(board=board)
+    except Exception as exc:
+        log.warning("kanban init_db failed: %s", exc)
+    return kanban_db.connect(board=board)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +148,7 @@ def _backend() -> str:
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
 
@@ -486,29 +313,6 @@ def _compute_task_diagnostics(
     return out
 
 
-def _compute_task_diagnostics_pg(
-    board_slug: str, task_ids: Optional[list[str]] = None,
-) -> dict[str, list[dict]]:
-    """Postgres counterpart to _compute_task_diagnostics: fetch dict rows via
-    pg_reads and run the (backend-agnostic) diagnostics engine."""
-    from hermes_cli import kanban_diagnostics as kd
-    from hermes_cli.config import load_config
-    pg = _pg_reads()
-    diag_config = kd.config_from_runtime_config(load_config())
-    task_rows, events_by, runs_by = pg.diagnostics_rows(board_slug, task_ids=task_ids)
-    if not task_rows:
-        return {}
-    out: dict[str, list[dict]] = {}
-    for r in task_rows:
-        tid = r["id"]
-        diags = kd.compute_task_diagnostics(
-            r, events_by.get(tid, []), runs_by.get(tid, []), config=diag_config,
-        )
-        if diags:
-            out[tid] = [d.to_dict() for d in diags]
-    return out
-
-
 def _warnings_summary_from_diagnostics(
     diagnostics: list[dict],
 ) -> Optional[dict]:
@@ -548,173 +352,6 @@ def _warnings_summary_from_diagnostics(
     }
 
 
-def _compute_wake_health(
-    conn: sqlite3.Connection,
-    *,
-    task_ids: list[str],
-) -> dict[str, Any]:
-    """Return board-level profile wake-health for the current board task scope."""
-    out = {
-        "subscription_count": 0,
-        "failing_count": 0,
-        "stale_count": 0,
-        "severity": "none",
-        "as_of": int(time.time()),
-    }
-    if not task_ids:
-        return out
-
-    subscription_count = 0
-    failing_count = 0
-    stale_count = 0
-
-    # Chunk ``IN`` batches to stay under SQLite's bind variable limit.
-    for i in range(0, len(task_ids), 200):
-        batch = task_ids[i:i + 200]
-        placeholders = ",".join(["?"] * len(batch))
-        row = conn.execute(
-            f"""
-            SELECT
-                COUNT(*) AS subscription_count,
-                SUM(CASE
-                    WHEN (last_wake_error_at IS NOT NULL OR COALESCE(wake_failure_count, 0) > 0)
-                    THEN 1 ELSE 0 END
-                ) AS failing_count,
-                SUM(CASE
-                    WHEN (last_wake_error_at IS NULL)
-                         AND COALESCE(wake_failure_count, 0) = 0
-                         AND COALESCE(last_wake_at, 0) = 0
-                    THEN 1 ELSE 0 END
-                ) AS stale_count
-            FROM kanban_profile_event_subs
-            WHERE enabled = 1
-              AND wake_agent = 1
-              AND task_id IN ({placeholders})
-            """,
-            tuple(batch),
-        ).fetchone()
-        subscription_count += int(row["subscription_count"] or 0)
-        failing_count += int(row["failing_count"] or 0)
-        stale_count += int(row["stale_count"] or 0)
-
-    severity = "healthy"
-    if subscription_count == 0:
-        severity = "none"
-    elif failing_count > 0:
-        severity = "failing"
-    elif stale_count > 0:
-        severity = "stale"
-
-    out.update({
-        "subscription_count": subscription_count,
-        "failing_count": failing_count,
-        "stale_count": stale_count,
-        "severity": severity,
-    })
-    return out
-
-
-def _resolved_board_slug_and_db_path(board: Optional[str]) -> tuple[str, str]:
-    """Return dashboard/gateway-compatible board slug and resolved DB path."""
-    slug = board or kanban_db.get_current_board()
-    try:
-        slug = kanban_db._normalize_board_slug(slug) or kanban_db.DEFAULT_BOARD
-    except Exception:
-        slug = kanban_db.DEFAULT_BOARD
-    try:
-        db_path = str(kanban_db.kanban_db_path(board).expanduser().resolve())
-    except Exception:
-        db_path = str(kanban_db.kanban_db_path(board))
-    return slug, db_path
-
-
-def _compute_notifier_health(
-    conn: sqlite3.Connection,
-    *,
-    board: Optional[str],
-    wake_health: dict[str, Any],
-) -> dict[str, Any]:
-    """Return gateway-notifier presence/overlap health for this board DB."""
-    as_of = int(time.time())
-    subscription_count = int(wake_health.get("subscription_count") or 0)
-    _board_slug, db_path = _resolved_board_slug_and_db_path(board)
-    try:
-        rows = kanban_db.list_notifier_heartbeats(
-            conn,
-            db_path=db_path,
-            now=as_of,
-            min_last_seen_at=as_of - kanban_db.NOTIFIER_HEARTBEAT_RETENTION_SECONDS,
-            limit=kanban_db.NOTIFIER_HEARTBEAT_LIST_LIMIT,
-        )
-    except sqlite3.DatabaseError as exc:
-        log.warning(
-            "kanban notifier health unavailable for board %s (%s): %s",
-            board or kanban_db.DEFAULT_BOARD,
-            db_path,
-            exc,
-        )
-        return {
-            "active_count": 0,
-            "overlap_count": 0,
-            "stale_count": 0,
-            "severity": "unavailable",
-            "message": (
-                "Notifier heartbeat health is temporarily unavailable; "
-                "board tasks are still shown from the main task tables."
-            ),
-            "latest_notifier": None,
-            "rows": [],
-            "as_of": as_of,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    active_count = sum(1 for row in rows if row.get("active"))
-    stale_count = max(0, len(rows) - active_count)
-    overlap_count = max(0, active_count - 1)
-    latest_notifier = rows[0] if rows else None
-
-    def _notifier_label(row: Optional[dict[str, Any]]) -> str:
-        if not row:
-            return ""
-        profile = row.get("notifier_profile") or "unknown profile"
-        host = row.get("host") or "unknown host"
-        age = row.get("age_seconds")
-        age_text = f"{int(age)}s ago" if age is not None else "unknown age"
-        return f"{profile} on {host} ({age_text})"
-
-    counts = f"{active_count} active / {stale_count} stale retained"
-
-    if subscription_count <= 0:
-        severity = "no_subscriptions"
-        message = "No profile wake subscriptions in this board scope."
-    elif active_count <= 0:
-        severity = "no_notifier"
-        last_seen = _notifier_label(latest_notifier)
-        message = (
-            f"No active notifier heartbeat for this board ({counts})"
-            + (f"; last seen {last_seen}." if last_seen else ".")
-        )
-    elif overlap_count > 0:
-        severity = "overlap"
-        message = (
-            f"{active_count} active notifiers for this board "
-            f"({counts}); duplicate wake races possible."
-        )
-    else:
-        severity = "healthy"
-        message = f"One active notifier heartbeat for this board ({counts})."
-
-    return {
-        "active_count": active_count,
-        "overlap_count": overlap_count,
-        "stale_count": stale_count,
-        "severity": severity,
-        "message": message,
-        "latest_notifier": latest_notifier,
-        "rows": rows[:10],
-        "as_of": as_of,
-    }
-
-
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     """Return {'parents': [...], 'children': [...]} for a task."""
     parents = [
@@ -734,73 +371,9 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
-def _links_for_pg(board_slug: str, task_id: str) -> dict[str, list[str]]:
-    """Postgres counterpart to _links_for: parents/children from task_links."""
-    pg = _pg_reads()
-    rows = pg._query(
-        "SELECT parent_id FROM task_links WHERE board=%s AND child_id=%s ORDER BY parent_id",
-        (board_slug, task_id),
-    )
-    parents = [r["parent_id"] for r in rows]
-    rows = pg._query(
-        "SELECT child_id FROM task_links WHERE board=%s AND parent_id=%s ORDER BY child_id",
-        (board_slug, task_id),
-    )
-    children = [r["child_id"] for r in rows]
-    return {"parents": parents, "children": children}
-
-
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
-
-
-@router.get("/reconcile")
-def get_reconcile_health(
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
-    ready_age_seconds: int = Query(
-        15 * 60,
-        ge=1,
-        description="Ready/review/scheduled age threshold passed through to reconcile.",
-    ),
-    max_examples: int = Query(
-        5,
-        ge=0,
-        le=50,
-        description="Maximum compact examples to include for dashboard preview text.",
-    ),
-):
-    """Return deterministic reconcile actions for dashboard/control-plane views."""
-    board = _resolve_board(board)
-    result = kanban_reconciler.run_reconciler(
-        board=board,
-        ready_age_seconds=max(1, int(ready_age_seconds or 900)),
-    )
-    result["text_preview"] = kanban_reconciler.format_reconcile_text(
-        result,
-        max_examples=max(0, int(max_examples or 0)),
-    )
-    return result
-
-
-@router.get("/doctor")
-def get_board_doctor_health(
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
-    ready_age_seconds: int = Query(
-        15 * 60,
-        ge=1,
-        description="Ready age threshold passed through to board doctor.",
-    ),
-):
-    """Return deterministic board doctor output for dashboard/control-plane views."""
-    board = _resolve_board(board)
-    result = kanban_board_doctor.run_board_doctor(
-        board=board,
-        ready_age_seconds=max(1, int(ready_age_seconds or 900)),
-    )
-    result["text_preview"] = kanban_board_doctor.format_doctor_text(result)
-    return result
-
 
 @router.get("/board")
 def get_board(
@@ -824,63 +397,7 @@ def get_board(
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        store = None
-        try:
-            pg = _pg_reads()
-            bslug = pg.slug(board)
-            store = _store(board=bslug)
-            tasks = store.list_tasks(
-                tenant=tenant, include_archived=include_archived,
-                workflow_template_id=workflow_template_id,
-                current_step_key=current_step_key,
-            )
-            task_ids = [t.id for t in tasks]
-            wake_health = pg.wake_health(bslug, task_ids)
-            notifier_health = _compute_notifier_health(
-                None, board=board, wake_health=wake_health,
-            )
-            link_counts = pg.link_counts(bslug)
-            comment_counts = pg.comment_counts(bslug)
-            progress = pg.child_progress(bslug)
-            diagnostics_per_task = _compute_task_diagnostics_pg(bslug, task_ids=None)
-            latest_event_id = pg.latest_event_id(bslug)
-            summary_map = store.latest_summaries(task_ids)
-
-            columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
-            if include_archived:
-                columns["archived"] = []
-            for t in tasks:
-                full = summary_map.get(t.id)
-                preview = full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
-                d = _task_dict(t, latest_summary=preview)
-                d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
-                d["comment_count"] = comment_counts.get(t.id, 0)
-                d["progress"] = progress.get(t.id)
-                diags = diagnostics_per_task.get(t.id)
-                if diags:
-                    d["diagnostics"] = diags
-                    d["warnings"] = _warnings_summary_from_diagnostics(diags)
-                col = t.status if t.status in columns else "todo"
-                columns[col].append(d)
-
-            return {
-                "columns": [{"name": name, "tasks": columns[name]} for name in columns.keys()],
-                "tenants": pg.distinct_tenants(bslug),
-                "assignees": pg.distinct_assignees(bslug),
-                "wake_health": wake_health,
-                "notifier_health": notifier_health,
-                "latest_event_id": int(latest_event_id),
-                "now": int(time.time()),
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-    conn = _conn(board=board, readonly=True)
+    conn = _conn(board=board)
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -889,12 +406,6 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
-        task_ids = [t.id for t in tasks]
-        wake_health = _compute_wake_health(conn, task_ids=task_ids)
-        notifier_health = _compute_notifier_health(
-            conn, board=board, wake_health=wake_health,
-        )
-
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
@@ -946,7 +457,7 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -992,186 +503,8 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
-            "wake_health": wake_health,
-            "notifier_health": notifier_health,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
-        }
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# GET /wake-health/details — drilldown for the toolbar wake-health pill
-# ---------------------------------------------------------------------------
-
-_WAKE_HEALTH_DETAILS_DEFAULT_LIMIT = 50
-_WAKE_HEALTH_DETAILS_MAX_LIMIT = 200
-
-
-def _collect_wake_health_rows(
-    conn: sqlite3.Connection,
-    *,
-    task_ids: list[str],
-    tasks_by_id: dict[str, Any],
-    limit: int,
-) -> tuple[list[dict[str, Any]], int]:
-    """Return ordered failing+stale rows plus an overflow count.
-
-    Only enabled rows with ``wake_agent=1`` are considered (mirrors
-    :func:`_compute_wake_health`). Rows for tasks outside ``task_ids`` are
-    skipped so the popover honours the same board/tenant scope as /board.
-    """
-    if not task_ids:
-        return [], 0
-
-    failing: list[dict[str, Any]] = []
-    stale: list[dict[str, Any]] = []
-    task_id_set = set(task_ids)
-
-    for i in range(0, len(task_ids), 200):
-        batch = task_ids[i:i + 200]
-        placeholders = ",".join(["?"] * len(batch))
-        rows = conn.execute(
-            f"""
-            SELECT task_id, profile, name,
-                   last_wake_at, last_wake_error_at, last_wake_error,
-                   wake_failure_count
-            FROM kanban_profile_event_subs
-            WHERE enabled = 1
-              AND wake_agent = 1
-              AND task_id IN ({placeholders})
-            """,
-            tuple(batch),
-        ).fetchall()
-        for row in rows:
-            tid = row["task_id"]
-            if tid not in task_id_set:
-                continue
-            failure_count = int(row["wake_failure_count"] or 0)
-            error_at = row["last_wake_error_at"]
-            last_wake_at = row["last_wake_at"]
-            is_failing = error_at is not None or failure_count > 0
-            is_stale = (
-                not is_failing
-                and (last_wake_at is None or last_wake_at == 0)
-            )
-            if not is_failing and not is_stale:
-                continue
-            task = tasks_by_id.get(tid)
-            base = {
-                "task_id": tid,
-                "task_title": task.title if task else tid,
-                "task_status": task.status if task else None,
-                "profile": row["profile"],
-                "name": row["name"] or "",
-                "last_wake_at": last_wake_at,
-                "last_wake_error_at": error_at,
-                "wake_failure_count": failure_count,
-            }
-            if is_failing:
-                base["kind"] = "failing"
-                base["message"] = row["last_wake_error"] or "Last wake errored"
-                failing.append(base)
-            else:
-                base["kind"] = "stale"
-                base["message"] = "No successful wake yet"
-                stale.append(base)
-
-    # Failing first, most recent error wins; stable on task id then profile.
-    failing.sort(key=lambda r: (
-        -(r["last_wake_error_at"] or 0),
-        r["task_id"],
-        r["profile"],
-        r["name"],
-    ))
-    # Stale next; no error/wake timestamps to lean on, so id-stable.
-    stale.sort(key=lambda r: (r["task_id"], r["profile"], r["name"]))
-
-    combined = failing + stale
-    overflow = max(0, len(combined) - limit)
-    return combined[:limit], overflow
-
-
-@router.get("/wake-health/details")
-def get_wake_health_details(
-    tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
-    include_archived: bool = Query(False),
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
-    workflow_template_id: Optional[str] = Query(
-        None, description="Restrict to tasks using this workflow template id",
-    ),
-    current_step_key: Optional[str] = Query(
-        None, description="Restrict to tasks at this workflow step key",
-    ),
-    limit: int = Query(
-        _WAKE_HEALTH_DETAILS_DEFAULT_LIMIT,
-        ge=1,
-        le=_WAKE_HEALTH_DETAILS_MAX_LIMIT,
-        description="Max rows to return (failing+stale combined).",
-    ),
-):
-    """Detail rows backing the toolbar wake-health pill popover.
-
-    Scope mirrors :func:`get_board` so the popover reflects the same tasks
-    the user is currently looking at. Healthy rows are omitted; failing
-    rows are returned before stale ones, with the most recent failure
-    first. ``overflow_count`` reports rows beyond ``limit``.
-    """
-    board = _resolve_board(board)
-    if _backend() == "postgres":
-        store = None
-        try:
-            pg = _pg_reads()
-            bslug = pg.slug(board)
-            store = _store(board=bslug)
-            tasks = store.list_tasks(
-                tenant=tenant, include_archived=include_archived,
-                workflow_template_id=workflow_template_id, current_step_key=current_step_key,
-            )
-            task_ids = [t.id for t in tasks]
-            tasks_by_id = {t.id: t for t in tasks}
-            wake_health = pg.wake_health(bslug, task_ids)
-            notifier_health = _compute_notifier_health(None, board=board, wake_health=wake_health)
-            rows, overflow = pg.wake_health_rows(bslug, task_ids, tasks_by_id, limit)
-            return {
-                "wake_health": wake_health, "notifier_health": notifier_health,
-                "rows": rows, "overflow_count": overflow, "as_of": int(time.time()),
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-    conn = _conn(board=board, readonly=True)
-    try:
-        tasks = kanban_db.list_tasks(
-            conn,
-            tenant=tenant,
-            include_archived=include_archived,
-            workflow_template_id=workflow_template_id,
-            current_step_key=current_step_key,
-        )
-        task_ids = [t.id for t in tasks]
-        tasks_by_id = {t.id: t for t in tasks}
-        wake_health = _compute_wake_health(conn, task_ids=task_ids)
-        notifier_health = _compute_notifier_health(
-            conn, board=board, wake_health=wake_health,
-        )
-        rows, overflow = _collect_wake_health_rows(
-            conn,
-            task_ids=task_ids,
-            tasks_by_id=tasks_by_id,
-            limit=limit,
-        )
-        return {
-            "wake_health": wake_health,
-            "notifier_health": notifier_health,
-            "rows": rows,
-            "overflow_count": overflow,
-            "as_of": int(time.time()),
         }
     finally:
         conn.close()
@@ -1193,59 +526,7 @@ def get_task(
     ),
 ):
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        # EVERYTHING (run-state validation, pool/store acquisition, assembly)
-        # runs inside the guarded try so a transient pooler outage in _store()/
-        # _pg_reads() maps to a controlled 503 (no DSN leak) instead of escaping
-        # as an unguarded 500 the way the other read endpoints already do.
-        #
-        # Run-state validation runs for the PG branch too so a bad combination
-        # 400s on both backends (the sqlite body below applies the identical
-        # checks). PG list_runs does not support these filters.
-        store = None
-        try:
-            if (run_state_type is None) ^ (run_state_name is None):
-                raise HTTPException(
-                    status_code=400,
-                    detail="run_state_type and run_state_name must be passed together or omitted",
-                )
-            if run_state_type is not None and run_state_type not in ("status", "outcome"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="run_state_type must be 'status' or 'outcome'",
-                )
-            if run_state_type is not None or run_state_name is not None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="run state filtering is not yet supported on the postgres backend",
-                )
-            pg = _pg_reads()
-            bslug = pg.slug(board)
-            store = _store(board=bslug)
-            task = store.get_task(task_id)
-            if task is None:
-                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-            full_summary = store.latest_summary(task_id)
-            task_d = _task_dict(task, latest_summary=full_summary)
-            diag_list = _compute_task_diagnostics_pg(bslug, task_ids=[task_id]).get(task_id) or []
-            if diag_list:
-                task_d["diagnostics"] = diag_list
-                task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
-            return {
-                "task": task_d,
-                "comments": [_comment_dict(c) for c in store.list_comments(task_id)],
-                "events": [_event_dict(e) for e in store.list_events(task_id)],
-                "links": _links_for_pg(bslug, task_id),
-                "runs": [_run_dict(r) for r in store.list_runs(task_id)],
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-    conn = _conn(board=board, readonly=True)
+    conn = _conn(board=board)
     try:
         if (run_state_type is None) ^ (run_state_name is None):
             raise HTTPException(
@@ -1316,64 +597,26 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        pg = _pg_reads()
-        bslug = pg.slug(board)
-        store = None
-        try:
-            store = _store(board=bslug)
-            try:
-                task_id = store.create_task(
-                    title=payload.title, body=payload.body, assignee=payload.assignee,
-                    created_by="dashboard", workspace_kind=payload.workspace_kind,
-                    workspace_path=payload.workspace_path, tenant=payload.tenant,
-                    priority=payload.priority, parents=payload.parents,
-                    triage=payload.triage, idempotency_key=payload.idempotency_key,
-                    max_runtime_seconds=payload.max_runtime_seconds, skills=payload.skills,
-                )
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-            task = store.get_task(task_id)
-            body_out: dict[str, Any] = {"task": _task_dict(task) if task else None}
-            if task and task.status == "ready" and task.assignee:
-                try:
-                    from hermes_cli.kanban import _check_dispatcher_presence
-                    running, message = _check_dispatcher_presence()
-                    if not running and message:
-                        body_out["warning"] = message
-                except Exception:
-                    pass
-            return body_out
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-    # Single-writer: the mutation routes through the daemon; the read-back uses
-    # a separate read-only (snapshot) connection.
+    conn = _conn(board=board)
     try:
-        with kanban_db.write_session(board=board) as w:
-            task_id = w.create_task(
-                title=payload.title,
-                body=payload.body,
-                assignee=payload.assignee,
-                created_by="dashboard",
-                workspace_kind=payload.workspace_kind,
-                workspace_path=payload.workspace_path,
-                tenant=payload.tenant,
-                priority=payload.priority,
-                parents=payload.parents,
-                triage=payload.triage,
-                idempotency_key=payload.idempotency_key,
-                max_runtime_seconds=payload.max_runtime_seconds,
-                skills=payload.skills,
-            )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    conn = _conn(board=board, readonly=True)
-    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title=payload.title,
+            body=payload.body,
+            assignee=payload.assignee,
+            created_by="dashboard",
+            workspace_kind=payload.workspace_kind,
+            workspace_path=payload.workspace_path,
+            tenant=payload.tenant,
+            priority=payload.priority,
+            parents=payload.parents,
+            triage=payload.triage,
+            idempotency_key=payload.idempotency_key,
+            max_runtime_seconds=payload.max_runtime_seconds,
+            skills=payload.skills,
+            goal_mode=payload.goal_mode,
+            goal_max_turns=payload.goal_max_turns,
+        )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
@@ -1391,6 +634,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
                 # Probe failure must never block the create itself.
                 pass
         return body
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 
@@ -1575,149 +820,64 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
-    from hermes_cli.kanban_writer_client import RemoteWriteError
-
     board = _resolve_board(board)
-    # Validate inputs that the kb layer would only reject mid-write (over the
-    # socket a kb ValueError surfaces as RemoteWriteError, not ValueError, so we
-    # can't rely on `except ValueError` to map it to 400).
-    if payload.title is not None and not payload.title.strip():
-        raise HTTPException(status_code=400, detail="title cannot be empty")
-    if payload.status == "running":
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
-        )
-    if payload.status is not None and payload.status not in {
-        "done", "blocked", "scheduled", "ready", "archived", "todo", "triage",
-    }:
-        raise HTTPException(status_code=400, detail=f"unknown status: {payload.status}")
-
-    if _backend() == "postgres":
-        pg = _pg_reads()
-        bslug = pg.slug(board)
-        store = None
-        try:
-            store = _store(board=bslug)
-            if store.get_task(task_id) is None:
-                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-
-            def _read_status_pg():
-                t = store.get_task(task_id)
-                return t.status if t else None
-
-            if payload.assignee is not None:
-                try:
-                    ok = store.assign_task(task_id=task_id, profile=payload.assignee or None)
-                except RuntimeError as e:
-                    raise HTTPException(status_code=409, detail=str(e))
-                if not ok:
-                    raise HTTPException(status_code=404, detail="task not found")
-            if payload.status is not None:
-                s = payload.status
-                if s == "done":
-                    ok = store.complete_task(task_id=task_id, result=payload.result, summary=payload.summary, metadata=payload.metadata)
-                elif s == "blocked":
-                    ok = store.block_task(task_id=task_id, reason=payload.block_reason)
-                elif s == "scheduled":
-                    ok = store.schedule_task(task_id=task_id, reason=payload.block_reason)
-                elif s == "ready":
-                    ok = (store.unblock_task(task_id=task_id) if _read_status_pg() in ("blocked", "scheduled")
-                          else store.set_status_direct(task_id=task_id, new_status="ready"))
-                elif s == "archived":
-                    ok = store.archive_task(task_id=task_id)
-                else:  # todo / triage
-                    ok = store.set_status_direct(task_id=task_id, new_status=s)
-                if not ok:
-                    if s == "ready":
-                        blockers = pg.parents_blocking_ready(bslug, task_id)
-                        if blockers:
-                            names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
-                            raise HTTPException(status_code=409, detail=f"Cannot move to 'ready': blocked by parent(s) not done — {names}")
-                    raise HTTPException(status_code=409, detail=f"status transition to {s!r} not valid from current state")
-            if payload.priority is not None:
-                store.set_task_priority(task_id=task_id, priority=int(payload.priority))
-            if payload.title is not None or payload.body is not None:
-                store.edit_task_fields(task_id=task_id, title=payload.title, body=payload.body)
-            updated = store.get_task(task_id)
-            return {"task": _task_dict(updated) if updated else None}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-
-    # Existence check on a read-only connection.
-    rconn = _conn(board=board, readonly=True)
+    conn = _conn(board=board)
     try:
-        if kanban_db.get_task(rconn, task_id) is None:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-    finally:
-        rconn.close()
 
-    def _read_status() -> Optional[str]:
-        rc = _conn(board=board, readonly=True)
-        try:
-            t = kanban_db.get_task(rc, task_id)
-            return t.status if t else None
-        finally:
-            rc.close()
-
-    # Phase 1: intentionally kept on write_session — this block performs multiple
-    # writer operations (assign_task, complete_task/block_task/schedule_task/
-    # unblock_task/set_status_direct/archive_task, set_task_priority, edit_task_fields)
-    # with per-op RuntimeError/RemoteWriteError exception handling and intermediate
-    # _read_status() calls. Opening one store per operation would multiply connection
-    # setup and complicate the multi-branch flow; revisit if the store grows a
-    # batch-write API.
-    with kanban_db.write_session(board=board) as w:
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:
-                ok = w.assign_task(task_id=task_id, profile=payload.assignee or None)
-            except RuntimeError as e:  # LocalWriter / DaemonWriter path
+                ok = kanban_db.assign_task(
+                    conn, task_id, payload.assignee or None,
+                )
+            except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
-            except RemoteWriteError as e:  # socket path
-                if e.error_type == "RuntimeError":
-                    raise HTTPException(status_code=409, detail=str(e))
-                raise
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            ok = True
             if s == "done":
-                ok = w.complete_task(
-                    task_id=task_id,
+                ok = kanban_db.complete_task(
+                    conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = w.block_task(task_id=task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
-                ok = w.schedule_task(task_id=task_id, reason=payload.block_reason)
+                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
-                # Re-open a blocked/scheduled task, else a direct drag-drop set.
-                if _read_status() in ("blocked", "scheduled"):
-                    ok = w.unblock_task(task_id=task_id)
+                # Re-open a blocked/scheduled task, or just an explicit status set.
+                current = kanban_db.get_task(conn, task_id)
+                if current and current.status in ("blocked", "scheduled"):
+                    ok = kanban_db.unblock_task(conn, task_id)
                 else:
-                    ok = w.set_status_direct(task_id=task_id, new_status="ready")
+                    # Direct status write for drag-drop (todo -> ready etc).
+                    ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = w.archive_task(task_id=task_id)
-            else:  # todo / triage
-                ok = w.set_status_direct(task_id=task_id, new_status=s)
+                ok = kanban_db.archive_task(conn, task_id)
+            elif s == "running":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                )
+            elif s in ("todo", "triage", "scheduled"):
+                ok = _set_status_direct(conn, task_id, s)
+            else:
+                raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
-                # For ``ready``, name the blocking parent(s) (see #26744).
+                # For ``ready``, name the blocking parent(s) so the dashboard
+                # can render an actionable toast instead of a silent no-op.
+                # See #26744.
                 if s == "ready":
-                    rc = _conn(board=board, readonly=True)
-                    try:
-                        blockers = _parents_blocking_ready(rc, task_id)
-                    finally:
-                        rc.close()
+                    blockers = _parents_blocking_ready(conn, task_id)
                     if blockers:
                         names = ", ".join(
                             f"{p['title']!r} ({p['id']}, status={p['status']})"
@@ -1737,18 +897,44 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
-            w.set_task_priority(task_id=task_id, priority=int(payload.priority))
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET priority = ? WHERE id = ?",
+                    (int(payload.priority), task_id),
+                )
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'reprioritized', ?, ?)",
+                    (task_id, json.dumps({"priority": int(payload.priority)}),
+                     int(time.time())),
+                )
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
-            w.edit_task_fields(task_id=task_id, title=payload.title, body=payload.body)
+            with kanban_db.write_txn(conn):
+                sets, vals = [], []
+                if payload.title is not None:
+                    if not payload.title.strip():
+                        raise HTTPException(status_code=400, detail="title cannot be empty")
+                    sets.append("title = ?")
+                    vals.append(payload.title.strip())
+                if payload.body is not None:
+                    sets.append("body = ?")
+                    vals.append(payload.body)
+                vals.append(task_id)
+                conn.execute(
+                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+                )
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'edited', NULL, ?)",
+                    (task_id, int(time.time())),
+                )
 
-    rconn = _conn(board=board, readonly=True)
-    try:
-        updated = kanban_db.get_task(rconn, task_id)
+        updated = kanban_db.get_task(conn, task_id)
+        return {"task": _task_dict(updated) if updated else None}
     finally:
-        rconn.close()
-    return {"task": _task_dict(updated) if updated else None}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1758,14 +944,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        ok = store.delete_task(task_id=task_id)
+        ok = kanban_db.delete_task(conn, task_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return {"deleted": True, "task_id": task_id}
     finally:
-        store.close()
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-    return {"deleted": True, "task_id": task_id}
+        conn.close()
 
 
 def _parents_blocking_ready(
@@ -1791,6 +977,108 @@ def _parents_blocking_ready(
     ]
 
 
+def _set_status_direct(
+    conn: sqlite3.Connection, task_id: str, new_status: str,
+) -> bool:
+    """Direct status write for drag-drop moves that aren't covered by the
+    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
+    running<->ready). Appends a ``status`` event row for the live feed.
+
+    When this transitions OFF ``running`` to anything other than the
+    terminal verbs above (which own their own run closing), we close the
+    active run with outcome='reclaimed' so attempt history isn't
+    orphaned. ``running -> ready`` via drag-drop is the common case
+    (user yanking a stuck worker back to the queue).
+    """
+    with kanban_db.write_txn(conn):
+        # Snapshot current state so we know whether to close a run.
+        prev = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        # Guard: don't allow promoting to 'ready' unless all parents are done.
+        # Prevents the dispatcher from spawning a child whose upstream work
+        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
+        if new_status == "ready":
+            parent_statuses = conn.execute(
+                "SELECT t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            if parent_statuses and not all(
+                p["status"] == "done" for p in parent_statuses
+            ):
+                return False
+
+        was_running = prev["status"] == "running"
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and new_status not in {"done", "archived"}
+        )
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, "
+            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
+            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "WHERE id = ?",
+            (new_status, new_status, new_status, new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = None
+        if was_running and new_status != "running" and prev["current_run_id"]:
+            run_id = kanban_db._end_run(
+                conn, task_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=f"status changed to {new_status} (dashboard/direct)",
+            )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'status', ?, ?)",
+            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+        )
+        if reopening_satisfied_parent:
+            # A parent leaving done/archived invalidates any direct child that
+            # was sitting in ready solely because that parent used to satisfy
+            # the dependency gate. Demote those children immediately so the
+            # dashboard does not keep advertising stale-ready work.
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                        "VALUES (?, 'status', ?, ?)",
+                        (
+                            child_id,
+                            json.dumps(
+                                {
+                                    "status": "todo",
+                                    "reason": "parent_reopened",
+                                    "parent": task_id,
+                                }
+                            ),
+                            int(time.time()),
+                        ),
+                    )
+    # If we re-opened something, children may have gone stale.
+    if new_status in {"done", "ready"}:
+        kanban_db.recompute_ready(conn)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Comments
 # ---------------------------------------------------------------------------
@@ -1805,16 +1093,16 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        if store.get_task(task_id) is None:
+        if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        store.add_comment(
-            task_id=task_id, author=payload.author or "dashboard", body=payload.body,
+        kanban_db.add_comment(
+            conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
+        return {"ok": True}
     finally:
-        store.close()
-    return {"ok": True}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1829,14 +1117,14 @@ class LinkBody(BaseModel):
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        store.link_tasks(parent_id=payload.parent_id, child_id=payload.child_id)
+        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+        return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        store.close()
-    return {"ok": True}
+        conn.close()
 
 
 @router.delete("/links")
@@ -1846,12 +1134,12 @@ def delete_link(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        ok = store.unlink_tasks(parent_id=parent_id, child_id=child_id)
+        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        return {"ok": bool(ok)}
     finally:
-        store.close()
-    return {"ok": bool(ok)}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1877,163 +1165,94 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     This is an *independent* iteration — per-task failures don't abort
     siblings. Returns per-id outcome so the UI can surface partials.
     """
-    from hermes_cli.kanban_writer_client import RemoteWriteError
-
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        pg = _pg_reads()
-        bslug = pg.slug(board)
-        store = None
-        try:
-            store = _store(board=bslug)
-            for tid in ids:
-                entry: dict[str, Any] = {"id": tid, "ok": True}
-                try:
-                    task = store.get_task(tid)
-                    if task is None:
-                        entry.update(ok=False, error="not found")
-                        results.append(entry)
-                        continue
-                    if payload.archive:
-                        if not store.archive_task(task_id=tid):
-                            entry.update(ok=False, error="archive refused")
-                    if payload.status is not None and not payload.archive:
-                        s = payload.status
-                        if s == "done":
-                            ok = store.complete_task(task_id=tid, result=payload.result, summary=payload.summary, metadata=payload.metadata)
-                        elif s == "blocked":
-                            ok = store.block_task(task_id=tid)
-                        elif s == "ready":
-                            cur = store.get_task(tid)
-                            ok = (store.unblock_task(task_id=tid) if cur and cur.status in ("blocked", "scheduled")
-                                  else store.set_status_direct(task_id=tid, new_status="ready"))
-                        elif s == "running":
-                            entry.update(ok=False, error=("Cannot set status to 'running' directly; use the dispatcher/claim path"))
-                            results.append(entry)
-                            continue
-                        elif s == "scheduled":
-                            ok = store.schedule_task(task_id=tid)
-                        elif s in {"todo", "triage"}:
-                            ok = store.set_status_direct(task_id=tid, new_status=s)
-                        else:
-                            entry.update(ok=False, error=f"unknown status {s!r}")
-                            results.append(entry)
-                            continue
-                        if not ok:
-                            entry.update(ok=False, error=f"transition to {s!r} refused")
-                    if payload.assignee is not None:
-                        try:
-                            ok = (store.reassign_task(task_id=tid, profile=payload.assignee or None, reclaim_first=True)
-                                  if payload.reclaim_first
-                                  else store.assign_task(task_id=tid, profile=payload.assignee or None))
-                            if not ok:
-                                entry.update(ok=False, error="assign refused")
-                        except RuntimeError as e:
-                            entry.update(ok=False, error=str(e))
-                    if payload.priority is not None:
-                        store.set_task_priority(task_id=tid, priority=int(payload.priority))
-                except Exception as e:  # defensive — one bad id shouldn't kill the batch
-                    entry.update(ok=False, error=str(e))
-                results.append(entry)
-            return {"results": results}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            # Only a store-acquisition/catastrophic failure reaches here; per-id
-            # errors are captured into entry["error"] by the inner try above.
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-    # Reads off a read-only snapshot; every mutation through the single-writer
-    # daemon. Distinct ids are independent, so reading each id's pre-batch state
-    # from one snapshot is correct.
-    # Phase 1: intentionally kept on write_session — this block iterates over
-    # many ids and performs multiple writer operations per id (archive_task,
-    # complete_task/block_task/schedule_task/unblock_task/set_status_direct,
-    # assign_task/reassign_task, set_task_priority) inside a single session,
-    # reading pre-batch state from a shared rconn snapshot. Converting to per-
-    # operation store calls would open one store per operation across the batch,
-    # multiplying connection setup; revisit if the store grows a batch-write API.
-    rconn = _conn(board=board, readonly=True)
+    conn = _conn(board=board)
     try:
-        with kanban_db.write_session(board=board) as w:
-            for tid in ids:
-                entry: dict[str, Any] = {"id": tid, "ok": True}
-                try:
-                    task = kanban_db.get_task(rconn, tid)
-                    if task is None:
-                        entry.update(ok=False, error="not found")
+        for tid in ids:
+            entry: dict[str, Any] = {"id": tid, "ok": True}
+            try:
+                task = kanban_db.get_task(conn, tid)
+                if task is None:
+                    entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                if payload.archive:
+                    if not kanban_db.archive_task(conn, tid):
+                        entry.update(ok=False, error="archive refused")
+                if payload.status is not None and not payload.archive:
+                    s = payload.status
+                    if s == "done":
+                        ok = kanban_db.complete_task(
+                            conn, tid,
+                            result=payload.result,
+                            summary=payload.summary,
+                            metadata=payload.metadata,
+                        )
+                    elif s == "blocked":
+                        ok = kanban_db.block_task(conn, tid)
+                    elif s == "ready":
+                        cur = kanban_db.get_task(conn, tid)
+                        if cur and cur.status in ("blocked", "scheduled"):
+                            ok = kanban_db.unblock_task(conn, tid)
+                        else:
+                            ok = _set_status_direct(conn, tid, "ready")
+                    elif s == "running":
+                        entry.update(
+                            ok=False,
+                            error=(
+                                "Cannot set status to 'running' directly; "
+                                "use the dispatcher/claim path"
+                            ),
+                        )
                         results.append(entry)
                         continue
-                    if payload.archive:
-                        if not w.archive_task(task_id=tid):
-                            entry.update(ok=False, error="archive refused")
-                    if payload.status is not None and not payload.archive:
-                        s = payload.status
-                        if s == "done":
-                            ok = w.complete_task(
-                                task_id=tid,
-                                result=payload.result,
-                                summary=payload.summary,
-                                metadata=payload.metadata,
+                    elif s == "scheduled":
+                        ok = kanban_db.schedule_task(conn, tid)
+                    elif s in {"todo", "triage"}:
+                        ok = _set_status_direct(conn, tid, s)
+                    else:
+                        entry.update(ok=False, error=f"unknown status {s!r}")
+                        results.append(entry)
+                        continue
+                    if not ok:
+                        entry.update(ok=False, error=f"transition to {s!r} refused")
+                if payload.assignee is not None:
+                    try:
+                        if payload.reclaim_first:
+                            ok = kanban_db.reassign_task(
+                                conn, tid, payload.assignee or None,
+                                reclaim_first=True,
                             )
-                        elif s == "blocked":
-                            ok = w.block_task(task_id=tid)
-                        elif s == "ready":
-                            cur = kanban_db.get_task(rconn, tid)
-                            if cur and cur.status in ("blocked", "scheduled"):
-                                ok = w.unblock_task(task_id=tid)
-                            else:
-                                ok = w.set_status_direct(task_id=tid, new_status="ready")
-                        elif s == "running":
-                            entry.update(
-                                ok=False,
-                                error=(
-                                    "Cannot set status to 'running' directly; "
-                                    "use the dispatcher/claim path"
-                                ),
-                            )
-                            results.append(entry)
-                            continue
-                        elif s == "scheduled":
-                            ok = w.schedule_task(task_id=tid)
-                        elif s in {"todo", "triage"}:
-                            ok = w.set_status_direct(task_id=tid, new_status=s)
                         else:
-                            entry.update(ok=False, error=f"unknown status {s!r}")
-                            results.append(entry)
-                            continue
+                            ok = kanban_db.assign_task(
+                                conn, tid, payload.assignee or None,
+                            )
                         if not ok:
-                            entry.update(ok=False, error=f"transition to {s!r} refused")
-                    if payload.assignee is not None:
-                        try:
-                            if payload.reclaim_first:
-                                ok = w.reassign_task(
-                                    task_id=tid,
-                                    profile=payload.assignee or None,
-                                    reclaim_first=True,
-                                )
-                            else:
-                                ok = w.assign_task(
-                                    task_id=tid, profile=payload.assignee or None,
-                                )
-                            if not ok:
-                                entry.update(ok=False, error="assign refused")
-                        except (RuntimeError, RemoteWriteError) as e:
-                            entry.update(ok=False, error=str(e))
-                    if payload.priority is not None:
-                        w.set_task_priority(task_id=tid, priority=int(payload.priority))
-                except Exception as e:  # defensive — one bad id shouldn't kill the batch
-                    entry.update(ok=False, error=str(e))
-                results.append(entry)
+                            entry.update(ok=False, error="assign refused")
+                    except RuntimeError as e:
+                        entry.update(ok=False, error=str(e))
+                if payload.priority is not None:
+                    with kanban_db.write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET priority = ? WHERE id = ?",
+                            (int(payload.priority), tid),
+                        )
+                        conn.execute(
+                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                            "VALUES (?, 'reprioritized', ?, ?)",
+                            (tid, json.dumps({"priority": int(payload.priority)}),
+                             int(time.time())),
+                        )
+            except Exception as e:  # defensive — one bad id shouldn't kill the batch
+                entry.update(ok=False, error=str(e))
+            results.append(entry)
+        return {"results": results}
     finally:
-        rconn.close()
-    return {"results": results}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2061,49 +1280,7 @@ def list_diagnostics(
     directly when it isn't.
     """
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        try:
-            pg = _pg_reads()
-            bslug = pg.slug(board)
-            diags_by_task = _compute_task_diagnostics_pg(bslug, task_ids=None)
-            if not diags_by_task:
-                return {"diagnostics": [], "count": 0}
-            if severity:
-                filtered: dict[str, list[dict]] = {}
-                for tid, dl in diags_by_task.items():
-                    keep = [d for d in dl if kd.severity_at_or_above(d.get("severity"), severity)]
-                    if keep:
-                        filtered[tid] = keep
-                diags_by_task = filtered
-                if not diags_by_task:
-                    return {"diagnostics": [], "count": 0}
-            store = _store(board=bslug)
-            try:
-                tasks_by_id = {t.id: t for t in store.list_tasks(include_archived=True)}
-            finally:
-                store.close()
-            out = []
-            for tid, dl in diags_by_task.items():
-                t = tasks_by_id.get(tid)
-                out.append({
-                    "task_id": tid,
-                    "task_title": t.title if t else None,
-                    "task_status": t.status if t else None,
-                    "task_assignee": t.assignee if t else None,
-                    "diagnostics": dl,
-                })
-            from hermes_cli.kanban_diagnostics import SEVERITY_ORDER
-            sev_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
-            def _sort_key(row):
-                top = row["diagnostics"][0]
-                return (-sev_idx.get(top.get("severity"), -1), -(top.get("last_seen_at") or 0))
-            out.sort(key=_sort_key)
-            return {"diagnostics": out, "count": sum(len(d["diagnostics"]) for d in out)}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-    conn = _conn(board=board, readonly=True)
+    conn = _conn(board=board)
     try:
         diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
         if not diags_by_task:
@@ -2161,6 +1338,7 @@ def list_diagnostics(
         conn.close()
 
 
+
 # ---------------------------------------------------------------------------
 # Worker visibility — cross-task active-worker list and per-run inspection
 # ---------------------------------------------------------------------------
@@ -2185,14 +1363,7 @@ def list_active_workers(
     its task without a second round-trip.
     """
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        try:
-            pg = _pg_reads()
-            workers = pg.active_workers(pg.slug(board))
-            return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-    conn = _conn(board=board, readonly=True)
+    conn = _conn(board=board)
     try:
         rows = conn.execute(
             """
@@ -2251,14 +1422,14 @@ def get_run_endpoint(
     404 when no such run exists.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        r = store.get_run(run_id)
+        r = kanban_db.get_run(conn, run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
         return {"run": _run_dict(r)}
     finally:
-        store.close()
+        conn.close()
 
 
 @router.get("/runs/{run_id}/inspect")
@@ -2280,13 +1451,13 @@ def inspect_run_endpoint(
     ``reason="psutil not available"``.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        r = store.get_run(run_id)
+        r = kanban_db.get_run(conn, run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     finally:
-        store.close()
+        conn.close()
 
     if r.ended_at is not None:
         return {"run_id": run_id, "alive": False, "reason": "run already ended"}
@@ -2357,10 +1528,9 @@ def terminate_run_endpoint(
     ``/runs/{run_id}/inspect``) but no termination control surface.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
-    ok = False
+    conn = _conn(board=board)
     try:
-        r = store.get_run(run_id)
+        r = kanban_db.get_run(conn, run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
         if r.ended_at is not None:
@@ -2368,18 +1538,18 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = store.reclaim_task(task_id=r.task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot terminate run {run_id}: task {r.task_id} is no "
+                    "longer in a reclaimable state"
+                ),
+            )
+        return {"ok": True, "run_id": run_id, "task_id": r.task_id}
     finally:
-        store.close()
-    if not ok:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"cannot terminate run {run_id}: task {r.task_id} is no "
-                "longer in a reclaimable state"
-            ),
-        )
-    return {"ok": True, "run_id": run_id, "task_id": r.task_id}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2404,20 +1574,20 @@ def reclaim_task_endpoint(
     ``hermes kanban reclaim <task_id> --reason ...``.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        ok = store.reclaim_task(task_id=task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot reclaim {task_id}: not in a claimable state "
+                    "(not running, or unknown id)"
+                ),
+            )
+        return {"ok": True, "task_id": task_id}
     finally:
-        store.close()
-    if not ok:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"cannot reclaim {task_id}: not in a claimable state "
-                "(not running, or unknown id)"
-            ),
-        )
-    return {"ok": True, "task_id": task_id}
+        conn.close()
 
 
 class SpecifyBody(BaseModel):
@@ -2492,25 +1662,25 @@ def reassign_task_endpoint(
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        ok = store.reassign_task(
-            task_id=task_id,
-            profile=payload.profile or None,
+        ok = kanban_db.reassign_task(
+            conn, task_id,
+            payload.profile or None,
             reclaim_first=bool(payload.reclaim_first),
             reason=payload.reason,
         )
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cannot reassign {task_id}: unknown id, or still "
+                    "running (pass reclaim_first=true to release the claim first)"
+                ),
+            )
+        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
     finally:
-        store.close()
-    if not ok:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"cannot reassign {task_id}: unknown id, or still "
-                "running (pass reclaim_first=true to release the claim first)"
-            ),
-        )
-    return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2621,11 +1791,11 @@ def get_home_channels(
     subscribed_homes: set[tuple[str, str, str]] = set()
     if task_id:
         board = _resolve_board(board)
-        store = _store(board=board)
+        conn = _conn(board=board)
         try:
-            subs = store.list_notify_subs(task_id)
+            subs = kanban_db.list_notify_subs(conn, task_id)
         finally:
-            store.close()
+            conn.close()
         for sub in subs:
             key = (
                 str(sub.get("platform") or ""),
@@ -2657,21 +1827,22 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
                    f"gateway.platforms.{platform}.home_channel in config.yaml.",
         )
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        task = store.get_task(task_id)
+        task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        store.add_notify_sub(
+        kanban_db.add_notify_sub(
+            conn,
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
             notifier_profile=_active_profile_name(),
         )
+        return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
-        store.close()
-    return {"ok": True, "task_id": task_id, "home_channel": home}
+        conn.close()
 
 
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
@@ -2685,199 +1856,18 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             detail=f"No home channel configured for platform {platform!r}.",
         )
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        store.remove_notify_sub(
+        kanban_db.remove_notify_sub(
+            conn,
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or None,
         )
+        return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
-        store.close()
-    return {"ok": True, "task_id": task_id, "home_channel": home}
-
-
-# ---------------------------------------------------------------------------
-# Profile wake subscriptions (per-task; gateway wakes a Hermes profile)
-# ---------------------------------------------------------------------------
-#
-# Dashboard CRUD for ``kanban_profile_event_subs``. Each row tells the
-# kanban-notifier to spawn ``hermes -p <profile> chat -q <prompt>`` when
-# matching events land on ``task_id`` (or its dependency subtree when
-# ``include_children=1``). The Iris handoff places this section inside
-# TaskDrawer between HomeSubsSection and the body editor, so the API is
-# scoped per-task — no board-level/global surface here.
-
-
-def _serialize_profile_sub(row: dict) -> dict[str, Any]:
-    """Shape a ``kanban_profile_event_subs`` row for the dashboard.
-
-    Resolves ``event_kinds`` (NULL → default terminal kinds) so the UI
-    can render the "Default terminal events" summary without round-tripping
-    the gateway's fallback rule.
-    """
-    parsed_kinds = kanban_db._parse_event_kinds_column(row.get("event_kinds"))
-    resolved = parsed_kinds if parsed_kinds else list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS)
-    return {
-        "task_id": row.get("task_id"),
-        "profile": row.get("profile"),
-        "name": row.get("name") or "",
-        "event_kinds": parsed_kinds,
-        "event_kinds_resolved": resolved,
-        "include_children": int(row.get("include_children") or 0),
-        "wake_agent": int(row.get("wake_agent") or 0),
-        "wake_prompt": row.get("wake_prompt"),
-        "enabled": int(row.get("enabled") or 0),
-        "created_at": row.get("created_at"),
-        "last_wake_at": row.get("last_wake_at"),
-        "last_wake_error_at": row.get("last_wake_error_at"),
-        "last_wake_error": row.get("last_wake_error"),
-        "wake_failure_count": int(row.get("wake_failure_count") or 0),
-    }
-
-
-class ProfileSubBody(BaseModel):
-    """POST body for upserting a ``kanban_profile_event_subs`` row.
-
-    Mirrors the CLI's preserve-vs-reset semantics:
-
-    - Omitted fields preserve the existing column on a re-add.
-    - ``use_default_events=True`` resets ``event_kinds`` to NULL (gateway
-      falls back to ``DEFAULT_NOTIFY_TERMINAL_KINDS``). Mutually exclusive
-      with a non-empty ``event_kinds`` list.
-    - ``clear_wake_prompt=True`` resets ``wake_prompt`` to NULL.
-    """
-
-    profile: str
-    name: str = ""
-    event_kinds: Optional[list[str]] = None
-    use_default_events: Optional[bool] = None
-    include_children: Optional[bool] = None
-    wake_agent: Optional[bool] = None
-    wake_prompt: Optional[str] = None
-    clear_wake_prompt: Optional[bool] = None
-    enabled: Optional[bool] = None
-
-
-@router.get("/tasks/{task_id}/profile-subs")
-def list_profile_subs(task_id: str, board: Optional[str] = Query(None)):
-    """List every profile wake subscription registered against ``task_id``.
-
-    Includes disabled rows so the dashboard can render them greyed out;
-    the gateway-side ``enabled_only=True`` filter happens during dispatch,
-    not here. ``default_event_kinds`` echoes the fallback list so the UI
-    can render the "Default terminal events" summary without a second
-    round-trip.
-    """
-    board = _resolve_board(board)
-    store = _store(board=board)
-    try:
-        if store.get_task(task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        rows = store.list_profile_event_subs(
-            task_id=task_id, enabled_only=False,
-        )
-    finally:
-        store.close()
-    return {
-        "profile_subs": [_serialize_profile_sub(r) for r in rows],
-        "default_event_kinds": list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS),
-    }
-
-
-@router.post("/tasks/{task_id}/profile-subs")
-def upsert_profile_sub(
-    task_id: str,
-    payload: ProfileSubBody,
-    board: Optional[str] = Query(None),
-):
-    """Add or update a profile wake subscription for ``task_id``.
-
-    Idempotent on ``(task_id, profile, name)``: re-posting only the fields
-    the operator changed (e.g. just ``enabled``) preserves the rest, same
-    as the kanban_db helper. ``use_default_events`` / ``clear_wake_prompt``
-    are explicit reset switches; without them the dashboard can't tell
-    "leave the existing custom kinds alone" from "fall back to default".
-    """
-    profile = (payload.profile or "").strip()
-    if not profile:
-        raise HTTPException(status_code=400, detail="profile is required")
-    if payload.use_default_events and payload.event_kinds:
-        raise HTTPException(
-            status_code=400,
-            detail="event_kinds and use_default_events are mutually exclusive",
-        )
-
-    board = _resolve_board(board)
-    store = _store(board=board)
-    try:
-        if store.get_task(task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-
-        add_kwargs: dict[str, Any] = {
-            "task_id": task_id,
-            "profile": profile,
-            "name": payload.name or "",
-        }
-        if payload.use_default_events:
-            add_kwargs["event_kinds"] = None
-        elif payload.event_kinds is not None:
-            add_kwargs["event_kinds"] = payload.event_kinds
-        if payload.include_children is not None:
-            add_kwargs["include_children"] = bool(payload.include_children)
-        if payload.wake_agent is not None:
-            add_kwargs["wake_agent"] = bool(payload.wake_agent)
-        if payload.clear_wake_prompt:
-            add_kwargs["wake_prompt"] = None
-        elif payload.wake_prompt is not None:
-            add_kwargs["wake_prompt"] = payload.wake_prompt
-        if payload.enabled is not None:
-            add_kwargs["enabled"] = bool(payload.enabled)
-
-        store.add_profile_event_sub(**add_kwargs)
-        rows = store.list_profile_event_subs(
-            task_id=task_id, profile=profile, enabled_only=False,
-        )
-    finally:
-        store.close()
-
-    stored = next(
-        (r for r in rows if (r.get("name") or "") == (payload.name or "")),
-        None,
-    )
-    return {
-        "ok": True,
-        "sub": _serialize_profile_sub(stored) if stored else None,
-        "default_event_kinds": list(kanban_db.DEFAULT_NOTIFY_TERMINAL_KINDS),
-    }
-
-
-@router.delete("/tasks/{task_id}/profile-subs/{profile}")
-def remove_profile_sub(
-    task_id: str,
-    profile: str,
-    name: str = Query("", description="Subscription label; empty for the default lane"),
-    board: Optional[str] = Query(None),
-):
-    """Remove a profile wake subscription. 404 if the row does not exist."""
-    board = _resolve_board(board)
-    store = _store(board=board)
-    try:
-        ok = store.remove_profile_event_sub(
-            task_id=task_id, profile=profile, name=name or "",
-        )
-    finally:
-        store.close()
-    if not ok:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"no profile-sub for task {task_id!r} profile {profile!r} "
-                f"name {name!r}"
-            ),
-        )
-    return {"ok": True, "task_id": task_id, "profile": profile, "name": name or ""}
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2893,11 +1883,11 @@ def get_stats(board: Optional[str] = Query(None)):
     board themselves.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        return store.board_stats()
+        return kanban_db.board_stats(conn)
     finally:
-        store.close()
+        conn.close()
 
 
 @router.get("/assignees")
@@ -2910,11 +1900,11 @@ def get_assignees(board: Optional[str] = Query(None)):
     appears in the picker before it's been given any task.
     """
     board = _resolve_board(board)
-    store = _store(board=board)
+    conn = _conn(board=board)
     try:
-        return {"assignees": store.known_assignees()}
+        return {"assignees": kanban_db.known_assignees(conn)}
     finally:
-        store.close()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2936,26 +1926,11 @@ def get_task_log(
     generations, so disk usage per task is bounded at ~4 MiB.
     """
     board = _resolve_board(board)
-    if _backend() == "postgres":
-        # Guard pool/store acquisition + the existence check so a transient
-        # pooler outage maps to 503 (no DSN leak) rather than an unguarded 500.
-        store = None
-        try:
-            store = _store(board=_pg_reads().slug(board))
-            task = store.get_task(task_id)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_pg_read_unavailable(exc, board)
-        finally:
-            if store is not None:
-                store.close()
-    else:
-        conn = _conn(board=board, readonly=True)
-        try:
-            task = kanban_db.get_task(conn, task_id)
-        finally:
-            conn.close()
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
     if task is None:
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     content = kanban_db.read_worker_log(task_id, tail_bytes=tail, board=board)
@@ -2972,138 +1947,6 @@ def get_task_log(
     }
 
 
-def _read_worker_log_bytes(task_id: str, board: Optional[str], start: int, limit: int) -> tuple[str, int, int, str]:
-    """Read a bounded worker-log byte range for websocket streaming."""
-    log_path = kanban_db.worker_log_path(task_id, board=board)
-    stat = log_path.stat()
-    size = int(stat.st_size)
-    safe_start = max(0, min(int(start), size))
-    with open(log_path, "rb") as f:
-        f.seek(safe_start)
-        data = f.read(max(1, int(limit)))
-    return data.decode("utf-8", errors="replace"), safe_start + len(data), size, str(log_path)
-
-
-@router.websocket("/tasks/{task_id}/log/stream")
-async def stream_task_log(ws: WebSocket, task_id: str):
-    """Stream appended worker-log chunks for an open dashboard drawer.
-
-    The regular ``/events`` websocket is intentionally DB-event only. Worker
-    stdout/stderr is an append-only file stream, so this endpoint tails the log
-    file directly and emits small JSON frames without bloating ``task_events``.
-    """
-    # Authorize the upgrade via the dashboard's canonical WS gate, exactly as
-    # the /events stream does, so the right credential is accepted in every
-    # mode (loopback token / gated single-use ticket / server-internal).
-    if not _ws_upgrade_authorized(ws):
-        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
-        return
-
-    raw_board = ws.query_params.get("board")
-    try:
-        board = kanban_db._normalize_board_slug(raw_board) if raw_board else None
-    except ValueError:
-        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
-        return
-
-    try:
-        offset = max(0, int(ws.query_params.get("offset", "0") or "0"))
-    except ValueError:
-        offset = 0
-
-    if _backend() == "postgres":
-        store = _store(board=_pg_reads().slug(board))
-        try:
-            task = store.get_task(task_id)
-        finally:
-            store.close()
-    else:
-        conn = _conn(board=board, readonly=True)
-        try:
-            task = kanban_db.get_task(conn, task_id)
-        finally:
-            conn.close()
-    if task is None:
-        await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
-        return
-
-    await ws.accept()
-    cursor = offset
-    sent_missing = False
-    try:
-        while True:
-            log_path = kanban_db.worker_log_path(task_id, board=board)
-            if not log_path.exists():
-                if not sent_missing:
-                    await ws.send_json({
-                        "type": "missing",
-                        "task_id": task_id,
-                        "offset": 0,
-                        "path": str(log_path),
-                    })
-                    sent_missing = True
-                cursor = 0
-                await asyncio.sleep(_LOG_STREAM_POLL_SECONDS)
-                continue
-
-            size = log_path.stat().st_size
-            if cursor <= 0:
-                content = kanban_db.read_worker_log(
-                    task_id, tail_bytes=_LOG_STREAM_TAIL_BYTES, board=board,
-                ) or ""
-                cursor = size
-                await ws.send_json({
-                    "type": "snapshot",
-                    "task_id": task_id,
-                    "offset": cursor,
-                    "size_bytes": size,
-                    "path": str(log_path),
-                    "content": content,
-                    "truncated": size > _LOG_STREAM_TAIL_BYTES,
-                })
-                sent_missing = False
-            elif size < cursor:
-                content = kanban_db.read_worker_log(
-                    task_id, tail_bytes=_LOG_STREAM_TAIL_BYTES, board=board,
-                ) or ""
-                cursor = size
-                await ws.send_json({
-                    "type": "rotated",
-                    "task_id": task_id,
-                    "offset": cursor,
-                    "size_bytes": size,
-                    "path": str(log_path),
-                    "content": content,
-                    "truncated": size > _LOG_STREAM_TAIL_BYTES,
-                })
-                sent_missing = False
-            elif size > cursor:
-                chunk, cursor, size, path = await asyncio.to_thread(
-                    _read_worker_log_bytes, task_id, board, cursor, _LOG_STREAM_MAX_CHUNK_BYTES,
-                )
-                await ws.send_json({
-                    "type": "append",
-                    "task_id": task_id,
-                    "offset": cursor,
-                    "size_bytes": size,
-                    "path": path,
-                    "chunk": chunk,
-                })
-                sent_missing = False
-
-            await asyncio.sleep(_LOG_STREAM_POLL_SECONDS)
-    except WebSocketDisconnect:
-        return
-    except asyncio.CancelledError:
-        return
-    except Exception as exc:
-        log.warning("Kanban worker log stream error for %s: %s", task_id, exc)
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-
 # ---------------------------------------------------------------------------
 # Dispatch nudge (optional quick-path so the UI doesn't wait 60 s)
 # ---------------------------------------------------------------------------
@@ -3115,19 +1958,6 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    # dispatch_once reclaims tasks (writes) and spawns worker subprocesses, so it
-    # can't run on the single-writer daemon thread. The gateway's embedded
-    # dispatcher already runs it (~10s cadence), so under single-writer a manual
-    # nudge degrades to an informative no-op instead of a DirectWriteForbidden 500.
-    if kanban_db.single_writer_enabled(board=board):
-        body = asdict(kanban_db.DispatchResult())
-        body["dry_run"] = dry_run
-        body["note"] = (
-            "Dispatch runs automatically in the gateway (~10s cadence) under the "
-            "single-writer daemon; manual dispatch from the dashboard is a no-op "
-            "while it is enabled."
-        )
-        return body
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
@@ -3164,22 +1994,11 @@ class RenameBoardBody(BaseModel):
 
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
-    if _backend() == "postgres":
-        # /boards enumerates on-disk board dirs (sqlite life-support); under PG,
-        # only the active/default board's counts are authoritative in Postgres.
-        # Other listed boards (if any) return empty rather than reading sqlite.
-        try:
-            pg = _pg_reads()
-            if slug == pg.slug(None):
-                return pg.board_counts(slug)
-            return {}
-        except Exception:
-            return {}
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        conn = _readonly_snapshot_conn(board=slug)
+        conn = kanban_db.connect(board=slug)
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
@@ -3279,9 +2098,6 @@ def switch_board(slug: str):
 # the simplest and most robust approach; it adds a fraction of a percent
 # of CPU and has no shared state to synchronize across workers.
 _EVENT_POLL_SECONDS = 0.3
-_LOG_STREAM_POLL_SECONDS = 0.3
-_LOG_STREAM_TAIL_BYTES = 100_000
-_LOG_STREAM_MAX_CHUNK_BYTES = 64_000
 
 
 # ---------------------------------------------------------------------------
@@ -3388,7 +2204,7 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
 
 
 # ---------------------------------------------------------------------------
-# Decompose endpoint (orchestrator-driven fan-out)
+# Decompose endpoint (built-in decomposer fan-out)
 # ---------------------------------------------------------------------------
 
 class DecomposeBody(BaseModel):
@@ -3578,12 +2394,6 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             cursor = 0
 
-        wake_since_raw = ws.query_params.get("wake_since", "0")
-        try:
-            wake_cursor = int(wake_since_raw)
-        except ValueError:
-            wake_cursor = 0
-
         # Board selection — pinned at the WS handshake; re-subscribe to
         # switch boards. Changing boards mid-stream would require
         # reconciling two cursors, so the UI just opens a new WS on
@@ -3594,37 +2404,8 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             ws_board = None
 
-        def _fetch_new(cursor_val: int, wake_cursor_val: int) -> tuple[int, list[dict], int, list[dict]]:
-            if _backend() == "postgres":
-                pg = _pg_reads()
-                # Resolve the board slug ONCE and pass the same slug to both the
-                # events tail and the wake-event store, so they never read
-                # different boards (Task 5 split-brain lesson).
-                bslug = pg.slug(ws_board)
-                new_cursor, out = pg.events_since(bslug, cursor_val, 200)
-                store = _store(board=bslug)
-                try:
-                    wake_rows = store.list_profile_wake_events(
-                        since_id=wake_cursor_val, limit=200,
-                    )
-                finally:
-                    store.close()
-                wake_out: list[dict] = []
-                new_wake_cursor = wake_cursor_val
-                for wr in wake_rows:
-                    wake_out.append({
-                        "id": wr.get("id"),
-                        "task_id": wr.get("task_id"),
-                        "profile": wr.get("profile"),
-                        "name": wr.get("name") or "",
-                        "status": wr.get("status"),
-                        "error": wr.get("error"),
-                        "claimed_event_cursor": wr.get("claimed_event_cursor"),
-                        "created_at": wr.get("created_at"),
-                    })
-                    new_wake_cursor = int(wr.get("id") or new_wake_cursor)
-                return new_cursor, out, new_wake_cursor, wake_out
-            conn = _readonly_snapshot_conn(board=ws_board)
+        def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
+            conn = kanban_db.connect(board=ws_board)
             try:
                 rows = conn.execute(
                     "SELECT id, task_id, run_id, kind, payload, created_at "
@@ -3647,38 +2428,14 @@ async def stream_events(ws: WebSocket):
                         "created_at": r["created_at"],
                     })
                     new_cursor = r["id"]
-
-                wake_rows = kanban_db.list_profile_wake_events(
-                    conn, since_id=wake_cursor_val, limit=200,
-                )
-                wake_out: list[dict] = []
-                new_wake_cursor = wake_cursor_val
-                for wr in wake_rows:
-                    wake_out.append({
-                        "id": wr.get("id"),
-                        "task_id": wr.get("task_id"),
-                        "profile": wr.get("profile"),
-                        "name": wr.get("name") or "",
-                        "status": wr.get("status"),
-                        "error": wr.get("error"),
-                        "claimed_event_cursor": wr.get("claimed_event_cursor"),
-                        "created_at": wr.get("created_at"),
-                    })
-                    new_wake_cursor = int(wr.get("id") or new_wake_cursor)
-                return new_cursor, out, new_wake_cursor, wake_out
+                return new_cursor, out
             finally:
                 conn.close()
 
         while True:
-            cursor, events, wake_cursor, wake_events = await asyncio.to_thread(
-                _fetch_new, cursor, wake_cursor,
-            )
-            if events or wake_events:
-                payload = {"events": events, "cursor": cursor}
-                if wake_events:
-                    payload["wake_events"] = wake_events
-                    payload["wake_cursor"] = wake_cursor
-                await ws.send_json(payload)
+            cursor, events = await asyncio.to_thread(_fetch_new, cursor)
+            if events:
+                await ws.send_json({"events": events, "cursor": cursor})
             await asyncio.sleep(_EVENT_POLL_SECONDS)
     except WebSocketDisconnect:
         return
@@ -3690,18 +2447,6 @@ async def stream_events(ws: WebSocket):
         # surfaces the cancellation as an application traceback. Quiet it.
         return
     except Exception as exc:  # defensive: never crash the dashboard worker
-        if _is_corrupt_db_error(exc):
-            log.error(
-                "Kanban event stream fail-stopped: board %s database unavailable/corrupt; "
-                "closing websocket until quiesced repair",
-                ws.query_params.get("board") or kanban_db.DEFAULT_BOARD,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            try:
-                await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
-            except Exception:
-                pass
-            return
         log.warning("Kanban event stream error: %s", exc)
         try:
             await ws.close()

@@ -8,3 +8,16 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# --- fork: keep the upstream-sync conflict surface small (see docs/UPDATING.md) ---
+# Generated lockfiles: never hand-merge. On conflict take ours, then REGENERATE
+# (npm install) so the lock matches the merged package.json. merge=ours just stops
+# git emitting conflict markers; the runbook regenerates afterward.
+# Activate once per clone: `git config merge.ours.driver true`
+package-lock.json      merge=ours
+web/package-lock.json  merge=ours
+
+# i18n string tables: transitional safety net — union keeps BOTH sides' added lines
+# instead of conflicting; follow with a dedupe/lint pass. Most of these go away once
+# control-center becomes a dashboard plugin (Phase C).
+web/src/i18n/*.ts      merge=union
