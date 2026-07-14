@@ -67,13 +67,20 @@ def _normalized_findings(value: Any) -> list[dict[str, Any] | str]:
     return normalized
 
 
-def _completion_timestamp(run: dict[str, Any]) -> str | None:
-    timestamp = _first_string(run, "ended_at", "completed_at")
-    if not timestamp:
+def _completion_timestamp(run: dict[str, Any]) -> int | None:
+    timestamp = run.get("ended_at", run.get("completed_at"))
+    if isinstance(timestamp, bool):
         return None
-    try:
-        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except ValueError:
+    if isinstance(timestamp, (int, float)):
+        completed = int(timestamp) if timestamp > 0 else None
+    elif isinstance(timestamp, str):
+        try:
+            completed = int(datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            completed = None
+    else:
+        completed = None
+    if completed is None:
         return None
 
     for field in ("status", "outcome"):
@@ -82,25 +89,30 @@ def _completion_timestamp(run: dict[str, Any]) -> str | None:
             or run[field].strip().lower() not in {"completed", "done"}
         ):
             return None
-    return timestamp
+    return completed
 
 
 def blocked_candidate(
     show: dict[str, Any], allowed_channels: set[str]
 ) -> dict[str, Any] | None:
     """Return the newest structured blocking-review run, if one exists."""
+    task = show.get("task")
+    if not isinstance(task, dict) or task.get("status") != "done" or task.get("assignee") != "reviewer":
+        return None
     runs = show.get("runs")
     if not isinstance(runs, list):
         return None
 
     newest_first = sorted(
         (run for run in runs if isinstance(run, dict)),
-        key=lambda run: _completion_timestamp(run) or "",
+        key=lambda run: _completion_timestamp(run) or 0,
         reverse=True,
     )
     for run in newest_first:
         completed_at = _completion_timestamp(run)
         if not completed_at:
+            continue
+        if "profile" in run and run.get("profile") != "reviewer":
             continue
         run_metadata = run.get("metadata")
         if not isinstance(run_metadata, dict):
@@ -148,7 +160,7 @@ def blocked_candidate(
         if findings is None:
             findings = metadata.get("blockers")
         return {
-            "task_id": show.get("id") or show.get("task_id"),
+            "task_id": task.get("id") or task.get("task_id"),
             "pr_url": pr_url,
             "reviewed_head": reviewed_head,
             "source_permalink": source_permalink,
@@ -224,7 +236,7 @@ def fetch_live_pr(pr_url: str) -> dict[str, Any]:
 
 
 def should_dispatch(candidate: dict[str, Any], live: dict[str, Any]) -> bool:
-    """Return whether the live PR is a changed, open third-party contribution."""
+    """Return whether the live PR is open and changed since its prior review."""
     author = live.get("author")
     author_login = author.get("login") if isinstance(author, dict) else None
     return (
@@ -235,7 +247,6 @@ def should_dispatch(candidate: dict[str, Any], live: dict[str, Any]) -> bool:
         != str(candidate.get("reviewed_head", "")).lower()
         and isinstance(author_login, str)
         and bool(author_login.strip())
-        and author_login.lower() != "chadtao206"
     )
 
 
@@ -267,19 +278,42 @@ def target_lane_exists(
 
 
 def build_rereview_body(candidate: dict[str, Any], live: dict[str, Any]) -> str:
-    """Build the read-only instructions for a third-party PR re-review lane."""
+    """Build complete, head-bound instructions for a re-review lane."""
     findings = json.dumps(candidate.get("findings", []), indent=2, sort_keys=True)
+    author = live["author"]["login"]
+    head_owner = live["headRepositoryOwner"]["login"]
+    third_party = author.lower() != "chadtao206"
+    safety = (
+        "STRICT THIRD-PARTY GUARD: Do not make code edits, perform a branch update, commit, push, "
+        "edit the PR body or metadata, or enter engineer/remediation/fix lanes. Report any "
+        "remaining blockers to the author."
+        if third_party
+        else "Chad-authored PR: normal review constraints apply: no merge and no stale-head review."
+    )
     return "\n".join([
-        "Re-review this third-party pull request. This task is STRICTLY READ-ONLY.",
-        "Do NOT edit code, push commits, or modify the pull request.",
+        "Re-review this pull request at the exact live head.",
+        "This review lane is STRICTLY READ-ONLY except for GitHub review submission.",
+        "Do NOT edit code or modify the pull request.",
+        safety,
+        "Permitted: read-only inspect, tests/validation, and GitHub review submission.",
+        "Immediately before submission, re-fetch the PR and require an exact head match.",
+        "Guard against a duplicate exact-head Chadtao206 approval; if one exists, do not submit another.",
         "",
         f"PR: {candidate['pr_url']}",
+        f"Live author: {author}",
+        f"Head owner: {head_owner}",
+        f"Live state: {live['state']}",
+        f"Draft: {live['isDraft']}",
         f"Old reviewed head: {candidate['reviewed_head']}",
         f"New live head: {live['headRefOid']}",
         f"Source review: {candidate['source_permalink']}",
         "",
         "Prior blocking findings:",
         findings,
+        "",
+        "Structured completion metadata is required: pr_url; reviewed head; live author; "
+        "verdict/findings; review state/id/url/commit; validation/CI; approval submitted/already "
+        "existed; source permalink; reaction result.",
     ])
 
 
@@ -327,9 +361,12 @@ def create_rereview(candidate: dict[str, Any], live: dict[str, Any]) -> str:
         ),
         "created re-review lane verification",
     )
+    shown_task = shown.get("task")
     if (
-        shown.get("status") not in {"ready", "todo", "running"}
-        or shown.get("assignee") != "reviewer"
+        not isinstance(shown_task, dict)
+        or (shown_task.get("id") or shown_task.get("task_id")) != task_id
+        or shown_task.get("status") not in {"ready", "todo", "running"}
+        or shown_task.get("assignee") != "reviewer"
     ):
         raise RuntimeError("created re-review lane failed verification")
     return task_id
@@ -374,11 +411,7 @@ def _task_list() -> list[dict[str, Any]]:
 
 
 def _completed_epoch(candidate: dict[str, Any]) -> int:
-    return int(
-        datetime.fromisoformat(
-            candidate["completed_at"].replace("Z", "+00:00")
-        ).timestamp()
-    )
+    return int(candidate["completed_at"])
 
 
 def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
@@ -410,6 +443,8 @@ def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
         if not isinstance(task_id, str) or (
             args.only_task and task_id != args.only_task
         ):
+            continue
+        if task.get("status") != "done" or task.get("assignee") != "reviewer":
             continue
         try:
             key = f"show|{task_id}"
@@ -444,9 +479,10 @@ def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
             if not should_dispatch(item, live):
                 continue
             key = f"{item['pr_url'].lower()}|{live['headRefOid'].lower()}"
-            if key in state["dispatched"] or target_lane_exists(
-                tasks, item["pr_url"], live["headRefOid"]
-            ):
+            existing = target_lane_exists(tasks, item["pr_url"], live["headRefOid"])
+            if key in state["dispatched"] or existing:
+                if args.dry_run and existing:
+                    output.append(f"WOULD_SKIP pr={item['pr_url']} head={live['headRefOid']} existing_lane={existing}")
                 continue
             failed_at = state["failures"].get(key)
             if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
@@ -454,6 +490,7 @@ def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
             if dispatches >= MAX_DISPATCHES_PER_TICK:
                 continue
             if args.dry_run:
+                output.append(f"WOULD_DISPATCH pr={item['pr_url']} head={live['headRefOid']}")
                 continue
             new_task = create_rereview(item, live)
             state["dispatched"][key] = {"task_id": new_task, "dispatched_at": now}
@@ -466,15 +503,35 @@ def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
             _save_state(state)
         except (RuntimeError, KeyError, ValueError) as error:
             if isinstance(key, str):
-                state["failures"][key] = now
-                try:
-                    _save_state(state)
-                except RuntimeError:
-                    pass
                 try:
                     tasks = _task_list()
                 except RuntimeError:
                     pass
+                reconciled = None
+                if "|" in key:
+                    pr_url, target_head = key.rsplit("|", 1)
+                    matches = [
+                        task.get("id") or task.get("task_id") for task in tasks
+                        if target_lane_exists([task], pr_url, target_head)
+                    ]
+                    matches = [match for match in matches if isinstance(match, str)]
+                    if len(matches) == 1:
+                        reconciled = matches[0]
+                if reconciled:
+                    state["dispatched"][key] = {"task_id": reconciled, "dispatched_at": now}
+                    state["failures"].pop(key, None)
+                else:
+                    state["failures"][key] = now
+                try:
+                    _save_state(state)
+                except RuntimeError:
+                    pass
+                if reconciled:
+                    output.append(
+                        f"JUST_DO_IT_BLOCKED_REREVIEW dispatched pr={item['pr_url']} "
+                        f"head={live['headRefOid'][:7]} task={reconciled} reconciled=true"
+                    )
+                    continue
             output.append(f"JUST_DO_IT_BLOCKED_REREVIEW error task={task_id}: {error}")
 
     return (1 if any(" error" in line for line in output) else 0), output

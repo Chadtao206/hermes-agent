@@ -28,11 +28,12 @@ PR_URL = "https://github.com/Ylopo/example/pull/42"
 
 def review_show(**metadata):
     return {
-        "id": "t_review42",
+        "task": {"id": "t_review42", "status": "done", "assignee": "reviewer"},
         "runs": [
             {
                 "id": "run-42",
-                "completed_at": "2026-07-14T12:00:00Z",
+                "completed_at": 1784030400,
+                "profile": "reviewer",
                 "metadata": {
                     "pr_url": "https://github.com/Ylopo/example/pull/42/files#diff-1",
                     "source_slack_permalink": PERMALINK,
@@ -50,7 +51,7 @@ def candidate():
         "reviewed_head": "a" * 40,
         "source_permalink": PERMALINK,
         "findings": [{"severity": "blocking", "issue": "wrong docs"}],
-        "completed_at": "2026-07-14T12:00:00Z",
+        "completed_at": 1784030400,
         "run_id": "run-42",
     }
 
@@ -75,6 +76,33 @@ def existing_lane(head):
 
 
 class BlockedCandidateTest(unittest.TestCase):
+    def test_production_shaped_blocked_review_is_candidate(self):
+        show = review_show(
+            pr_url="https://github.com/Ylopo/hermes-agent/pull/696",
+            review_verdict="NEEDS-FIX",
+            reviewed_head_oid="1" * 40,
+            findings=[{"severity": "blocking", "issue": "stale guard"}],
+        )
+        show["task"]["id"] = "t_b2eb8405"
+        show["runs"][0]["ended_at"] = 1784034629
+        del show["runs"][0]["completed_at"]
+
+        item = m.blocked_candidate(show, {CHANNEL})
+
+        self.assertEqual(item["task_id"], "t_b2eb8405")
+        self.assertEqual(item["completed_at"], 1784034629)
+
+    def test_task_must_be_done_and_assigned_reviewer(self):
+        for field, value in (("status", "ready"), ("assignee", "engineer")):
+            with self.subTest(field=field):
+                show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
+                show["task"][field] = value
+                self.assertIsNone(m.blocked_candidate(show, {CHANNEL}))
+
+    def test_explicit_non_reviewer_run_is_rejected(self):
+        show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
+        show["runs"][0]["profile"] = "engineer"
+        self.assertIsNone(m.blocked_candidate(show, {CHANNEL}))
     def test_needs_fix_run_becomes_candidate(self):
         show = review_show(
             review_verdict="NEEDS-FIX",
@@ -189,7 +217,8 @@ class BlockedCandidateTest(unittest.TestCase):
         show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
         show["runs"].append({
             "id": "run-new",
-            "completed_at": "2026-07-15T12:00:00Z",
+            "completed_at": 1784116800,
+            "profile": "reviewer",
             "metadata": {
                 "pr_url": "https://github.com/Ylopo/example/pull/42",
                 "review_verdict": "NEEDS-FIX",
@@ -283,16 +312,35 @@ class LivePrAndDispatchTest(unittest.TestCase):
             m.should_dispatch(candidate(), live(headRepositoryOwner={"login": "Ylopo"}))
         )
 
-    def test_watchdog_author_is_not_dispatchable(self):
-        self.assertFalse(
+    def test_chad_authored_pr_is_dispatchable(self):
+        self.assertTrue(
             m.should_dispatch(candidate(), live(author={"login": "Chadtao206"}))
         )
+
+    def test_body_has_full_contract_and_conditional_third_party_safety(self):
+        third_party = m.build_rereview_body(candidate(), live())
+        chad = m.build_rereview_body(candidate(), live(author={"login": "Chadtao206"}))
+        for text in (
+            "Live author: barwin", "Head owner: barwin", "Live state: OPEN",
+            "Draft: False", "Old reviewed head:", "New live head:",
+            "re-fetch", "exact head", "duplicate", "Chadtao206", "approval",
+            "read-only inspect", "tests", "GitHub review submission",
+            "branch update", "commit", "push", "PR body", "metadata",
+            "engineer", "remediation", "remaining blockers", "author",
+            "pr_url", "reviewed head", "verdict/findings", "review state/id/url/commit",
+            "validation/CI", "approval submitted/already existed", "reaction result",
+        ):
+            self.assertIn(text.lower(), third_party.lower())
+        self.assertIn(candidate()["source_permalink"], third_party)
+        self.assertIn("strict third-party guard", third_party.lower())
+        self.assertNotIn("strict third-party guard", chad.lower())
+        self.assertIn("no merge", chad.lower())
 
     @patch.object(m, "run", create=True)
     def test_create_rereview_uses_safe_command_and_verifies_lane(self, run):
         run.side_effect = [
             json.dumps({"id": "t_new"}),
-            json.dumps({"id": "t_new", "status": "ready", "assignee": "reviewer"}),
+            json.dumps({"task": {"id": "t_new", "status": "ready", "assignee": "reviewer"}, "runs": []}),
         ]
 
         self.assertEqual(m.create_rereview(candidate(), live()), "t_new")
@@ -316,7 +364,7 @@ class LivePrAndDispatchTest(unittest.TestCase):
     def test_create_rereview_rejects_unverified_lane(self, run):
         run.side_effect = [
             json.dumps({"id": "t_new"}),
-            json.dumps({"id": "t_new", "status": "done", "assignee": "reviewer"}),
+            json.dumps({"task": {"id": "t_new", "status": "done", "assignee": "reviewer"}, "runs": []}),
         ]
 
         with self.assertRaisesRegex(RuntimeError, "created re-review lane"):
@@ -334,7 +382,7 @@ class OrchestrationTest(unittest.TestCase):
             only_task=None,
             channel=[CHANNEL],
         )
-        self.tasks = [{"id": "t_review42"}]
+        self.tasks = [{"id": "t_review42", "status": "done", "assignee": "reviewer"}]
         self.shows = {
             "t_review42": review_show(
                 review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
@@ -347,6 +395,7 @@ class OrchestrationTest(unittest.TestCase):
         self.fail_show = False
         self.fail_github = False
         self.fail_readback = False
+        self.reconcile_created_lane = False
         self.list_calls = 0
 
     def tearDown(self):
@@ -366,12 +415,17 @@ class OrchestrationTest(unittest.TestCase):
                 task_id = command[3]
                 if task_id.startswith("t_new"):
                     if self.fail_readback:
+                        if self.reconcile_created_lane:
+                            self.tasks.append({
+                                "id": "t_fc423563",
+                                "status": "ready",
+                                "assignee": "reviewer",
+                                "body": f"PR: {PR_URL}\nNew live head: {'b' * 40}",
+                            })
                         raise RuntimeError("command failed: hermes")
-                    return json.dumps({
-                        "id": task_id,
-                        "status": "ready",
-                        "assignee": "reviewer",
-                    })
+                    return json.dumps({"task": {
+                        "id": task_id, "status": "ready", "assignee": "reviewer",
+                    }, "runs": []})
                 if self.fail_show:
                     raise RuntimeError("command failed: hermes")
                 return json.dumps(self.shows[task_id])
@@ -436,11 +490,11 @@ class OrchestrationTest(unittest.TestCase):
         for index in range(3):
             task_id = f"t_review{index}"
             show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
-            show["id"] = task_id
+            show["task"]["id"] = task_id
             show["runs"][0]["metadata"]["pr_url"] = (
                 f"https://github.com/Ylopo/example/pull/{index + 1}"
             )
-            self.tasks.append({"id": task_id})
+            self.tasks.append({"id": task_id, "status": "done", "assignee": "reviewer"})
             self.shows[task_id] = show
 
         self.assertEqual(self.tick()[0], 0)
@@ -464,7 +518,7 @@ class OrchestrationTest(unittest.TestCase):
         ):
             with self.subTest(live=changed_live["state"], existing=bool(extra_tasks)):
                 self.live_pr = changed_live
-                self.tasks = [{"id": "t_review42"}, *extra_tasks]
+                self.tasks = [{"id": "t_review42", "status": "done", "assignee": "reviewer"}, *extra_tasks]
                 self.shows.update({
                     task["id"]: {**task, "runs": []} for task in extra_tasks
                 })
@@ -530,6 +584,45 @@ class OrchestrationTest(unittest.TestCase):
         self.shows["t_existing"] = {"id": "t_existing", "runs": []}
         self.assertEqual(self.tick(now=1784120401), (0, []))
         self.assertEqual(len(self.created), 1)
+
+    def test_readback_failure_immediately_reconciles_exactly_one_created_lane(self):
+        self.args.backfill_existing = True
+        self.fail_readback = True
+        self.reconcile_created_lane = True
+
+        rc, output = self.tick()
+
+        self.assertEqual(rc, 0)
+        self.assertIn("task=t_fc423563 reconciled=true", output[0])
+        state = json.loads(self.state_path.read_text())
+        key = f"{PR_URL.lower()}|{'b' * 40}"
+        self.assertEqual(state["dispatched"][key]["task_id"], "t_fc423563")
+        self.assertNotIn(key, state["failures"])
+
+    def test_dry_run_reports_existing_lane_for_production_shaped_candidate(self):
+        self.args.backfill_existing = True
+        self.args.dry_run = True
+        lane = existing_lane("b" * 40)
+        lane["id"] = "t_fc423563"
+        lane.update(status="ready", assignee="reviewer")
+        self.tasks.append(lane)
+
+        rc, output = self.tick()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.created), 0)
+        self.assertIn("WOULD_SKIP", output[0])
+        self.assertIn("existing_lane=t_fc423563", output[0])
+
+    def test_list_prefilter_avoids_show_for_non_done_or_non_reviewer_rows(self):
+        self.args.backfill_existing = True
+        self.tasks = [
+            {"id": "t_ready", "status": "ready", "assignee": "reviewer"},
+            {"id": "t_engineer", "status": "done", "assignee": "engineer"},
+        ]
+        self.shows = {}
+
+        self.assertEqual(self.tick(), (0, []))
 
 
 if __name__ == "__main__":
