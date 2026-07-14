@@ -185,15 +185,22 @@ def fetch_live_pr(pr_url: str) -> dict[str, Any]:
         ]),
         "live PR lookup",
     )
-    required = {
-        "state",
-        "isDraft",
-        "headRefOid",
-        "author",
-        "headRepositoryOwner",
-        "headRefName",
-    }
-    if not required.issubset(live):
+    author = live.get("author")
+    head_owner = live.get("headRepositoryOwner")
+    if not (
+        live.get("state") in {"OPEN", "CLOSED", "MERGED"}
+        and isinstance(live.get("isDraft"), bool)
+        and isinstance(live.get("headRefOid"), str)
+        and SHA_RE.fullmatch(live["headRefOid"])
+        and isinstance(author, dict)
+        and isinstance(author.get("login"), str)
+        and bool(author["login"].strip())
+        and isinstance(head_owner, dict)
+        and isinstance(head_owner.get("login"), str)
+        and bool(head_owner["login"].strip())
+        and isinstance(live.get("headRefName"), str)
+        and bool(live["headRefName"].strip())
+    ):
         raise RuntimeError("invalid response from live PR lookup")
     return live
 
@@ -206,6 +213,7 @@ def should_dispatch(candidate: dict[str, Any], live: dict[str, Any]) -> bool:
         live.get("state") == "OPEN"
         and live.get("isDraft") is False
         and isinstance(live.get("headRefOid"), str)
+        and bool(SHA_RE.fullmatch(live["headRefOid"]))
         and live["headRefOid"].lower()
         != str(candidate.get("reviewed_head", "")).lower()
         and isinstance(owner_login, str)
@@ -218,15 +226,19 @@ def target_lane_exists(
 ) -> str | None:
     """Return the existing lane ID for this PR and target head, if present."""
     canonical_url = canonical_pr_url(pr_url)
+    if not canonical_url:
+        return None
+    canonical_url = canonical_url.lower()
     for task in tasks:
         metadata = task.get("metadata")
         metadata_match = isinstance(metadata, dict) and (
-            canonical_pr_url(str(metadata.get("pr_url", ""))) == canonical_url
+            (canonical_pr_url(str(metadata.get("pr_url", ""))) or "").lower()
+            == canonical_url
             and str(metadata.get("target_head", "")).lower() == target_head.lower()
         )
         body = task.get("body")
         body_match = isinstance(body, str) and (
-            canonical_pr_url(body) == canonical_url
+            (canonical_pr_url(body) or "").lower() == canonical_url
             and f"New live head: {target_head}".lower() in body.lower()
         )
         if metadata_match or body_match:

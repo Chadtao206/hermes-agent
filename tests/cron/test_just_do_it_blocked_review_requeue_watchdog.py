@@ -222,6 +222,22 @@ class LivePrAndDispatchTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "live PR lookup"):
                     m.fetch_live_pr(PR_URL)
 
+    @patch.object(m, "run", create=True)
+    def test_fetch_live_pr_rejects_invalid_field_values(self, run):
+        invalid_values = {
+            "headRefOid": "not-a-sha",
+            "state": "UNKNOWN",
+            "isDraft": "false",
+            "author": {"login": ""},
+            "headRepositoryOwner": None,
+            "headRefName": "",
+        }
+        for field, value in invalid_values.items():
+            with self.subTest(field=field, value=value):
+                run.return_value = json.dumps(live(**{field: value}))
+                with self.assertRaisesRegex(RuntimeError, "live PR lookup"):
+                    m.fetch_live_pr(PR_URL)
+
     def test_live_head_change_builds_third_party_read_only_lane(self):
         body = m.build_rereview_body(candidate(), live())
 
@@ -238,10 +254,19 @@ class LivePrAndDispatchTest(unittest.TestCase):
             "t_existing",
         )
 
+    def test_existing_lane_pr_comparison_is_case_insensitive(self):
+        lane = existing_lane("b" * 40)
+        lane["body"] = lane["body"].replace("Ylopo/example", "YLOPO/EXAMPLE")
+
+        self.assertEqual(
+            m.target_lane_exists([lane], PR_URL, "b" * 40), "t_existing"
+        )
+
     def test_closed_unchanged_or_draft_pr_is_not_dispatchable(self):
         self.assertFalse(m.should_dispatch(candidate(), live(state="CLOSED")))
         self.assertFalse(m.should_dispatch(candidate(), live(headRefOid="a" * 40)))
         self.assertFalse(m.should_dispatch(candidate(), live(isDraft=True)))
+        self.assertFalse(m.should_dispatch(candidate(), live(headRefOid="not-a-sha")))
         self.assertFalse(
             m.should_dispatch(
                 candidate(), live(headRepositoryOwner={"login": "Ylopo"})
