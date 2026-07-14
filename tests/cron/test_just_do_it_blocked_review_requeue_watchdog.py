@@ -24,6 +24,7 @@ except ImportError:
 CHANNEL = "C08K8FQKX9S"
 PERMALINK = f"https://ylopo.slack.com/archives/{CHANNEL}/p1720000000000000"
 PR_URL = "https://github.com/Ylopo/example/pull/42"
+PR_696_URL = "https://github.com/Ylopo/npm-ylopo-models-bookshelf/pull/696"
 
 
 def review_show(**metadata):
@@ -648,6 +649,48 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(len(self.created), 0)
         self.assertIn("WOULD_SKIP", output[0])
         self.assertIn("existing_lane=t_fc423563", output[0])
+
+    def configure_merged_696(self, with_lane):
+        self.args.backfill_existing = True
+        self.live_pr = live(state="MERGED")
+        self.shows["t_review42"]["runs"][0]["metadata"]["pr_url"] = PR_696_URL
+        if with_lane:
+            self.tasks.append({
+                "id": "t_fc423563",
+                "status": "ready",
+                "assignee": "reviewer",
+                "body": f"PR: {PR_696_URL}\nNew live head: {'b' * 40}",
+            })
+
+    def test_merged_696_dry_run_reports_existing_reviewer_lane(self):
+        self.configure_merged_696(with_lane=True)
+        self.args.dry_run = True
+
+        rc, output = self.tick()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.created, [])
+        self.assertEqual(
+            output,
+            [f"WOULD_SKIP pr={PR_696_URL} head={'b' * 40} existing_lane=t_fc423563"],
+        )
+
+    def test_merged_696_without_existing_lane_is_silent(self):
+        self.configure_merged_696(with_lane=False)
+
+        self.assertEqual(self.tick(), (0, []))
+        self.assertEqual(self.created, [])
+
+    def test_existing_lane_is_recorded_in_ledger_without_create(self):
+        self.configure_merged_696(with_lane=True)
+
+        rc, output = self.tick()
+
+        self.assertEqual((rc, output), (0, []))
+        self.assertEqual(self.created, [])
+        state = json.loads(self.state_path.read_text())
+        key = f"{PR_696_URL.lower()}|{'b' * 40}"
+        self.assertEqual(state["dispatched"][key]["task_id"], "t_fc423563")
 
     def test_list_prefilter_avoids_show_for_non_done_or_non_reviewer_rows(self):
         self.args.backfill_existing = True

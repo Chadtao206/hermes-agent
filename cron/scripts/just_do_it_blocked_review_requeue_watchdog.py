@@ -478,13 +478,24 @@ def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
             if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
                 continue
             live = fetch_live_pr(item["pr_url"])
-            if not should_dispatch(item, live):
+            if live["headRefOid"].lower() == item["reviewed_head"].lower():
                 continue
             key = f"{item['pr_url'].lower()}|{live['headRefOid'].lower()}"
             existing = target_lane_exists(tasks, item["pr_url"], live["headRefOid"])
-            if key in state["dispatched"] or existing:
-                if args.dry_run and existing:
+            if existing:
+                if args.dry_run:
                     output.append(f"WOULD_SKIP pr={item['pr_url']} head={live['headRefOid']} existing_lane={existing}")
+                elif key not in state["dispatched"]:
+                    state["dispatched"][key] = {
+                        "task_id": existing,
+                        "dispatched_at": now,
+                    }
+                    state["failures"].pop(key, None)
+                    _save_state(state)
+                continue
+            if key in state["dispatched"]:
+                continue
+            if not should_dispatch(item, live):
                 continue
             failed_at = state["failures"].get(key)
             if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
