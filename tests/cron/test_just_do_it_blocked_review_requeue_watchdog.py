@@ -1,5 +1,8 @@
 import json
+import argparse
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from cron.scripts import just_do_it_blocked_review_requeue_watchdog as m
@@ -76,7 +79,9 @@ class BlockedCandidateTest(unittest.TestCase):
 
         self.assertEqual(candidate["task_id"], "t_review42")
         self.assertEqual(candidate["run_id"], "run-42")
-        self.assertEqual(candidate["pr_url"], "https://github.com/Ylopo/example/pull/42")
+        self.assertEqual(
+            candidate["pr_url"], "https://github.com/Ylopo/example/pull/42"
+        )
         self.assertEqual(candidate["reviewed_head"], "a" * 40)
         self.assertEqual(candidate["source_permalink"], PERMALINK)
 
@@ -114,9 +119,7 @@ class BlockedCandidateTest(unittest.TestCase):
         candidate = m.blocked_candidate(show, {CHANNEL})
 
         self.assertEqual(candidate["reviewed_head"], "d" * 40)
-        self.assertEqual(
-            candidate["findings"], [{"issue": "unsafe"}, "missing test"]
-        )
+        self.assertEqual(candidate["findings"], [{"issue": "unsafe"}, "missing test"])
         json.dumps(candidate)
 
     def test_nested_github_state_and_reviewed_head_sha_are_accepted(self):
@@ -150,9 +153,7 @@ class BlockedCandidateTest(unittest.TestCase):
         self.assertIsNone(m.blocked_candidate(invalid_permalink, {CHANNEL}))
 
     def test_run_without_completion_timestamp_is_rejected(self):
-        show = review_show(
-            review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
-        )
+        show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
         show["runs"][0]["completed_at"] = None
 
         self.assertIsNone(m.blocked_candidate(show, {CHANNEL}))
@@ -172,22 +173,18 @@ class BlockedCandidateTest(unittest.TestCase):
                 self.assertIsNone(m.blocked_candidate(show, {CHANNEL}))
 
     def test_newest_qualifying_run_is_selected(self):
-        show = review_show(
-            review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
-        )
-        show["runs"].append(
-            {
-                "id": "run-new",
-                "completed_at": "2026-07-15T12:00:00Z",
-                "metadata": {
-                    "pr_url": "https://github.com/Ylopo/example/pull/42",
-                    "review_verdict": "NEEDS-FIX",
-                    "reviewed_head_oid": "f" * 40,
-                    "source_slack_permalink": PERMALINK,
-                    "findings": [],
-                },
-            }
-        )
+        show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
+        show["runs"].append({
+            "id": "run-new",
+            "completed_at": "2026-07-15T12:00:00Z",
+            "metadata": {
+                "pr_url": "https://github.com/Ylopo/example/pull/42",
+                "review_verdict": "NEEDS-FIX",
+                "reviewed_head_oid": "f" * 40,
+                "source_slack_permalink": PERMALINK,
+                "findings": [],
+            },
+        })
 
         candidate = m.blocked_candidate(show, {CHANNEL})
 
@@ -258,9 +255,7 @@ class LivePrAndDispatchTest(unittest.TestCase):
         lane = existing_lane("b" * 40)
         lane["body"] = lane["body"].replace("Ylopo/example", "YLOPO/EXAMPLE")
 
-        self.assertEqual(
-            m.target_lane_exists([lane], PR_URL, "b" * 40), "t_existing"
-        )
+        self.assertEqual(m.target_lane_exists([lane], PR_URL, "b" * 40), "t_existing")
 
     def test_closed_unchanged_or_malformed_pr_is_not_dispatchable(self):
         self.assertFalse(m.should_dispatch(candidate(), live(state="CLOSED")))
@@ -272,16 +267,12 @@ class LivePrAndDispatchTest(unittest.TestCase):
 
     def test_ylopo_head_repository_from_third_party_author_is_dispatchable(self):
         self.assertTrue(
-            m.should_dispatch(
-                candidate(), live(headRepositoryOwner={"login": "Ylopo"})
-            )
+            m.should_dispatch(candidate(), live(headRepositoryOwner={"login": "Ylopo"}))
         )
 
     def test_watchdog_author_is_not_dispatchable(self):
         self.assertFalse(
-            m.should_dispatch(
-                candidate(), live(author={"login": "Chadtao206"})
-            )
+            m.should_dispatch(candidate(), live(author={"login": "Chadtao206"}))
         )
 
     @patch.object(m, "run", create=True)
@@ -296,7 +287,9 @@ class LivePrAndDispatchTest(unittest.TestCase):
         create_command = run.call_args_list[0].args[0]
         self.assertEqual(create_command[:3], ["hermes", "kanban", "create"])
         self.assertIn("--body", create_command)
-        self.assertIn("STRICTLY READ-ONLY", create_command[create_command.index("--body") + 1])
+        self.assertIn(
+            "STRICTLY READ-ONLY", create_command[create_command.index("--body") + 1]
+        )
         self.assertIn(
             "just-do-it-rereview:ylopo/example#42:" + "b" * 40,
             create_command,
@@ -315,6 +308,154 @@ class LivePrAndDispatchTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "created re-review lane"):
             m.create_rereview(candidate(), live())
+
+
+class OrchestrationTest(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.state_path = Path(self.tempdir.name) / "state.json"
+        self.args = argparse.Namespace(
+            dry_run=False,
+            backfill_existing=False,
+            lookback_seconds=7 * 24 * 3600,
+            only_task=None,
+            channel=[CHANNEL],
+        )
+        self.tasks = [{"id": "t_review42"}]
+        self.shows = {
+            "t_review42": review_show(
+                review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
+            )
+        }
+        self.live_pr = live()
+        self.created = []
+        self.fail_create = False
+        self.fail_list = False
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def write_state(self, state):
+        self.state_path.write_text(json.dumps(state))
+
+    def tick(self, now=1784116800):
+        def fake_run(command):
+            if command[:3] == ["hermes", "kanban", "list"]:
+                if self.fail_list:
+                    raise RuntimeError("command failed: hermes")
+                return json.dumps({"tasks": self.tasks})
+            if command[:3] == ["hermes", "kanban", "show"]:
+                task_id = command[3]
+                if task_id.startswith("t_new"):
+                    return json.dumps({
+                        "id": task_id,
+                        "status": "ready",
+                        "assignee": "reviewer",
+                    })
+                return json.dumps(self.shows[task_id])
+            if command[0] == str(m.GHX):
+                return json.dumps(self.live_pr)
+            if command[:3] == ["hermes", "kanban", "create"]:
+                if self.fail_create:
+                    raise RuntimeError("command failed: hermes")
+                task_id = f"t_new{len(self.created) + 1}"
+                self.created.append(command)
+                return json.dumps({"id": task_id})
+            raise AssertionError(command)
+
+        with (
+            patch.object(m, "STATE_PATH", self.state_path),
+            patch.object(m, "run", side_effect=fake_run),
+        ):
+            return m.process_tick(self.args, now)
+
+    def test_new_head_dispatches_exactly_once(self):
+        self.write_state({
+            "baseline_completed_at": 1784000000,
+            "dispatched": {},
+            "failures": {},
+        })
+
+        rc, output = self.tick()
+        self.assertEqual(
+            (rc, output),
+            (
+                0,
+                [
+                    f"JUST_DO_IT_BLOCKED_REREVIEW dispatched pr={PR_URL} head={'b' * 7} task=t_new1"
+                ],
+            ),
+        )
+        self.assertEqual(len(self.created), 1)
+
+        self.assertEqual(self.tick(), (0, []))
+        self.assertEqual(len(self.created), 1)
+
+    def test_first_run_baselines_without_historical_dispatch(self):
+        self.assertEqual(self.tick(), (0, []))
+        self.assertEqual(self.created, [])
+        self.assertEqual(
+            json.loads(self.state_path.read_text())["baseline_completed_at"], 1784116800
+        )
+
+    def test_backfill_bypasses_baseline_and_head_changes_dispatch_new_lane(self):
+        self.args.backfill_existing = True
+        self.assertEqual(self.tick()[0], 0)
+        self.live_pr["headRefOid"] = "c" * 40
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(len(self.created), 2)
+
+    def test_dispatch_cap_is_two(self):
+        self.args.backfill_existing = True
+        self.tasks = []
+        self.shows = {}
+        for index in range(3):
+            task_id = f"t_review{index}"
+            show = review_show(review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40)
+            show["id"] = task_id
+            show["runs"][0]["metadata"]["pr_url"] = (
+                f"https://github.com/Ylopo/example/pull/{index + 1}"
+            )
+            self.tasks.append({"id": task_id})
+            self.shows[task_id] = show
+
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(len(self.created), 2)
+
+    def test_failure_is_reported_then_backed_off_silently(self):
+        self.args.backfill_existing = True
+        self.fail_create = True
+        rc, output = self.tick()
+        self.assertEqual(rc, 1)
+        self.assertIn("error task=t_review42", output[0])
+
+        self.assertEqual(self.tick(now=1784116801), (0, []))
+
+    def test_unchanged_closed_and_existing_lane_are_quiet(self):
+        self.args.backfill_existing = True
+        for changed_live, extra_tasks in (
+            (live(headRefOid="a" * 40), []),
+            (live(state="CLOSED"), []),
+            (live(), [existing_lane("b" * 40)]),
+        ):
+            with self.subTest(live=changed_live["state"], existing=bool(extra_tasks)):
+                self.live_pr = changed_live
+                self.tasks = [{"id": "t_review42"}, *extra_tasks]
+                self.shows.update({
+                    task["id"]: {**task, "runs": []} for task in extra_tasks
+                })
+                self.assertEqual(self.tick(), (0, []))
+
+    def test_list_failure_is_explicit(self):
+        self.write_state({
+            "baseline_completed_at": 1784000000,
+            "dispatched": {},
+            "failures": {},
+        })
+        self.fail_list = True
+        rc, output = self.tick()
+        self.assertEqual(rc, 1)
+        self.assertIn("Kanban list", output[0])
 
 
 if __name__ == "__main__":

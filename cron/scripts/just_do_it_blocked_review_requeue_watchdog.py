@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import argparse
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -11,6 +13,11 @@ from typing import Any
 
 
 DEFAULT_ALLOWED_CHANNELS = {"C08K8FQKX9S"}
+HOME = Path.home() / ".hermes"
+STATE_PATH = HOME / "state" / "just_do_it_blocked_review_requeue.json"
+DEFAULT_LOOKBACK_SECONDS = 7 * 24 * 3600
+FAIL_RETRY_SECONDS = 60 * 60
+MAX_DISPATCHES_PER_TICK = 2
 GHX = Path.home() / ".hermes" / "scripts" / "ghx.sh"
 PR_RE = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
@@ -309,3 +316,163 @@ def create_rereview(candidate: dict[str, Any], live: dict[str, Any]) -> str:
     ):
         raise RuntimeError("created re-review lane failed verification")
     return task_id
+
+
+def _load_state() -> dict[str, Any]:
+    try:
+        value = json.loads(STATE_PATH.read_text())
+    except FileNotFoundError:
+        value = {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("state read failed") from error
+    if not isinstance(value, dict):
+        raise RuntimeError("state read failed")
+    value.setdefault("dispatched", {})
+    value.setdefault("failures", {})
+    return value
+
+
+def _save_state(state: dict[str, Any]) -> None:
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, sort_keys=True) + "\n")
+        os.replace(temporary, STATE_PATH)
+    except OSError as error:
+        raise RuntimeError("state write failed") from error
+
+
+def _task_list() -> list[dict[str, Any]]:
+    try:
+        output = run(["hermes", "kanban", "list", "--json"])
+    except RuntimeError as error:
+        raise RuntimeError("Kanban list failed") from error
+    value = _json_object(output, "Kanban list")
+    tasks = value.get("tasks")
+    if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
+        raise RuntimeError("invalid response from Kanban list")
+    return tasks
+
+
+def _completed_epoch(candidate: dict[str, Any]) -> int:
+    return int(
+        datetime.fromisoformat(
+            candidate["completed_at"].replace("Z", "+00:00")
+        ).timestamp()
+    )
+
+
+def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
+    """Run one bounded discovery and dispatch tick."""
+    output: list[str] = []
+    try:
+        state = _load_state()
+    except RuntimeError as error:
+        return 1, [f"JUST_DO_IT_BLOCKED_REREVIEW error={error}"]
+
+    if "baseline_completed_at" not in state:
+        state["baseline_completed_at"] = now
+        try:
+            _save_state(state)
+        except RuntimeError as error:
+            return 1, [f"JUST_DO_IT_BLOCKED_REREVIEW error={error}"]
+        if not args.backfill_existing:
+            return 0, []
+
+    try:
+        tasks = _task_list()
+    except RuntimeError as error:
+        return 1, [f"JUST_DO_IT_BLOCKED_REREVIEW error={error}"]
+
+    dispatches = 0
+    for task in tasks:
+        key: str | None = None
+        task_id = task.get("id") or task.get("task_id")
+        if not isinstance(task_id, str) or (
+            args.only_task and task_id != args.only_task
+        ):
+            continue
+        try:
+            key = f"show|{task_id}"
+            failed_at = state["failures"].get(key)
+            if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
+                continue
+            show = _json_object(
+                run(["hermes", "kanban", "show", task_id, "--json"]),
+                f"Kanban show task={task_id}",
+            )
+            item = blocked_candidate(
+                show, set(args.channel or DEFAULT_ALLOWED_CHANNELS)
+            )
+            if item is None:
+                continue
+            completed = _completed_epoch(item)
+            if completed < now - args.lookback_seconds:
+                continue
+            if (
+                not args.backfill_existing
+                and completed <= state["baseline_completed_at"]
+            ):
+                continue
+            key = f"live|{item['pr_url'].lower()}"
+            failed_at = state["failures"].get(key)
+            if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
+                continue
+            live = fetch_live_pr(item["pr_url"])
+            if not should_dispatch(item, live):
+                continue
+            key = f"{item['pr_url'].lower()}|{live['headRefOid'].lower()}"
+            if key in state["dispatched"] or target_lane_exists(
+                tasks, item["pr_url"], live["headRefOid"]
+            ):
+                continue
+            failed_at = state["failures"].get(key)
+            if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
+                continue
+            if dispatches >= MAX_DISPATCHES_PER_TICK:
+                continue
+            if args.dry_run:
+                continue
+            new_task = create_rereview(item, live)
+            state["dispatched"][key] = {"task_id": new_task, "dispatched_at": now}
+            state["failures"].pop(key, None)
+            dispatches += 1
+            output.append(
+                f"JUST_DO_IT_BLOCKED_REREVIEW dispatched pr={item['pr_url']} "
+                f"head={live['headRefOid'][:7]} task={new_task}"
+            )
+            _save_state(state)
+        except (RuntimeError, KeyError, ValueError) as error:
+            if isinstance(key, str):
+                state["failures"][key] = now
+                try:
+                    _save_state(state)
+                except RuntimeError:
+                    pass
+                try:
+                    tasks = _task_list()
+                except RuntimeError:
+                    pass
+            output.append(f"JUST_DO_IT_BLOCKED_REREVIEW error task={task_id}: {error}")
+
+    return (1 if any(" error" in line for line in output) else 0), output
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--backfill-existing", action="store_true")
+    parser.add_argument(
+        "--lookback-seconds", type=int, default=DEFAULT_LOOKBACK_SECONDS
+    )
+    parser.add_argument("--only-task")
+    parser.add_argument("--channel", action="append", default=[])
+    args = parser.parse_args(argv)
+    rc, lines = process_tick(args, int(datetime.now().timestamp()))
+    for line in lines:
+        print(line)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
