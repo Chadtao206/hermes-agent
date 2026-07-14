@@ -71,17 +71,22 @@ def live(**overrides):
 def existing_lane(head):
     return {
         "id": "t_existing",
+        "assignee": "reviewer",
         "body": f"PR: {PR_URL}\nNew live head: {head}",
     }
 
 
 class BlockedCandidateTest(unittest.TestCase):
-    def test_production_shaped_blocked_review_is_candidate(self):
+    def test_motivating_production_shaped_blocked_review_is_candidate(self):
         show = review_show(
-            pr_url="https://github.com/Ylopo/hermes-agent/pull/696",
+            pr_url="https://github.com/Ylopo/npm-ylopo-models-bookshelf/pull/696",
             review_verdict="NEEDS-FIX",
-            reviewed_head_oid="1" * 40,
-            findings=[{"severity": "blocking", "issue": "stale guard"}],
+            github_review_state="CHANGES_REQUESTED",
+            reviewed_head_oid="4455c6d245f32b52e752097c49be5f20874a9d59",
+            findings=[{
+                "severity": "blocking",
+                "issue": "Generated declaration output is stale",
+            }],
         )
         show["task"]["id"] = "t_b2eb8405"
         show["runs"][0]["ended_at"] = 1784034629
@@ -90,7 +95,15 @@ class BlockedCandidateTest(unittest.TestCase):
         item = m.blocked_candidate(show, {CHANNEL})
 
         self.assertEqual(item["task_id"], "t_b2eb8405")
+        self.assertEqual(
+            item["pr_url"],
+            "https://github.com/Ylopo/npm-ylopo-models-bookshelf/pull/696",
+        )
+        self.assertEqual(
+            item["reviewed_head"], "4455c6d245f32b52e752097c49be5f20874a9d59"
+        )
         self.assertEqual(item["completed_at"], 1784034629)
+        self.assertEqual(item["run_id"], "run-42")
 
     def test_task_must_be_done_and_assigned_reviewer(self):
         for field, value in (("status", "ready"), ("assignee", "engineer")):
@@ -293,6 +306,12 @@ class LivePrAndDispatchTest(unittest.TestCase):
             "t_existing",
         )
 
+    def test_engineer_lane_for_target_head_does_not_dedupe(self):
+        lane = existing_lane("b" * 40)
+        lane["assignee"] = "engineer"
+
+        self.assertIsNone(m.target_lane_exists([lane], PR_URL, "b" * 40))
+
     def test_existing_lane_pr_comparison_is_case_insensitive(self):
         lane = existing_lane("b" * 40)
         lane["body"] = lane["body"].replace("Ylopo/example", "YLOPO/EXAMPLE")
@@ -396,6 +415,7 @@ class OrchestrationTest(unittest.TestCase):
         self.fail_github = False
         self.fail_readback = False
         self.reconcile_created_lane = False
+        self.reconciled_lane_assignee = "reviewer"
         self.list_calls = 0
 
     def tearDown(self):
@@ -419,7 +439,7 @@ class OrchestrationTest(unittest.TestCase):
                             self.tasks.append({
                                 "id": "t_fc423563",
                                 "status": "ready",
-                                "assignee": "reviewer",
+                                "assignee": self.reconciled_lane_assignee,
                                 "body": f"PR: {PR_URL}\nNew live head: {'b' * 40}",
                             })
                         raise RuntimeError("command failed: hermes")
@@ -598,6 +618,21 @@ class OrchestrationTest(unittest.TestCase):
         key = f"{PR_URL.lower()}|{'b' * 40}"
         self.assertEqual(state["dispatched"][key]["task_id"], "t_fc423563")
         self.assertNotIn(key, state["failures"])
+
+    def test_readback_failure_does_not_reconcile_engineer_lane(self):
+        self.args.backfill_existing = True
+        self.fail_readback = True
+        self.reconcile_created_lane = True
+        self.reconciled_lane_assignee = "engineer"
+
+        rc, output = self.tick()
+
+        self.assertEqual(rc, 1)
+        self.assertIn("created re-review lane verification", output[0])
+        state = json.loads(self.state_path.read_text())
+        key = f"{PR_URL.lower()}|{'b' * 40}"
+        self.assertNotIn(key, state["dispatched"])
+        self.assertEqual(state["failures"][key], 1784116800)
 
     def test_dry_run_reports_existing_lane_for_production_shaped_candidate(self):
         self.args.backfill_existing = True

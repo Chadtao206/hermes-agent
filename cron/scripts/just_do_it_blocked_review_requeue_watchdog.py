@@ -259,6 +259,8 @@ def target_lane_exists(
         return None
     canonical_url = canonical_url.lower()
     for task in tasks:
+        if task.get("assignee") != "reviewer":
+            continue
         metadata = task.get("metadata")
         metadata_match = isinstance(metadata, dict) and (
             (canonical_pr_url(str(metadata.get("pr_url", ""))) or "").lower()
