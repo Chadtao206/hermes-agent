@@ -2,10 +2,23 @@ import json
 import argparse
 import tempfile
 import unittest
+import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
-from cron.scripts import just_do_it_blocked_review_requeue_watchdog as m
+try:
+    from cron.scripts import just_do_it_blocked_review_requeue_watchdog as m
+except ImportError:
+    module_path = Path(__file__).with_name(
+        "just_do_it_blocked_review_requeue_watchdog.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "just_do_it_blocked_review_requeue_watchdog", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load watchdog from {module_path}")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
 
 
 CHANNEL = "C08K8FQKX9S"
@@ -348,7 +361,7 @@ class OrchestrationTest(unittest.TestCase):
                 self.list_calls += 1
                 if self.fail_list:
                     raise RuntimeError("command failed: hermes")
-                return json.dumps({"tasks": self.tasks})
+                return json.dumps(self.tasks)
             if command[:3] == ["hermes", "kanban", "show"]:
                 task_id = command[3]
                 if task_id.startswith("t_new"):
@@ -467,6 +480,18 @@ class OrchestrationTest(unittest.TestCase):
         rc, output = self.tick()
         self.assertEqual(rc, 1)
         self.assertIn("Kanban list", output[0])
+
+    def test_live_top_level_array_list_contract_and_malformed_outputs(self):
+        with patch.object(m, "run", return_value='[{"id":"t_live"}]'):
+            self.assertEqual(m._task_list(), [{"id": "t_live"}])
+
+        for output in ('{"tasks":[]}', "not json", '[{"id":"ok"}, 7]'):
+            with (
+                self.subTest(output=output),
+                patch.object(m, "run", return_value=output),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Kanban list"):
+                    m._task_list()
 
     def test_show_failure_is_explicit_and_backed_off(self):
         self.write_state({

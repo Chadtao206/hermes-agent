@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Deterministic helpers for blocked just-do-it review discovery."""
 
 from __future__ import annotations
@@ -363,8 +364,10 @@ def _task_list() -> list[dict[str, Any]]:
         output = run(["hermes", "kanban", "list", "--json"])
     except RuntimeError as error:
         raise RuntimeError("Kanban list failed") from error
-    value = _json_object(output, "Kanban list")
-    tasks = value.get("tasks")
+    try:
+        tasks = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("invalid JSON from Kanban list") from error
     if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
         raise RuntimeError("invalid response from Kanban list")
     return tasks
