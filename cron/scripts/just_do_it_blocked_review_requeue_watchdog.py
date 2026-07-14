@@ -207,17 +207,17 @@ def fetch_live_pr(pr_url: str) -> dict[str, Any]:
 
 def should_dispatch(candidate: dict[str, Any], live: dict[str, Any]) -> bool:
     """Return whether the live PR is a changed, open third-party contribution."""
-    owner = live.get("headRepositoryOwner")
-    owner_login = owner.get("login") if isinstance(owner, dict) else None
+    author = live.get("author")
+    author_login = author.get("login") if isinstance(author, dict) else None
     return (
         live.get("state") == "OPEN"
-        and live.get("isDraft") is False
         and isinstance(live.get("headRefOid"), str)
         and bool(SHA_RE.fullmatch(live["headRefOid"]))
         and live["headRefOid"].lower()
         != str(candidate.get("reviewed_head", "")).lower()
-        and isinstance(owner_login, str)
-        and owner_login.lower() != "ylopo"
+        and isinstance(author_login, str)
+        and bool(author_login.strip())
+        and author_login.lower() != "chadtao206"
     )
 
 

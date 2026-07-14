@@ -262,14 +262,25 @@ class LivePrAndDispatchTest(unittest.TestCase):
             m.target_lane_exists([lane], PR_URL, "b" * 40), "t_existing"
         )
 
-    def test_closed_unchanged_or_draft_pr_is_not_dispatchable(self):
+    def test_closed_unchanged_or_malformed_pr_is_not_dispatchable(self):
         self.assertFalse(m.should_dispatch(candidate(), live(state="CLOSED")))
         self.assertFalse(m.should_dispatch(candidate(), live(headRefOid="a" * 40)))
-        self.assertFalse(m.should_dispatch(candidate(), live(isDraft=True)))
         self.assertFalse(m.should_dispatch(candidate(), live(headRefOid="not-a-sha")))
-        self.assertFalse(
+
+    def test_open_draft_from_third_party_author_is_dispatchable(self):
+        self.assertTrue(m.should_dispatch(candidate(), live(isDraft=True)))
+
+    def test_ylopo_head_repository_from_third_party_author_is_dispatchable(self):
+        self.assertTrue(
             m.should_dispatch(
                 candidate(), live(headRepositoryOwner={"login": "Ylopo"})
+            )
+        )
+
+    def test_watchdog_author_is_not_dispatchable(self):
+        self.assertFalse(
+            m.should_dispatch(
+                candidate(), live(author={"login": "Chadtao206"})
             )
         )
 
