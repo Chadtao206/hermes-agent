@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 
@@ -55,6 +56,24 @@ def _normalized_findings(value: Any) -> list[dict[str, Any] | str]:
     return normalized
 
 
+def _completion_timestamp(run: dict[str, Any]) -> str | None:
+    timestamp = _first_string(run, "ended_at", "completed_at")
+    if not timestamp:
+        return None
+    try:
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    for field in ("status", "outcome"):
+        if field in run and (
+            not isinstance(run[field], str)
+            or run[field].strip().lower() not in {"completed", "done"}
+        ):
+            return None
+    return timestamp
+
+
 def blocked_candidate(
     show: dict[str, Any], allowed_channels: set[str]
 ) -> dict[str, Any] | None:
@@ -65,10 +84,13 @@ def blocked_candidate(
 
     newest_first = sorted(
         (run for run in runs if isinstance(run, dict)),
-        key=lambda run: str(run.get("completed_at") or ""),
+        key=lambda run: _completion_timestamp(run) or "",
         reverse=True,
     )
     for run in newest_first:
+        completed_at = _completion_timestamp(run)
+        if not completed_at:
+            continue
         run_metadata = run.get("metadata")
         if not isinstance(run_metadata, dict):
             continue
@@ -120,7 +142,7 @@ def blocked_candidate(
             "reviewed_head": reviewed_head,
             "source_permalink": source_permalink,
             "findings": _normalized_findings(findings),
-            "completed_at": run.get("completed_at"),
+            "completed_at": completed_at,
             "run_id": run.get("id") or run.get("run_id"),
         }
 

@@ -116,6 +116,28 @@ class BlockedCandidateTest(unittest.TestCase):
         self.assertIsNone(m.blocked_candidate(invalid_sha, {CHANNEL}))
         self.assertIsNone(m.blocked_candidate(invalid_permalink, {CHANNEL}))
 
+    def test_run_without_completion_timestamp_is_rejected(self):
+        show = review_show(
+            review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
+        )
+        show["runs"][0]["completed_at"] = None
+
+        self.assertIsNone(m.blocked_candidate(show, {CHANNEL}))
+
+    def test_non_completed_status_or_outcome_is_rejected(self):
+        for field, value in (
+            ("status", "running"),
+            ("status", "failed"),
+            ("outcome", "reclaimed"),
+        ):
+            with self.subTest(field=field, value=value):
+                show = review_show(
+                    review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
+                )
+                show["runs"][0][field] = value
+
+                self.assertIsNone(m.blocked_candidate(show, {CHANNEL}))
+
     def test_newest_qualifying_run_is_selected(self):
         show = review_show(
             review_verdict="NEEDS-FIX", reviewed_head_oid="a" * 40
