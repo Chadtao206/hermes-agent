@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
 DEFAULT_ALLOWED_CHANNELS = {"C08K8FQKX9S"}
+GHX = Path.home() / ".hermes" / "scripts" / "ghx.sh"
 PR_RE = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
     r"(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>\d+)"
@@ -147,3 +150,150 @@ def blocked_candidate(
         }
 
     return None
+
+
+def run(command: list[str]) -> str:
+    """Run an adapter command and return its stdout."""
+    try:
+        return subprocess.run(
+            command, check=True, capture_output=True, text=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"command failed: {command[0]}") from error
+
+
+def _json_object(output: str, boundary: str) -> dict[str, Any]:
+    try:
+        value = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid JSON from {boundary}") from error
+    if not isinstance(value, dict) or "error" in value:
+        raise RuntimeError(f"invalid response from {boundary}")
+    return value
+
+
+def fetch_live_pr(pr_url: str) -> dict[str, Any]:
+    """Fetch the current GitHub state needed for safe re-review dispatch."""
+    live = _json_object(
+        run([
+            str(GHX),
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "state,isDraft,headRefOid,author,headRepositoryOwner,headRefName",
+        ]),
+        "live PR lookup",
+    )
+    required = {
+        "state",
+        "isDraft",
+        "headRefOid",
+        "author",
+        "headRepositoryOwner",
+        "headRefName",
+    }
+    if not required.issubset(live):
+        raise RuntimeError("invalid response from live PR lookup")
+    return live
+
+
+def should_dispatch(candidate: dict[str, Any], live: dict[str, Any]) -> bool:
+    """Return whether the live PR is a changed, open third-party contribution."""
+    owner = live.get("headRepositoryOwner")
+    owner_login = owner.get("login") if isinstance(owner, dict) else None
+    return (
+        live.get("state") == "OPEN"
+        and live.get("isDraft") is False
+        and isinstance(live.get("headRefOid"), str)
+        and live["headRefOid"].lower()
+        != str(candidate.get("reviewed_head", "")).lower()
+        and isinstance(owner_login, str)
+        and owner_login.lower() != "ylopo"
+    )
+
+
+def target_lane_exists(
+    tasks: list[dict[str, Any]], pr_url: str, target_head: str
+) -> str | None:
+    """Return the existing lane ID for this PR and target head, if present."""
+    canonical_url = canonical_pr_url(pr_url)
+    for task in tasks:
+        metadata = task.get("metadata")
+        metadata_match = isinstance(metadata, dict) and (
+            canonical_pr_url(str(metadata.get("pr_url", ""))) == canonical_url
+            and str(metadata.get("target_head", "")).lower() == target_head.lower()
+        )
+        body = task.get("body")
+        body_match = isinstance(body, str) and (
+            canonical_pr_url(body) == canonical_url
+            and f"New live head: {target_head}".lower() in body.lower()
+        )
+        if metadata_match or body_match:
+            task_id = task.get("id") or task.get("task_id")
+            if isinstance(task_id, str):
+                return task_id
+    return None
+
+
+def build_rereview_body(candidate: dict[str, Any], live: dict[str, Any]) -> str:
+    """Build the read-only instructions for a third-party PR re-review lane."""
+    findings = json.dumps(candidate.get("findings", []), indent=2, sort_keys=True)
+    return "\n".join([
+        "Re-review this third-party pull request. This task is STRICTLY READ-ONLY.",
+        "Do NOT edit code, push commits, or modify the pull request.",
+        "",
+        f"PR: {candidate['pr_url']}",
+        f"Old reviewed head: {candidate['reviewed_head']}",
+        f"New live head: {live['headRefOid']}",
+        f"Source review: {candidate['source_permalink']}",
+        "",
+        "Prior blocking findings:",
+        findings,
+    ])
+
+
+def create_rereview(candidate: dict[str, Any], live: dict[str, Any]) -> str:
+    """Create and verify a reviewer lane for the candidate's live head."""
+    match = PR_RE.fullmatch(candidate["pr_url"])
+    if not match:
+        raise RuntimeError("invalid candidate PR URL")
+    owner, repo, number = (match.group(name) for name in ("owner", "repo", "number"))
+    target_head = live["headRefOid"]
+    title = f"Re-review {owner}/{repo}#{number} at {target_head[:12]}"
+    created = _json_object(
+        run([
+            "hermes",
+            "kanban",
+            "create",
+            title,
+            "--body",
+            build_rereview_body(candidate, live),
+            "--assignee",
+            "reviewer",
+            "--workspace",
+            "scratch",
+            "--priority",
+            "110",
+            "--created-by",
+            "just-do-it-blocked-review-requeue-watchdog",
+            "--idempotency-key",
+            f"just-do-it-rereview:{owner.lower()}/{repo.lower()}#{number}:{target_head.lower()}",
+            "--json",
+        ]),
+        "re-review lane creation",
+    )
+    task_id = created.get("id") or created.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise RuntimeError("invalid response from re-review lane creation")
+
+    shown = _json_object(
+        run(["hermes", "kanban", "show", task_id, "--json"]),
+        "created re-review lane verification",
+    )
+    if (
+        shown.get("status") not in {"ready", "todo", "running"}
+        or shown.get("assignee") != "reviewer"
+    ):
+        raise RuntimeError("created re-review lane failed verification")
+    return task_id
