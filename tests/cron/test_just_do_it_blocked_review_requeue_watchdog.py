@@ -202,7 +202,7 @@ class LivePrAndDispatchTest(unittest.TestCase):
         self.assertEqual(
             run.call_args.args[0],
             [
-                str(m.GHX),
+                "/Users/ctao/.hermes/scripts/pr/ghx.sh",
                 "pr",
                 "view",
                 PR_URL,
@@ -331,6 +331,10 @@ class OrchestrationTest(unittest.TestCase):
         self.created = []
         self.fail_create = False
         self.fail_list = False
+        self.fail_show = False
+        self.fail_github = False
+        self.fail_readback = False
+        self.list_calls = 0
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -341,19 +345,26 @@ class OrchestrationTest(unittest.TestCase):
     def tick(self, now=1784116800):
         def fake_run(command):
             if command[:3] == ["hermes", "kanban", "list"]:
+                self.list_calls += 1
                 if self.fail_list:
                     raise RuntimeError("command failed: hermes")
                 return json.dumps({"tasks": self.tasks})
             if command[:3] == ["hermes", "kanban", "show"]:
                 task_id = command[3]
                 if task_id.startswith("t_new"):
+                    if self.fail_readback:
+                        raise RuntimeError("command failed: hermes")
                     return json.dumps({
                         "id": task_id,
                         "status": "ready",
                         "assignee": "reviewer",
                     })
+                if self.fail_show:
+                    raise RuntimeError("command failed: hermes")
                 return json.dumps(self.shows[task_id])
             if command[0] == str(m.GHX):
+                if self.fail_github:
+                    raise RuntimeError("command failed: ghx.sh")
                 return json.dumps(self.live_pr)
             if command[:3] == ["hermes", "kanban", "create"]:
                 if self.fail_create:
@@ -427,7 +438,7 @@ class OrchestrationTest(unittest.TestCase):
         self.fail_create = True
         rc, output = self.tick()
         self.assertEqual(rc, 1)
-        self.assertIn("error task=t_review42", output[0])
+        self.assertIn("re-review lane creation", output[0])
 
         self.assertEqual(self.tick(now=1784116801), (0, []))
 
@@ -456,6 +467,44 @@ class OrchestrationTest(unittest.TestCase):
         rc, output = self.tick()
         self.assertEqual(rc, 1)
         self.assertIn("Kanban list", output[0])
+
+    def test_show_failure_is_explicit_and_backed_off(self):
+        self.write_state({
+            "baseline_completed_at": 1784000000,
+            "dispatched": {},
+            "failures": {},
+        })
+        self.fail_show = True
+
+        rc, output = self.tick()
+        self.assertEqual(rc, 1)
+        self.assertIn("Kanban show task=t_review42", output[0])
+        self.assertEqual(self.tick(now=1784116801), (0, []))
+
+    def test_live_github_failure_is_explicit_and_backed_off(self):
+        self.args.backfill_existing = True
+        self.fail_github = True
+
+        rc, output = self.tick()
+        self.assertEqual(rc, 1)
+        self.assertIn("live PR lookup", output[0])
+        self.assertEqual(self.tick(now=1784116801), (0, []))
+
+    def test_readback_failure_refreshes_tasks_and_never_duplicates(self):
+        self.args.backfill_existing = True
+        self.fail_readback = True
+
+        rc, output = self.tick()
+        self.assertEqual(rc, 1)
+        self.assertIn("created re-review lane verification", output[0])
+        self.assertEqual(self.list_calls, 2)
+        self.assertEqual(len(self.created), 1)
+
+        self.fail_readback = False
+        self.tasks.append(existing_lane("b" * 40))
+        self.shows["t_existing"] = {"id": "t_existing", "runs": []}
+        self.assertEqual(self.tick(now=1784120401), (0, []))
+        self.assertEqual(len(self.created), 1)
 
 
 if __name__ == "__main__":

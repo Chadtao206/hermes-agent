@@ -18,7 +18,7 @@ STATE_PATH = HOME / "state" / "just_do_it_blocked_review_requeue.json"
 DEFAULT_LOOKBACK_SECONDS = 7 * 24 * 3600
 FAIL_RETRY_SECONDS = 60 * 60
 MAX_DISPATCHES_PER_TICK = 2
-GHX = Path.home() / ".hermes" / "scripts" / "ghx.sh"
+GHX = HOME / "scripts" / "pr" / "ghx.sh"
 PR_RE = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
     r"(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>\d+)"
@@ -179,17 +179,27 @@ def _json_object(output: str, boundary: str) -> dict[str, Any]:
     return value
 
 
+def _run_boundary(command: list[str], boundary: str) -> str:
+    try:
+        return run(command)
+    except RuntimeError as error:
+        raise RuntimeError(f"{boundary} failed") from error
+
+
 def fetch_live_pr(pr_url: str) -> dict[str, Any]:
     """Fetch the current GitHub state needed for safe re-review dispatch."""
     live = _json_object(
-        run([
-            str(GHX),
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "state,isDraft,headRefOid,author,headRepositoryOwner,headRefName",
-        ]),
+        _run_boundary(
+            [
+                str(GHX),
+                "pr",
+                "view",
+                pr_url,
+                "--json",
+                "state,isDraft,headRefOid,author,headRepositoryOwner,headRefName",
+            ],
+            "live PR lookup",
+        ),
         "live PR lookup",
     )
     author = live.get("author")
@@ -281,25 +291,28 @@ def create_rereview(candidate: dict[str, Any], live: dict[str, Any]) -> str:
     target_head = live["headRefOid"]
     title = f"Re-review {owner}/{repo}#{number} at {target_head[:12]}"
     created = _json_object(
-        run([
-            "hermes",
-            "kanban",
-            "create",
-            title,
-            "--body",
-            build_rereview_body(candidate, live),
-            "--assignee",
-            "reviewer",
-            "--workspace",
-            "scratch",
-            "--priority",
-            "110",
-            "--created-by",
-            "just-do-it-blocked-review-requeue-watchdog",
-            "--idempotency-key",
-            f"just-do-it-rereview:{owner.lower()}/{repo.lower()}#{number}:{target_head.lower()}",
-            "--json",
-        ]),
+        _run_boundary(
+            [
+                "hermes",
+                "kanban",
+                "create",
+                title,
+                "--body",
+                build_rereview_body(candidate, live),
+                "--assignee",
+                "reviewer",
+                "--workspace",
+                "scratch",
+                "--priority",
+                "110",
+                "--created-by",
+                "just-do-it-blocked-review-requeue-watchdog",
+                "--idempotency-key",
+                f"just-do-it-rereview:{owner.lower()}/{repo.lower()}#{number}:{target_head.lower()}",
+                "--json",
+            ],
+            "re-review lane creation",
+        ),
         "re-review lane creation",
     )
     task_id = created.get("id") or created.get("task_id")
@@ -307,7 +320,10 @@ def create_rereview(candidate: dict[str, Any], live: dict[str, Any]) -> str:
         raise RuntimeError("invalid response from re-review lane creation")
 
     shown = _json_object(
-        run(["hermes", "kanban", "show", task_id, "--json"]),
+        _run_boundary(
+            ["hermes", "kanban", "show", task_id, "--json"],
+            "created re-review lane verification",
+        ),
         "created re-review lane verification",
     )
     if (
@@ -398,7 +414,10 @@ def process_tick(args: argparse.Namespace, now: int) -> tuple[int, list[str]]:
             if isinstance(failed_at, int) and now - failed_at < FAIL_RETRY_SECONDS:
                 continue
             show = _json_object(
-                run(["hermes", "kanban", "show", task_id, "--json"]),
+                _run_boundary(
+                    ["hermes", "kanban", "show", task_id, "--json"],
+                    f"Kanban show task={task_id}",
+                ),
                 f"Kanban show task={task_id}",
             )
             item = blocked_candidate(
