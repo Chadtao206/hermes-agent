@@ -313,6 +313,40 @@ class LivePrAndDispatchTest(unittest.TestCase):
 
         self.assertIsNone(m.target_lane_exists([lane], PR_URL, "b" * 40))
 
+    def test_actual_exact_head_sha_reviewer_lane_is_detected(self):
+        head = "c40fb1db61c6c02625904017d67647e512576598"
+        lane = {
+            "id": "t_fc423563",
+            "assignee": "reviewer",
+            "body": f"PR: {PR_696_URL}\nExact head SHA: {head}",
+        }
+
+        self.assertEqual(
+            m.target_lane_exists([lane], PR_696_URL, head), "t_fc423563"
+        )
+
+    def test_body_match_requires_same_pr_and_full_sha(self):
+        head = "c40fb1db61c6c02625904017d67647e512576598"
+        for lane in (
+            {
+                "id": "t_other_head",
+                "assignee": "reviewer",
+                "body": f"PR: {PR_696_URL}\nExact head SHA: {'d' * 40}",
+            },
+            {
+                "id": "t_other_pr",
+                "assignee": "reviewer",
+                "body": f"PR: https://github.com/Ylopo/other/pull/696\nExact head SHA: {head}",
+            },
+            {
+                "id": "t_engineer",
+                "assignee": "engineer",
+                "body": f"PR: {PR_696_URL}\nExact head SHA: {head}",
+            },
+        ):
+            with self.subTest(task=lane["id"]):
+                self.assertIsNone(m.target_lane_exists([lane], PR_696_URL, head))
+
     def test_existing_lane_pr_comparison_is_case_insensitive(self):
         lane = existing_lane("b" * 40)
         lane["body"] = lane["body"].replace("Ylopo/example", "YLOPO/EXAMPLE")
@@ -659,7 +693,7 @@ class OrchestrationTest(unittest.TestCase):
                 "id": "t_fc423563",
                 "status": "ready",
                 "assignee": "reviewer",
-                "body": f"PR: {PR_696_URL}\nNew live head: {'b' * 40}",
+                "body": f"PR: {PR_696_URL}\nExact head SHA: {'b' * 40}",
             })
 
     def test_merged_696_dry_run_reports_existing_reviewer_lane(self):

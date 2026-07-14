@@ -255,7 +255,7 @@ def target_lane_exists(
 ) -> str | None:
     """Return the existing lane ID for this PR and target head, if present."""
     canonical_url = canonical_pr_url(pr_url)
-    if not canonical_url:
+    if not canonical_url or not SHA_RE.fullmatch(target_head):
         return None
     canonical_url = canonical_url.lower()
     for task in tasks:
@@ -270,7 +270,7 @@ def target_lane_exists(
         body = task.get("body")
         body_match = isinstance(body, str) and (
             (canonical_pr_url(body) or "").lower() == canonical_url
-            and f"New live head: {target_head}".lower() in body.lower()
+            and target_head.lower() in body.lower()
         )
         if metadata_match or body_match:
             task_id = task.get("id") or task.get("task_id")
