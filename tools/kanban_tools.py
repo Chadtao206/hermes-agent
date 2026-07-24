@@ -240,10 +240,8 @@ def heartbeat_current_worker_from_env() -> bool:
     Identity comes from:
       * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
       * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
-        a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
+        a stale run that may have already been reclaimed, and so the claim
+        renewal that rides along cannot extend a successor's claim
 
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
@@ -261,11 +259,14 @@ def heartbeat_current_worker_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+            # No separate ``heartbeat_claim`` here: ``heartbeat_worker``
+            # renews ``claim_expires`` inside the same run-fenced statement
+            # that writes ``last_heartbeat_at``. Calling both was not merely
+            # redundant, it was unsafe — ``heartbeat_claim`` is fenced on the
+            # claim LOCK, and the dispatcher reuses one ``host:pid`` lock
+            # across runs, so a worker left over from a superseded run
+            # extended its successor's claim even though the run fence
+            # rejected the heartbeat event itself.
             run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
             run_id: Optional[int]
             try:
@@ -762,12 +763,12 @@ def _handle_block(args: dict, **kw) -> str:
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
-    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
-    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
-    a diligent worker that loops this tool while a single tool call
-    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
-    by ``release_stale_claims`` — which is exactly the trap that
-    ``heartbeat_claim``'s docstring warns against.
+    One call to ``heartbeat_worker`` records the heartbeat event, touches
+    ``last_heartbeat_at`` AND renews the claim TTL, all in one run-fenced
+    transaction. The TTL half matters: a diligent worker that loops this
+    tool while a single tool call blocks the agent for longer than
+    ``DEFAULT_CLAIM_TTL_SECONDS`` would otherwise still be reclaimed by
+    ``release_stale_claims``.
     """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
@@ -782,14 +783,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-
+            # ``heartbeat_worker`` renews ``claim_expires`` in the same
+            # run-fenced statement as ``last_heartbeat_at``; a separate
+            # ``heartbeat_claim`` is not just redundant but unsafe (it is
+            # fenced on the claim LOCK, which the dispatcher reuses across
+            # runs, so a superseded run could extend its successor's claim).
             ok = kb.heartbeat_worker(
                 conn,
                 tid,

@@ -453,7 +453,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reclaim.add_argument("task_id")
     p_reclaim.add_argument(
         "--reason", default=None,
-        help="Human-readable reason (recorded on the reclaimed event)",
+        help="Human-readable reason (recorded on the reclaimed event). "
+             "Include the PR URL when re-queuing a card that already has an "
+             "open PR — the duplicate-PR respawn guard treats naming the PR "
+             "as acknowledging it, which is what releases the guard when the "
+             "reclaim and the PR comment land in the same second",
     )
 
     p_reassign = sub.add_parser(

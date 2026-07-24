@@ -426,7 +426,127 @@ def test_heartbeat_adopts_over_a_dead_recorded_pid(kanban_home, monkeypatch):
             conn, tid, expected_run_id=task.current_run_id, worker_pid=888,
         ) is True
         assert _worker_pid(conn, tid) == 888
+        adopted = _events(conn, tid, "ownership_adopted")
+        assert len(adopted) == 1
+        assert json.loads(adopted[0]["payload"])["replaced_dead_pid"] == 777
+
+
+# ---------------------------------------------------------------------------
+# 4b. Ownership is compare-and-set: first valid owner of a run wins
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_adopted_pid_survives_the_dispatchers_later_write(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """Boris repro 2: the supervisor heartbeats BEFORE ``spawn_fn`` returns.
+
+    The dispatcher's pid write lands second, on the same run — so the run
+    fence passes and, before ownership was compare-and-set, it overwrote the
+    adopted pid: two ownership records for one run (11111 -> 22222, with both
+    an ``ownership_adopted`` and a ``spawned`` event) and the live supervisor
+    silently demoted. First valid owner wins; the loser is a diagnostic."""
+    now = 8_100_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    supervisor_pid, spawn_pid = 11111, 22222
+    # Both processes are alive: this is a genuine two-process disagreement,
+    # not a dead pid being cleaned up.
+    monkeypatch.setattr(
+        kb, "_pid_alive", lambda pid: int(pid) in (supervisor_pid, spawn_pid),
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="race", assignee="alice")
+
+        def spawn_fn(task, ws):
+            # The supervisor is already up and heartbeating with its own pid
+            # while the launcher is still returning.
+            assert kb.heartbeat_worker(
+                conn, task.id,
+                expected_run_id=task.current_run_id,
+                worker_pid=supervisor_pid,
+            ) is True
+            return spawn_pid
+
+        res = kb.dispatch_once(conn, spawn_fn=spawn_fn)
+        assert [t[0] for t in res.spawned] == [tid]
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        # One owner, and it is the one that got there first.
+        assert _worker_pid(conn, tid) == supervisor_pid
+        run_row = conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        assert run_row["worker_pid"] == supervisor_pid
+
+        # Exactly one ownership event, and no ``spawned`` claiming otherwise.
         assert len(_events(conn, tid, "ownership_adopted")) == 1
+        assert _events(conn, tid, "spawned") == []
+        conflicts = _events(conn, tid, "spawn_ownership_conflict")
+        assert len(conflicts) == 1
+        payload = json.loads(conflicts[0]["payload"])
+        assert payload["pid"] == spawn_pid
+        assert payload["recorded_pid"] == supervisor_pid
+        assert payload["recorded_alive"] is True
+        # A conflict is not "no ownership evidence" — the card HAS an owner.
+        assert _events(conn, tid, "spawn_ownership_unrecorded") == []
+
+
+def test_same_pid_from_both_paths_records_one_owner_once(kanban_home, monkeypatch):
+    """The real lane integration: the supervisor IS the process the launcher
+    returns, so both paths offer the SAME pid. That must be idempotent —
+    one owner, one adoption event, and the spawn still recorded (a missing
+    ``spawned`` event is what made 23 of 44 live runs unattributable), marked
+    so it is never read as a second ownership claim."""
+    now = 8_110_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    pid = 33333
+    monkeypatch.setattr(kb, "_pid_alive", lambda p: int(p) == pid)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="same-pid", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+
+        assert kb.heartbeat_worker(
+            conn, tid, expected_run_id=task.current_run_id, worker_pid=pid,
+        ) is True
+        assert kb._record_spawn_ownership(
+            conn, tid, pid, expected_run_id=task.current_run_id,
+        ) is True
+
+        assert _worker_pid(conn, tid) == pid
+        assert len(_events(conn, tid, "ownership_adopted")) == 1
+        spawned = _events(conn, tid, "spawned")
+        assert len(spawned) == 1
+        assert json.loads(spawned[0]["payload"]) == {
+            "pid": pid, "ownership": "already_recorded",
+        }
+        assert _events(conn, tid, "spawn_ownership_conflict") == []
+
+
+def test_spawn_write_never_takes_over_a_dead_recorded_pid(
+    kanban_home, monkeypatch,
+):
+    """Asymmetry by design: adoption by a live supervisor may replace a dead
+    owner, a spawn write may not. A spawn is no evidence about the recorded
+    owner, and a card owned only by a dead pid is what
+    ``detect_crashed_workers`` exists to resolve — quietly overwriting it
+    would hide the crash instead."""
+    now = 8_120_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dead-owner", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        assert kb.heartbeat_worker(
+            conn, tid, expected_run_id=task.current_run_id, worker_pid=444,
+        ) is True
+
+        assert kb._record_spawn_ownership(
+            conn, tid, 555, expected_run_id=task.current_run_id,
+        ) is False
+        assert _worker_pid(conn, tid) == 444
+        conflicts = _events(conn, tid, "spawn_ownership_conflict")
+        assert len(conflicts) == 1
+        assert json.loads(conflicts[0]["payload"])["recorded_alive"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -480,25 +600,186 @@ def test_explicit_requeue_after_pr_comment_permits_respawn(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
-@pytest.mark.parametrize("kind", ["status", "promoted", "unblocked", "reclaimed"])
-def test_every_deliberate_requeue_kind_releases_the_pr_guard(
-    kanban_home, monkeypatch, kind,
+def _requeue_via_operator_reclaim(conn, tid, *, reason=None):
+    """Operator reclaim (``hermes kanban reclaim`` / dashboard abort)."""
+    kb.claim_task(conn, tid, ttl_seconds=900)
+    assert kb.reclaim_task(conn, tid, reason=reason, signal_fn=lambda *_: None)
+
+
+def _requeue_via_operator_promote(conn, tid, **_):
+    """Operator promote (``hermes kanban promote``)."""
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+    conn.commit()
+    ok, why = kb.promote_task(conn, tid, actor="operator")
+    assert ok, why
+
+
+def _requeue_via_unblock(conn, tid, **_):
+    """Operator unblock (``hermes kanban unblock``)."""
+    assert kb.block_task(conn, tid, reason="parked for the test")
+    assert kb.unblock_task(conn, tid)
+
+
+def _requeue_via_dashboard_status(conn, tid, **_):
+    """Dashboard drag-and-drop: the direct ``status`` write."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+    conn.commit()
+    assert _set_status_direct(conn, tid, "ready")
+
+
+@pytest.mark.parametrize(
+    "requeue",
+    [
+        _requeue_via_operator_reclaim,
+        _requeue_via_operator_promote,
+        _requeue_via_unblock,
+        _requeue_via_dashboard_status,
+    ],
+    ids=["operator_reclaim", "operator_promote", "unblock", "dashboard_status"],
+)
+def test_every_deliberate_requeue_path_releases_the_pr_guard(
+    kanban_home, monkeypatch, requeue,
 ):
-    """Reclaim, unblock, promote and an explicit ready all mean "run this
-    again" — the guard reads them the same way it does for recent_success."""
+    """An operator reclaim, a manual promote, an unblock and a dashboard drag
+    all mean "run this again".
+
+    Driven through the REAL transition functions rather than hand-inserted
+    event rows: the guard now reads payloads, not just kinds, so a test that
+    fabricates ``(kind, NULL)`` rows would pass while every real caller of
+    that kind was classified the other way."""
     now = 7_850_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     with kb.connect() as conn:
         tid = _park_ready_with_pr_comment(
-            conn, title=f"requeue-{kind}", pr_at=now - 600,
+            conn, title="requeued", pr_at=now - 600,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+        monkeypatch.setattr(kb.time, "time", lambda: now - 60)
+        requeue(conn, tid)
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_automatic_ttl_reclaim_does_not_release_the_pr_guard(
+    kanban_home, monkeypatch,
+):
+    """Boris repro 4: duplicate-PR protection must survive an AUTOMATIC
+    transition.
+
+    ``release_stale_claims`` writes the same ``reclaimed`` kind an operator's
+    abort does, so reading kind alone made every TTL lapse switch the guard
+    off — the dispatcher would then re-spawn onto a card that already has an
+    open PR and get a second PR for the same task. Nobody looked at the PR
+    here, so nothing was decided about it."""
+    now = 7_860_000
+    monkeypatch.setattr(kb.time, "time", lambda: now - 600)
+    with kb.connect() as conn:
+        tid = _park_ready_with_pr_comment(
+            conn, title="ttl-reclaim", pr_at=now - 600,
+        )
+        kb.claim_task(conn, tid, ttl_seconds=60)
+
+        # TTL lapses with no heartbeat and no live pid -> automatic reclaim.
+        monkeypatch.setattr(kb.time, "time", lambda: now - 60)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_: None) == 1
+        auto = _events(conn, tid, "reclaimed")
+        assert len(auto) == 1
+        assert "manual" not in json.loads(auto[0]["payload"])
+
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_automatic_dependency_promotion_does_not_release_the_pr_guard(
+    kanban_home, monkeypatch,
+):
+    """``recompute_ready``'s promotion is the dispatcher noticing deps are
+    satisfied, not a person asking for a re-run. The operator's deliberate
+    promote is a different kind (``promoted_manual``) and still releases it."""
+    now = 7_865_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = _park_ready_with_pr_comment(
+            conn, title="auto-promote", pr_at=now - 600,
+        )
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        conn.commit()
+
+        monkeypatch.setattr(kb.time, "time", lambda: now - 60)
+        assert kb.recompute_ready(conn) >= 1
+        assert len(_events(conn, tid, "promoted")) == 1
+
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_same_second_pr_comment_keeps_the_guard_armed(kanban_home, monkeypatch):
+    """Boris repro 4b: ``created_at`` has one-second resolution, so a PR
+    comment and a re-queue stamped in the same second have no knowable order.
+    Resolve it the duplicate-PR-safe way — every time, not depending on which
+    writes the clock happened to round together."""
+    now = 7_870_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = _park_ready_with_pr_comment(conn, title="tie", pr_at=now - 300)
+        _requeue_via_operator_reclaim(conn, tid, reason="looks stuck")
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'reclaimed'",
+            (now - 300, tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_same_second_requeue_that_names_the_pr_is_honored(
+    kanban_home, monkeypatch,
+):
+    """The deterministic escape hatch from the tie above: an operator who
+    writes the PR URL into the re-queue reason has demonstrably seen that PR,
+    which is exactly what the duplicate-PR guard needs to know. So the
+    same-second re-queue is honored, and the operator is never left with a
+    card that cannot be released."""
+    now = 7_875_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = _park_ready_with_pr_comment(conn, title="tie-ack", pr_at=now - 300)
+        _requeue_via_operator_reclaim(
+            conn, tid,
+            reason="remediate https://github.com/acme/widgets/pull/7 review",
         )
         conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, ?, NULL, ?)",
-            (tid, kind, now - 60),
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'reclaimed'",
+            (now - 300, tid),
         )
         conn.commit()
         assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_acknowledging_a_different_pr_does_not_break_the_tie(
+    kanban_home, monkeypatch,
+):
+    """The acknowledgement has to name the PR the guard is protecting. Naming
+    some other PR is not evidence about this one."""
+    now = 7_880_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = _park_ready_with_pr_comment(conn, title="wrong-ack", pr_at=now - 300)
+        _requeue_via_operator_reclaim(
+            conn, tid,
+            reason="see https://github.com/acme/widgets/pull/999 instead",
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'reclaimed'",
+            (now - 300, tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
 
 
 def test_pr_comment_newer_than_requeue_rearms_the_guard(kanban_home, monkeypatch):
@@ -707,6 +988,60 @@ def test_in_process_heartbeat_paths_do_not_self_adopt(kanban_home, monkeypatch):
         assert _worker_pid(conn, tid) is None
         assert len(_events(conn, tid, "heartbeat")) == 1
         assert _events(conn, tid, "ownership_adopted") == []
+
+
+def test_stale_run_cannot_extend_its_successors_claim_on_the_same_lock(
+    kanban_home, monkeypatch,
+):
+    """Boris repro 3: the claim lock is NOT a run fence.
+
+    The dispatcher derives one ``host:pid`` claim lock and reuses it across
+    runs, so a worker left over from a superseded run holds the same lock its
+    successor now holds. The tool heartbeat paths used to call lock-fenced
+    ``heartbeat_claim`` before run-fenced ``heartbeat_worker``: the event was
+    correctly rejected, but the TTL had already been extended — a dead run
+    silently keeping its replacement's claim alive. The renewal now rides
+    inside the run-fenced statement, so rejection means nothing moved."""
+    import tools.kanban_tools as kt
+
+    now = 8_260_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale-run", assignee="alice")
+        first = kb.claim_task(conn, tid, ttl_seconds=900)
+        old_run = first.current_run_id
+        lock = first.claim_lock
+
+        kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
+        second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=lock)
+        assert second.current_run_id != old_run
+        assert second.claim_lock == lock  # same lock, new run
+        successor_expiry = _claim_expires(conn, tid)
+
+    # The stale worker heartbeats much later, still holding the same lock.
+    later = now + 800
+    monkeypatch.setattr(kb.time, "time", lambda: later)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old_run))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", lock)
+
+    monkeypatch.setattr(kt, "_auto_heartbeat_last_attempt", 0.0)
+    kt.heartbeat_current_worker_from_env()
+    out = json.loads(kt._handle_heartbeat({"task_id": tid}))
+    assert "error" in out and out.get("ok") is not True
+
+    with kb.connect() as conn:
+        # Neither the event nor the TTL moved.
+        assert _events(conn, tid, "heartbeat") == []
+        assert _claim_expires(conn, tid) == successor_expiry
+        assert kb.get_task(conn, tid).current_run_id == second.current_run_id
+
+    # The successor's own heartbeat still renews, on the same lock.
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
+    monkeypatch.setattr(kt, "_auto_heartbeat_last_attempt", 0.0)
+    assert json.loads(kt._handle_heartbeat({"task_id": tid}))["ok"] is True
+    with kb.connect() as conn:
+        assert _claim_expires(conn, tid) > successor_expiry
 
 
 def test_cli_heartbeat_accepts_and_forwards_worker_pid(kanban_home, monkeypatch):

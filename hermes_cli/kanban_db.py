@@ -5954,11 +5954,27 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Event kinds that mean "somebody deliberately asked for this to run
-# again": an operator dragging a card back to ready, a dependency
-# re-promotion, an unblock, a reclaim. Used to distinguish a card the
-# guard is protecting from a card an operator is explicitly re-queuing.
-_RESPAWN_REQUEUE_EVENT_KINDS = ("status", "promoted", "unblocked", "reclaimed")
+# Event kinds that CAN mean "somebody deliberately asked for this to run
+# again": an operator dragging a card back to ready, a manual promote, an
+# unblock, a manual reclaim. Used to distinguish a card the guard is
+# protecting from a card an operator is explicitly re-queuing.
+#
+# Kind alone is NOT the answer — three of these are written by automatic
+# machinery too, and treating those as deliberate is how an automatic TTL
+# reclaim came to switch off duplicate-PR protection. ``promoted`` is
+# ``recompute_ready``'s dependency/retry promotion; ``reclaimed`` is written
+# both by ``reclaim_task`` (operator) and by ``release_stale_claims`` /
+# ``detect_crashed_workers`` (TTL, crash); ``status`` is written both by the
+# dashboard's own transitions and by its parent-reopened cascade. The
+# payload is what separates them — see :func:`_is_deliberate_requeue`.
+_RESPAWN_REQUEUE_EVENT_KINDS = (
+    "status", "promoted", "promoted_manual", "unblocked", "reclaimed",
+)
+
+# ``status`` payload reasons written by an automatic cascade rather than by
+# an operator/API transition. Anything else on a ``status`` event came from
+# somebody deciding this card's status.
+_AUTOMATIC_STATUS_REASONS = frozenset({"parent_reopened"})
 
 # How often an UNCHANGED respawn_guarded event may repeat for one task.
 # The dispatcher ticks every 10 seconds by default, and it evaluated the
@@ -5973,22 +5989,96 @@ _RESPAWN_REQUEUE_EVENT_KINDS = ("status", "promoted", "unblocked", "reclaimed")
 _RESPAWN_GUARD_EVENT_REPEAT_SECONDS = 600  # 10 minutes
 
 
-def _deliberate_rerun_since(
-    conn: sqlite3.Connection, task_id: str, since: int
+def _is_deliberate_requeue(kind: str, payload_raw: Optional[str]) -> bool:
+    """True when this event is somebody *deciding* to run the task again.
+
+    Automatic transitions must not count. A TTL reclaim, a crash reclaim and
+    a dependency/retry promotion all move a card back toward ``ready``
+    without anyone having looked at it, so reading them as "run it again"
+    silently switched off the duplicate-PR guard on every automatic reclaim —
+    the dispatcher would then re-spawn a worker onto a card that already has
+    an open PR and get a second PR for the same task.
+    """
+    try:
+        payload = json.loads(payload_raw) if payload_raw else {}
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if kind == "reclaimed":
+        # ``reclaim_task`` (the operator path) stamps ``manual``; the TTL and
+        # crash paths stamp ``stale_lock`` / ``prev_pid`` and no ``manual``.
+        return payload.get("manual") is True
+    if kind == "promoted":
+        # ``recompute_ready``'s automatic promotion (deps satisfied, or a
+        # blocked task inside its retry budget). The operator's deliberate
+        # promote writes ``promoted_manual`` instead.
+        return False
+    if kind == "status":
+        return payload.get("reason") not in _AUTOMATIC_STATUS_REASONS
+    return True  # promoted_manual, unblocked: operator-only paths
+
+
+def _payload_acknowledges_pr(
+    payload_raw: Optional[str], pr_urls: tuple[str, ...],
 ) -> bool:
-    """True when an explicit re-queue event landed at or after ``since``.
+    """True when a re-queue event's payload names one of ``pr_urls``.
+
+    This is the tie-break for the same-second case (below): an operator who
+    writes the PR URL into the re-queue — ``hermes kanban reclaim <id>
+    --reason "remediate .../pull/7"`` — has demonstrably seen that PR, which
+    is exactly what the duplicate-PR guard wants to know.
+    """
+    if not pr_urls or not payload_raw:
+        return False
+    text = payload_raw.lower()
+    return any(url in text for url in pr_urls)
+
+
+def _deliberate_rerun_since(
+    conn: sqlite3.Connection,
+    task_id: str,
+    since: int,
+    *,
+    strict: bool = False,
+    ack_pr_urls: tuple[str, ...] = (),
+) -> bool:
+    """True when a *deliberate* re-queue event landed after ``since``.
 
     Shared by the ``recent_success`` and ``active_pr`` guards so both read
-    "an operator asked for this again" the same way.
+    "somebody asked for this again" the same way. Automatic transitions are
+    filtered out by :func:`_is_deliberate_requeue`.
+
+    ``strict`` decides the same-second case, where ``created_at``'s
+    one-second resolution leaves the real order unknown. The ``active_pr``
+    guard sets it: a PR comment and a re-queue stamped in the same second
+    must resolve the same way every time, and the duplicate-PR-safe reading
+    is that the comment wins and the guard stays armed — otherwise whether a
+    second PR gets opened depends on which write the clock happened to
+    round together. An explicit rerun is not left without a move: a re-queue
+    that names the PR (``ack_pr_urls``) is honored even on a tie, because
+    naming it is the acknowledgement the guard is asking for.
+
+    ``recent_success`` keeps the inclusive reading. There the ``since``
+    boundary is this task's own run ending, not a competing external
+    write, so a re-queue in that same second is unambiguously the operator
+    reacting to that completion.
     """
-    row = conn.execute(
-        "SELECT 1 FROM task_events "
+    rows = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
         "WHERE task_id = ? AND created_at >= ? "
         f"AND kind IN ({', '.join('?' * len(_RESPAWN_REQUEUE_EVENT_KINDS))}) "
-        "LIMIT 1",
+        "ORDER BY created_at, id",
         (task_id, int(since), *_RESPAWN_REQUEUE_EVENT_KINDS),
-    ).fetchone()
-    return row is not None
+    ).fetchall()
+    for row in rows:
+        if not _is_deliberate_requeue(row["kind"], row["payload"]):
+            continue
+        if not strict or int(row["created_at"] or 0) > int(since):
+            return True
+        if _payload_acknowledges_pr(row["payload"], ack_pr_urls):
+            return True
+    return False
 
 
 def _should_log_respawn_guard(
@@ -6428,11 +6518,15 @@ def heartbeat_worker(
     a short-lived CLI shim's pid would be dead on arrival and would read as
     a crashed worker.
 
-    Adoption never *steals*: it writes only when the card has no pid or
-    already names this one. A different pid that is still alive is a real
-    ownership conflict, and silently overwriting it is what lets two
-    workers run the same card (observed on run 1469, where a stale
-    supervisor kept heartbeating beside its replacement).
+    Adoption never *steals*: it writes only when the card has no pid, or
+    already names this one, or names a pid that is dead. A different pid
+    that is still alive is a real ownership conflict, and silently
+    overwriting it is what lets two workers run the same card (observed on
+    run 1469, where a stale supervisor kept heartbeating beside its
+    replacement). The symmetric guarantee holds on the other side: the
+    dispatcher's later pid write cannot overwrite what this heartbeat
+    adopted (see :func:`_record_worker_pid`), so a run ends up with one
+    owner and one ownership event no matter which side won the race.
 
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or the run has been superseded).
@@ -6468,8 +6562,9 @@ def heartbeat_worker(
                 "WHERE id = ?",
                 (now, renewed, run_id),
             )
-        adopted = _adopt_worker_pid_locked(
-            conn, task_id, worker_pid, run_id=run_id,
+        adopted, replaced = _adopt_worker_pid_locked(
+            conn, task_id, worker_pid,
+            run_id=run_id, expected_run_id=expected_run_id,
         )
         _append_event(
             conn, task_id, "heartbeat",
@@ -6477,12 +6572,107 @@ def heartbeat_worker(
             run_id=run_id,
         )
         if adopted is not None:
+            payload: dict[str, Any] = {
+                "worker_pid": adopted, "via": "heartbeat",
+            }
+            if replaced is not None:
+                payload["replaced_dead_pid"] = replaced
             _append_event(
-                conn, task_id, "ownership_adopted",
-                {"worker_pid": adopted, "via": "heartbeat"},
-                run_id=run_id,
+                conn, task_id, "ownership_adopted", payload, run_id=run_id,
             )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Worker-pid ownership (compare-and-set)
+# ---------------------------------------------------------------------------
+#
+# Ownership of a run is compare-and-set, not last-write-wins. Two paths race
+# for it by construction — the dispatcher writes the pid its ``spawn_fn``
+# returned, and a long-lived supervisor adopts its own pid on its first
+# heartbeat, which can land *before* that spawn call has returned. Both must
+# converge on ONE owner per run with exactly one ownership event, so whichever
+# arrives first wins and the loser is a no-op (plus, on the spawn path, a
+# conflict diagnostic).
+_OWNERSHIP_RECORDED = "recorded"            # we now own it; nobody did before
+_OWNERSHIP_REPLACED_DEAD = "replaced_dead"  # took over from a dead owner
+_OWNERSHIP_ALREADY_OURS = "already_ours"    # this pid is already the owner
+_OWNERSHIP_CONFLICT = "conflict"            # a different owner holds the card
+_OWNERSHIP_FENCED = "fenced"                # not running / run superseded
+_OWNERSHIP_INVALID = "invalid"              # no usable pid offered
+
+
+def _cas_worker_pid_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: Optional[int],
+    *,
+    run_id: Optional[int],
+    expected_run_id: Optional[int] = None,
+    allow_dead_takeover: bool = False,
+) -> tuple[str, Optional[int]]:
+    """Compare-and-set ``tasks.worker_pid``; return ``(outcome, prior_pid)``.
+
+    Must be called inside an open write transaction — ownership is part of
+    its caller's atomic unit (the heartbeat moves liveness and ownership
+    together or not at all), and the read-then-write below is only atomic
+    because ``write_txn`` holds ``BEGIN IMMEDIATE``. The prior value is
+    re-asserted in the UPDATE predicate anyway, so a lost race degrades to
+    ``conflict`` rather than to an overwrite.
+
+    ``allow_dead_takeover`` distinguishes the two callers. Adoption by a
+    live supervisor may take over a *dead* recorded pid (that is what the
+    readopt path exists for); the dispatcher's spawn write may not, since a
+    spawn is no evidence about the recorded owner and a card owned only by a
+    dead pid is ``detect_crashed_workers``' business. Neither may ever take
+    over from a pid that is still alive — that is what let two workers run
+    the same card (observed on run 1469).
+    """
+    try:
+        pid_i = int(pid) if pid else None
+    except (TypeError, ValueError):
+        pid_i = None
+    if pid_i is None or pid_i <= 0:
+        return (_OWNERSHIP_INVALID, None)
+    row = conn.execute(
+        "SELECT status, current_run_id, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running":
+        return (_OWNERSHIP_FENCED, None)
+    if expected_run_id is not None and (
+        row["current_run_id"] is None
+        or int(row["current_run_id"]) != int(expected_run_id)
+    ):
+        return (_OWNERSHIP_FENCED, None)
+    current = None if row["worker_pid"] is None else int(row["worker_pid"])
+    if current == pid_i:
+        return (_OWNERSHIP_ALREADY_OURS, current)
+    if current is not None and not (
+        allow_dead_takeover and not _pid_alive(current)
+    ):
+        return (_OWNERSHIP_CONFLICT, current)
+    # ``IS`` rather than ``=`` so the NULL case (no prior owner) is expressed
+    # by the same bound predicate instead of a second SQL string.
+    sql = (
+        "UPDATE tasks SET worker_pid = ? "
+        "WHERE id = ? AND status = 'running' AND worker_pid IS ?"
+    )
+    params: list[Any] = [pid_i, task_id, current]
+    if expected_run_id is not None:
+        sql += " AND current_run_id = ?"
+        params.append(int(expected_run_id))
+    if conn.execute(sql, params).rowcount != 1:
+        return (_OWNERSHIP_CONFLICT, current)
+    if run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ?", (pid_i, run_id),
+        )
+    return (
+        _OWNERSHIP_REPLACED_DEAD if current is not None
+        else _OWNERSHIP_RECORDED,
+        current,
+    )
 
 
 def _adopt_worker_pid_locked(
@@ -6491,43 +6681,73 @@ def _adopt_worker_pid_locked(
     worker_pid: Optional[int],
     *,
     run_id: Optional[int],
-) -> Optional[int]:
-    """Record ``worker_pid`` as this card's owner if nothing else claims it.
+    expected_run_id: Optional[int] = None,
+) -> tuple[Optional[int], Optional[int]]:
+    """Adopt ``worker_pid`` as this card's owner if nothing live claims it.
 
-    Must be called inside an open write transaction (it is part of the
-    heartbeat's atomic unit — ownership and liveness move together or not
-    at all). Returns the adopted pid when a write happened, else None, so
-    the caller can emit exactly one event per actual change and keep a
-    2-minute heartbeat cadence from becoming a 2-minute event flood.
-
-    A recorded pid that is still alive is left alone even if it differs:
-    see the ownership-conflict note on :func:`heartbeat_worker`.
+    Returns ``(adopted_pid, replaced_dead_pid)`` — both None when no write
+    happened, so the caller emits exactly one event per actual change and a
+    2-minute heartbeat cadence does not become a 2-minute event flood. A
+    conflict is deliberately silent here for the same reason: the spawn path
+    reports it once, a heartbeat would report it forever.
     """
-    if not worker_pid:
-        return None
-    try:
-        pid = int(worker_pid)
-    except (TypeError, ValueError):
-        return None
-    if pid <= 0:
-        return None
-    row = conn.execute(
-        "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    current = row["worker_pid"] if row else None
-    if current is not None and int(current) == pid:
-        return None  # already ours; nothing to write, nothing to announce
-    if current is not None and _pid_alive(int(current)):
-        return None  # someone else is alive on this card — do not steal it
-    conn.execute(
-        "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running'",
-        (pid, task_id),
+    outcome, prior = _cas_worker_pid_locked(
+        conn, task_id, worker_pid,
+        run_id=run_id,
+        expected_run_id=expected_run_id,
+        allow_dead_takeover=True,
     )
-    if run_id is not None:
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = ? WHERE id = ?", (pid, run_id),
+    if outcome == _OWNERSHIP_RECORDED:
+        return (int(worker_pid), None)  # type: ignore[arg-type]
+    if outcome == _OWNERSHIP_REPLACED_DEAD:
+        return (int(worker_pid), prior)  # type: ignore[arg-type]
+    return (None, None)
+
+
+def adopt_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    worker_pid: int,
+    expected_run_id: Optional[int] = None,
+    via: str = "supervisor",
+) -> str:
+    """Public ownership-adoption entry point for out-of-process supervisors.
+
+    A lane supervisor that takes over an already-live worker session (the
+    ``claude-kanban-lane`` readopt path) has to name itself as the card's
+    owner before its first ownership check, or the stale dead pid still on
+    the card reads as a foreign owner and it kills the very session it was
+    launched to keep. That write must be fenced to the run the supervisor
+    was launched for: without ``expected_run_id`` a supervisor left over
+    from run N can stamp itself onto run N+1 and then act on a card it does
+    not own.
+
+    Returns one of the ``_OWNERSHIP_*`` outcomes; only ``recorded`` /
+    ``replaced_dead`` / ``already_ours`` mean "this pid owns the card".
+    """
+    with write_txn(conn):
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
         )
-    return pid
+        outcome, prior = _cas_worker_pid_locked(
+            conn, task_id, worker_pid,
+            run_id=run_id,
+            expected_run_id=expected_run_id,
+            allow_dead_takeover=True,
+        )
+        if outcome in (_OWNERSHIP_RECORDED, _OWNERSHIP_REPLACED_DEAD):
+            payload: dict[str, Any] = {
+                "worker_pid": int(worker_pid), "via": via,
+            }
+            if prior is not None:
+                payload["replaced_dead_pid"] = prior
+            _append_event(
+                conn, task_id, "ownership_adopted", payload, run_id=run_id,
+            )
+    return outcome
 
 
 def enforce_max_runtime(
@@ -7160,14 +7380,14 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(
+def _record_worker_pid(
     conn: sqlite3.Connection,
     task_id: str,
     pid: int,
     *,
     expected_run_id: Optional[int] = None,
-) -> bool:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+) -> str:
+    """Compare-and-set the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
@@ -7187,39 +7407,78 @@ def _set_worker_pid(
     misattributed, and the ``spawned`` event can never be emitted against
     the wrong run.
 
-    Returns True when the pid was recorded, False when the fence rejected
-    it (the task is no longer running, or the run has been superseded).
-    Callers should treat False as "this card has no ownership evidence" —
-    ``release_stale_claims`` falls back to heartbeat freshness for exactly
-    that case.
+    **Fencing the run is not enough — ownership is compare-and-set.** The
+    run fence only asks "is this still the run I spawned for"; it says
+    nothing about whether somebody *within that run* already recorded an
+    owner. A supervisor that heartbeats with ``--worker-pid`` before its
+    launcher's spawn call has returned does exactly that, and the
+    unconditional write then replaced the adopted pid with the spawn pid —
+    two ownership records for one run, and (when the two processes really
+    are different) the live one silently demoted. This path therefore
+    writes only when the card has no owner or already names this pid; a
+    different owner is reported as ``spawn_ownership_conflict`` and left
+    alone. First valid owner of a run wins.
+
+    Unlike the adoption path (:func:`adopt_worker_pid`) this never takes
+    over from a *dead* recorded pid: the dispatcher's spawn is not evidence
+    that the previously-recorded owner is gone, and a card whose only owner
+    is dead is exactly what ``detect_crashed_workers`` exists to resolve.
+
+    Returns one of the ``_OWNERSHIP_*`` outcomes.
     """
     with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                "UPDATE tasks SET worker_pid = ? "
-                "WHERE id = ? AND status = 'running'",
-                (int(pid), task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET worker_pid = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (int(pid), task_id, int(expected_run_id)),
-            )
-        if cur.rowcount != 1:
-            return False
         run_id = (
             int(expected_run_id)
             if expected_run_id is not None
             else _current_run_id(conn, task_id)
         )
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+        outcome, prior = _cas_worker_pid_locked(
+            conn, task_id, pid,
+            run_id=run_id,
+            expected_run_id=expected_run_id,
+            allow_dead_takeover=False,
+        )
+        if outcome == _OWNERSHIP_CONFLICT:
+            _append_event(
+                conn, task_id, "spawn_ownership_conflict",
+                {
+                    "pid": int(pid),
+                    "recorded_pid": prior,
+                    "recorded_alive": bool(
+                        prior is not None and _pid_alive(prior)
+                    ),
+                },
+                run_id=run_id,
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
-    return True
+        elif outcome in (_OWNERSHIP_RECORDED, _OWNERSHIP_ALREADY_OURS):
+            # ``spawned`` records the spawn, which happened either way; the
+            # marker distinguishes "we wrote the pid" from "the worker had
+            # already adopted it" so the two are never read as two owners.
+            payload: dict[str, Any] = {"pid": int(pid)}
+            if outcome == _OWNERSHIP_ALREADY_OURS:
+                payload["ownership"] = "already_recorded"
+            _append_event(conn, task_id, "spawned", payload, run_id=run_id)
+    return outcome
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Boolean façade over :func:`_record_worker_pid`.
+
+    True means "this pid is the card's recorded owner" — whether this call
+    wrote it or a heartbeat from the same process had already adopted it.
+    False means the card has some *other* ownership state (a superseded
+    run, a different owner, no usable pid); ``release_stale_claims`` falls
+    back to heartbeat freshness for that case.
+    """
+    return _record_worker_pid(
+        conn, task_id, pid, expected_run_id=expected_run_id,
+    ) in (_OWNERSHIP_RECORDED, _OWNERSHIP_ALREADY_OURS)
 
 
 def _record_spawn_ownership(
@@ -7261,10 +7520,16 @@ def _record_spawn_ownership(
         # but unidentified" rather than crashing the dispatch loop.
         pid_int = None
     if pid_int is not None and pid_int > 0:
-        if _set_worker_pid(
+        outcome = _record_worker_pid(
             conn, task_id, pid_int, expected_run_id=expected_run_id,
-        ):
+        )
+        if outcome in (_OWNERSHIP_RECORDED, _OWNERSHIP_ALREADY_OURS):
             return True
+        if outcome == _OWNERSHIP_CONFLICT:
+            # The card DOES have ownership evidence — just not this pid.
+            # ``_record_worker_pid`` already emitted the conflict; claiming
+            # "unrecorded" on top of that would misdescribe the state.
+            return False
         reason = "run_superseded"
     else:
         reason = "spawn_returned_no_pid"
@@ -7342,23 +7607,35 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
         seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning. Bypassed when an
-        explicit re-queue event (status change, promote, unblock, reclaim)
-        arrives AFTER that completion — that's a deliberate re-run request.
+        human review rather than immediately re-spawning. Bypassed when a
+        *deliberate* re-queue event (an operator status change, a manual
+        promote, an unblock, a manual reclaim) arrives at or after that
+        completion — that's a re-run request.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
-        Bypassed on the same terms as ``recent_success``: an explicit
-        re-queue event after the newest PR comment is a deliberate "run
-        this again" — typically an existing-PR remediation card — and must
-        be honored. Without the bypass the guard was permanent for a full
-        24 hours, and an explicitly requeued remediation card was refused
-        on every 10-second tick with no way for an operator to release it
-        (live incident, ``t_b14df276``). Duplicate-PR safety is preserved
-        both ways: with no deliberate re-queue the guard still holds, and a
-        PR comment newer than the re-queue re-arms it.
+        Bypassed on the same terms as ``recent_success``, with two
+        differences that keep duplicate-PR safety intact where the two
+        guards differ in consequence (a wasted respawn vs a second PR on
+        somebody's repo):
+
+        * only *deliberate* re-queues count. An automatic TTL/crash reclaim
+          or a dependency/retry promotion moves the card without anyone
+          having seen the PR, so it leaves the guard armed
+          (:func:`_is_deliberate_requeue`).
+        * the re-queue must be strictly newer than the PR comment. Within
+          one second the order is unknowable, so the comment wins and the
+          guard holds — unless the re-queue names that PR, which is the
+          operator telling us they have seen it.
+
+        Without any bypass the guard was permanent for a full 24 hours, and
+        an explicitly requeued remediation card was refused on every
+        10-second tick with no way for an operator to release it (live
+        incident, ``t_b14df276``). Duplicate-PR safety is preserved in the
+        other direction too: a PR comment newer than the re-queue re-arms
+        the guard, because a fresh PR is fresh duplicate-risk.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7440,17 +7717,23 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    guard (a fresh PR is fresh duplicate-risk).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     newest_pr_comment_at: Optional[int] = None
+    newest_pr_urls: tuple[str, ...] = ()
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? "
-        "ORDER BY created_at DESC",
+        "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        urls = (
+            _RESPAWN_GUARD_PR_URL_RE.findall(c["body"]) if c["body"] else []
+        )
+        if urls:
             newest_pr_comment_at = int(c["created_at"] or 0)
+            newest_pr_urls = tuple(u.lower() for u in urls)
             break
     if newest_pr_comment_at is not None and not _deliberate_rerun_since(
-        conn, task_id, newest_pr_comment_at
+        conn, task_id, newest_pr_comment_at,
+        strict=True, ack_pr_urls=newest_pr_urls,
     ):
         return "active_pr"
 
