@@ -760,6 +760,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_hb.add_argument("task_id")
     p_hb.add_argument("--note", default=None,
                       help="Optional short note attached to the heartbeat event")
+    p_hb.add_argument("--worker-pid", type=int, default=None,
+                      help="PID of the long-lived worker/supervisor process to "
+                           "record as this task's owner if the card has none. "
+                           "Pass the supervising process's own pid, never this "
+                           "CLI invocation's — a pid that exits immediately "
+                           "reads as a crashed worker.")
 
     # --- assignees ---
     p_asg = sub.add_parser(
@@ -1275,6 +1281,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             args.task_id,
             note=getattr(args, "note", None),
             expected_run_id=_worker_run_id_for(args.task_id),
+            worker_pid=getattr(args, "worker_pid", None),
         )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)

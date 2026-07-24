@@ -273,6 +273,15 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
+                # Deliberately NOT passing ``worker_pid=os.getpid()``. Any
+                # child process this worker starts inherits
+                # ``HERMES_KANBAN_TASK``, so a nested ``hermes`` run would
+                # reach this bridge and register its own short-lived pid as
+                # the card's owner — and ``detect_crashed_workers`` would
+                # then reclaim a live card the moment that child exited.
+                # Ownership is recorded by the dispatcher (which knows the
+                # pid it spawned) or adopted explicitly by a supervisor that
+                # knows it is one (``hermes kanban heartbeat --worker-pid``).
                 kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
@@ -786,6 +795,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                # No ``worker_pid`` here either — see the note in
+                # ``heartbeat_current_worker_from_env``: a nested agent that
+                # inherited HERMES_KANBAN_TASK must not be able to register
+                # itself as the card's owner.
             )
             if not ok:
                 return tool_error(

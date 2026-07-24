@@ -3613,6 +3613,18 @@ def release_stale_claims(
     call (#23025): no tool calls means no ``kanban_heartbeat``, even
     though the subprocess is healthy.
 
+    A stale-by-TTL claim with **no recorded PID** but a heartbeat fresher
+    than one full claim window is *also* held — for a short grace rather
+    than a full window, since a heartbeat proves the worker was alive as of
+    the last beat, not as of now. Requiring a PID here was a real outage:
+    launcher paths that supervise the worker out-of-process can leave
+    ``worker_pid`` unset (see ``_set_worker_pid``'s note on the
+    spawn→heartbeat window), and a card in that state was reclaimed at the
+    TTL boundary 42 seconds after its last heartbeat, mid-flight, while its
+    supervisor was still running (live incident, run 1514). The claim-lock
+    host prefix — not the PID — is what makes a claim host-local, and that
+    is what we key the protection off.
+
     Backstop (#29747 gap 3): if the worker's PID is still alive but its
     ``last_heartbeat_at`` is stale by more than
     ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has
@@ -3623,10 +3635,13 @@ def release_stale_claims(
     liveness into ``last_heartbeat_at`` via #31752, so any genuinely
     active worker keeps its heartbeat fresh as a side effect of normal
     API traffic. ``enforce_max_runtime`` and ``detect_crashed_workers``
-    remain the upper bounds for genuinely wedged or dead workers.
+    remain the upper bounds for genuinely wedged or dead workers. The
+    heartbeat-only case needs no such upper bound of its own: it renews by
+    a grace window at a time, so a worker that has stopped heartbeating is
+    reclaimed one grace period after its claim lapses.
 
-    Returns the number of stale claims actually reclaimed (live-pid
-    extensions don't count). Safe to call often.
+    Returns the number of stale claims actually reclaimed (extensions
+    don't count). Safe to call often.
     """
     now = int(time.time())
     reclaimed = 0
@@ -3638,25 +3653,36 @@ def release_stale_claims(
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
+    claim_ttl = _resolve_claim_ttl_seconds()
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
+        hb_age = None if hb is None else (now - int(hb))
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
         # not making observable progress.  Reclaim instead of extending,
         # even if the PID is still alive (it's likely in a logic loop).
         heartbeat_stale = (
-            hb is not None
-            and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            hb_age is not None
+            and hb_age > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
-        if (
-            host_local
-            and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
-            and not heartbeat_stale
-        ):
-            new_expires = now + _resolve_claim_ttl_seconds()
+        pid_alive = bool(row["worker_pid"]) and _pid_alive(row["worker_pid"])
+        # "Heard from within one full claim window" — self-scaling against
+        # whatever TTL this board runs, and the exact evidence the reclaim
+        # path was throwing away when no PID had been recorded.
+        heartbeat_fresh = hb_age is not None and hb_age < claim_ttl
+        if host_local and not heartbeat_stale and (pid_alive or heartbeat_fresh):
+            # A live PID is proof the worker exists *right now*, so it earns a
+            # full window. A fresh heartbeat is proof it existed as of the last
+            # beat, which may be stale by up to a window — so it earns only a
+            # short grace, re-tested every tick. A worker that really is alive
+            # renews its own claim on its next heartbeat and never depends on
+            # this path twice; one that has died is reclaimed a grace period
+            # later instead of being held for the full max-stale hour.
+            new_expires = now + (
+                claim_ttl if pid_alive else RECLAIM_DEFER_GRACE_SECONDS
+            )
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
@@ -3677,8 +3703,11 @@ def release_stale_claims(
                 _append_event(
                     conn, row["id"], "claim_extended",
                     {
-                        "reason": "pid_alive",
-                        "worker_pid": int(row["worker_pid"]),
+                        "reason": "pid_alive" if pid_alive else "heartbeat_fresh",
+                        "worker_pid": (
+                            int(row["worker_pid"])
+                            if row["worker_pid"] is not None else None
+                        ),
                         "claim_lock": row["claim_lock"],
                         "claim_expires_was": int(row["claim_expires"]),
                         "claim_expires_now": new_expires,
@@ -3687,6 +3716,7 @@ def release_stale_claims(
                             if row["last_heartbeat_at"] is not None
                             else None
                         ),
+                        "heartbeat_age_seconds": hb_age,
                     },
                     run_id=run_id,
                 )
@@ -3713,11 +3743,21 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
+            # ``termination`` reports on the *kill attempt*: its own
+            # ``host_local`` is False whenever there was no PID to signal,
+            # which is a different claim from "the lock belongs to another
+            # host". Merging it raw let the run metadata read
+            # ``host_local: false`` for a card whose claim lock was plainly
+            # ours, which is what sent the first triage of run 1514 down the
+            # wrong path. Keep both facts, separately named.
+            run_metadata = dict(termination)
+            run_metadata["claim_host_local"] = host_local
+            run_metadata["heartbeat_age_seconds"] = hb_age
             run_id = _end_run(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
                 error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
+                metadata=run_metadata,
             )
             payload = {
                 "stale_lock": row["claim_lock"],
@@ -3730,11 +3770,16 @@ def release_stale_claims(
                     int(row["last_heartbeat_at"])
                     if row["last_heartbeat_at"] is not None else None
                 ),
+                "heartbeat_age_seconds": hb_age,
                 "now": now,
                 "host_local": host_local,
                 "heartbeat_stale": bool(heartbeat_stale),
             }
-            payload.update(termination)
+            term_payload = dict(termination)
+            payload["termination_host_local"] = bool(
+                term_payload.pop("host_local", False)
+            )
+            payload.update(term_payload)
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -5909,6 +5954,71 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Event kinds that mean "somebody deliberately asked for this to run
+# again": an operator dragging a card back to ready, a dependency
+# re-promotion, an unblock, a reclaim. Used to distinguish a card the
+# guard is protecting from a card an operator is explicitly re-queuing.
+_RESPAWN_REQUEUE_EVENT_KINDS = ("status", "promoted", "unblocked", "reclaimed")
+
+# How often an UNCHANGED respawn_guarded event may repeat for one task.
+# The dispatcher ticks every 10 seconds by default, and it evaluated the
+# guard — and wrote an event — on every tick, so a single card held by the
+# guard produced hundreds of byte-identical rows (836 on one card in 15
+# minutes) that buried the rest of its history. Emission is throttled per
+# task while the reason is unchanged; a *changed* reason is emitted
+# immediately, so every state transition stays visible and the periodic
+# repeat keeps a long-lived hold observable in `hermes kanban tail`.
+# ``DispatchResult.respawn_guarded`` is still populated on every tick, so
+# live telemetry and the CLI lose nothing.
+_RESPAWN_GUARD_EVENT_REPEAT_SECONDS = 600  # 10 minutes
+
+
+def _deliberate_rerun_since(
+    conn: sqlite3.Connection, task_id: str, since: int
+) -> bool:
+    """True when an explicit re-queue event landed at or after ``since``.
+
+    Shared by the ``recent_success`` and ``active_pr`` guards so both read
+    "an operator asked for this again" the same way.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND created_at >= ? "
+        f"AND kind IN ({', '.join('?' * len(_RESPAWN_REQUEUE_EVENT_KINDS))}) "
+        "LIMIT 1",
+        (task_id, int(since), *_RESPAWN_REQUEUE_EVENT_KINDS),
+    ).fetchone()
+    return row is not None
+
+
+def _should_log_respawn_guard(
+    conn: sqlite3.Connection, task_id: str, reason: str, now: int
+) -> bool:
+    """Throttle repeated, unchanged ``respawn_guarded`` events for one task.
+
+    Returns True when the event should be written: no prior guard event, a
+    different reason than last time (a state change), or the previous
+    identical event is older than ``_RESPAWN_GUARD_EVENT_REPEAT_SECONDS``.
+    """
+    row = conn.execute(
+        # created_at first so ``idx_events_task(task_id, created_at)`` serves
+        # the ordering in reverse — this runs on every guarded task on every
+        # tick, and a card the guard has held has thousands of events.
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'respawn_guarded' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return True
+    try:
+        prev_reason = (json.loads(row["payload"] or "{}") or {}).get("reason")
+    except (TypeError, ValueError):
+        prev_reason = None
+    if prev_reason != reason:
+        return True
+    return (now - int(row["created_at"] or 0)) >= _RESPAWN_GUARD_EVENT_REPEAT_SECONDS
+
 
 @dataclass
 class DispatchResult:
@@ -6255,36 +6365,94 @@ def _defer_reclaim_for_live_worker(
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+# SQL fragment that renews a claim TTL from a heartbeat without ever
+# *shortening* it and without inventing an expiry where there was none.
+#
+# ``MAX(claim_expires, ?)`` keeps a deliberately-longer claim (an operator
+# or dispatcher that asked for a big TTL) intact when the heartbeat's own
+# window is smaller. The ``CASE ... IS NULL`` arm preserves the "runs
+# without a TTL" state: ``release_stale_claims`` only considers rows with
+# ``claim_expires IS NOT NULL``, so stamping one here would make an
+# intentionally-unexpiring claim reclaimable.
+_HEARTBEAT_CLAIM_RENEWAL_SQL = (
+    "claim_expires = CASE WHEN claim_expires IS NULL THEN NULL "
+    "                     ELSE MAX(claim_expires, ?) END"
+)
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    ttl_seconds: Optional[int] = None,
+    worker_pid: Optional[int] = None,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Record a ``heartbeat`` event, touch ``last_heartbeat_at``, and renew
+    the active claim TTL — all in one transaction.
 
     Called by long-running workers as a liveness signal orthogonal to
     the PID check. A worker that forks a long-lived child (train loop,
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
 
+    **The heartbeat renews ``claim_expires``.** A heartbeat is the
+    strongest evidence we have that a worker is alive, so a heartbeating
+    worker must never be reclaimed for outliving the TTL it was claimed
+    under. Before this, ``last_heartbeat_at`` advanced while
+    ``claim_expires`` sat frozen at claim time, so a worker heartbeating
+    every 2 minutes was still reclaimed the moment the original 15-minute
+    window lapsed — the reclaim payload even recorded a 42-second-old
+    heartbeat (live incident, run 1514). Only the model tool
+    (``kanban_heartbeat``) paired its heartbeat with an explicit
+    ``heartbeat_claim``; the CLI path (``hermes kanban heartbeat``, which
+    is what supervisors and the worker shim use) had no such pairing.
+    Doing the renewal inside this one function makes every heartbeat path
+    consistent and keeps ``last_heartbeat_at`` and ``claim_expires`` from
+    ever disagreeing — they move in the same statement or not at all.
+
+    The renewal inherits this function's fencing: the ``status = 'running'``
+    predicate rejects heartbeats for a task that is no longer running, and
+    ``expected_run_id`` (when given) rejects a heartbeat from a superseded
+    run, so a stale worker can never extend the claim now held by its
+    replacement.
+
+    **``worker_pid`` adopts ownership.** The dispatcher records the child's
+    pid only *after* the spawn call returns, so a fast child heartbeats
+    first and the ownership write races the run it belongs to. Letting the
+    heartbeat carry the caller's own pid closes that window from the other
+    side: whoever gets there first records ownership and the loser is a
+    no-op, with no second spawn and no duplicate ``spawned`` event. Pass it
+    only from a process that is genuinely the worker (or its supervisor) —
+    a short-lived CLI shim's pid would be dead on arrival and would read as
+    a crashed worker.
+
+    Adoption never *steals*: it writes only when the card has no pid or
+    already names this one. A different pid that is still alive is a real
+    ownership conflict, and silently overwriting it is what lets two
+    workers run the same card (observed on run 1469, where a stale
+    supervisor kept heartbeating beside its replacement).
+
     Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    should be heartbeating (not running, or the run has been superseded).
     """
     now = int(time.time())
+    renewed = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                "UPDATE tasks SET last_heartbeat_at = ?, "
+                f"    {_HEARTBEAT_CLAIM_RENEWAL_SQL} "
                 "WHERE id = ? AND status = 'running'",
-                (now, task_id),
+                (now, renewed, task_id),
             )
         else:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                "UPDATE tasks SET last_heartbeat_at = ?, "
+                f"    {_HEARTBEAT_CLAIM_RENEWAL_SQL} "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                (now, renewed, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -6295,15 +6463,71 @@ def heartbeat_worker(
         )
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
+                "UPDATE task_runs SET last_heartbeat_at = ?, "
+                f"    {_HEARTBEAT_CLAIM_RENEWAL_SQL} "
+                "WHERE id = ?",
+                (now, renewed, run_id),
             )
+        adopted = _adopt_worker_pid_locked(
+            conn, task_id, worker_pid, run_id=run_id,
+        )
         _append_event(
             conn, task_id, "heartbeat",
             {"note": note} if note else None,
             run_id=run_id,
         )
+        if adopted is not None:
+            _append_event(
+                conn, task_id, "ownership_adopted",
+                {"worker_pid": adopted, "via": "heartbeat"},
+                run_id=run_id,
+            )
     return True
+
+
+def _adopt_worker_pid_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_pid: Optional[int],
+    *,
+    run_id: Optional[int],
+) -> Optional[int]:
+    """Record ``worker_pid`` as this card's owner if nothing else claims it.
+
+    Must be called inside an open write transaction (it is part of the
+    heartbeat's atomic unit — ownership and liveness move together or not
+    at all). Returns the adopted pid when a write happened, else None, so
+    the caller can emit exactly one event per actual change and keep a
+    2-minute heartbeat cadence from becoming a 2-minute event flood.
+
+    A recorded pid that is still alive is left alone even if it differs:
+    see the ownership-conflict note on :func:`heartbeat_worker`.
+    """
+    if not worker_pid:
+        return None
+    try:
+        pid = int(worker_pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    row = conn.execute(
+        "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    current = row["worker_pid"] if row else None
+    if current is not None and int(current) == pid:
+        return None  # already ours; nothing to write, nothing to announce
+    if current is not None and _pid_alive(int(current)):
+        return None  # someone else is alive on this card — do not steal it
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running'",
+        (pid, task_id),
+    )
+    if run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ?", (pid, run_id),
+        )
+    return pid
 
 
 def enforce_max_runtime(
@@ -6936,25 +7160,130 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    **The spawn→heartbeat window.** This write is the dispatcher's only
+    record of who owns a card, and it necessarily lands *after* the child
+    is already alive: the spawn call has to return before we know the pid.
+    In that window the child can already have heartbeated, completed, or —
+    if the claim lapsed — been reclaimed and re-claimed under a *new* run.
+    Writing unconditionally then stamped the old child's pid onto the new
+    run, which is worse than writing nothing: the supervisor's ownership
+    check reads a foreign pid and kills the pane it was meant to keep, and
+    ``detect_crashed_workers`` sees a dead pid on a live run and reclaims
+    it as crashed. ``expected_run_id`` fences the write to the run the
+    caller actually spawned for, so a late pid is dropped rather than
+    misattributed, and the ``spawned`` event can never be emitted against
+    the wrong run.
+
+    Returns True when the pid was recorded, False when the fence rejected
+    it (the task is no longer running, or the run has been superseded).
+    Callers should treat False as "this card has no ownership evidence" —
+    ``release_stale_claims`` falls back to heartbeat freshness for exactly
+    that case.
     """
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET worker_pid = ? "
+                "WHERE id = ? AND status = 'running'",
+                (int(pid), task_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET worker_pid = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (int(pid), task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
         )
-        run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+    return True
+
+
+def _record_spawn_ownership(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: Optional[int],
+    *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Record spawn ownership, or record that we could not.
+
+    The dispatcher used to write the pid under a bare ``if pid:`` and drop
+    the outcome on the floor. Both silent branches were real blind spots:
+    a ``spawn_fn`` that returns no pid (an out-of-process supervisor, a
+    launcher that forks and detaches) and a pid that arrives too late to
+    belong to the run it was spawned for both left the card with **no
+    ownership evidence at all** and nothing in the event log saying so.
+    That is the shape behind the live incident: 23 of 44 supervisor-lane
+    runs on this board have no ``spawned`` event, and the run that died
+    mid-flight (run 1514) was one of them — the dispatcher believed it had
+    recorded a pid, and the reclaim path later found ``worker_pid`` NULL.
+
+    Emitting ``spawn_ownership_unrecorded`` costs one row per spawn at
+    most and turns that silent gap into something ``hermes kanban tail``
+    shows. The task is deliberately *not* failed: the child is running,
+    and the claim is now protected by heartbeat freshness rather than by
+    the pid (see :func:`release_stale_claims`), so missing pid evidence
+    degrades diagnosis, not liveness. A later heartbeat can also supply
+    the pid itself (see ``worker_pid`` on :func:`heartbeat_worker`).
+
+    Returns True when ownership was recorded.
+    """
+    pid_int: Optional[int]
+    try:
+        pid_int = int(pid) if pid else None
+    except (TypeError, ValueError):
+        # A spawn_fn that returns something non-numeric but truthy (a
+        # Popen, a bare True) still spawned a child; treat it as "alive
+        # but unidentified" rather than crashing the dispatch loop.
+        pid_int = None
+    if pid_int is not None and pid_int > 0:
+        if _set_worker_pid(
+            conn, task_id, pid_int, expected_run_id=expected_run_id,
+        ):
+            return True
+        reason = "run_superseded"
+    else:
+        reason = "spawn_returned_no_pid"
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "spawn_ownership_unrecorded",
+            {
+                "reason": reason,
+                "pid": pid_int,
+                "expected_run_id": (
+                    int(expected_run_id) if expected_run_id is not None else None
+                ),
+            },
+            run_id=(
+                int(expected_run_id) if expected_run_id is not None
+                else _current_run_id(conn, task_id)
+            ),
+        )
+    return False
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7021,6 +7350,15 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed on the same terms as ``recent_success``: an explicit
+        re-queue event after the newest PR comment is a deliberate "run
+        this again" — typically an existing-PR remediation card — and must
+        be honored. Without the bypass the guard was permanent for a full
+        24 hours, and an explicitly requeued remediation card was refused
+        on every 10-second tick with no way for an operator to release it
+        (live incident, ``t_b14df276``). Duplicate-PR safety is preserved
+        both ways: with no deliberate re-queue the guard still holds, and a
+        PR comment newer than the re-queue re-arms it.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7092,24 +7430,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
-        ).fetchone()
-        if not requeued_after:
+        if not _deliberate_rerun_since(conn, task_id, completed_at):
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Same deliberate-rerun exception as ``recent_success``: keyed off the
+    #    NEWEST matching comment, so a requeue after the PR comment permits
+    #    the run, and a PR comment posted after that requeue re-arms the
+    #    guard (a fresh PR is fresh duplicate-risk).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    newest_pr_comment_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            newest_pr_comment_at = int(c["created_at"] or 0)
+            break
+    if newest_pr_comment_at is not None and not _deliberate_rerun_since(
+        conn, task_id, newest_pr_comment_at
+    ):
+        return "active_pr"
 
     return None
 
@@ -7476,7 +7819,12 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
+            # Throttled while the reason is unchanged so a 10-second tick
+            # interval doesn't bury the card's real history under
+            # identical rows; see _should_log_respawn_guard.
+            if not dry_run and _should_log_respawn_guard(
+                conn, row["id"], guard_reason, int(time.time())
+            ):
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
@@ -7530,8 +7878,9 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            _record_spawn_ownership(
+                conn, claimed.id, pid, expected_run_id=claimed.current_run_id,
+            )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -7625,8 +7974,9 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            _record_spawn_ownership(
+                conn, claimed.id, pid, expected_run_id=claimed.current_run_id,
+            )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
