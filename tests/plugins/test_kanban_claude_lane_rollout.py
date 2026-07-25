@@ -65,11 +65,68 @@ def installer():
 # The runtime probe: does the TARGET core have the contract?
 # ---------------------------------------------------------------------------
 
+# A synthetic old core has to be hermetic against the *host's own* install, and
+# absence of a file is not enough to achieve that. Under a PEP 660 editable
+# install the distribution appends an ``_EditableFinder`` to ``sys.meta_path``
+# whose child branch is, verbatim:
+#
+#     parent, _, child = fullname.rpartition(".")
+#     if parent and parent in MAPPING:
+#         return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+#
+# It resolves ``hermes_cli.<child>`` off the *checkout* and never consults this
+# package's ``__path__``. So ``import hermes_cli.kanban_supervisor`` against a
+# stub that omits it misses in ``PathFinder`` (correct), then falls through to
+# that finder and gets served the live module (not correct) — which proceeds to
+# import this stub's deliberately minimal ``kanban_db`` and dies on an unrelated
+# AttributeError. The stub therefore has to refuse the fall-through itself.
+#
+# This is a harness concern only: on a real host the editable finder means the
+# module genuinely *is* importable, so the installer's probe answering "present"
+# is the right answer, not a leak. Only the synthetic core is a fiction that has
+# to be maintained against every finder the host happens to have installed.
+_HERMETIC_STUB_INIT = '''\
+"""A ``hermes_cli`` that resolves its own submodules or none at all."""
+
+import sys
+from importlib.machinery import PathFinder
+
+_HERE = __path__[0]
+
+
+class _OnlyThisStub:
+    """Meta-path guard, ahead of every finder the host may have installed.
+
+    Scoped to direct children of this package, which is the shape the leak has
+    (``parent in MAPPING``) and the shape this stub has (flat modules). A miss
+    raises rather than returning ``None``, so no later finder can answer for a
+    module this synthetic core is asserting it does not have.
+    """
+
+    @classmethod
+    def find_spec(cls, fullname, path=None, target=None):
+        parent, _, child = fullname.rpartition(".")
+        if parent != __name__ or not child:
+            return None
+        spec = PathFinder.find_spec(fullname, path=[_HERE])
+        if spec is None:
+            raise ModuleNotFoundError(
+                f"No module named {fullname!r}", name=fullname)
+        return spec
+
+
+# Ahead of PathFinder *and* of anything appended after it. ``sys`` / ``PathFinder``
+# / ``_HERE`` stay bound: ``find_spec`` reads them on every later import.
+if not any(f is _OnlyThisStub for f in sys.meta_path):
+    sys.meta_path.insert(0, _OnlyThisStub)
+'''
+
+
 def _stub_core(root: Path, *, attrs) -> Path:
     """A minimal ``hermes_cli`` package exposing ``attrs`` from kanban_supervisor."""
     pkg = root / "hermes_cli"
     pkg.mkdir(parents=True, exist_ok=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text(_HERMETIC_STUB_INIT, encoding="utf-8")
     (pkg / "kanban_db.py").write_text(
         "KANBAN_RATE_LIMIT_EXIT_CODE = 75\n"
         "def worker_log_path(task, board=None):\n    return '/dev/null'\n"
@@ -98,6 +155,38 @@ def _fake_python(root: Path, *, stub_root: Path | None) -> Path:
     return exe
 
 
+def test_the_synthetic_old_core_is_hermetic_against_this_host(tmp_path):
+    """Guard the guard: the fiction the three probe tests rest on.
+
+    Every "old core" assertion below is only meaningful if the stub really is
+    the whole of ``hermes_cli`` for the probed interpreter. It was not: this
+    host's PEP 660 editable finder answered for submodules the stub omits, so
+    the omission was invisible and the tests failed (or passed) on the live
+    module's behaviour instead. Asserted directly, and on the interpreter that
+    actually has the editable install, so a regression here reports the cause
+    rather than surfacing as a puzzling AttributeError three tests down.
+    """
+    stub = _stub_core(tmp_path / "hermetic", attrs=None)
+    probe = (
+        "import hermes_cli\n"
+        "assert hermes_cli.__file__.startswith(%r), hermes_cli.__file__\n"
+        "import hermes_cli.kanban_db as kb\n"
+        "assert kb.__file__.startswith(%r), kb.__file__\n"
+        "try:\n"
+        "    import hermes_cli.kanban_supervisor as leaked\n"
+        "except ModuleNotFoundError:\n"
+        "    print('HERMETIC')\n"
+        "else:\n"
+        "    print('LEAKED ' + (leaked.__file__ or '?'))\n"
+    ) % (str(stub), str(stub))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(stub)
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                         text=True, cwd=str(stub), env=env, timeout=120)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.strip() == "HERMETIC", out.stdout + out.stderr
+
+
 def test_runtime_probe_detects_a_complete_contract(installer, tmp_path):
     stub = _stub_core(tmp_path / "good", attrs=installer.REQUIRED_CORE_ATTRS)
     ok, detail = installer.runtime_contract_status(str(_fake_python(tmp_path, stub_root=stub)))
@@ -121,7 +210,12 @@ def test_runtime_probe_rejects_a_core_without_the_module(installer, tmp_path):
     ok, detail = installer.runtime_contract_status(
         str(_fake_python(tmp_path, stub_root=stub)))
     assert not ok
-    assert "kanban_supervisor" in detail  # the ModuleNotFoundError text
+    assert "kanban_supervisor" in detail
+    # Name the failure, not just the module: any *other* error mentioning
+    # kanban_supervisor would satisfy the line above, and the one this used to
+    # get was an AttributeError raised by the host's own live module leaking in
+    # past the stub. Rejection has to come from the module being absent.
+    assert "ModuleNotFoundError" in detail, detail
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +262,11 @@ def test_supervisor_stands_down_without_the_contract_and_touches_no_pane(tmp_pat
     assert "standing down" in out.stderr
     assert "kanban_supervisor" in out.stderr
     assert "Traceback" not in out.stderr
+    # The stand-down has to be for the reason under test. The guard catches
+    # broad ``Exception``, so before the stub was made hermetic this passed on
+    # an AttributeError from the host's leaked-in live supervisor rather than on
+    # the absent module it claims to cover.
+    assert "ModuleNotFoundError" in out.stderr, out.stderr
 
 
 # ---------------------------------------------------------------------------
