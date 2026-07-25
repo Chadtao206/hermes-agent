@@ -44,6 +44,10 @@ if _host_has_siblings():
         "CLAUDE_LANE_SUPERVISOR",
         os.path.join(_LANE_ROOT, "scripts", "claude_kanban_supervisor.py"),
     )
+    os.environ.setdefault(
+        "CLAUDE_LANE_SHIM",
+        os.path.join(_LANE_ROOT, "scripts", "hermes-kanban-task"),
+    )
 else:
     # No installed host plugin -> the unchanged siblings can't be imported.
     # Skip the whole directory instead of erroring at collection.

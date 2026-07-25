@@ -1,12 +1,14 @@
 # tests/test_shim.py
 import os
 import subprocess
+import sys
 
-# The installed shim by default; CLAUDE_LANE_SHIM points this at the
-# source-controlled copy so the same assertions run before install.
+# The installed host shim by default; CLAUDE_LANE_SHIM (set by conftest) points
+# this at the source-controlled copy so the same assertions run against the
+# artifact BEFORE it is installed (checkout-pinned) and the host copy after.
 SHIM = os.environ.get("CLAUDE_LANE_SHIM") or os.path.expanduser(
     "~/.hermes/scripts/hermes-kanban-task")
-VENV = "/Users/ctao/.hermes/hermes-agent/venv/bin/python"
+VENV = sys.executable
 
 
 def _run(args, env_extra, fake_hermes_out):
