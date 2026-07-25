@@ -1,0 +1,127 @@
+#!/usr/bin/env /Users/ctao/.hermes/hermes-agent/venv/bin/python
+"""Guarded + redacting kanban lifecycle shim for the claude-CLI lane.
+
+Usage (from inside the claude session; id is FORCED to $HERMES_KANBAN_TASK):
+  hermes-kanban-task complete [--summary TEXT] [--result TEXT] [--metadata JSON]
+  hermes-kanban-task block "<reason words...>"
+  hermes-kanban-task comment "<text words...>"
+  hermes-kanban-task heartbeat [--note TEXT] [--worker-pid PID]
+
+Installed from ``plugins/kanban/claude_lane`` in the hermes-agent repo — see
+that directory's README. Edit the versioned copy, not the host copy.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+def _fallback_redact(t):
+    """Conservative fail-closed masker used when agent.redact is unimportable.
+
+    Returning text verbatim on an import failure would leak secrets into the
+    kanban DB / events; instead mask the common high-entropy credential shapes.
+    """
+    if not t:
+        return t
+    t = re.sub(r'sk-[A-Za-z0-9_\-]{8,}', '***', t)
+    t = re.sub(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-.]+', '***', t)
+    t = re.sub(r'gAAAA[A-Za-z0-9_\-=]{8,}', '***', t)
+    return t
+
+
+try:
+    from agent.redact import redact_sensitive_text
+except Exception:  # pragma: no cover - never crash the shim on import
+    def redact_sensitive_text(text, **_):
+        return _fallback_redact(text)
+
+# A kanban task id is "t_" followed by an alphanumeric token (e.g. t_ea894469).
+# Only a positional matching this shape is treated as a (possibly foreign) task
+# id to validate/strip; free-text reasons for `block`/`comment` are left intact.
+_TASK_ID_RE = re.compile(r"^t_[A-Za-z0-9]+$")
+
+
+def _redact(text):
+    return redact_sensitive_text(text or "", force=True)
+
+
+def _hermes():
+    return os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
+
+
+def main(argv):
+    if not argv:
+        print("usage: hermes-kanban-task <complete|block|comment|heartbeat> ...", file=sys.stderr)
+        return 2
+    sub = argv[0]
+    rest = argv[1:]
+    task = os.environ.get("HERMES_KANBAN_TASK")
+    if not task:
+        print("refused: HERMES_KANBAN_TASK not set", file=sys.stderr)
+        return 2
+
+    # If an explicit id-shaped positional was passed, it MUST match ours. We only
+    # treat a token that LOOKS like a task id as an id (so a `block "stuck"` reason
+    # or a `comment "progress"` note is never mistaken for a foreign id). A foreign
+    # but id-shaped token is still refused. The refusal message is redacted so a
+    # secret accidentally placed in the first positional never leaks to stderr.
+    if rest and _TASK_ID_RE.match(rest[0]):
+        if rest[0] != task:
+            print(f"refused: foreign task id {_redact(rest[0])!r} (only {task} is allowed)",
+                  file=sys.stderr)
+            return 2
+        rest = rest[1:]  # drop it; we re-insert the forced id below
+
+    hermes = _hermes()
+    if sub == "complete":
+        cmd = [hermes, "kanban", "complete", task]
+        it = iter(rest)
+        for tok in it:
+            if tok in ("--summary", "--result", "--metadata"):
+                val = next(it, "")
+                # Redact ALL of summary/result/metadata. The redactor only
+                # rewrites high-entropy secret SPANS, so a JSON metadata blob
+                # stays valid JSON (only embedded secrets are masked).
+                cmd += [tok, _redact(val)]
+            # ignore anything else (defensive)
+        return subprocess.run(cmd).returncode
+    if sub == "block":
+        reason = _redact(" ".join(rest)) or "blocked by claude-lane worker"
+        return subprocess.run([hermes, "kanban", "block", task, reason]).returncode
+    if sub == "comment":
+        text = _redact(" ".join(rest)) or "(empty)"
+        return subprocess.run([hermes, "kanban", "comment", task, text]).returncode
+    if sub == "heartbeat":
+        cmd = [hermes, "kanban", "heartbeat", task]
+        if "--note" in rest:
+            i = rest.index("--note")
+            cmd += ["--note", _redact(rest[i + 1] if i + 1 < len(rest) else "")]
+        # --worker-pid: forwarded so an out-of-process SUPERVISOR can name its
+        # own long-lived pid as the card's owner (the dispatcher cannot — an
+        # out-of-process launcher returns no usable pid). Validated as an int
+        # so nothing else can ride in on the flag, and dropped when <= 0.
+        #
+        # Note who may pass this: only a process that IS the worker/supervisor.
+        # A worker agent's own `hermes-kanban-task heartbeat` must NOT pass it
+        # (its pid dies with the invocation and would read as a crashed
+        # worker), which is why this is opt-in per call rather than
+        # os.getpid() here.
+        if "--worker-pid" in rest:
+            i = rest.index("--worker-pid")
+            raw = rest[i + 1] if i + 1 < len(rest) else ""
+            try:
+                pid = int(str(raw).strip())
+            except (TypeError, ValueError):
+                print(f"refused: --worker-pid must be an integer, got {_redact(str(raw))!r}",
+                      file=sys.stderr)
+                return 2
+            if pid > 0:
+                cmd += ["--worker-pid", str(pid)]
+        return subprocess.run(cmd).returncode
+    print(f"refused: unknown subcommand {sub!r}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
