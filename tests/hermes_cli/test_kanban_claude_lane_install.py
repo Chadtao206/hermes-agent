@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 
-_INSTALL = Path(__file__).resolve().parents[1] / "plugins/kanban/claude_lane/install.py"
+_INSTALL = Path(__file__).resolve().parents[2] / "plugins/kanban/claude_lane/install.py"
 
 
 def _load_installer():

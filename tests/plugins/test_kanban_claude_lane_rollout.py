@@ -18,15 +18,18 @@ Three properties are pinned here:
    with its contract-unavailable code instead of raising — so a core rollback
    under installed artifacts degrades to the native worker.
 
-Plus the caller-side ownership behaviour of the versioned ``launcher.py`` /
-``wrapper.py``, exercised by running the versioned plugin tests against a
-synthetic plugin package. That is what makes "no unfenced supervisor is ever
-launched" checkable in CI, with no host installation involved.
+``install.py``'s own check / install / rollback logic is covered in
+``tests/hermes_cli/test_kanban_claude_lane_install.py`` with the runtime probe
+stubbed. This file owns the parts that need the real thing: the probe itself,
+the artifacts' behaviour against a core that lacks the contract, the versioned
+``launcher.py`` / ``wrapper.py`` run against a synthetic plugin package (so "no
+unfenced supervisor is ever launched" is checkable with no host installation at
+all), and drift between the versioned copies and whatever this host has
+installed.
 """
 
 from __future__ import annotations
 
-import filecmp
 import importlib.machinery
 import importlib.util
 import os
@@ -56,36 +59,6 @@ def _load_installer():
 @pytest.fixture(scope="module")
 def installer():
     return _load_installer()
-
-
-# ---------------------------------------------------------------------------
-# The manifest itself
-# ---------------------------------------------------------------------------
-
-def test_every_manifest_entry_exists_and_targets_the_host_layout(installer):
-    for rel_src, rel_dst, mode in installer.MANIFEST:
-        source = LANE_ROOT / rel_src
-        assert source.is_file(), f"manifest names a missing artifact: {rel_src}"
-        assert rel_dst.startswith(".hermes/"), rel_dst
-        assert mode in (0o644, 0o755)
-    # The supervisor and the shim are executables; the plugin modules are not.
-    modes = dict((rel_dst, mode) for _s, rel_dst, mode in installer.MANIFEST)
-    assert modes[".hermes/scripts/claude_kanban_supervisor.py"] == 0o755
-    assert modes[".hermes/scripts/hermes-kanban-task"] == 0o755
-    assert modes[".hermes/plugins/claude-kanban-lane/launcher.py"] == 0o644
-
-
-def test_scripts_are_installed_before_the_plugin_modules(installer):
-    """Ordering inside the manifest is load-bearing. A new launcher passes
-    ``--run-id`` / ``--claim-lock`` to the supervisor; an OLD supervisor's
-    argparse rejects them, exits 2 and orphans a live claude pane. The reverse
-    skew is harmless (the new supervisor pins the run itself), so scripts must
-    land first."""
-    order = [rel_dst for _src, rel_dst, _mode in installer.MANIFEST]
-    assert order.index(".hermes/scripts/claude_kanban_supervisor.py") < \
-        order.index(".hermes/plugins/claude-kanban-lane/launcher.py")
-    assert order.index(".hermes/scripts/claude_kanban_supervisor.py") < \
-        order.index(".hermes/plugins/claude-kanban-lane/wrapper.py")
 
 
 # ---------------------------------------------------------------------------
@@ -149,119 +122,6 @@ def test_runtime_probe_rejects_a_core_without_the_module(installer, tmp_path):
         str(_fake_python(tmp_path, stub_root=stub)))
     assert not ok
     assert "kanban_supervisor" in detail  # the ModuleNotFoundError text
-
-
-# ---------------------------------------------------------------------------
-# check / install / rollback
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def fake_host(tmp_path, installer):
-    """An empty host tree plus interpreters that do and do not carry the core."""
-    home = tmp_path / "home"
-    home.mkdir()
-    with_core_dir = tmp_path / "with-core"
-    with_core_dir.mkdir()
-    without_core_dir = tmp_path / "no-core"
-    without_core_dir.mkdir()
-    good = _fake_python(
-        with_core_dir,
-        stub_root=_stub_core(tmp_path / "core", attrs=installer.REQUIRED_CORE_ATTRS),
-    )
-    bad = _fake_python(
-        without_core_dir, stub_root=_stub_core(tmp_path / "oldcore", attrs=None),
-    )
-    return {"home": str(home), "python_with_core": str(good), "python_without_core": str(bad)}
-
-
-def test_check_reports_a_clean_host_as_staged_not_installed(installer, fake_host, capsys):
-    assert installer.main(["--check", "--home", fake_host["home"],
-                           "--python", fake_host["python_with_core"]]) == 3
-    assert "staged, not installed" in capsys.readouterr().out
-
-
-def test_install_refuses_a_runtime_without_the_core_contract(installer, fake_host, capsys):
-    """The ordering gate, and the exact mistake it prevents: artifacts updated
-    before the core they import exists."""
-    assert installer.main(["--install", "--home", fake_host["home"],
-                           "--python", fake_host["python_without_core"]]) == 1
-    err = capsys.readouterr().err
-    assert "Install order is core FIRST" in err
-    for _src, rel_dst, _mode in installer.MANIFEST:
-        assert not (Path(fake_host["home"]) / rel_dst).exists(), rel_dst
-
-
-def test_forced_install_is_possible_but_explicit(installer, fake_host):
-    assert installer.main(["--install", "--home", fake_host["home"],
-                           "--python", fake_host["python_without_core"],
-                           "--force", "--stamp", "s0"]) == 0
-    # ... and then --check calls the result what it is: incoherent.
-    assert installer.main(["--check", "--home", fake_host["home"],
-                           "--python", fake_host["python_without_core"]]) == 1
-
-
-def test_install_then_check_is_clean_and_byte_identical(installer, fake_host):
-    assert installer.main(["--install", "--home", fake_host["home"],
-                           "--python", fake_host["python_with_core"],
-                           "--stamp", "s1"]) == 0
-    for rel_src, rel_dst, mode in installer.MANIFEST:
-        target = Path(fake_host["home"]) / rel_dst
-        assert target.exists()
-        assert filecmp.cmp(LANE_ROOT / rel_src, target, shallow=False)
-        assert (target.stat().st_mode & 0o777) == mode
-    assert installer.main(["--check", "--home", fake_host["home"],
-                           "--python", fake_host["python_with_core"]]) == 0
-
-
-def test_check_flags_a_partial_install_as_an_error(installer, fake_host, capsys):
-    """The state the live lane was actually left in: some artifacts new, some
-    old. Silence here is what let it run for an hour."""
-    assert installer.main(["--install", "--home", fake_host["home"],
-                           "--python", fake_host["python_with_core"],
-                           "--stamp", "s1"]) == 0
-    victim = Path(fake_host["home"]) / installer.MANIFEST[0][1]
-    victim.write_text("# hand-edited on the host\n", encoding="utf-8")
-    capsys.readouterr()
-    assert installer.main(["--check", "--home", fake_host["home"],
-                           "--python", fake_host["python_with_core"]]) == 1
-    out = capsys.readouterr().out
-    assert "PARTIAL INSTALL" in out
-    assert "drifted" in out
-
-
-def test_install_backs_up_and_rollback_restores_the_previous_files(installer, fake_host):
-    home = Path(fake_host["home"])
-    # A pre-existing host artifact (the legacy version we must be able to return to).
-    legacy_target = home / installer.MANIFEST[0][1]
-    legacy_target.parent.mkdir(parents=True, exist_ok=True)
-    legacy_target.write_text("# legacy supervisor\n", encoding="utf-8")
-
-    assert installer.main(["--install", "--home", str(home),
-                           "--python", fake_host["python_with_core"],
-                           "--stamp", "s1"]) == 0
-    assert legacy_target.read_text(encoding="utf-8") != "# legacy supervisor\n"
-
-    assert installer.main(["--rollback", "--home", str(home)]) == 0
-    assert legacy_target.read_text(encoding="utf-8") == "# legacy supervisor\n"
-    # Artifacts with no prior version are left as installed (there is nothing to
-    # go back to); --check then reports the partial state honestly.
-    assert installer.main(["--check", "--home", str(home),
-                           "--python", fake_host["python_with_core"],
-                           ]) in (1, 3)
-
-
-def test_rollback_uses_the_newest_backup(installer, fake_host):
-    home = Path(fake_host["home"])
-    target = home / installer.MANIFEST[0][1]
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("gen0\n", encoding="utf-8")
-    installer.main(["--install", "--home", str(home),
-                    "--python", fake_host["python_with_core"], "--stamp", "20260101-000000"])
-    target.write_text("gen1\n", encoding="utf-8")
-    installer.main(["--install", "--home", str(home),
-                    "--python", fake_host["python_with_core"], "--stamp", "20260102-000000"])
-    assert installer.main(["--rollback", "--home", str(home)]) == 0
-    assert target.read_text(encoding="utf-8") == "gen1\n"  # newest backup, not gen0
 
 
 # ---------------------------------------------------------------------------
