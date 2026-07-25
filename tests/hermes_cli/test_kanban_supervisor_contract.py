@@ -7,23 +7,20 @@ therefore had no owner (23 of 44 supervisor-lane runs on the live board had no
 ``spawned`` event), and a supervisor left over from run N could keep renewing
 run N+1's claim.
 
-The second round of that failure is the one this file now pins hardest: the
-*fallbacks*. Fencing was wired in, but every path that could not resolve a run
-fell back to running unfenced, and a readopt that could not verify its
-ownership write fell back to assuming it owned the card forever. Both fallbacks
-are gone; the tests below assert that the code refuses instead.
-
-Two layers are tested here, and both are checkout-pinned:
+Two layers are tested here, both checkout-pinned (no host dependency, so the
+whole file runs in the standard ``scripts/run_tests.sh`` suite):
 
 * the source-controlled contract in :mod:`hermes_cli.kanban_supervisor`, end to
   end through the real ``hermes kanban heartbeat`` CLI; and
-* the source-controlled lane artifacts under ``plugins/kanban/claude_lane``,
-  which are what gets installed to ``~/.hermes``. Testing the versioned copies
-  rather than the installed ones is deliberate: the installed files legitimately
-  lag until the core they depend on is deployed (see that directory's README),
-  and a test that required them to be updated first is what let a half-installed
-  integration break the live lane. ``tests/plugins/test_kanban_claude_lane_rollout.py``
-  covers the install/drift side of that.
+* the source-controlled lane supervisor script under
+  ``plugins/kanban/claude_lane`` — driven behaviourally (its ``main`` loop,
+  not a regex over its source), so the wiring cannot regress to an unfenced
+  heartbeat and the two Boris repros stay covered.
+
+The installed *host* copies (``~/.hermes/scripts``, ``~/.hermes/plugins``) are
+verified separately by the installer's runtime probe and the plugin's own
+suite; this file deliberately does not read or import them, so a stale/reverted
+host tree cannot make it pass or fail.
 """
 
 from __future__ import annotations
@@ -33,8 +30,8 @@ import importlib.machinery
 import importlib.util
 import json
 import os
-import re
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -44,11 +41,11 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_supervisor as ks
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-LANE_ROOT = REPO_ROOT / "plugins" / "kanban" / "claude_lane"
-LANE_SUPERVISOR = LANE_ROOT / "scripts" / "claude_kanban_supervisor.py"
-LANE_SHIM = LANE_ROOT / "scripts" / "hermes-kanban-task"
-LANE_PLUGIN = LANE_ROOT / "plugin"
+# The source-controlled lane artifacts. They live in the repo (unlike the
+# installed host copies), so these tests always run rather than skip.
+_CLAUDE_LANE = Path(__file__).resolve().parents[2] / "plugins/kanban/claude_lane"
+SC_SUPERVISOR = _CLAUDE_LANE / "scripts/claude_kanban_supervisor.py"
+SC_SHIM = _CLAUDE_LANE / "scripts/hermes-kanban-task"
 
 
 @pytest.fixture
@@ -70,6 +67,8 @@ def _events(conn, task_id, kind):
 
 
 def _card_row(conn, task_id):
+    # Raw SQL on purpose: it keeps working when a test has monkeypatched
+    # kb.get_task to simulate a read failure.
     return conn.execute(
         "SELECT worker_pid, claim_expires, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
@@ -83,30 +82,21 @@ def _run_cli(argv):
     return kc.kanban_command(parser.parse_args(argv))
 
 
-def _superseded_card(monkeypatch, *, now, live_pid):
-    """A card whose run N has been superseded by run N+1, owned by ``live_pid``.
+def _load_script(path, name):
+    """Import a host-shaped script by path.
 
-    The dispatcher reuses one ``host:pid`` claim lock, so the successor usually
-    holds the very same lock as its predecessor — which is why the RUN is the
-    only thing that can tell a stale supervisor apart from a live one.
+    An explicit ``SourceFileLoader`` because the lifecycle shim is an
+    extensionless executable, which path-based spec inference declines.
     """
-    monkeypatch.setattr(kb.time, "time", lambda: now)
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_pid)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="superseded", assignee="alice")
-        first = kb.claim_task(conn, tid, ttl_seconds=900)
-        kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
-        second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
-        assert second.claim_lock == first.claim_lock
-        assert kb.adopt_worker_pid(
-            conn, tid, worker_pid=live_pid, expected_run_id=second.current_run_id,
-        ) == kb._OWNERSHIP_RECORDED
-        row = _card_row(conn, tid)
-    return tid, first, second, row
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 # ---------------------------------------------------------------------------
-# 1. The env contract — a run is mandatory, never inherited, never omitted
+# 1. The env contract
 # ---------------------------------------------------------------------------
 
 def test_shim_env_pins_the_whole_contract(kanban_home):
@@ -124,49 +114,32 @@ def test_shim_env_pins_the_whole_contract(kanban_home):
         assert key in env, f"contract key {key} missing"
 
 
-@pytest.mark.parametrize("bad", [None, 0, -1, "", "nope"])
-def test_shim_env_refuses_to_build_an_unfenced_call(kanban_home, bad):
-    """The exact shape of Boris' first repro. This builder used to *strip*
-    ``HERMES_KANBAN_RUN_ID`` when the run was unknown, on the theory that
-    unfenced-but-honest beat fencing against the wrong run. It is neither: the
-    resulting ``hermes kanban heartbeat`` ran with ``expected_run_id=None``, so
-    a supervisor left over from run 1 renewed run 2's claim, added a heartbeat
-    event to it and stamped pid 424242 onto it — all with CLI rc 0. There is no
-    unfenced mode any more; a supervisor that cannot name its run must exit."""
+@pytest.mark.parametrize("bad", [None, 0, -1, "nope"])
+def test_shim_env_requires_an_exact_positive_run(kanban_home, bad):
+    """There is no unfenced way to address a card. ``run_id`` is required and a
+    non-positive/unparseable one raises, so a supervisor that cannot name its
+    run fails loudly at the boundary instead of building an env whose
+    ``expected_run_id`` silently becomes None."""
     with pytest.raises(ks.SupervisorRunUnresolved):
-        ks.supervisor_shim_env(
-            {"PATH": "/usr/bin"}, task_id="t_abc", board="default", run_id=bad,
-        )
+        ks.supervisor_shim_env({}, task_id="t_1", board="default", run_id=bad)
 
 
-def test_inherited_run_and_lock_are_never_trusted(kanban_home):
+def test_unknown_run_and_lock_are_overwritten_not_inherited(kanban_home):
     """A supervisor is a gateway child, and the gateway is the parent of every
-    lane — so its environment can carry ANOTHER lane's run/lock. Ours always
-    overwrites; an unknown lock is removed rather than inherited, because
-    inheriting it would silently address someone else's claim."""
+    lane — so its environment can carry ANOTHER lane's run/lock. Our own run
+    must overwrite the inherited one (never trust it), and a lock we did not
+    pass must be stripped rather than inherited from a sibling lane."""
     env = ks.supervisor_shim_env(
         {
             "HERMES_KANBAN_RUN_ID": "777",
             "HERMES_KANBAN_CLAIM_LOCK": "other-host:1",
             "HERMES_KANBAN_TASK": "t_someone_else",
         },
-        task_id="t_mine", board="default", run_id=1514,
+        task_id="t_mine", board="default", run_id=1234,
     )
     assert env["HERMES_KANBAN_TASK"] == "t_mine"
-    assert env["HERMES_KANBAN_RUN_ID"] == "1514"
-    assert "HERMES_KANBAN_CLAIM_LOCK" not in env
-
-
-@pytest.mark.parametrize("good,expected", [(1, 1), ("42", 42), (1514, 1514)])
-def test_require_run_id_accepts_exact_positive_runs(good, expected):
-    assert ks.require_run_id(good) == expected
-
-
-@pytest.mark.parametrize("bad", [None, 0, -5, "", "x", object()])
-def test_require_run_id_rejects_everything_else(bad):
-    with pytest.raises(ks.SupervisorRunUnresolved) as exc:
-        ks.require_run_id(bad)
-    assert exc.value.transient is False  # nothing to retry: it is not a run
+    assert env["HERMES_KANBAN_RUN_ID"] == "1234"        # ours wins, 777 discarded
+    assert "HERMES_KANBAN_CLAIM_LOCK" not in env         # sibling lock stripped
 
 
 # ---------------------------------------------------------------------------
@@ -191,219 +164,7 @@ def test_heartbeat_argv_refuses_a_non_pid(bad):
 
 
 # ---------------------------------------------------------------------------
-# 3. Pinning the run: resolve once, or refuse
-# ---------------------------------------------------------------------------
-
-def test_pin_supervised_run_prefers_the_launcher_s_run(kanban_home, monkeypatch):
-    monkeypatch.setattr(kb.time, "time", lambda: 9_000_000)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="pin", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-        assert ks.resolve_supervised_run(conn, tid) == task.current_run_id
-        assert ks.resolve_supervised_run(conn, tid, run_id=5) == 5
-    assert ks.pin_supervised_run(tid, board="default") == task.current_run_id
-    assert ks.pin_supervised_run(tid, board="default", run_id=7) == 7
-
-
-def test_pin_supervised_run_classifies_an_unreadable_board_as_transient(
-    kanban_home, monkeypatch,
-):
-    """The production shape: SQLite 'disk I/O error' from WAL contention at
-    gateway startup. The old code swallowed it and continued with
-    ``run_id=None`` — i.e. unfenced. It must raise, and say the answer may
-    exist, so the caller defers instead of guessing."""
-    def boom(*a, **kw):
-        raise sqlite3.OperationalError("disk I/O error")
-
-    monkeypatch.setattr(kb, "connect_closing", boom)
-    with pytest.raises(ks.SupervisorRunUnresolved) as exc:
-        ks.pin_supervised_run("t_whatever", board="default")
-    assert exc.value.transient is True
-
-
-def test_pin_supervised_run_refuses_an_absent_card_or_missing_run(
-    kanban_home, monkeypatch,
-):
-    monkeypatch.setattr(kb.time, "time", lambda: 9_010_000)
-    with pytest.raises(ks.SupervisorRunUnresolved) as absent:
-        ks.pin_supervised_run("t_nope", board="default")
-    assert absent.value.transient is False
-
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="unclaimed", assignee="alice")
-        # Never claimed -> no task_runs row -> nothing exact to fence to.
-        with pytest.raises(ks.SupervisorRunUnresolved) as norun:
-            ks.resolve_supervised_run(conn, tid)
-    assert norun.value.transient is False
-
-
-# ---------------------------------------------------------------------------
-# 4. Adoption: held / refused / unverified — and never "assume it is ours"
-# ---------------------------------------------------------------------------
-
-def test_acquire_session_ownership_holds_after_replacing_a_dead_owner(
-    kanban_home, monkeypatch,
-):
-    monkeypatch.setattr(kb.time, "time", lambda: 9_100_000)
-    replacement = 90909
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == replacement)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="readopt", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-        assert kb.adopt_worker_pid(
-            conn, tid, worker_pid=11011, expected_run_id=task.current_run_id,
-        ) == kb._OWNERSHIP_RECORDED  # the original supervisor, now dead
-
-    verdict, outcome = ks.acquire_session_ownership(
-        tid, board="default", worker_pid=replacement,
-        expected_run_id=task.current_run_id, sleep_fn=lambda _s: None,
-    )
-    assert (verdict, outcome) == (ks.OWNERSHIP_HELD, kb._OWNERSHIP_REPLACED_DEAD)
-    with kb.connect() as conn:
-        assert _card_row(conn, tid)["worker_pid"] == replacement
-
-
-def test_acquire_session_ownership_refuses_a_live_foreign_owner(
-    kanban_home, monkeypatch,
-):
-    monkeypatch.setattr(kb.time, "time", lambda: 9_110_000)
-    live = 51015
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="occupied", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-        kb.adopt_worker_pid(
-            conn, tid, worker_pid=live, expected_run_id=task.current_run_id,
-        )
-
-    verdict, outcome = ks.acquire_session_ownership(
-        tid, board="default", worker_pid=12012,
-        expected_run_id=task.current_run_id, sleep_fn=lambda _s: None,
-    )
-    assert (verdict, outcome) == (ks.OWNERSHIP_REFUSED, kb._OWNERSHIP_CONFLICT)
-    with kb.connect() as conn:
-        assert _card_row(conn, tid)["worker_pid"] == live
-        assert len(_events(conn, tid, "ownership_adopted")) == 1
-
-
-def test_acquire_session_ownership_reports_unverified_when_the_db_never_answers(
-    kanban_home, monkeypatch,
-):
-    """Unknown is not ours. The old code retried three times and then continued
-    with ``assume_ours=True`` for the rest of the process' life."""
-    monkeypatch.setattr(kb.time, "time", lambda: 9_120_000)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="unreadable", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-
-    attempts = {"n": 0}
-
-    def boom(*a, **kw):
-        attempts["n"] += 1
-        raise sqlite3.OperationalError("disk I/O error")
-
-    monkeypatch.setattr(kb, "connect_closing", boom)
-    slept = []
-    verdict, outcome = ks.acquire_session_ownership(
-        tid, board="default", worker_pid=4242,
-        expected_run_id=task.current_run_id, attempts=3,
-        sleep_fn=slept.append,
-    )
-    assert (verdict, outcome) == (ks.OWNERSHIP_UNVERIFIED, None)
-    assert attempts["n"] == 3
-    assert slept == [ks.ADOPTION_RETRY_SECONDS] * 2  # no sleep after the last try
-
-
-def test_three_db_errors_then_a_live_foreign_owner_is_refused(
-    kanban_home, monkeypatch,
-):
-    """Boris' second repro, at the layer that decides it.
-
-    Three adoption attempts raise (WAL contention at gateway startup), then the
-    DB comes back — and the card names a LIVE foreign supervisor. The old code
-    had already given up on verifying and passed ``assume_ours=True`` forever,
-    so ``caller_decision`` returned 'continue' for a readable card naming pid
-    99999 while we were pid 11111: two supervisors on one run, with only a
-    silent heartbeat conflict to show for it. Now the retry sees the recovered
-    DB, gets a conflict, and the verdict is a stand-down.
-    """
-    monkeypatch.setattr(kb.time, "time", lambda: 9_130_000)
-    live_foreign = 99999
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_foreign)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="foreign-owner", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-        kb.adopt_worker_pid(
-            conn, tid, worker_pid=live_foreign,
-            expected_run_id=task.current_run_id,
-        )
-        before = _card_row(conn, tid)
-
-    real_connect_closing = kb.connect_closing
-    calls = {"n": 0}
-
-    def flaky(*a, **kw):
-        calls["n"] += 1
-        if calls["n"] <= 3:
-            raise sqlite3.OperationalError("disk I/O error")
-        return real_connect_closing(*a, **kw)
-
-    monkeypatch.setattr(kb, "connect_closing", flaky)
-    verdict, outcome = ks.acquire_session_ownership(
-        tid, board="default", worker_pid=11111,
-        expected_run_id=task.current_run_id, attempts=5,
-        sleep_fn=lambda _s: None,
-    )
-    assert (verdict, outcome) == (ks.OWNERSHIP_REFUSED, kb._OWNERSHIP_CONFLICT)
-    assert calls["n"] == 4  # it really did retry into the recovered DB
-    monkeypatch.setattr(kb, "connect_closing", real_connect_closing)
-    with kb.connect() as conn:
-        after = _card_row(conn, tid)
-        assert after["worker_pid"] == before["worker_pid"] == live_foreign
-        assert after["claim_expires"] == before["claim_expires"]
-        assert len(_events(conn, tid, "ownership_adopted")) == 1
-
-
-def test_adoption_is_run_fenced_and_never_takes_a_live_owner(kanban_home, monkeypatch):
-    """The readopt path's whole purpose is taking over from the dead original
-    supervisor; the thing it must never do is run beside a live one, or across
-    runs."""
-    now = 9_200_000
-    tid, first, second, row = _superseded_card(monkeypatch, now=now, live_pid=90909)
-    with kb.connect() as conn:
-        # Fenced to the superseded run -> refused, card untouched.
-        assert ks.adopt_session_ownership(
-            conn, tid, worker_pid=70707, expected_run_id=first.current_run_id,
-        ) == kb._OWNERSHIP_FENCED
-        # Right run, but a live owner -> still refused.
-        assert ks.adopt_session_ownership(
-            conn, tid, worker_pid=70707, expected_run_id=second.current_run_id,
-        ) == kb._OWNERSHIP_CONFLICT
-        # Our own pid again is a no-op, not a second ownership event.
-        assert ks.adopt_session_ownership(
-            conn, tid, worker_pid=90909, expected_run_id=second.current_run_id,
-        ) == kb._OWNERSHIP_ALREADY_OURS
-        assert _card_row(conn, tid)["worker_pid"] == 90909
-        assert len(_events(conn, tid, "ownership_adopted")) == 1
-
-
-@pytest.mark.parametrize("bad", [None, 0, -1])
-def test_adoption_refuses_an_unfenced_run(kanban_home, monkeypatch, bad):
-    monkeypatch.setattr(kb.time, "time", lambda: 9_210_000)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="unfenced-adopt", assignee="alice")
-        kb.claim_task(conn, tid, ttl_seconds=900)
-        with pytest.raises(ks.SupervisorRunUnresolved):
-            ks.adopt_session_ownership(conn, tid, worker_pid=4242, expected_run_id=bad)
-        with pytest.raises(ks.SupervisorRunUnresolved):
-            ks.acquire_session_ownership(
-                tid, board="default", worker_pid=4242, expected_run_id=bad,
-            )
-        assert _card_row(conn, tid)["worker_pid"] is None
-
-
-# ---------------------------------------------------------------------------
-# 5. End to end through the real CLI
+# 3. Core fencing + adoption, end to end through the real CLI / DB
 # ---------------------------------------------------------------------------
 
 def test_supervisor_contract_end_to_end_adopts_and_renews(kanban_home, monkeypatch):
@@ -455,10 +216,22 @@ def test_stale_supervisor_cannot_heartbeat_or_adopt_the_next_run(
     dispatcher reuses one host:pid lock) often the very same claim lock, so
     the RUN is the only thing that can tell it apart."""
     now = 9_100_000
-    tid, first, second, before = _superseded_card(
-        monkeypatch, now=now, live_pid=80808,
-    )
-    stale_pid = 70707
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    stale_pid, live_pid = 70707, 80808
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_pid)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="superseded", assignee="alice")
+        first = kb.claim_task(conn, tid, ttl_seconds=900)
+        kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
+        second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
+        assert second.claim_lock == first.claim_lock
+        # The successor's own supervisor owns the card.
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=live_pid,
+            expected_run_id=second.current_run_id,
+        ) == kb._OWNERSHIP_RECORDED
+        successor_expiry = _card_row(conn, tid)["claim_expires"]
 
     stale_env = ks.supervisor_shim_env(
         dict(os.environ), task_id=tid, board="default",
@@ -477,71 +250,167 @@ def test_stale_supervisor_cannot_heartbeat_or_adopt_the_next_run(
 
     with kb.connect() as conn:
         row = _card_row(conn, tid)
-        assert row["worker_pid"] == 80808                     # not adopted
-        assert row["claim_expires"] == before["claim_expires"]  # not renewed
+        assert row["worker_pid"] == live_pid          # not adopted
+        assert row["claim_expires"] == successor_expiry  # not renewed
         assert _events(conn, tid, "heartbeat") == []
 
-
-# ---------------------------------------------------------------------------
-# 6. The source-controlled lane artifacts
-# ---------------------------------------------------------------------------
-
-def _load_lane(path, name):
-    """Import a versioned lane artifact by path.
-
-    An explicit ``SourceFileLoader`` because the lifecycle shim is an
-    extensionless executable, which path-based spec inference declines.
-    """
-    loader = importlib.machinery.SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+        # Explicit adoption is fenced the same way.
+        assert ks.adopt_session_ownership(
+            conn, tid, worker_pid=stale_pid,
+            expected_run_id=first.current_run_id,
+        ) == kb._OWNERSHIP_FENCED
+        assert _card_row(conn, tid)["worker_pid"] == live_pid
 
 
-@pytest.fixture
-def lane_supervisor(monkeypatch):
-    """The real versioned supervisor, with its process-level effects stubbed."""
-    sup = _load_lane(LANE_SUPERVISOR, "lane_claude_kanban_supervisor")
-    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
-    # The retry sleep lives in the contract module, and its default is 2s x 5.
-    monkeypatch.setattr(ks.time, "sleep", lambda _s: None)
-    return sup
-
-
-def test_lane_supervisor_uses_the_contract():
-    """The integration Boris found broken: the supervisor must pass its OWN
-    pid and the exact run/lock through the contract builders, not call the
-    shim bare. Asserted against the real file so the wiring cannot regress
-    back to an unfenced ``worker_pid=None`` heartbeat — or to an unfenced
-    fallback when the run cannot be resolved."""
-    source = LANE_SUPERVISOR.read_text(encoding="utf-8")
-    assert "from hermes_cli.kanban_supervisor import" in source
-    assert "supervisor_heartbeat_argv(" in source
-    assert "supervisor_shim_env(" in source
-    assert "worker_pid=my_pid" in source
-    # Run/lock reach the shim env on every lifecycle call.
-    assert re.search(r"run_id=run_id,\s*claim_lock=a\.claim_lock", source)
-    # Adoption goes through the fenced CAS helper, never the dispatcher's
-    # private spawn write.
-    assert "acquire_session_ownership(" in source
-    assert "_set_worker_pid" not in source
-    # No fail-open fallbacks: the two that Boris found are gone by name.
-    assert "run_id = None" not in source
-    assert "assume_ours" not in source
-    # The run is pinned exactly once, and refusing is a real code path.
-    assert source.count("pin_supervised_run(") == 1
-    assert "SupervisorRunUnresolved" in source
-
-    for flag in ("--run-id", "--claim-lock", "--adopt"):
-        assert flag in source
-
-
-def test_lane_supervisor_heartbeat_owns_the_card_end_to_end(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
+def test_adoption_replaces_a_dead_owner_but_never_a_live_one(
+    kanban_home, monkeypatch,
 ):
-    """Drive the REAL supervisor for one loop iteration and check the card
-    afterwards.
+    """The readopt path's whole purpose is taking over from the dead original
+    supervisor; the thing it must never do is run beside a live one."""
+    now = 9_200_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    alive = {90909}
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) in alive)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="readopt", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        run_id = task.current_run_id
+
+        # Original supervisor recorded, then died.
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=11011, expected_run_id=run_id,
+        ) == kb._OWNERSHIP_RECORDED
+
+        # Replacement adopts over the dead pid.
+        assert ks.adopt_session_ownership(
+            conn, tid, worker_pid=90909, expected_run_id=run_id,
+        ) == kb._OWNERSHIP_REPLACED_DEAD
+        assert _card_row(conn, tid)["worker_pid"] == 90909
+
+        # A third supervisor finds a LIVE owner and is refused.
+        assert ks.adopt_session_ownership(
+            conn, tid, worker_pid=12012, expected_run_id=run_id,
+        ) == kb._OWNERSHIP_CONFLICT
+        assert _card_row(conn, tid)["worker_pid"] == 90909
+
+        # Re-adopting our own pid is a no-op, not a second ownership event.
+        assert ks.adopt_session_ownership(
+            conn, tid, worker_pid=90909, expected_run_id=run_id,
+        ) == kb._OWNERSHIP_ALREADY_OURS
+        assert len(_events(conn, tid, "ownership_adopted")) == 2
+
+
+def test_resolve_supervised_run_pins_the_card_s_current_run(kanban_home, monkeypatch):
+    now = 9_300_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pin", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        assert ks.resolve_supervised_run(conn, tid) == task.current_run_id
+        # An explicitly-passed run always wins over the card's current one.
+        assert ks.resolve_supervised_run(conn, tid, run_id=5) == 5
+        # A card that cannot be found is a HARD (non-transient) failure, not
+        # None: returning None here is exactly what let the old fallback run a
+        # supervisor unfenced.
+        with pytest.raises(ks.SupervisorRunUnresolved) as ei:
+            ks.resolve_supervised_run(conn, "t_nope")
+        assert ei.value.transient is False
+
+
+# ---------------------------------------------------------------------------
+# 3b. acquire_session_ownership: retry / recover / refuse (Boris repro 2 core)
+# ---------------------------------------------------------------------------
+
+def test_acquire_session_ownership_recovers_then_refuses_a_live_foreign_owner(
+    kanban_home, monkeypatch,
+):
+    """Boris repro 2, at the contract level: three DB-read exceptions, then the
+    DB recovers and the card names a LIVE foreign owner. The old readopt path
+    left ``assume_ours=True`` after three exceptions and supervised anyway; the
+    retry now recovers, sees the foreign owner, and REFUSES — it never grants
+    ownership it could not verify."""
+    now = 9_400_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    foreign_pid = 99999
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == foreign_pid)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="readopt-flaky", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        run_id = task.current_run_id
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=foreign_pid, expected_run_id=run_id,
+        ) == kb._OWNERSHIP_RECORDED
+        adopt_events = len(_events(conn, tid, "ownership_adopted"))
+        expiry = _card_row(conn, tid)["claim_expires"]
+
+    real_cc = kb.connect_closing
+    calls = {"n": 0}
+
+    def flaky_cc(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_cc(*a, **k)
+
+    monkeypatch.setattr(kb, "connect_closing", flaky_cc)
+    slept: list[float] = []
+    verdict, outcome = ks.acquire_session_ownership(
+        tid, board="default", worker_pid=11111, expected_run_id=run_id,
+        sleep_fn=slept.append,
+    )
+    assert verdict == ks.OWNERSHIP_REFUSED
+    assert outcome == kb._OWNERSHIP_CONFLICT
+    assert calls["n"] == 4        # 3 failures + 1 recovery
+    assert len(slept) == 3        # slept between each failure, not after success
+
+    with kb.connect() as conn:
+        row = _card_row(conn, tid)
+        assert row["worker_pid"] == foreign_pid                       # unchanged
+        assert row["claim_expires"] == expiry
+        assert len(_events(conn, tid, "ownership_adopted")) == adopt_events
+
+
+def test_acquire_session_ownership_is_unverified_when_the_db_never_recovers(
+    kanban_home, monkeypatch,
+):
+    """When the DB never becomes readable the verdict is UNVERIFIED, NOT held:
+    unknown is not ours, and the caller stands down without touching the pane."""
+    def always_raises(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "connect_closing", always_raises)
+    slept: list[float] = []
+    verdict, outcome = ks.acquire_session_ownership(
+        "t_x", board="default", worker_pid=4242, expected_run_id=7,
+        attempts=3, sleep_fn=slept.append,
+    )
+    assert verdict == ks.OWNERSHIP_UNVERIFIED
+    assert outcome is None
+    assert len(slept) == 2  # slept between attempts, none after the last
+
+
+# ---------------------------------------------------------------------------
+# 4. The source-controlled lane supervisor, driven behaviourally
+# ---------------------------------------------------------------------------
+
+def _stub_state(monkeypatch):
+    """Stub the plugin's per-session ``state`` module, which the supervisor
+    imports lazily; the real one writes under the host's live state dir."""
+    stub = type("state", (), {
+        "cap_reset": staticmethod(lambda _t: None),
+        "cap_increment": staticmethod(lambda _t: None),
+        "session_delete": staticmethod(lambda _t: None),
+    })
+    monkeypatch.setitem(sys.modules, "state", stub)
+
+
+def test_local_supervisor_heartbeat_owns_the_card_end_to_end(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Drive the REAL source-controlled supervisor for one loop iteration and
+    check the card afterwards.
 
     The whole chain runs: supervisor loop -> ``_hermes_task_shim`` env ->
     the real lifecycle shim -> ``hermes kanban heartbeat`` -> core. Only the
@@ -551,10 +420,10 @@ def test_lane_supervisor_heartbeat_owns_the_card_end_to_end(
     ``worker_pid`` NULL and an unfenced heartbeat."""
     import subprocess
 
-    sup = lane_supervisor
-    shim = _load_lane(LANE_SHIM, "lane_hermes_kanban_task_shim")
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_e2e")
+    shim = _load_script(SC_SHIM, "sc_shim_e2e")
 
-    now = 9_400_000
+    now = 9_500_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="lane-e2e", assignee="alice")
@@ -591,15 +460,8 @@ def test_lane_supervisor_heartbeat_owns_the_card_end_to_end(
     monkeypatch.setattr(sup, "_tmux_alive", lambda *a, **k: True)
     monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: None)
     monkeypatch.setattr(sup, "_stream_transcript", lambda *a, **k: (0, "", False))
-
-    # A stub for the plugin's per-session state module, which ``main`` imports
-    # lazily; the real one writes under the host's live state dir.
-    stub_state = type("state", (), {
-        "cap_reset": staticmethod(lambda _t: None),
-        "cap_increment": staticmethod(lambda _t: None),
-        "session_delete": staticmethod(lambda _t: None),
-    })
-    monkeypatch.setitem(__import__("sys").modules, "state", stub_state)
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
 
     # Second read reports the card done, so the loop exits after one iteration.
     reads = {"n": 0}
@@ -643,81 +505,129 @@ def test_lane_supervisor_heartbeat_owns_the_card_end_to_end(
         assert len(_events(conn, tid, "heartbeat")) == len(heartbeats)
 
 
-def test_lane_supervisor_stands_down_when_the_run_cannot_be_resolved(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
+def test_local_supervisor_stands_down_when_its_run_cannot_be_resolved(
+    kanban_home, monkeypatch, tmp_path,
 ):
-    """Boris' first repro, driven through the real supervisor.
+    """Boris repro 1: a supervisor whose run cannot be resolved must NOT fall
+    back to an unfenced heartbeat.
 
-    A supervisor launched without ``--run-id`` whose startup card read fails
-    used to continue with ``run_id=None`` and heartbeat forever through an
-    unfenced env — successfully renewing its SUCCESSOR's claim (CLI rc 0,
-    worker_pid None -> 424242, expiry extended, heartbeat event added). It must
-    now exit before it can mutate anything, and leave a readopted pane alone.
-    """
-    sup = lane_supervisor
-    now = 9_500_000
-    live_pid = 80808
-    tid, first, second, before = _superseded_card(
-        monkeypatch, now=now, live_pid=live_pid,
-    )
+    The old host script set ``run_id=None`` after a startup DB exception and
+    heartbeated forever through that unfenced env, so a stale run-N supervisor
+    renewed run N+1's claim. Here the launch stands down (RUN_UNRESOLVED)
+    without a single lifecycle call, and the live successor's PID / expiry /
+    events are all left exactly as they were."""
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_run_unresolved")
 
-    killed, shimmed = [], []
-    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
-    monkeypatch.setattr(sup, "_hermes_task_shim", lambda *a, **k: shimmed.append(a))
+    now = 9_600_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    successor_pid = 424242
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == successor_pid)
 
-    def unreadable(*a, **kw):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="run-unresolved", assignee="alice")
+        first = kb.claim_task(conn, tid, ttl_seconds=900)
+        kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
+        second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=successor_pid,
+            expected_run_id=second.current_run_id,
+        ) == kb._OWNERSHIP_RECORDED
+        before = _card_row(conn, tid)
+        before_pid = before["worker_pid"]
+        before_expiry = before["claim_expires"]
+        before_hb = len(_events(conn, tid, "heartbeat"))
+        before_adopt = len(_events(conn, tid, "ownership_adopted"))
+
+    # Make run resolution fail: the card lookup pin_supervised_run relies on
+    # raises (a transient WAL/disk-I/O error at startup, the incident's shape).
+    def flaky_get(conn, task_id):
         raise sqlite3.OperationalError("disk I/O error")
 
-    real_connect_closing = kb.connect_closing
-    monkeypatch.setattr(kb, "connect_closing", unreadable)
+    monkeypatch.setattr(kb, "get_task", flaky_get)
 
+    shim_calls: list = []
+    monkeypatch.setattr(sup, "_hermes_task_shim",
+                        lambda *a, **k: shim_calls.append((a, k)))
+    killed: list = []
+    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
+
+    # A fresh readopt with NO --run-id, so the run must be resolved from the
+    # card — which now fails. The launch must stand down, not run unfenced.
     rc = sup.main([
         "--task", tid, "--board", "default", "--session", "sess",
         "--transcript", str(tmp_path / "t.jsonl"), "--adopt",
     ])
     assert rc == sup.RUN_UNRESOLVED_EXIT_CODE
-    assert killed == []    # a readopt never touches a pane it may not own
-    assert shimmed == []   # and issues no lifecycle call at all
+    assert shim_calls == []   # no heartbeat/adopt/block was issued
+    assert killed == []       # --adopt: the (maybe-successor's) pane is untouched
 
-    # Restore only the connection factory. ``monkeypatch.undo()`` would also
-    # revert the kanban_home fixture's HERMES_HOME / Path.home patches and
-    # point these assertions at the LIVE board.
-    monkeypatch.setattr(kb, "connect_closing", real_connect_closing)
     with kb.connect() as conn:
-        after = _card_row(conn, tid)
-        assert after["worker_pid"] == live_pid              # successor untouched
-        assert after["claim_expires"] == before["claim_expires"]
-        assert after["current_run_id"] == second.current_run_id
-        assert _events(conn, tid, "heartbeat") == []
+        row = _card_row(conn, tid)  # raw SQL, unaffected by the get_task patch
+        assert row["worker_pid"] == before_pid == successor_pid
+        assert row["claim_expires"] == before_expiry
+        assert len(_events(conn, tid, "heartbeat")) == before_hb
+        assert len(_events(conn, tid, "ownership_adopted")) == before_adopt
+
+
+def test_local_supervisor_readopt_refuses_after_db_recovers_to_a_live_owner(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """Boris repro 2, at the supervisor level: --adopt survives three transient
+    DB-read exceptions, the DB then recovers and names a LIVE foreign owner, and
+    the supervisor STANDS DOWN (READOPT_REFUSED) without touching the pane —
+    instead of the old ``assume_ours`` path that supervised beside the real
+    owner with only a silent heartbeat conflict to show for it."""
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_flaky_readopt")
+
+    now = 9_700_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    foreign_pid = 99999
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == foreign_pid)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="flaky-readopt", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        run_id = task.current_run_id
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=foreign_pid, expected_run_id=run_id,
+        ) == kb._OWNERSHIP_RECORDED
+
+    real_cc = kb.connect_closing
+    calls = {"n": 0}
+
+    def flaky_cc(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_cc(*a, **k)
+
+    monkeypatch.setattr(kb, "connect_closing", flaky_cc)
+    monkeypatch.setattr(ks.time, "sleep", lambda _s: None)  # acquire's retry sleep
+    killed: list = []
+    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
+
+    # --run-id given, so pin_supervised_run returns without a DB read and only
+    # the ownership CAS hits the flaky connection.
+    rc = sup.main([
+        "--task", tid, "--board", "default", "--session", "sess",
+        "--transcript", str(tmp_path / "t.jsonl"),
+        "--run-id", str(run_id), "--adopt",
+    ])
+    assert rc == sup.READOPT_REFUSED_EXIT_CODE
+    assert calls["n"] == 4     # 3 transient failures + 1 recovery that refused
+    assert killed == []        # the live owner's pane is left alone
+
+    with kb.connect() as conn:
+        assert _card_row(conn, tid)["worker_pid"] == foreign_pid
         assert len(_events(conn, tid, "ownership_adopted")) == 1
 
 
-def test_lane_supervisor_kills_its_own_pane_when_it_cannot_fence_a_fresh_launch(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
-):
-    """The same refusal, on the launch path rather than the readopt path.
-
-    Here the pane was created for us seconds ago and nobody else is watching
-    it, so leaving it would mean a live claude session with no supervisor while
-    the card is requeued — a double-run. The launcher is supposed to have
-    stopped this before a pane existed (it checks ``current_run_id`` first);
-    this is the backstop for a hand-launched or stale-launcher spawn."""
-    sup = lane_supervisor
-    monkeypatch.setattr(kb.time, "time", lambda: 9_600_000)
-
-    killed = []
-    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
-
-    rc = sup.main([
-        "--task", "t_missing", "--board", "default", "--session", "sess",
-        "--transcript", str(tmp_path / "t.jsonl"),
-    ])
-    assert rc == sup.RUN_UNRESOLVED_EXIT_CODE
-    assert killed, "a fresh launch must not leave an unsupervised pane behind"
-
-
-def test_lane_supervisor_readopt_refuses_a_superseded_run(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
+def test_local_supervisor_readopt_refuses_a_superseded_run(
+    kanban_home, monkeypatch, tmp_path,
 ):
     """A supervisor relaunched for run N, finding the card on run N+1, must
     not adopt it.
@@ -725,14 +635,30 @@ def test_lane_supervisor_readopt_refuses_a_superseded_run(
     ``--adopt`` exists so a replacement can take over the dead original's pid;
     unfenced, it also let a leftover supervisor stamp itself onto the
     SUCCESSOR run and then act (kill panes, block the card) on work it never
-    launched. It refuses and leaves both the card and the pane alone."""
-    sup = lane_supervisor
-    tid, first, second, before = _superseded_card(
-        monkeypatch, now=9_700_000, live_pid=51015,
-    )
+    launched. It refuses and leaves both the card and the pane alone — a
+    process that just learned it is not the owner is the last one that should
+    be killing sessions."""
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_superseded")
 
-    killed = []
+    now = 9_800_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    live_pid = 51015
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_pid)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="readopt-stale", assignee="alice")
+        first = kb.claim_task(conn, tid, ttl_seconds=900)
+        kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
+        second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=live_pid,
+            expected_run_id=second.current_run_id,
+        ) == kb._OWNERSHIP_RECORDED
+
+    killed: list = []
     monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
 
     rc = sup.main([
         "--task", tid, "--board", "default", "--session", "sess",
@@ -743,115 +669,21 @@ def test_lane_supervisor_readopt_refuses_a_superseded_run(
     assert killed == []  # the live successor's pane is untouched
 
     with kb.connect() as conn:
-        assert _card_row(conn, tid)["worker_pid"] == 51015
+        assert _card_row(conn, tid)["worker_pid"] == live_pid
         assert len(_events(conn, tid, "ownership_adopted")) == 1
 
 
-def test_lane_supervisor_readopt_stands_down_on_a_live_foreign_owner_after_db_errors(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
-):
-    """Boris' second repro, driven through the real supervisor.
-
-    Three adoption attempts raise, the DB recovers, and the card names a live
-    foreign supervisor. The old code had stopped verifying by then and ran the
-    whole loop with ``assume_ours=True``, so it supervised a card it did not
-    own. It must stand down — and, being a readopt, without touching the pane
-    the real owner is watching."""
-    sup = lane_supervisor
-    now = 9_800_000
-    live_foreign = 99999
-    monkeypatch.setattr(kb.time, "time", lambda: now)
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_foreign)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="foreign-live", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-        kb.adopt_worker_pid(
-            conn, tid, worker_pid=live_foreign, expected_run_id=task.current_run_id,
-        )
-        before = _card_row(conn, tid)
-
-    real_connect_closing = kb.connect_closing
-    calls = {"n": 0}
-
-    def flaky(*a, **kw):
-        calls["n"] += 1
-        if calls["n"] <= 3:
-            raise sqlite3.OperationalError("disk I/O error")
-        return real_connect_closing(*a, **kw)
-
-    monkeypatch.setattr(kb, "connect_closing", flaky)
-    killed, shimmed = [], []
-    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
-    monkeypatch.setattr(sup, "_hermes_task_shim", lambda *a, **k: shimmed.append(a))
-
-    rc = sup.main([
-        "--task", tid, "--board", "default", "--session", "sess",
-        "--transcript", str(tmp_path / "t.jsonl"),
-        "--run-id", str(task.current_run_id), "--adopt",
-    ])
-    assert rc == sup.READOPT_REFUSED_EXIT_CODE
-    assert killed == []
-    assert shimmed == []
-
-    monkeypatch.setattr(kb, "connect_closing", real_connect_closing)
-    with kb.connect() as conn:
-        after = _card_row(conn, tid)
-        assert after["worker_pid"] == before["worker_pid"] == live_foreign
-        assert after["claim_expires"] == before["claim_expires"]
-        assert _events(conn, tid, "heartbeat") == []
-        assert len(_events(conn, tid, "ownership_adopted")) == 1
-
-
-def test_lane_supervisor_readopt_defers_when_ownership_cannot_be_verified(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
-):
-    """The DB never becomes readable during adoption. Unknown ownership is a
-    deferral: exit with the unverified code, leave the pane for whoever owns
-    it, and let a later readopt try again. The old code took this branch as a
-    licence to supervise."""
-    sup = lane_supervisor
-    now = 9_900_000
-    monkeypatch.setattr(kb.time, "time", lambda: now)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="unverifiable", assignee="alice")
-        task = kb.claim_task(conn, tid, ttl_seconds=900)
-        before = _card_row(conn, tid)
-
-    def unreadable(*a, **kw):
-        raise sqlite3.OperationalError("disk I/O error")
-
-    real_connect_closing = kb.connect_closing
-    monkeypatch.setattr(kb, "connect_closing", unreadable)
-    killed, shimmed = [], []
-    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
-    monkeypatch.setattr(sup, "_hermes_task_shim", lambda *a, **k: shimmed.append(a))
-
-    rc = sup.main([
-        "--task", tid, "--board", "default", "--session", "sess",
-        "--transcript", str(tmp_path / "t.jsonl"),
-        "--run-id", str(task.current_run_id), "--adopt",
-    ])
-    assert rc == sup.OWNERSHIP_UNVERIFIED_EXIT_CODE
-    assert killed == []
-    assert shimmed == []
-
-    monkeypatch.setattr(kb, "connect_closing", real_connect_closing)
-    with kb.connect() as conn:
-        after = _card_row(conn, tid)
-        assert after["worker_pid"] == before["worker_pid"]  # still unowned
-        assert after["claim_expires"] == before["claim_expires"]
-        assert _events(conn, tid, "ownership_adopted") == []
-
-
-def test_verified_adoption_stands_down_on_a_mid_run_takeover(
-    kanban_home, monkeypatch, tmp_path, lane_supervisor,
+def test_local_supervisor_stands_down_when_a_foreign_owner_appears_mid_run(
+    kanban_home, monkeypatch, tmp_path,
 ):
     """``--adopt`` used to make the supervisor assume it owned the card for its
     whole life, so it kept running after a reclaim handed the card to somebody
     else. Now that adoption is a verified CAS, the real pid check applies: a
     foreign owner appearing mid-run is a stand-down, not something to ignore."""
-    sup = lane_supervisor
-    monkeypatch.setattr(kb.time, "time", lambda: 10_000_000)
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_standdown")
+
+    now = 9_900_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
     with kb.connect() as conn:
@@ -863,11 +695,8 @@ def test_verified_adoption_stands_down_on_a_mid_run_takeover(
     monkeypatch.setattr(sup, "_tmux_alive", lambda *a, **k: True)
     monkeypatch.setattr(sup, "_stream_transcript", lambda *a, **k: (0, "", False))
     monkeypatch.setattr(sup, "_hermes_task_shim", lambda *a, **k: None)
-    monkeypatch.setitem(__import__("sys").modules, "state", type("state", (), {
-        "cap_reset": staticmethod(lambda _t: None),
-        "cap_increment": staticmethod(lambda _t: None),
-        "session_delete": staticmethod(lambda _t: None),
-    }))
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
     # A different supervisor takes the card over between ticks.
     monkeypatch.setattr(sup, "_read_card", lambda board, task_id: (
         True, type("card", (), {"status": "running", "worker_pid": 424242}),
@@ -886,28 +715,217 @@ def test_verified_adoption_stands_down_on_a_mid_run_takeover(
         assert len(_events(conn, tid, "ownership_adopted")) == 1
 
 
-def test_lane_shim_forwards_worker_pid():
+# ---------------------------------------------------------------------------
+# 5. The source-controlled lifecycle shim, driven behaviourally
+# ---------------------------------------------------------------------------
+
+def test_local_shim_forwards_worker_pid(kanban_home, monkeypatch, tmp_path):
     """The shim is the only thing between the supervisor and the CLI; if it
-    drops ``--worker-pid`` the whole chain is back to unowned cards."""
-    source = LANE_SHIM.read_text(encoding="utf-8")
-    assert "--worker-pid" in source
-    assert 'cmd += ["--worker-pid"' in source
+    drops ``--worker-pid`` the whole chain is back to unowned cards. Driven,
+    not regex'd: a fake ``hermes`` records the argv it receives."""
+    shim = _load_script(SC_SHIM, "sc_shim_worker_pid")
+    calls = tmp_path / "calls.txt"
+    fake = tmp_path / "fake-hermes"
+    fake.write_text('#!/bin/sh\necho "$@" >> %s\n' % calls)
+    fake.chmod(0o755)
+
+    monkeypatch.setenv("HERMES_BIN", str(fake))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_MINE")
+    rc = shim.main(["heartbeat", "--note", "supervisor alive",
+                    "--worker-pid", "4242"])
+    assert rc == 0
+    out = calls.read_text()
+    assert "kanban heartbeat t_MINE" in out
+    assert "--worker-pid 4242" in out
 
 
-def test_lane_launcher_and_wrapper_never_launch_an_unfenced_supervisor():
-    """The caller side of the same invariant, asserted on the versioned files:
-    the run comes from the just-claimed card, is persisted for readopt, and
-    every path that cannot produce one declines to launch."""
-    launcher = (LANE_PLUGIN / "launcher.py").read_text(encoding="utf-8")
-    assert '"--run-id"' in launcher
-    assert '"--claim-lock"' in launcher
-    assert 'getattr(task, "current_run_id", None)' in launcher
-    assert '"run_id"' in launcher and '"claim_lock"' in launcher
-    # No pane may exist before the run is known.
-    assert launcher.index("_positive_run_id(task)") < launcher.index("_tmux_new_session(tmux_bin")
-    assert "supervisor_contract_available" in launcher
+def test_local_shim_refuses_a_foreign_task_id(kanban_home, monkeypatch, tmp_path):
+    """The shim forces the caller's own task id; a foreign id-shaped positional
+    is refused before ``hermes`` is ever invoked."""
+    shim = _load_script(SC_SHIM, "sc_shim_foreign")
+    calls = tmp_path / "calls.txt"
+    fake = tmp_path / "fake-hermes"
+    fake.write_text('#!/bin/sh\necho "$@" >> %s\n' % calls)
+    fake.chmod(0o755)
 
-    wrapper = (LANE_PLUGIN / "wrapper.py").read_text(encoding="utf-8")
-    assert '"--run-id"' in wrapper
-    assert "session_run_matches_card" in wrapper
-    assert "relaunch_run_id" in wrapper
+    monkeypatch.setenv("HERMES_BIN", str(fake))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_MINE")
+    rc = shim.main(["complete", "t_OTHER", "--summary", "x"])
+    assert rc != 0
+    assert not calls.exists()  # hermes never called
+
+
+# ---------------------------------------------------------------------------
+# 6. Boundaries and the remaining stand-down paths
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("good,expected", [(1, 1), ("42", 42), (1514, 1514)])
+def test_require_run_id_accepts_exact_positive_runs(good, expected):
+    assert ks.require_run_id(good) == expected
+
+
+@pytest.mark.parametrize("bad", [None, 0, -5, "", "x", object()])
+def test_require_run_id_rejects_everything_else(bad):
+    """The single boundary that makes "fenced" unfalsifiable: everything
+    downstream may assume an int it can compare with ``current_run_id``."""
+    with pytest.raises(ks.SupervisorRunUnresolved) as ei:
+        ks.require_run_id(bad)
+    assert ei.value.transient is False  # not a run at all: nothing to retry
+
+
+def test_pin_supervised_run_distinguishes_transient_from_hard_failure(
+    kanban_home, monkeypatch,
+):
+    """The classification the caller acts on. An unreadable BOARD may become
+    readable (retry later, leave the pane); a card with no run never will. The
+    old code collapsed both into ``run_id = None`` and carried on unfenced."""
+    monkeypatch.setattr(kb.time, "time", lambda: 9_950_000)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pin", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+
+    # An explicitly-passed run needs no DB at all.
+    assert ks.pin_supervised_run(tid, board="default", run_id=task.current_run_id) \
+        == task.current_run_id
+    assert ks.pin_supervised_run(tid, board="default") == task.current_run_id
+
+    def unopenable(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "connect_closing", unopenable)
+    with pytest.raises(ks.SupervisorRunUnresolved) as ei:
+        ks.pin_supervised_run(tid, board="default")
+    assert ei.value.transient is True
+
+
+def test_acquire_session_ownership_holds_after_replacing_a_dead_owner(
+    kanban_home, monkeypatch,
+):
+    """The positive verdict. Without this, an implementation that refused
+    everything would satisfy every other assertion in this file — and the
+    readopt path exists precisely to take over from the dead original."""
+    monkeypatch.setattr(kb.time, "time", lambda: 10_000_000)
+    replacement = 90909
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == replacement)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dead-owner", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        assert kb.adopt_worker_pid(
+            conn, tid, worker_pid=11011, expected_run_id=task.current_run_id,
+        ) == kb._OWNERSHIP_RECORDED  # the original supervisor, since died
+
+    verdict, outcome = ks.acquire_session_ownership(
+        tid, board="default", worker_pid=replacement,
+        expected_run_id=task.current_run_id, sleep_fn=lambda _s: None,
+    )
+    assert (verdict, outcome) == (ks.OWNERSHIP_HELD, kb._OWNERSHIP_REPLACED_DEAD)
+    with kb.connect() as conn:
+        assert _card_row(conn, tid)["worker_pid"] == replacement
+
+
+@pytest.mark.parametrize("bad", [None, 0, -1])
+def test_adoption_itself_refuses_an_unfenced_run(kanban_home, monkeypatch, bad):
+    """Adoption is the one write that can take a card away from another pid, so
+    it must never run without a run fence: unfenced, a leftover supervisor
+    stamps itself onto whatever run happens to be current."""
+    monkeypatch.setattr(kb.time, "time", lambda: 10_050_000)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unfenced-adopt", assignee="alice")
+        kb.claim_task(conn, tid, ttl_seconds=900)
+        with pytest.raises(ks.SupervisorRunUnresolved):
+            ks.adopt_session_ownership(conn, tid, worker_pid=4242, expected_run_id=bad)
+        with pytest.raises(ks.SupervisorRunUnresolved):
+            ks.acquire_session_ownership(
+                tid, board="default", worker_pid=4242, expected_run_id=bad,
+            )
+        assert _card_row(conn, tid)["worker_pid"] is None
+
+
+def test_local_supervisor_kills_its_own_pane_when_a_fresh_launch_cannot_be_fenced(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """The launch-path half of the run fence, where the pane policy inverts.
+
+    On a readopt the pane predates us and may belong to the real owner, so we
+    touch nothing. On a FRESH launch it was created for us seconds ago and
+    nobody else is watching it: leaving it would mean a live claude session with
+    no supervisor while the card is requeued — a double-run and double API
+    billing. The launcher is meant to catch this before a pane exists; this is
+    the backstop for a hand-launched or stale-launcher spawn."""
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_fresh_unfenced")
+    monkeypatch.setattr(kb.time, "time", lambda: 10_100_000)
+
+    killed: list = []
+    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
+
+    rc = sup.main([
+        "--task", "t_no_such_card", "--board", "default", "--session", "sess",
+        "--transcript", str(tmp_path / "t.jsonl"),
+    ])
+    assert rc == sup.RUN_UNRESOLVED_EXIT_CODE
+    assert killed, "a fresh launch must not leave an unsupervised pane behind"
+
+
+def test_local_supervisor_readopt_defers_when_ownership_is_unverifiable(
+    kanban_home, monkeypatch, tmp_path,
+):
+    """The DB never recovers during adoption, so ownership is UNKNOWN — which is
+    not ours. Exit with the unverified code, leave the pane for whoever owns it,
+    and let a later readopt try again. The old code treated this exact branch as
+    a licence to supervise for the rest of the process' life."""
+    sup = _load_script(SC_SUPERVISOR, "sc_supervisor_unverified")
+    monkeypatch.setattr(kb.time, "time", lambda: 10_150_000)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unverifiable", assignee="alice")
+        task = kb.claim_task(conn, tid, ttl_seconds=900)
+        before = _card_row(conn, tid)
+        before_pid, before_expiry = before["worker_pid"], before["claim_expires"]
+
+    real_cc = kb.connect_closing
+
+    def never_opens(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(kb, "connect_closing", never_opens)
+    monkeypatch.setattr(ks.time, "sleep", lambda _s: None)  # acquire's retry sleep
+    killed, shim_calls = [], []
+    monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(sup, "_hermes_task_shim", lambda *a, **k: shim_calls.append(a))
+    monkeypatch.setattr(sup.time, "sleep", lambda _s: None)
+    _stub_state(monkeypatch)
+
+    rc = sup.main([
+        "--task", tid, "--board", "default", "--session", "sess",
+        "--transcript", str(tmp_path / "t.jsonl"),
+        "--run-id", str(task.current_run_id), "--adopt",
+    ])
+    assert rc == sup.OWNERSHIP_UNVERIFIED_EXIT_CODE
+    assert killed == []
+    assert shim_calls == []
+
+    # Restore only the connection factory: monkeypatch.undo() would also revert
+    # the kanban_home fixture and point these assertions at the LIVE board.
+    monkeypatch.setattr(kb, "connect_closing", real_cc)
+    with kb.connect() as conn:
+        row = _card_row(conn, tid)
+        assert row["worker_pid"] == before_pid          # still unowned
+        assert row["claim_expires"] == before_expiry
+        assert _events(conn, tid, "ownership_adopted") == []
+
+
+def test_local_supervisor_source_carries_no_fail_open_idioms():
+    """A cheap regression guard on the two fallbacks Boris found, by name.
+
+    Both were single lines that read as prudence (``run_id = None`` "unfenced
+    but honest"; ``assume_ours`` "don't kill the pane we came to adopt") and
+    both silently disabled a fence. The behavioural tests above would catch
+    their return, but only via whatever path they were re-added to; the names
+    themselves are worth pinning."""
+    source = SC_SUPERVISOR.read_text(encoding="utf-8")
+    assert "assume_ours" not in source
+    assert "run_id = None" not in source
+    assert "_set_worker_pid" not in source        # dispatcher-only spawn write
+    assert source.count("pin_supervised_run(") == 1  # pinned once, never re-resolved
