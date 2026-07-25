@@ -16,7 +16,9 @@ This script makes that skew impossible to reach by accident:
 * ``--install`` refuses to run until the TARGET RUNTIME actually exposes the
   core contract, which encodes the ordering: **core first, artifacts second**;
 * install and rollback are ONE TRANSACTION over the whole manifest, never a
-  per-file best effort (see below).
+  per-file best effort (see below);
+* every mutation of one target home is SERIALIZED against every other one, so
+  two installs — or an install and a rollback — cannot interleave (see below).
 
 Ordering matters in one direction only, and it is worth being explicit about
 why. The supervisor script is re-read from disk on every lane spawn; the
@@ -52,13 +54,57 @@ backup, and delete every member the transaction created. Never a mix.
 
 * every target write is atomic (temp file in the destination dir, fsync,
   ``os.replace``), so a concurrent lane spawn reads either the old file or the
-  new one, never a truncated script;
+  new one, never a truncated script. There is no in-place fallback: if
+  ``os.replace`` is unavailable on a deployment, the install FAILS CLOSED and
+  the transaction restores the previous generation, because copying over a live
+  artifact is exactly the partial-supervisor exposure this promises to prevent;
 * all sources and destinations are preflighted before the first mutation;
 * a mid-install failure immediately restores that exact pre-install set. If the
   automatic restore cannot finish, the manifest is left open so ``--rollback``
   deterministically completes it;
 * ``--rollback`` returns nonzero — and does NOT say the core may be rolled back
   — if any manifest member cannot be restored or removed.
+
+Concurrency
+-----------
+
+A transaction journal only helps if there is exactly one writer. Two installs
+that started in the same second used to pick the same id by unsynchronized
+directory scan, then share one manifest and one set of ``.pre-<id>`` backups:
+each overwrote the other's record, and the surviving manifest described a
+generation that was never on disk, so rolling it back produced a mix. An
+install racing a ``--rollback`` was worse — one wrote targets forward while the
+other restored them in reverse.
+
+So every mutation of one home runs under an exclusive ``flock(2)`` on
+``~/.hermes/.claude-lane-install/lock``, held for the WHOLE operation rather
+than for id allocation alone. Two properties make that safe:
+
+* **crash behaviour is free.** The kernel drops the lock when the holder's file
+  descriptor closes, including when the holder is killed, panics or is
+  ``SIGKILL``ed. There is no lease to renew and no stale lock to reap, so there
+  is no timeout heuristic that could break an exclusion guarantee. Recovery
+  from a crashed *install* is the transaction journal's job, not the lock's:
+  the next ``--rollback`` finishes the interrupted transaction. The lock file
+  is never unlinked (that would race a waiter that already opened it) and its
+  contents — holder pid, operation, start time — are diagnostics for humans and
+  ``lsof``, never a gate;
+* **a waiter waits, then gives up loudly.** ``--install``/``--rollback`` block
+  up to ``--lock-timeout`` seconds (default 120) and then return nonzero
+  without touching anything, naming the holder. A host with no ``flock(2)`` is
+  refused rather than run unserialized.
+
+Transaction ids are additionally reserved with ``O_CREAT|O_EXCL``, so the
+sequence is claimed by the filesystem and not by a scan two callers can both
+win — the uniqueness of manifests and backup generations does not depend on the
+lock being present. That layering is deliberate: ``flock`` is only as strong as
+the filesystem underneath ``$HOME`` (a network mount can weaken it), and the
+``O_EXCL`` reservation keeps the destructive half of the old bug — two runs
+sharing one manifest and one backup generation — unreachable even there.
+
+``--check`` is deliberately lock-free: it must never block on an install, and
+it is read-only. It can therefore observe an in-flight generation, which it
+reports as PARTIAL INSTALL — correctly, since that is what is on disk.
 
 Usage::
 
@@ -68,12 +114,13 @@ Usage::
     python install.py --check --home /tmp/fake-home   # tests
 
 Exit codes: 0 success / fully installed, 1 drift or partial install (or a
-refused install, or an incomplete rollback), 3 staged but not installed (the
-coherent pre-deploy state).
+refused install, or an incomplete rollback, or a lock this process could not
+take), 3 staged but not installed (the coherent pre-deploy state).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import filecmp
 import hashlib
@@ -85,6 +132,11 @@ import subprocess
 import sys
 import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the host artifacts are POSIX-only
+    fcntl = None  # type: ignore[assignment]
 
 # (versioned path relative to this file, host path relative to $HOME, mode).
 # Install order is the list order: the supervisor script and the shim BEFORE the
@@ -134,10 +186,32 @@ TXN_OPEN = "pending"          # manifest written, targets may be half-written
 TXN_COMMITTED = "committed"   # all targets installed
 TXN_ROLLED_BACK = "rolled-back"
 _TXN_NAME_RE = re.compile(r"^txn-(\d{4,})-(.+)\.json$")
+# How many sequence numbers to try before giving up on reserving an id. Only a
+# genuinely broken journal directory can exhaust this.
+_TXN_ALLOC_ATTEMPTS = 1024
+
+# Per-home mutual exclusion for install/rollback. Lives beside the journal it
+# protects, is created once and never unlinked.
+LOCK_NAME = "lock"
+LOCK_TIMEOUT_SECONDS = 120.0
+LOCK_POLL_SECONDS = 0.05
 
 
 class TransactionError(Exception):
     """The transaction journal is unusable — never guess a backup set instead."""
+
+
+class LockUnavailable(Exception):
+    """This home's install/rollback lock could not be taken, so nothing ran."""
+
+
+class AtomicReplaceUnavailable(OSError):
+    """``os.replace`` failed and there is no in-place substitute for it.
+
+    Subclasses ``OSError`` on purpose: the restore path already treats an
+    ``OSError`` per member as "this member could not be put back", which is
+    exactly the right handling for a deployment where rename does not work.
+    """
 
 
 def versioned_root() -> str:
@@ -253,6 +327,9 @@ def _atomic_write_bytes(target: str, data: bytes, mode: int) -> None:
     is deliberately stdlib-only — it has to run when the core contract, and so
     the checkout's ``utils``, is unimportable — so the semantics are replicated
     here rather than shared.
+
+    Raises ``AtomicReplaceUnavailable`` if the rename cannot be done. There is
+    deliberately no fallback: see the exception's construction below.
     """
     real = os.path.realpath(target) if os.path.islink(target) else target
     directory = os.path.dirname(real) or "."
@@ -267,12 +344,20 @@ def _atomic_write_bytes(target: str, data: bytes, mode: int) -> None:
         try:
             os.replace(tmp, real)
         except OSError as exc:
-            # Cross-device, bind-mount and busy-file deployments cannot rename.
-            if exc.errno not in (errno.EXDEV, errno.EBUSY):
-                raise
-            shutil.copyfile(tmp, real)
-            os.chmod(real, mode)
-            os.unlink(tmp)
+            # Cross-device, bind-mount and busy-file deployments (EXDEV, EBUSY)
+            # cannot rename. Copying the temp file onto `real` would open the
+            # LIVE artifact for a truncating write, so a lane spawn reading the
+            # supervisor mid-copy gets a partial script — the precise failure
+            # this function exists to make impossible. No in-place write is a
+            # substitute for a rename, so fail closed and let the caller's
+            # transaction restore the previous coherent generation.
+            raise AtomicReplaceUnavailable(
+                exc.errno,
+                f"cannot be replaced atomically ({exc.strerror or exc}); refusing "
+                f"to copy over the live artifact, which would expose a partially "
+                f"written file to a concurrent lane spawn",
+                real,
+            ) from exc
     except BaseException:
         try:
             os.unlink(tmp)
@@ -283,24 +368,144 @@ def _atomic_write_bytes(target: str, data: bytes, mode: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# transaction journal
+# per-home mutual exclusion
 # --------------------------------------------------------------------------- #
 
 def _txn_dir(home: str) -> str:
     return os.path.join(home, TXN_DIR_REL)
 
 
+def _lock_path(home: str) -> str:
+    return os.path.join(_txn_dir(home), LOCK_NAME)
+
+
+def _lock_holder(path: str) -> str:
+    """Best-effort description of the current holder, for the wait notice only.
+
+    Read without the lock, so it can be stale or empty; it never decides
+    anything. The kernel is what grants and releases the lock.
+    """
+    try:
+        with open(path, "rb") as fh:
+            record = json.loads(fh.read().decode() or "{}")
+    except (OSError, ValueError):
+        return "another process"
+    if not isinstance(record, dict) or not record.get("pid"):
+        return "another process"
+    return (f"pid {record['pid']} running --{record.get('operation') or '?'} "
+            f"since {record.get('acquired') or '?'}")
+
+
+def _record_lock_holder(fd: int, home: str, operation: str) -> None:
+    """Stamp who holds the lock. Diagnostics for humans; never read as a gate.
+
+    Deliberately not a lease: a record left behind by a killed holder cannot
+    block anyone, because the kernel already released the lock when that
+    process's descriptor closed.
+    """
+    record = json.dumps({"pid": os.getpid(), "operation": operation, "home": home,
+                         "acquired": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                        sort_keys=True).encode()
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, record + b"\n")
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def home_lock(home: str, operation: str, *, timeout: float | None = None,
+              quiet: bool = False):
+    """Hold this home's exclusive install/rollback lock for a whole operation.
+
+    Serializing id allocation alone is not enough: the mutations themselves must
+    be mutually exclusive, or an install still interleaves its writes with a
+    concurrent install's writes or with a ``--rollback``'s restores.
+
+    ``flock(2)`` is used rather than a pid file or a lease because its release
+    is the kernel's job — a holder that crashes, is killed or is ``SIGKILL``ed
+    releases it immediately, so there is no stale-lock state to reap and no
+    expiry heuristic that could hand the lock to a second writer while the
+    first is still running. Recovering the *data* after such a crash is the
+    transaction journal's separate job.
+
+    The lock is per open file description, so it serializes threads in one
+    process as well as separate processes.
+
+    Raises ``LockUnavailable`` — and mutates nothing — if the lock cannot be
+    taken within ``timeout`` seconds, or if this platform has no ``flock``.
+    """
+    if fcntl is None:  # pragma: no cover - the host artifacts are POSIX-only
+        raise LockUnavailable(
+            "this platform provides no flock(2), so install and rollback cannot be "
+            "made mutually exclusive; refusing to mutate the host artifacts rather "
+            "than racing another run")
+    path = _lock_path(home)
+    try:
+        os.makedirs(_txn_dir(home), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    except OSError as exc:
+        raise LockUnavailable(f"cannot open the lock file {path} "
+                              f"({exc.strerror or exc})") from exc
+    deadline = time.monotonic() + (LOCK_TIMEOUT_SECONDS if timeout is None else timeout)
+    try:
+        announced = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise LockUnavailable(f"cannot lock {path} "
+                                          f"({exc.strerror or exc})") from exc
+                if time.monotonic() >= deadline:
+                    raise LockUnavailable(
+                        f"{path} is held by {_lock_holder(path)}; refusing to run "
+                        f"--{operation} concurrently with another install or "
+                        f"rollback of {home}") from exc
+                if not announced and not quiet:
+                    print(f"  waiting for the install lock on {home} "
+                          f"(held by {_lock_holder(path)})")
+                    announced = True
+                time.sleep(LOCK_POLL_SECONDS)
+        _record_lock_holder(fd, home, operation)
+        yield path
+    finally:
+        # Closing the descriptor is what releases the lock; the file itself is
+        # never unlinked, since a waiter may already have it open.
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------- #
+# transaction journal
+# --------------------------------------------------------------------------- #
+
 def _backup_path(target: str, txn_id: str) -> str:
     return f"{target}.pre-{txn_id}"
 
 
 def _allocate_txn(home: str, stamp: str) -> tuple[str, str]:
-    """Reserve the next transaction id. Returns ``(txn_id, manifest_path)``.
+    """Atomically RESERVE the next transaction id. Returns ``(txn_id, path)``.
 
     The id carries a monotonic sequence, not just the caller's stamp: two
     installs sharing a stamp must not share a manifest OR a backup filename, or
     the second would overwrite the first's record of the older generation —
     reintroducing exactly the generation-mixing this guards against.
+
+    The sequence is claimed by creating the manifest file ``O_CREAT|O_EXCL``,
+    not by trusting the directory scan that suggested it: a scan is a read, and
+    two callers can both win a read. Doing the reservation in the filesystem
+    keeps ids unique even for a caller that somehow runs without the home lock
+    (an older copy of this installer, a home on a filesystem where the lock
+    could not be opened), so manifest and backup uniqueness never rests on the
+    lock alone.
+
+    The reservation stays ZERO BYTES until the manifest is written, and that is
+    load-bearing: ``install`` mutates no target before the manifest is complete,
+    so an empty reservation proves nothing was touched. ``--rollback`` skips
+    such a file instead of treating the journal as corrupt.
     """
     directory = _txn_dir(home)
     os.makedirs(directory, exist_ok=True)
@@ -309,8 +514,38 @@ def _allocate_txn(home: str, stamp: str) -> tuple[str, str]:
         match = _TXN_NAME_RE.match(name)
         if match:
             seq = max(seq, int(match.group(1)))
-    txn_id = f"{seq + 1:04d}-{stamp}"
-    return txn_id, os.path.join(directory, f"txn-{txn_id}.json")
+    for candidate in range(seq + 1, seq + 1 + _TXN_ALLOC_ATTEMPTS):
+        txn_id = f"{candidate:04d}-{stamp}"
+        path = os.path.join(directory, f"txn-{txn_id}.json")
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+        except FileExistsError:
+            continue
+        _fsync_dir(directory)
+        return txn_id, path
+    raise TransactionError(
+        f"could not reserve a transaction id in {directory}: "
+        f"{_TXN_ALLOC_ATTEMPTS} consecutive ids from {seq + 1:04d} are taken")
+
+
+def _abandon_reservation(manifest_path: str, txn_id: str, plan) -> None:
+    """Drop a reserved transaction that never started mutating anything.
+
+    Only ever called before the manifest is complete, which is also the only
+    window in which ``install`` has not yet written a single target — so this
+    removes backups no one can need, and never another generation's record: the
+    files it unlinks are this transaction's own ``.pre-<txn_id>`` copies.
+    """
+    for target, _mode, _data, existed in plan:
+        if existed:
+            try:
+                os.unlink(_backup_path(target, txn_id))
+            except OSError:
+                pass
+    try:
+        os.unlink(manifest_path)
+    except OSError:
+        pass
 
 
 def _write_manifest(path: str, manifest: dict) -> None:
@@ -351,6 +586,12 @@ def _latest_open_transaction(home: str) -> dict | None:
     A corrupt or unreadable newest manifest raises rather than silently falling
     through to an older one: that fallback would roll the host back to the wrong
     generation while reporting success.
+
+    A ZERO-BYTE manifest is the one exception, and it is not a guess: it is an
+    id reserved by ``_allocate_txn`` for a run that died before recording
+    anything, and ``install`` writes no target until the manifest is complete.
+    Such a transaction provably mutated nothing, so it is skipped rather than
+    blocking the rollback of the generation actually on disk.
     """
     directory = _txn_dir(home)
     try:
@@ -363,10 +604,37 @@ def _latest_open_transaction(home: str) -> dict | None:
         if match:
             candidates.append((int(match.group(1)), name))
     for _seq, name in sorted(candidates, reverse=True):
-        manifest = _load_manifest(os.path.join(directory, name))
+        path = os.path.join(directory, name)
+        try:
+            reserved_only = os.path.getsize(path) == 0
+        except OSError:
+            reserved_only = False
+        if reserved_only:
+            continue
+        manifest = _load_manifest(path)
         if manifest.get("state") != TXN_ROLLED_BACK:
             return manifest
     return None
+
+
+def _already_restored(target: str, data: bytes, mode: int) -> bool:
+    """Is ``target`` byte-for-byte (and mode-for-mode) its pre-install content?
+
+    A member the install never reached needs no rewrite, and rewriting it is not
+    free: on a deployment where ``os.replace`` does not work, the pointless
+    rewrite fails and the restore would report a MIXED host over a target that
+    was never mutated.
+
+    Follows symlinks, exactly as ``_atomic_write_bytes`` does, so the comparison
+    describes the bytes a restore would actually change.
+    """
+    try:
+        with open(target, "rb") as fh:
+            if fh.read() != data:
+                return False
+        return (os.stat(target).st_mode & 0o7777) == mode
+    except OSError:
+        return False
 
 
 def _restore_transaction(manifest: dict, *, quiet: bool = False) -> list[str]:
@@ -394,12 +662,21 @@ def _restore_transaction(manifest: dict, *, quiet: bool = False) -> list[str]:
                 failures.append(f"{target}: backup {backup} is corrupt "
                                 f"(sha256 does not match the manifest)")
                 continue
+            restore_mode = int(member.get("restore_mode") or member["mode"])
             try:
                 with open(backup, "rb") as fh:
                     data = fh.read()
+            except OSError as exc:
+                failures.append(f"{target}: backup {backup} is unreadable "
+                                f"({exc.strerror or exc})")
+                continue
+            if _already_restored(target, data, restore_mode):
+                if not quiet:
+                    print(f"  unchanged       {target} (already its pre-install bytes)")
+                continue
+            try:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                _atomic_write_bytes(target, data, int(member.get("restore_mode")
-                                                      or member["mode"]))
+                _atomic_write_bytes(target, data, restore_mode)
             except OSError as exc:
                 failures.append(f"{target}: restore failed ({exc.strerror or exc})")
                 continue
@@ -460,7 +737,15 @@ def _plan_destination(target: str) -> tuple[list[str], str | None]:
 # --------------------------------------------------------------------------- #
 
 def install(home: str, python: str | None = None, *, force: bool = False,
-            stamp: str | None = None) -> int:
+            stamp: str | None = None, lock_timeout: float | None = None) -> int:
+    """Install the versioned artifacts as one transaction, holding this home's
+    exclusive lock for the whole thing.
+
+    The runtime contract probe runs BEFORE the lock on purpose: it spawns a
+    subprocess with its own timeout and answers a question about the target
+    interpreter, not about this home's files, so holding the lock across it
+    would only make a concurrent ``--rollback`` wait on an unrelated probe.
+    """
     ok, detail = runtime_contract_status(python)
     if not ok and not force:
         print(f"refusing to install: the target runtime has no core supervisor "
@@ -470,7 +755,15 @@ def install(home: str, python: str | None = None, *, force: bool = False,
               f"staging artifacts that will stand down until the core lands.",
               file=sys.stderr)
         return 1
+    try:
+        with home_lock(home, "install", timeout=lock_timeout):
+            return _install_locked(home, stamp)
+    except LockUnavailable as exc:
+        print(f"refusing to install: {exc}; nothing was changed", file=sys.stderr)
+        return 1
 
+
+def _install_locked(home: str, stamp: str | None) -> int:
     # ---- preflight: read every source and vet every destination BEFORE any
     # mutation, so the common failures never produce a half-installed host.
     plan: list[tuple[str, int, bytes, bool]] = []
@@ -498,9 +791,10 @@ def install(home: str, python: str | None = None, *, force: bool = False,
     stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
     try:
         txn_id, manifest_path = _allocate_txn(home, stamp)
-    except OSError as exc:
-        print(f"refusing to install: cannot write the transaction journal in "
-              f"{_txn_dir(home)} ({exc.strerror or exc})", file=sys.stderr)
+    except (OSError, TransactionError) as exc:
+        print(f"refusing to install: cannot reserve a transaction in "
+              f"{_txn_dir(home)} ({getattr(exc, 'strerror', None) or exc})",
+              file=sys.stderr)
         return 1
 
     # ---- back up every pre-existing target up front. Backups are additive, so
@@ -519,6 +813,7 @@ def install(home: str, python: str | None = None, *, force: bool = False,
             except OSError as exc:
                 print(f"refusing to install: cannot back up {target} "
                       f"({exc.strerror or exc}); nothing was changed", file=sys.stderr)
+                _abandon_reservation(manifest_path, txn_id, plan)
                 return 1
             print(f"  backed up {target} -> {backup}")
         members.append(member)
@@ -530,6 +825,7 @@ def install(home: str, python: str | None = None, *, force: bool = False,
     except OSError as exc:
         print(f"refusing to install: cannot record transaction {txn_id} "
               f"({exc.strerror or exc}); nothing was changed", file=sys.stderr)
+        _abandon_reservation(manifest_path, txn_id, plan)
         return 1
 
     # ---- mutate. Past this point every failure path restores the exact set the
@@ -561,7 +857,15 @@ def install(home: str, python: str | None = None, *, force: bool = False,
               f"the host is unchanged", file=sys.stderr)
         return 1
 
-    _write_manifest(manifest_path, {**manifest, "state": TXN_COMMITTED})
+    try:
+        _write_manifest(manifest_path, {**manifest, "state": TXN_COMMITTED})
+    except OSError as exc:
+        print(f"installed every artifact, but could not mark transaction {txn_id} "
+              f"committed ({exc.strerror or exc}). The artifacts ARE in place and the "
+              f"transaction is still open, so `--rollback` still undoes exactly this "
+              f"generation; re-run --install once {_txn_dir(home)} is writable.",
+              file=sys.stderr)
+        return 1
     created = sum(1 for m in members if not m["existed"])
     print(f"installed {len(members)} artifact(s) as transaction {txn_id} "
           f"({created} created, {len(members) - created} overwritten)")
@@ -569,7 +873,7 @@ def install(home: str, python: str | None = None, *, force: bool = False,
     return 0
 
 
-def rollback(home: str) -> int:
+def rollback(home: str, *, lock_timeout: float | None = None) -> int:
     """Undo ONE install transaction in full: restore what it overwrote, remove
     what it created.
 
@@ -580,7 +884,20 @@ def rollback(home: str) -> int:
 
     Repeated calls walk back one generation at a time: each rolled-back
     transaction is marked, so the next call takes the one before it.
+
+    Runs under the same per-home lock as ``--install``: choosing a transaction
+    while an install is still writing would restore members the install has yet
+    to reach and then let it overwrite them again, in the opposite order.
     """
+    try:
+        with home_lock(home, "rollback", timeout=lock_timeout):
+            return _rollback_locked(home)
+    except LockUnavailable as exc:
+        print(f"cannot roll back: {exc}; nothing was changed", file=sys.stderr)
+        return 1
+
+
+def _rollback_locked(home: str) -> int:
     try:
         manifest = _latest_open_transaction(home)
     except TransactionError as exc:
@@ -638,11 +955,16 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true",
                     help="install even when the target runtime lacks the core contract")
     ap.add_argument("--stamp", default=None, help="backup suffix (default: local timestamp)")
+    ap.add_argument("--lock-timeout", type=float, default=LOCK_TIMEOUT_SECONDS,
+                    help="seconds to wait for another install/rollback of this home "
+                         "to finish before giving up without changing anything "
+                         f"(default: {LOCK_TIMEOUT_SECONDS:g})")
     a = ap.parse_args(argv)
     if a.install:
-        return install(a.home, a.python, force=a.force, stamp=a.stamp)
+        return install(a.home, a.python, force=a.force, stamp=a.stamp,
+                       lock_timeout=a.lock_timeout)
     if a.rollback:
-        return rollback(a.home)
+        return rollback(a.home, lock_timeout=a.lock_timeout)
     return check(a.home, a.python)
 
 

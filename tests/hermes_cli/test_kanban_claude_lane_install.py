@@ -8,11 +8,19 @@ install / rollback logic against a temp home, with the runtime contract probe
 stubbed so we exercise the ORDERING guarantees rather than this interpreter's
 core.
 """
+import errno
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -73,6 +81,54 @@ def _expected_generation(tag, count):
 
 def _manifest_paths(inst, home):
     return sorted(Path(inst._txn_dir(str(home))).glob("txn-*.json"))
+
+
+def _stage_generation(inst, root, tag):
+    """A private copy of the versioned tree whose bytes identify its generation.
+
+    The concurrency tests need two installs that write DIFFERENT content, so
+    "which generation is on disk" is answerable; the real versioned tree is one
+    shared checkout, so each racer gets its own staged root instead.
+    """
+    for index, (rel_src, _dst, _mode) in enumerate(inst.MANIFEST):
+        source = Path(root) / rel_src
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"{tag}-{index}\n")
+    return root
+
+
+def _independent_installer(monkeypatch, tag, root):
+    """A separately loaded installer module that installs generation ``tag``.
+
+    Separately loaded on purpose: two racers must share no module state, so the
+    only thing that can serialize them is the OS-level lock on the target home —
+    which is the property under test.
+    """
+    inst = _load_installer()
+    monkeypatch.setattr(inst, "runtime_contract_status",
+                        lambda python=None: (True, "stub: present"))
+    _stage_generation(inst, root, tag)
+    monkeypatch.setattr(inst, "versioned_root", lambda: str(root))
+    return inst
+
+
+def _forbid_copying_onto(monkeypatch, live):
+    """Fail the test if anything copies onto one of ``live``'s paths.
+
+    Scoped to the live artifacts on purpose: ``shutil.copy2`` legitimately uses
+    ``copyfile`` to create a fresh ``.pre-*`` backup, which nobody is reading.
+    What must never happen is a copy whose DESTINATION is an artifact a lane
+    spawn may open — that is an in-place truncating write to a live file.
+    """
+    forbidden = {str(path) for path in live}
+    real = shutil.copyfile
+
+    def guarded(src, dst, *args, **kwargs):
+        assert str(dst) not in forbidden, \
+            f"copied in place over the live artifact {dst}"
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copyfile", guarded)
 
 
 def _fail_on_target(inst, monkeypatch, victim, exc):
@@ -532,6 +588,368 @@ def test_install_refuses_a_dangling_symlinked_target(contract_present, tmp_path,
     assert "not a regular file" in capsys.readouterr().err
     assert _installed_count(inst, tmp_path) == 0
     assert _manifest_paths(inst, tmp_path) == []
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency.
+#
+# A transaction journal only helps if there is exactly one writer. Two installs
+# that started in the same second used to pick their id by unsynchronized
+# directory scan, both land on `0001-<stamp>`, and then share one manifest and
+# one set of `.pre-0001-<stamp>` backups: each overwrote the other's record, so
+# the surviving manifest described a generation that was never on disk and
+# rolling it back produced a mix. An install racing a `--rollback` was worse:
+# one wrote targets forward while the other restored them in reverse.
+#
+# These tests drive real threads against real files. The two racers are loaded
+# as separate module objects so they share no in-process state — the only thing
+# that can serialize them is the lock on the target home.
+# --------------------------------------------------------------------------- #
+
+def test_concurrent_installs_never_share_a_transaction(tmp_path, monkeypatch):
+    """Two installs racing on one home with the SAME stamp must serialize into
+    two transactions, so the host lands on exactly one of the two generations
+    and `--rollback` walks back one generation per call."""
+    first = _independent_installer(monkeypatch, "GEN-A", tmp_path / "stage-a")
+    second = _independent_installer(monkeypatch, "GEN-B", tmp_path / "stage-b")
+    home = tmp_path / "home"
+    targets = _targets(first, home)
+    _seed_generation(targets, "LEGACY")
+
+    # Hold the first install inside the exact window the collision needed: after
+    # it reserved an id, before it recorded the manifest that would otherwise
+    # have told the second that id was taken.
+    reserving = threading.Event()
+    second_reserved = threading.Event()
+    real_backup_path = first._backup_path
+
+    def hold_first(target, txn_id):
+        if not reserving.is_set():
+            reserving.set()
+            # A one-way wait with a deadline, never a barrier: once install and
+            # rollback are mutually exclusive the second racer is parked on the
+            # lock and can never reach its reservation, so the first must not
+            # depend on it getting there.
+            second_reserved.wait(timeout=1.0)
+        return real_backup_path(target, txn_id)
+
+    monkeypatch.setattr(first, "_backup_path", hold_first)
+    real_allocate = second._allocate_txn
+
+    def announce_second(home_arg, stamp):
+        reserved = real_allocate(home_arg, stamp)
+        second_reserved.set()
+        return reserved
+
+    monkeypatch.setattr(second, "_allocate_txn", announce_second)
+
+    def run_second():
+        assert reserving.wait(timeout=30)
+        return second.install(str(home), stamp="same")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ran_first = pool.submit(first.install, str(home), stamp="same")
+        ran_second = pool.submit(run_second)
+        assert ran_first.result(timeout=60) == 0
+        assert ran_second.result(timeout=60) == 0
+
+    manifests = _manifest_paths(first, home)
+    assert len(manifests) == 2, "the two installs shared one transaction manifest"
+    assert {json.loads(p.read_text())["id"] for p in manifests} == {"0001-same", "0002-same"}
+    # Distinct backup generations, so neither transaction's record of the older
+    # generation was clobbered by the other.
+    assert sorted(p.name for p in targets[0].parent.glob(targets[0].name + ".pre-*")) == [
+        f"{targets[0].name}.pre-0001-same", f"{targets[0].name}.pre-0002-same",
+    ]
+
+    gen_a = _expected_generation("GEN-A", len(targets))
+    gen_b = _expected_generation("GEN-B", len(targets))
+    installed = _generation(targets)
+    assert installed in (gen_a, gen_b), "the installs interleaved into a mixed generation"
+    overwritten = gen_a if installed == gen_b else gen_b
+    assert first.rollback(str(home)) == 0
+    assert _generation(targets) == overwritten
+    assert first.rollback(str(home)) == 0
+    assert _generation(targets) == _expected_generation("LEGACY", len(targets))
+
+
+def test_a_rollback_cannot_interleave_with_a_running_install(tmp_path, monkeypatch):
+    """The other half of the exclusion. `--rollback` picks a transaction and
+    restores its members in REVERSE manifest order; an install writes them
+    forward. Unserialized the two passes cross, and the rollback reports having
+    undone a generation the install then finishes putting back."""
+    installer = _independent_installer(monkeypatch, "GEN-B", tmp_path / "stage-b")
+    roller = _independent_installer(monkeypatch, "GEN-A", tmp_path / "stage-a")
+    home = tmp_path / "home"
+    targets = _targets(installer, home)
+    _seed_generation(targets, "LEGACY")
+    # Transaction 1 puts the host on generation A; its backups hold LEGACY.
+    assert roller.install(str(home), stamp="s1") == 0
+    assert _generation(targets) == _expected_generation("GEN-A", len(targets))
+
+    installing = threading.Event()
+    target_paths = {str(t) for t in targets}
+    real_write = installer._atomic_write_bytes
+
+    def slow_write(target, data, mode):
+        result = real_write(target, data, mode)
+        if target in target_paths:
+            installing.set()
+            time.sleep(0.05)  # widen the window a racing rollback would land in
+        return result
+
+    monkeypatch.setattr(installer, "_atomic_write_bytes", slow_write)
+
+    def run_rollback():
+        assert installing.wait(timeout=30)
+        return roller.rollback(str(home))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ran_install = pool.submit(installer.install, str(home), stamp="s2")
+        ran_rollback = pool.submit(run_rollback)
+        assert ran_install.result(timeout=60) == 0
+        assert ran_rollback.result(timeout=60) == 0
+
+    # Serialized: the install committed generation B as transaction 2, then the
+    # rollback undid that transaction in full, so the host is coherently on A.
+    assert _generation(targets) == _expected_generation("GEN-A", len(targets))
+    states = [json.loads(p.read_text())["state"] for p in _manifest_paths(installer, home)]
+    assert states == [installer.TXN_COMMITTED, installer.TXN_ROLLED_BACK]
+
+
+@pytest.mark.parametrize("operation", ["install", "rollback"])
+def test_a_held_home_lock_stops_the_operation_without_touching_anything(
+    contract_present, tmp_path, capsys, operation,
+):
+    """A waiter waits, then gives up loudly and changes NOTHING. Proceeding
+    unserialized is never an option, so there is no path that ignores the lock."""
+    inst = contract_present
+    targets = _targets(inst, tmp_path)
+    _seed_generation(targets, "GEN-A")
+    # Give --rollback something to undo, so the refusal is the lock's doing.
+    assert inst.install(str(tmp_path), stamp="s1") == 0
+    before = _generation(targets)
+    before_manifests = _manifest_paths(inst, tmp_path)
+
+    holder = os.open(inst._lock_path(str(tmp_path)), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        if operation == "install":
+            rc = inst.install(str(tmp_path), stamp="s2", lock_timeout=0.2)
+        else:
+            rc = inst.rollback(str(tmp_path), lock_timeout=0.2)
+    finally:
+        os.close(holder)
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert f"refusing to run --{operation} concurrently" in err
+    assert "nothing was changed" in err
+    assert _generation(targets) == before
+    assert _manifest_paths(inst, tmp_path) == before_manifests
+
+
+def test_the_home_lock_is_released_when_its_holder_is_killed(contract_present, tmp_path):
+    """Stale/crash behaviour, stated as a test.
+
+    The kernel drops an ``flock`` when the holder's descriptor closes, INCLUDING
+    on SIGKILL, so there is no stale lock to reap and no lease whose expiry
+    could hand the lock to a second writer while the first is still running.
+    Recovering the data after a crashed install is the transaction journal's
+    separate job (see the interrupted-install test above).
+    """
+    inst = contract_present
+    targets = _targets(inst, tmp_path)
+    _seed_generation(targets, "GEN-A")
+    lock_path = inst._lock_path(str(tmp_path))
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl, os, sys, time\n"
+         "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)\n"
+         "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+         "sys.stdout.write('locked\\n'); sys.stdout.flush()\n"
+         "time.sleep(300)\n",
+         lock_path],
+        stdout=subprocess.PIPE, text=True)
+    announcements = holder.stdout
+    assert announcements is not None
+    try:
+        assert announcements.readline().strip() == "locked"
+        # While it really holds the lock, an install refuses rather than race it.
+        assert inst.install(str(tmp_path), stamp="s1", lock_timeout=0.2) == 1
+        assert _installed_count(inst, tmp_path) == 0
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+        announcements.close()
+
+    # The lock file is never unlinked (a waiter may already have it open), and a
+    # record left behind by the dead holder must not gate anything: only the
+    # kernel's lock state does.
+    assert os.path.exists(lock_path)
+    with open(lock_path, "wb") as fh:
+        fh.write(json.dumps({"pid": holder.pid, "operation": "install",
+                             "acquired": "2026-01-01T00:00:00"}).encode())
+    assert inst.install(str(tmp_path), stamp="s2", lock_timeout=5) == 0
+    assert _installed_count(inst, tmp_path) == len(inst.MANIFEST)
+
+
+def test_transaction_ids_are_reserved_not_merely_scanned(contract_present, tmp_path):
+    """Allocation must CLAIM the id in the filesystem, not just read the highest
+    one it can see. A scan is a read, and two callers can both win a read — which
+    is how one manifest came to describe two generations."""
+    inst = contract_present
+    first_id, first_path = inst._allocate_txn(str(tmp_path), "same")
+    second_id, second_path = inst._allocate_txn(str(tmp_path), "same")
+    assert (first_id, second_id) == ("0001-same", "0002-same")
+    assert first_path != second_path
+    # Reserved, not recorded: a zero-byte manifest is the marker for "an id was
+    # taken but nothing was written", and install mutates no target before its
+    # manifest is complete.
+    assert os.path.getsize(first_path) == 0
+    assert os.path.getsize(second_path) == 0
+
+
+def test_rollback_skips_a_transaction_that_only_reserved_an_id(contract_present, tmp_path):
+    """An install killed between reserving its id and recording its manifest
+    provably mutated nothing. Its reservation must neither shadow the generation
+    that IS on disk nor read as a corrupt journal."""
+    inst = contract_present
+    targets = _targets(inst, tmp_path)
+    _seed_generation(targets, "GEN-A")
+    assert inst.install(str(tmp_path), stamp="s1") == 0
+    reserved_id, reserved_path = inst._allocate_txn(str(tmp_path), "s2")
+    assert reserved_id == "0002-s2"
+
+    assert inst.rollback(str(tmp_path)) == 0
+    assert _generation(targets) == _expected_generation("GEN-A", len(targets))
+    assert os.path.exists(reserved_path)
+
+
+def test_a_failed_backup_releases_the_reserved_transaction(
+    contract_present, tmp_path, monkeypatch, capsys,
+):
+    """A transaction abandoned before its manifest was written leaves no backups
+    and no reserved id behind — the journal only ever holds real generations."""
+    inst = contract_present
+    targets = _targets(inst, tmp_path)
+    _seed_generation(targets, "GEN-A")
+    real_copy = shutil.copy2
+
+    def fail_on_the_third(src, dst, *a, **k):
+        if str(src) == str(targets[2]):
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_copy(src, dst, *a, **k)
+
+    monkeypatch.setattr(shutil, "copy2", fail_on_the_third)
+    assert inst.install(str(tmp_path), stamp="s1") == 1
+    assert "cannot back up" in capsys.readouterr().err
+    assert _generation(targets) == _expected_generation("GEN-A", len(targets))
+    assert _manifest_paths(inst, tmp_path) == []
+    assert list(tmp_path.rglob("*.pre-*")) == []
+
+
+# --------------------------------------------------------------------------- #
+# Atomicity has no fallback.
+#
+# The EBUSY/EXDEV path used to fall back to `shutil.copyfile(tmp, real)`, which
+# opens the LIVE artifact for a truncating write: b'N' was observed on disk
+# while b'NEW-COMPLETE' was being installed. The supervisor script is re-read on
+# every lane spawn, so that window hands out a partial script — the precise
+# failure the atomic write exists to prevent. There is no safe in-place
+# substitute for a rename, so the only correct answer is to fail closed and let
+# the transaction restore the previous coherent generation.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("code", [errno.EBUSY, errno.EXDEV],
+                         ids=["EBUSY", "EXDEV"])
+def test_a_replace_failure_never_writes_over_the_live_target(
+    inst, tmp_path, monkeypatch, code,
+):
+    inst_module = inst
+    target = tmp_path / "claude_kanban_supervisor.py"
+    target.write_bytes(b"OLD-COMPLETE")
+    target.chmod(0o755)
+
+    def cannot_rename(src, dst, *a, **k):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(os, "replace", cannot_rename)
+    _forbid_copying_onto(monkeypatch, [target])
+
+    with pytest.raises(inst_module.AtomicReplaceUnavailable) as caught:
+        inst_module._atomic_write_bytes(str(target), b"NEW-COMPLETE", 0o755)
+    assert caught.value.errno == code
+    assert "refusing to copy over the live artifact" in str(caught.value)
+    # The live artifact never changed, and no temp file was left behind.
+    assert target.read_bytes() == b"OLD-COMPLETE"
+    assert target.stat().st_mode & 0o7777 == 0o755
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+@pytest.mark.parametrize("code", [errno.EBUSY, errno.EXDEV],
+                         ids=["EBUSY", "EXDEV"])
+def test_install_fails_closed_when_one_target_cannot_be_replaced(
+    contract_present, tmp_path, monkeypatch, capsys, code,
+):
+    """A deployment where a target cannot be renamed over (a busy file, a bind
+    mount) must end nonzero on the previous coherent generation — never with
+    that one target copied in place and the install reported as a success."""
+    inst = contract_present
+    targets = _targets(inst, tmp_path)
+    _seed_generation(targets, "GEN-A")
+    victim = str(targets[2])
+    real_replace = os.replace
+
+    def cannot_rename_the_victim(src, dst, *a, **k):
+        if str(dst) == victim:
+            raise OSError(code, os.strerror(code))
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", cannot_rename_the_victim)
+    _forbid_copying_onto(monkeypatch, targets)
+
+    rc = inst.install(str(tmp_path), stamp="s1")
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "install FAILED" in err
+    assert "refusing to copy over the live artifact" in err
+    assert "restored the exact pre-install set" in err
+    # Every target is generation A: the ones already written were put back, and
+    # the victim — which the failed rename never touched — still holds it.
+    assert _generation(targets) == _expected_generation("GEN-A", len(targets))
+    assert _installed_count(inst, tmp_path) == 0
+    assert list(tmp_path.rglob("*.tmp")) == []
+    assert json.loads(_manifest_paths(inst, tmp_path)[-1].read_text())["state"] == \
+        inst.TXN_ROLLED_BACK
+
+
+def test_a_replace_failure_recording_the_manifest_mutates_nothing(
+    contract_present, tmp_path, monkeypatch, capsys,
+):
+    """The journal is written by the same atomic primitive, so it fails closed
+    too — before the first target is touched, and without leaving the reserved
+    id or the backups behind."""
+    inst = contract_present
+    targets = _targets(inst, tmp_path)
+    _seed_generation(targets, "GEN-A")
+    journal = inst._txn_dir(str(tmp_path))
+    real_replace = os.replace
+
+    def cannot_rename_in_the_journal(src, dst, *a, **k):
+        if os.path.dirname(str(dst)) == journal:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", cannot_rename_in_the_journal)
+    assert inst.install(str(tmp_path), stamp="s1") == 1
+    assert "cannot record transaction" in capsys.readouterr().err
+    assert _generation(targets) == _expected_generation("GEN-A", len(targets))
+    assert _installed_count(inst, tmp_path) == 0
+    assert _manifest_paths(inst, tmp_path) == []
+    assert list(tmp_path.rglob("*.pre-*")) == []
+    assert list(tmp_path.rglob("*.tmp")) == []
 
 
 def test_manifest_orders_scripts_before_plugin_modules(inst):

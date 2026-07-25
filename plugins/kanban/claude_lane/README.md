@@ -115,6 +115,7 @@ pre-install bytes and their sha256. Guarantees that follow:
 | --- | --- |
 | Preflight | every source is read and every destination vetted before the first write; a bad source or unwritable destination changes nothing |
 | Atomic writes | each target lands via temp-file + `fsync` + `os.replace`, so a concurrent lane spawn reads the old file or the new one, never a truncated script |
+| No in-place fallback | if `os.replace` is unavailable (`EBUSY` on a busy file, `EXDEV` across a bind mount) the install **fails closed**: nonzero exit and the transaction restores the previous generation. Copying the temp file onto the live artifact would open it for a truncating write, which is exactly the partial-supervisor exposure atomicity exists to prevent |
 | Mid-install failure | the exact pre-install set is restored automatically; if that cannot finish, the transaction is left **open** and `--rollback` deterministically completes it |
 | `--rollback` | undoes **one** transaction in full — restores every member that pre-existed, deletes every member the transaction created. Never a per-target backup search |
 | Partial rollback | nonzero exit, and it does **not** print that the core may be rolled back; the host is mixed and needs the reported gap fixed first |
@@ -122,6 +123,45 @@ pre-install bytes and their sha256. Guarantees that follow:
 
 Repeated `--rollback` walks back one generation per call: each transaction is
 marked once undone, so the next call takes the one before it.
+
+The temp file is always created in the target's *own* directory, so `EXDEV`
+cannot arise from a normal deployment; the reachable case is a target that
+cannot be renamed over at all — a single-file bind mount, or a filesystem that
+reports `EBUSY` for the artifact. If an install stops with
+`refusing to copy over the live artifact`, the host is still on its previous
+generation and the fix is to make the path renameable (install to the
+underlying path, or unmount the single-file bind and let the symlink handling
+write through it) — not to copy the file into place by hand, which reintroduces
+the partial-supervisor window on every future install.
+
+## One writer per home
+
+A transaction journal only helps if there is exactly one writer. Two installs
+started in the same second used to choose their id by an unsynchronized scan of
+the journal directory, both land on `0001-<stamp>`, and then share one manifest
+*and* one set of `.pre-0001-<stamp>` backups — each clobbering the other's
+record, so the surviving manifest described a generation that was never on disk
+and rolling it back produced a mix. An install racing a `--rollback` was worse:
+one wrote the targets forward while the other restored them in reverse.
+
+So every mutation of one home runs under an exclusive `flock(2)` on
+`~/.hermes/.claude-lane-install/lock`, held for the **whole** operation rather
+than for id allocation alone:
+
+| Property | Behaviour |
+| --- | --- |
+| Scope | `--install` and `--rollback` of one `--home` are mutually exclusive with each other and with themselves. Different homes never contend |
+| Waiting | a second run blocks up to `--lock-timeout` seconds (default 120), printing who holds the lock, then exits **nonzero having changed nothing**. There is no path that proceeds unserialized |
+| Crash / stale | none to handle: the kernel releases an `flock` when the holder's descriptor closes, **including** on `SIGKILL` or panic. No lease to renew, no timeout heuristic that could hand the lock to a second writer, no lock to reap by hand. Recovering the *data* after a crashed install is the journal's separate job — the next `--rollback` finishes the interrupted transaction |
+| Lock file | created once and never unlinked (a waiter may already hold it open). Its contents — holder pid, operation, start time — are diagnostics for humans and `lsof`, never read as a gate |
+| No `flock` | a platform without `flock(2)` is **refused**, not run unserialized |
+| Transaction ids | additionally reserved with `O_CREAT\|O_EXCL`, so the sequence is claimed by the filesystem rather than by a scan two callers can both win. Manifest and backup-generation uniqueness therefore does not depend on the lock being present — which matters because `flock` is only as strong as the filesystem under `$HOME`, and a network mount can weaken it |
+| `--check` | deliberately lock-free: read-only, and it must never block on an install. It can observe an in-flight generation, which it reports as `PARTIAL INSTALL` — correctly, since that is what is on disk |
+
+An id reserved by a run that died before writing its manifest stays a zero-byte
+file. That is meaningful rather than corrupt: `--install` mutates no target
+until the manifest is complete, so such a transaction provably touched nothing
+and `--rollback` skips it to reach the generation that *is* on disk.
 
 ## Verification
 
