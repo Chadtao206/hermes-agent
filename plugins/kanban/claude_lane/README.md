@@ -84,13 +84,44 @@ supervisor tolerates (the safe row above).
 Artifacts first, core second — the mirror image of install:
 
 ```sh
-python plugins/kanban/claude_lane/install.py --rollback   # restores newest .pre-<stamp> backups
+python plugins/kanban/claude_lane/install.py --rollback   # undoes the newest install transaction
 # then, if needed, revert the core commit
 ```
 
 Rolling back only the core is also survivable (that is what property 3 above
 buys): the installed artifacts detect the missing contract and keep the lane
 native until the core returns.
+
+## Install/rollback is one transaction
+
+`--install` is not a per-file loop with per-file backups, because rolling *that*
+back cannot be coherent:
+
+* a **first** install creates targets that have no backup at all, so restoring
+  "each target's newest backup" leaves every new artifact installed — and says
+  it succeeded;
+* after install generation A, an install of generation B that stops part way
+  leaves B-stamped backups only on the targets it reached. Restoring each
+  target's own newest backup then yields A for those and A's *older
+  predecessor* for the rest — a mixed runtime, announced as a clean rollback.
+
+So `--install` records a durable transaction manifest in
+`~/.hermes/.claude-lane-install/txn-<seq>-<stamp>.json` **before** it mutates
+anything. The manifest names one generation and, per member, whether the target
+already existed plus the `.pre-<seq>-<stamp>` backup holding its exact
+pre-install bytes and their sha256. Guarantees that follow:
+
+| Property | Behaviour |
+| --- | --- |
+| Preflight | every source is read and every destination vetted before the first write; a bad source or unwritable destination changes nothing |
+| Atomic writes | each target lands via temp-file + `fsync` + `os.replace`, so a concurrent lane spawn reads the old file or the new one, never a truncated script |
+| Mid-install failure | the exact pre-install set is restored automatically; if that cannot finish, the transaction is left **open** and `--rollback` deterministically completes it |
+| `--rollback` | undoes **one** transaction in full — restores every member that pre-existed, deletes every member the transaction created. Never a per-target backup search |
+| Partial rollback | nonzero exit, and it does **not** print that the core may be rolled back; the host is mixed and needs the reported gap fixed first |
+| Missing/corrupt journal | nonzero exit with nothing touched — a corrupt newest manifest never falls through to an older one, which would roll back a generation too far |
+
+Repeated `--rollback` walks back one generation per call: each transaction is
+marked once undone, so the next call takes the one before it.
 
 ## Verification
 
