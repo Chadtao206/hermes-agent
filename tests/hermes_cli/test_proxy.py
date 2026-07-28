@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.adapters.codex import CodexAdapter
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
@@ -26,6 +28,10 @@ def test_registry_lists_nous():
     assert "nous" in ADAPTERS
 
 
+def test_registry_lists_codex():
+    assert "codex" in ADAPTERS
+
+
 def test_registry_lists_xai():
     assert "xai" in ADAPTERS
 
@@ -33,6 +39,12 @@ def test_registry_lists_xai():
 def test_get_adapter_returns_instance():
     adapter = get_adapter("nous")
     assert isinstance(adapter, NousPortalAdapter)
+    assert isinstance(adapter, UpstreamAdapter)
+
+
+def test_get_adapter_returns_codex_instance():
+    adapter = get_adapter("codex")
+    assert isinstance(adapter, CodexAdapter)
     assert isinstance(adapter, UpstreamAdapter)
 
 
@@ -45,6 +57,7 @@ def test_get_adapter_returns_xai_instance():
 def test_get_adapter_case_insensitive():
     assert isinstance(get_adapter("NOUS"), NousPortalAdapter)
     assert isinstance(get_adapter("  Nous  "), NousPortalAdapter)
+    assert isinstance(get_adapter(" CODEX "), CodexAdapter)
     assert isinstance(get_adapter("XAI"), XAIGrokAdapter)
 
 
@@ -565,6 +578,184 @@ def test_xai_adapter_retry_returns_none_for_unrelated_status(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# CodexAdapter
+# ---------------------------------------------------------------------------
+
+
+def _codex_jwt(account_id: str) -> str:
+    payload = json.dumps({
+        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+    }).encode()
+    encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    return f"header.{encoded}.signature"
+
+
+def _codex_pool_entry(
+    *,
+    credential_id: str,
+    access_token: str,
+    refresh_token: str = "codex-refresh-token",
+    base_url: str = "https://chatgpt.com/backend-api/codex",
+    priority: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "id": credential_id,
+        "label": credential_id,
+        "auth_type": "oauth",
+        "priority": priority,
+        "source": "manual:codex",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "base_url": base_url,
+    }
+
+
+def _write_codex_pool_entries(hermes_home: Path, entries: list[Dict[str, Any]]) -> Path:
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {"openai-codex": entries},
+    }))
+    return auth_path
+
+
+def test_codex_adapter_metadata():
+    adapter = CodexAdapter()
+    assert adapter.name == "codex"
+    assert adapter.display_name == "OpenAI Codex (ChatGPT)"
+    assert adapter.allowed_paths == frozenset({"/responses", "/models"})
+
+
+def test_codex_adapter_refuses_without_usable_oauth_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entries(tmp_path, [])
+    adapter = CodexAdapter()
+
+    assert not adapter.is_authenticated()
+    with pytest.raises(RuntimeError, match="hermes auth add openai-codex --type oauth"):
+        adapter.get_credential()
+
+
+def test_codex_adapter_selects_oauth_pool_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entries(tmp_path, [
+        _codex_pool_entry(
+            credential_id="codex-primary",
+            access_token="codex-access-token",
+            base_url="https://chatgpt.com/backend-api/codex/",
+        ),
+    ])
+
+    cred = CodexAdapter().get_credential()
+
+    assert cred.bearer == "codex-access-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.token_type == "Bearer"
+
+
+def test_codex_adapter_sets_required_cloudflare_headers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entries(tmp_path, [
+        _codex_pool_entry(
+            credential_id="codex-primary",
+            access_token=_codex_jwt("acct_123"),
+        ),
+    ])
+
+    headers = CodexAdapter().get_credential().extra_headers
+
+    assert headers == {
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+        "originator": "codex_cli_rs",
+        "ChatGPT-Account-ID": "acct_123",
+    }
+
+
+def test_codex_adapter_refreshes_credential_after_401(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entries(tmp_path, [
+        _codex_pool_entry(
+            credential_id="codex-primary",
+            access_token="old-codex-access-token",
+        ),
+    ])
+
+    def refresh(access_token, refresh_token):
+        assert access_token == "old-codex-access-token"
+        assert refresh_token == "codex-refresh-token"
+        return {
+            "access_token": "new-codex-access-token",
+            "refresh_token": "new-codex-refresh-token",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", refresh)
+    adapter = CodexAdapter()
+    failed = adapter.get_credential()
+
+    retry = adapter.get_retry_credential(failed_credential=failed, status_code=401)
+
+    assert retry is not None
+    assert retry.bearer == "new-codex-access-token"
+
+
+def test_codex_adapter_rotates_when_401_refresh_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entries(tmp_path, [
+        _codex_pool_entry(
+            credential_id="codex-first",
+            access_token="first-codex-access-token",
+        ),
+        _codex_pool_entry(
+            credential_id="codex-second",
+            access_token="second-codex-access-token",
+            priority=1,
+        ),
+    ])
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("refresh rejected")),
+    )
+    adapter = CodexAdapter()
+    failed = adapter.get_credential()
+
+    retry = adapter.get_retry_credential(failed_credential=failed, status_code=401)
+
+    assert retry is not None
+    assert retry.bearer == "second-codex-access-token"
+
+
+def test_codex_adapter_rotates_and_exhausts_credential_after_429(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_codex_pool_entries(tmp_path, [
+        _codex_pool_entry(
+            credential_id="codex-first",
+            access_token="first-codex-access-token",
+        ),
+        _codex_pool_entry(
+            credential_id="codex-second",
+            access_token="second-codex-access-token",
+            priority=1,
+        ),
+    ])
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda *args: (_ for _ in ()).throw(AssertionError("429 must not refresh")),
+    )
+    adapter = CodexAdapter()
+    failed = adapter.get_credential()
+
+    retry = adapter.get_retry_credential(failed_credential=failed, status_code=429)
+
+    assert retry is not None
+    assert retry.bearer == "second-codex-access-token"
+    stored = json.loads((tmp_path / "auth.json").read_text())
+    first = stored["credential_pool"]["openai-codex"][0]
+    assert first["last_status"] == "exhausted"
+    assert first["last_error_code"] == 429
+
+
+# ---------------------------------------------------------------------------
 # Server: path filtering + forwarding
 #
 # We run the proxy AND a fake upstream as real aiohttp servers on ephemeral
@@ -838,6 +1029,67 @@ def test_server_strips_client_auth_header():
                     await resp.read()
             assert captured["requests"][0]["auth"] == "Bearer ours"
             assert "SHOULD_NOT_LEAK" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_forwards_codex_cloudflare_headers_and_strips_connection_headers(
+    tmp_path, monkeypatch
+):
+    """Connection-nominated headers are hop-by-hop in both directions."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    async def run():
+        captured: Dict[str, Any] = {}
+
+        async def responses(request):
+            captured["headers"] = dict(request.headers)
+            return web.Response(
+                body=b'{"ok": true}',
+                content_type="application/json",
+                headers={
+                    "Connection": "X-Upstream-Hop",
+                    "X-Upstream-Hop": "do-not-forward",
+                },
+            )
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/v1/responses", responses)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        _write_codex_pool_entries(tmp_path, [
+            _codex_pool_entry(
+                credential_id="codex-primary",
+                access_token=_codex_jwt("acct_123"),
+                base_url=f"{upstream_base}/v1",
+            ),
+        ])
+        proxy_runner, proxy_base = await _start_runner(create_app(CodexAdapter()))
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={"model": "gpt-5.4"},
+                    headers={
+                        "Authorization": "Bearer client-token",
+                        "Connection": "X-Client-Hop",
+                        "X-Client-Hop": "do-not-forward",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    assert await resp.json() == {"ok": True}
+                    response_headers = {key.lower() for key in resp.headers}
+
+            headers = {key.lower(): value for key, value in captured["headers"].items()}
+            assert headers["authorization"] == f"Bearer {_codex_jwt('acct_123')}"
+            assert headers["originator"] == "codex_cli_rs"
+            assert headers["user-agent"] == "codex_cli_rs/0.0.0 (Hermes Agent)"
+            assert headers["chatgpt-account-id"] == "acct_123"
+            assert "x-client-hop" not in headers
+            assert "x-upstream-hop" not in response_headers
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

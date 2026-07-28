@@ -62,11 +62,27 @@ def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Re
     return web.json_response(body, status=status)
 
 
+def _connection_nominated_headers(headers) -> frozenset[str]:
+    """Return additional hop-by-hop headers named by ``Connection``."""
+    getall = getattr(headers, "getall", None)
+    if callable(getall):
+        values = getall("Connection", [])
+    else:
+        values = [value for key, value in headers.items() if key.lower() == "connection"]
+    return frozenset(
+        token.strip().lower()
+        for value in values
+        for token in str(value).split(",")
+        if token.strip()
+    )
+
+
 def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
     """Strip hop-by-hop + auth headers from the inbound request."""
+    blocked_headers = _HOP_BY_HOP_HEADERS | _connection_nominated_headers(headers)
     out = {}
     for key, value in headers.items():
-        if key.lower() in _HOP_BY_HOP_HEADERS:
+        if key.lower() in blocked_headers:
             continue
         out[key] = value
     return out
@@ -74,9 +90,10 @@ def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
 
 def _filter_response_headers(headers) -> dict:
     """Strip hop-by-hop headers from the upstream response."""
+    blocked_headers = _HOP_BY_HOP_HEADERS | _connection_nominated_headers(headers)
     out = {}
     for key, value in headers.items():
-        if key.lower() in _HOP_BY_HOP_HEADERS:
+        if key.lower() in blocked_headers:
             continue
         # aiohttp recomputes Content-Encoding/Content-Length on stream — let it.
         if key.lower() in {"content-encoding", "content-length"}:
