@@ -114,13 +114,13 @@ def _tmux_new_session(*, tmux_bin, socket, session, workspace, env, argv):
     subprocess.run([tmux_bin, "-L", socket, "new-session", "-d", "-s", session,
                     "-c", workspace, "-x", "220", "-y", "50",
                     *_pane_env_argv(env), *argv],
-                   env=env, check=True)
+                   env=env, check=True, stdin=subprocess.DEVNULL)
 
 
 def _tmux_kill(*, tmux_bin, socket, session):
     """Best-effort kill of a just-created tmux session (no raise)."""
     subprocess.run([tmux_bin, "-L", socket, "kill-session", "-t", session],
-                   capture_output=True)
+                   capture_output=True, stdin=subprocess.DEVNULL)
 
 
 def _spawn_supervisor(*, task, board, session, transcript, cfgdir, cfg,

@@ -248,8 +248,17 @@ def runtime_contract_status(python: str | None = None) -> tuple[bool, str]:
     )
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     try:
-        out = subprocess.run([exe, "-c", probe], capture_output=True, text=True,
-                             cwd=tempfile.gettempdir(), env=env, timeout=120)
+        out = subprocess.run(
+            [exe, "-c", probe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            cwd=tempfile.gettempdir(),
+            env=env,
+            timeout=120,
+        )
     except Exception as exc:  # pragma: no cover - unusable interpreter
         return (False, f"{exe}: probe failed ({exc.__class__.__name__}: {exc})")
     text = (out.stdout or "").strip()

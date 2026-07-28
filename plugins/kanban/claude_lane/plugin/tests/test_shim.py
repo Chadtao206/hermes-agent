@@ -16,7 +16,14 @@ def _run(args, env_extra, fake_hermes_out):
     env.update(env_extra)
     # Point the shim at a fake hermes that just echoes its argv to a file.
     env["HERMES_BIN"] = fake_hermes_out
-    return subprocess.run([VENV, SHIM] + args, capture_output=True, text=True, env=env)
+    return subprocess.run(
+        [VENV, SHIM] + args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
 
 
 def test_rejects_foreign_task_id(tmp_path):
