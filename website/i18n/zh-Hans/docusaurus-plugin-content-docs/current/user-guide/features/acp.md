@@ -33,10 +33,10 @@ Hermes 使用专为编辑器工作流设计的精选 `hermes-acp` 工具集运�
 
 ## 安装
 
-正常安装 Hermes 后，添加 ACP 扩展：
+正常安装 Hermes 后，从安装检出目录添加 ACP 扩展：
 
 ```bash
-pip install -e '.[acp]'
+cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'
 ```
 
 这将安装 `agent-client-protocol` 依赖并启用：
@@ -44,14 +44,6 @@ pip install -e '.[acp]'
 - `hermes acp`
 - `hermes-acp`
 - `python -m acp_adapter`
-
-对于 Zed registry 安装，Zed 通过官方 ACP Registry 条目启动 Hermes。该条目使用 `uvx` 发行版运行：
-
-```bash
-uvx --from 'hermes-agent[acp]==<version>' hermes-acp
-```
-
-使用 registry 安装路径前，请确保 `uv` 已在 `PATH` 中可用。
 
 ## 启动 ACP 服务器
 
@@ -87,7 +79,7 @@ hermes acp --setup-browser           # 交互式（下载约 400 MB 前会提示
 hermes acp --setup-browser --yes     # 非交互式接受下载
 ```
 
-这是独立命令。Zed registry 的终端认证流程（`hermes acp --setup`）在模型选择后也会将浏览器引导作为后续问题提供，因此大多数用户无需直接运行 `--setup-browser`。
+这是独立命令。终端认证流程（`hermes acp --setup`）在模型选择后也会将浏览器引导作为后续问题提供，因此大多数用户无需直接运行 `--setup-browser`。
 
 具体操作：
 
@@ -124,19 +116,10 @@ hermes acp --setup-browser --yes     # 非交互式接受下载
 
 ### Zed
 
-Zed v0.221.x 及更新版本通过官方 ACP Registry 安装外部 agent。
+在 Zed 设置中将 Hermes 配置为自定义 agent 服务器：
 
 1. 打开 Agent 面板。
-2. 点击 **Add Agent**，或运行 `zed: acp registry` 命令。
-3. 搜索 **Hermes Agent**。
-4. 安装后启动新的 Hermes 外部 agent 线程。
-
-前提条件：
-
-- 先通过 `hermes model` 配置 Hermes provider 凭据，或在 `~/.hermes/.env` / `~/.hermes/config.yaml` 中设置。
-- 安装 `uv`，以便 registry 启动器可以运行 `uvx --from 'hermes-agent[acp]==<version>' hermes-acp`。
-
-在 registry 条目可用之前进行本地开发时，在 Zed 设置中使用自定义 agent 服务器：
+2. 使用以下配置添加自定义 agent 服务器：
 
 ```json
 {
@@ -150,32 +133,52 @@ Zed v0.221.x 及更新版本通过官方 ACP Registry 安装外部 agent。
 }
 ```
 
+3. 启动新的 Hermes 外部 agent 线程。
+
+前提条件：
+
+- 先通过 `hermes model` 配置 Hermes provider 凭据，或在 `~/.hermes/.env` / `~/.hermes/config.yaml` 中设置。
+
 ### JetBrains
 
-使用兼容 ACP 的插件并将其指向：
+使用兼容 ACP 的插件并将其指向 `hermes acp` 或 `hermes-acp`。
 
-```text
-/path/to/hermes-agent/acp_registry
+### Buzz Desktop
+
+[Buzz](https://github.com/block/buzz) 将 Hermes Agent 作为预设运行时提供。
+按常规方式安装 Hermes 后，Buzz 会自动发现它 —— 打开 **Settings → Runtimes**，
+Hermes 就会出现在你的运行时列表中。
+
+如果发现失败（较旧的安装），请确认 ACP 启动器可以在登录 shell 的 PATH 上解析：
+
+```bash
+command -v hermes-acp || command -v hermes
 ```
 
-## Registry 清单
+较新的安装会将 `hermes` 和 `hermes-acp` 两个启动器写入 `~/.local/bin`；
+运行 `hermes update` 会为较旧的安装补上 `hermes-acp` 启动器。作为手动兜底方案，
+可以将 Buzz 的 agent 命令配置为 `hermes`，参数为 `["acp"]`。
 
-Hermes 官方 ACP Registry 元数据的源文件位于：
+#### 将 Buzz agent 保持为 owner-only
 
-```text
-acp_registry/agent.json
-acp_registry/icon.svg
-```
+Buzz 创建的每个 agent 默认都将 **Who can talk to this agent** 设为 `Owner only`。
+当运行时为 Hermes 时，请保持该设置。
 
-上游 registry PR 将这些文件复制到 `agentclientprotocol/registry` 中的顶层 `hermes-agent/` 目录。
+这条路径上有两种行为叠加。`hermes-acp` 工具集包含 `terminal` 和 `execute_code`，
+而 Buzz 的 ACP 桥接层会自行以 `allow_once` 回应 Hermes 的权限请求，不会转交给你确认。
+因此 Buzz 中的 Hermes agent 会在不提示的情况下在宿主机上执行 shell 命令。
+让它对一个临时目录执行 `rm -rf`，该目录会被直接删除，全程没有任何提示。
 
-Registry 条目使用直接指向 `hermes-agent` PyPI 发行版的 `uvx` 发行版：
+将该设置改为 `Anyone`，等于把同样的 shell 访问权限交给频道中的每一位发言者。
+Buzz 在你选择该选项时不会给出任何警告。
 
-```text
-uvx --from 'hermes-agent[acp]==<version>' hermes-acp
-```
+目前两种看起来可行的缓解手段都无效：
 
-Registry CI 会验证固定版本是否存在于 PyPI，因此清单的 `version` 和 uvx `package` 固定版本必须始终与 `pyproject.toml` 匹配。`scripts/release.py` 会自动保持它们同步。
+- `approvals.mode: manual` 确实会让 Hermes 发出权限请求，但 Buzz 仍会自动批准，
+  命令照样执行。
+- `platform_toolsets.acp` 不会收窄 ACP 工具集，因此无法用它去掉 `terminal`。
+
+来自 owner 的 `!shutdown` 在任何模式下都能停止 agent，而 Buzz 会忽略其他人发出的同一命令。
 
 ## 配置与凭据
 
@@ -186,7 +189,7 @@ ACP 模式使用与 CLI 相同的 Hermes 配置：
 - `~/.hermes/skills/`
 - `~/.hermes/state.db`
 
-Provider 解析使用 Hermes 的正常运行时解析器，因此 ACP 继承当前配置的 provider 和凭据。Hermes 还为首次运行的 registry 客户端提供终端认证方法（`--setup`）；这将打开 Hermes 的交互式模型/provider 设置。
+Provider 解析使用 Hermes 的正常运行时解析器，因此 ACP 继承当前配置的 provider 和凭据。Hermes 还为首次运行的 ACP 客户端提供终端认证方法（`--setup`）；这将打开 Hermes 的交互式模型/provider 设置。
 
 ## 会话行为
 
@@ -214,6 +217,10 @@ ACP 会话将编辑器的 cwd 绑定到 Hermes 任务 ID，使文件和终端工
 - 始终允许
 - 拒绝
 
+你是否真的会看到提示取决于宿主端。宿主可以用程序方式直接回应该请求而不展示给你，
+此时这些选项只存在于协议层面，永远不会到达人类手中。Buzz Desktop 就是这样做的，
+因此无论你的 `approvals` 如何设置，都应把该路径视为无人值守执行。
+
 超时或出错时，审批桥接会拒绝请求。
 
 ### 会话范围的编辑自动审批
@@ -237,11 +244,9 @@ ACP 桥接将这些选项映射到 Hermes 的内部审批语义——`allow_alwa
 
 检查：
 
-- 在 Zed 中，使用 `zed: acp registry` 打开 ACP Registry 并搜索 **Hermes Agent**。
 - 对于手动/本地开发，验证自定义 `agent_servers` 命令是否指向 `hermes acp`。
 - Hermes 已安装且在 PATH 中。
-- ACP 扩展已安装（`pip install -e '.[acp]'`）。
-- 如果从官方 Zed registry 条目启动，`uv` 已安装。
+- ACP 扩展已安装（`cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`）。
 
 ### ACP 启动后立即报错
 
@@ -262,11 +267,7 @@ ACP 模式使用 Hermes 现有的 provider 设置。通过以下方式配置凭�
 hermes model
 ```
 
-或编辑 `~/.hermes/.env`。Registry 客户端也可以触发 Hermes 的终端认证流程，该流程运行相同的交互式 provider/模型设置。
-
-### Zed registry 启动器找不到 uv
-
-从官方 uv 安装文档安装 `uv`，然后从 Zed 重试 Hermes Agent 线程。
+或编辑 `~/.hermes/.env`。终端认证流程（`hermes acp --setup`）也可以触发交互式 provider/模型设置。
 
 ## 另请参阅
 

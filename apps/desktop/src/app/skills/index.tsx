@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 
 import { ArchiveSkillConfirmDialog } from '@/app/learning/archive-skill-confirm-dialog'
 import { CodeEditor } from '@/components/chat/code-editor'
@@ -23,6 +24,7 @@ import { useI18n } from '@/i18n'
 import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
 import { compactNumber } from '@/lib/format'
 import { queryClient, writeCache } from '@/lib/query-client'
+import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
@@ -46,8 +48,10 @@ import {
 } from '../master-detail'
 import { PanelEmpty, PanelPill } from '../overlays/panel'
 import { PageSearchShell } from '../page-search-shell'
+import { SETTINGS_ROUTE } from '../routes'
 import { ComputerUsePanel } from '../settings/computer-use-panel'
 import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
+import { TerminalBackendPanel } from '../settings/terminal-backend-panel'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
@@ -219,6 +223,8 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
       queryClient.invalidateQueries({ queryKey: TOOLSETS_QUERY_KEY })
     ])
 
+    invalidateSlashCompletions()
+
     // An explicit refresh is the one time we bypass the analytics TTL — but
     // only if the badges are already on screen; otherwise let the lazy load
     // pick it up when Toolsets is first shown. Guard the async set against a
@@ -333,6 +339,9 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
     try {
       await toggleSkill(skill.name, enabled)
+      // A disabled skill loses its `/name` command, so the composer's cached
+      // `/` list has to be dropped along with the row repaint.
+      invalidateSlashCompletions()
     } catch (err) {
       setSkills(
         current => current?.map(row => (row.name === skill.name ? { ...row, enabled: !enabled } : row)) ?? current
@@ -387,6 +396,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     } catch (err) {
       notifyError(err, t.skills.failedToUpdate(mode === 'skills' ? t.skills.tabSkills : t.skills.tabToolsets))
     } finally {
+      invalidateSlashCompletions()
       setBulkBusy(false)
     }
   }
@@ -671,6 +681,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
             const snapshot = skills
 
             setSkills(current => current?.filter(skill => skill.name !== name) ?? current)
+            invalidateSlashCompletions()
 
             if (skillEditor?.name === name) {
               setSkillEditor(null)
@@ -759,6 +770,7 @@ function ToolsetDetail({
   onConfiguredChange: () => void
 }) {
   const { t } = useI18n()
+  const navigate = useNavigate()
   const tools = toolNames(toolset)
   const label = toolsetDisplayLabel(toolset)
 
@@ -782,7 +794,28 @@ function ToolsetDetail({
           ))}
         </div>
       )}
+      {toolset.name === 'vision' && (
+        // Vision has no provider matrix — model resolution runs through the
+        // auxiliary model config. Point at the actual home (Settings → Models,
+        // aux "vision" row) via an internal deep link instead of leaving the
+        // detail pane empty.
+        <div className="grid gap-1.5">
+          <p className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+            {t.skills.visionModelHint}
+          </p>
+          <div>
+            <Button
+              onClick={() => navigate(`${SETTINGS_ROUTE}?tab=config:model&aux=vision`)}
+              size="xs"
+              variant="textStrong"
+            >
+              {t.skills.visionModelLink}
+            </Button>
+          </div>
+        </div>
+      )}
       {toolset.name === 'computer_use' && <ComputerUsePanel onConfiguredChange={onConfiguredChange} />}
+      {toolset.name === 'terminal' && <TerminalBackendPanel onConfiguredChange={onConfiguredChange} />}
       <ToolsetConfigPanel key={toolset.name} onConfiguredChange={onConfiguredChange} toolset={toolset.name} />
     </>
   )
