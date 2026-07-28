@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,11 @@ class UpstreamCredential:
 
     expires_at: Optional[str] = None
     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""
+
+    extra_headers: Optional[Mapping[str, str]] = None
+    """Adapter-supplied headers merged onto the forwarded request (after the
+    Authorization swap). ``None`` = no extra headers. Used by providers whose
+    upstream needs more than a bearer (e.g. Codex/Cloudflare originator)."""
 
 
 class UpstreamAdapter(ABC):
