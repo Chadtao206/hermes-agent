@@ -1742,15 +1742,10 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         assert kb.get_task(conn, t).claim_lock is None
 
 
-def test_dispatch_max_spawn_counts_existing_running_tasks(
+def test_dispatch_max_spawn_is_a_per_tick_budget(
     kanban_home, all_assignees_spawnable
 ):
-    """max_spawn is a live concurrency cap, not a per-tick spawn cap.
-
-    Without counting tasks already in ``running``, every dispatcher tick can
-    launch up to ``max_spawn`` more workers while previous workers are still
-    alive. Long-running boards then accumulate unbounded worker subprocesses.
-    """
+    """Existing workers do not consume this tick's spawn budget."""
     spawns = []
 
     def fake_spawn(task, workspace):
@@ -1759,21 +1754,23 @@ def test_dispatch_max_spawn_counts_existing_running_tasks(
     with kb.connect() as conn:
         running_a = kb.create_task(conn, title="running-a", assignee="alice")
         running_b = kb.create_task(conn, title="running-b", assignee="bob")
-        ready = kb.create_task(conn, title="ready", assignee="carol")
+        ready_a = kb.create_task(conn, title="ready-a", assignee="carol")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="carol")
         kb.claim_task(conn, running_a)
         kb.claim_task(conn, running_b)
 
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
 
-        assert res.spawned == []
-        assert spawns == []
-        assert kb.get_task(conn, ready).status == "ready"
+        assert [task_id for task_id, _, _ in res.spawned] == [ready_a, ready_b]
+        assert spawns == [ready_a, ready_b]
+        assert kb.get_task(conn, ready_a).status == "running"
+        assert kb.get_task(conn, ready_b).status == "running"
 
 
-def test_dispatch_max_spawn_fills_remaining_capacity(
+def test_dispatch_max_spawn_fills_the_tick_budget(
     kanban_home, all_assignees_spawnable
 ):
-    """When below cap, dispatch only fills available worker slots."""
+    """A running worker does not reduce a two-spawn tick budget to one."""
     spawns = []
 
     def fake_spawn(task, workspace):
@@ -1787,10 +1784,10 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
 
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
 
-        assert len(res.spawned) == 1
-        assert spawns == [ready_a]
+        assert len(res.spawned) == 2
+        assert spawns == [ready_a, ready_b]
         assert kb.get_task(conn, ready_a).status == "running"
-        assert kb.get_task(conn, ready_b).status == "ready"
+        assert kb.get_task(conn, ready_b).status == "running"
 
 
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):
@@ -4064,11 +4061,11 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
     assert len(spawns) == 2, f"expected 2 spawns (cap 3 - 1 running), got {len(spawns)}"
 
 
-def test_dispatch_max_spawn_and_max_in_progress_share_total_cap(
+def test_dispatch_max_spawn_and_max_in_progress_are_independent(
     kanban_home,
     all_assignees_spawnable,
 ):
-    """Both live caps allow dispatch to fill the same total capacity."""
+    """Spawn four this tick while the separate live cap still has seven slots."""
     spawns = []
 
     def fake_spawn(task, workspace):
@@ -4078,17 +4075,25 @@ def test_dispatch_max_spawn_and_max_in_progress_share_total_cap(
         for title in ["running-a", "running-b", "running-c"]:
             task_id = kb.create_task(conn, title=title, assignee="alice")
             kb.claim_task(conn, task_id)
-        ready_a = kb.create_task(conn, title="ready-a", assignee="bob")
-        ready_b = kb.create_task(conn, title="ready-b", assignee="bob")
+        ready = [
+            kb.create_task(conn, title=f"ready-{index}", assignee="bob")
+            for index in range(6)
+        ]
 
         kb.dispatch_once(
             conn,
             spawn_fn=fake_spawn,
-            max_spawn=5,
-            max_in_progress=5,
+            max_spawn=4,
+            max_in_progress=10,
+            max_in_progress_per_profile=10,
         )
 
-    assert spawns == [ready_a, ready_b]
+        running_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+        ).fetchone()[0]
+
+    assert spawns == ready[:4]
+    assert running_count == 7
 
 
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):

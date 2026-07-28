@@ -9041,13 +9041,12 @@ def _dispatch_once_locked(
     failures the task is auto-blocked with the last error as its reason —
     prevents the dispatcher from thrashing forever on an unfixable task.
 
-    ``max_spawn`` is a **live concurrency cap**, not a per-tick spawn budget:
-    it counts tasks already in ``status='running'`` plus this tick's spawns
-    against the limit. So ``max_spawn=4`` means "at most 4 workers running
-    at any time across the whole board" — matching the gateway's stated
-    intent ("limit concurrent kanban tasks"). With a per-tick interpretation
-    a 60-second tick interval could grow concurrency by N every minute on a
-    busy board and accumulate without bound.
+    ``max_spawn`` limits successful starts during this dispatcher tick.
+    ``max_in_progress`` independently caps total live workers across ticks,
+    and ``max_in_progress_per_profile`` applies the same live-cap semantics
+    to each assignee. Keeping the startup budget separate from live capacity
+    avoids under-filling the board when workers were already running before
+    the tick began.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -9082,15 +9081,11 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # Existing workers consume live capacity, but not this tick's startup
+    # budget. max_in_progress is the board-wide guard against accumulating
+    # more workers across successive dispatcher ticks.
     running_count = 0
-    if max_spawn is not None or max_in_progress is not None:
+    if max_in_progress is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -9107,16 +9102,8 @@ def _dispatch_once_locked(
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
+        if running_count >= max_in_progress:
             return result
-        # Both max_spawn and max_in_progress are live concurrency caps: the
-        # loop below compares existing running workers plus this tick's spawns
-        # against max_spawn. Clamp to the total cap, not remaining headroom.
-        if max_spawn is None or max_spawn > max_in_progress:
-            max_spawn = max_in_progress
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -9155,7 +9142,9 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if max_spawn is not None and spawned >= max_spawn:
+            break
+        if max_in_progress is not None and running_count + spawned >= max_in_progress:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -9228,7 +9217,7 @@ def _dispatch_once_locked(
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
         # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
+        # while the global max_in_progress cap and max_spawn tick budget allow
         # work on OTHER profiles.
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
@@ -9343,16 +9332,17 @@ def _dispatch_once_locked(
     # sdlc-review skill) that verifies the PR and either merges (→ done)
     # or rejects (→ back to running for the worker to fix).
     #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
+    # Same model as ready dispatch: review starts share this tick's max_spawn
+    # budget and the board-wide max_in_progress capacity.
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if max_spawn is not None and spawned >= max_spawn:
+            break
+        if max_in_progress is not None and running_count + spawned >= max_in_progress:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])

@@ -3047,7 +3047,7 @@ DEFAULT_CONFIG = {
         "default_assignee": "",
         # Per-profile concurrency cap (#21582). When set to a positive int,
         # no single profile can have more than N workers running at once,
-        # even if the global max_in_progress / max_spawn caps would allow
+        # even if the global max_in_progress cap and max_spawn tick budget allow
         # it. Tasks blocked this way defer to the next dispatcher tick.
         # Unset (None) means "no per-profile cap" — backward-compatible
         # with existing installs. Useful for fan-out workflows that would

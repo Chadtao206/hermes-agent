@@ -1029,7 +1029,8 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
+        # Read the per-dispatch-tick startup budget. Live concurrency is
+        # bounded independently by max_in_progress below.
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
