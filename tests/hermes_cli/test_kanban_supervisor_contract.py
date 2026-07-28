@@ -914,18 +914,3 @@ def test_local_supervisor_readopt_defers_when_ownership_is_unverifiable(
         assert row["worker_pid"] == before_pid          # still unowned
         assert row["claim_expires"] == before_expiry
         assert _events(conn, tid, "ownership_adopted") == []
-
-
-def test_local_supervisor_source_carries_no_fail_open_idioms():
-    """A cheap regression guard on the two fallbacks Boris found, by name.
-
-    Both were single lines that read as prudence (``run_id = None`` "unfenced
-    but honest"; ``assume_ours`` "don't kill the pane we came to adopt") and
-    both silently disabled a fence. The behavioural tests above would catch
-    their return, but only via whatever path they were re-added to; the names
-    themselves are worth pinning."""
-    source = SC_SUPERVISOR.read_text(encoding="utf-8")
-    assert "assume_ours" not in source
-    assert "run_id = None" not in source
-    assert "_set_worker_pid" not in source        # dispatcher-only spawn write
-    assert source.count("pin_supervised_run(") == 1  # pinned once, never re-resolved

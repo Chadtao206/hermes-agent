@@ -4214,6 +4214,70 @@ def test_dispatch_review_counts_toward_max_spawn(
     assert len(spawns) == 2
 
 
+def test_dispatch_review_respects_live_per_profile_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review starts share the assignee's live-worker capacity."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        kb.claim_task(conn, running)
+        first_review = kb.create_task(conn, title="review 1", assignee="alice")
+        second_review = kb.create_task(conn, title="review 2", assignee="alice")
+        _set_task_status(conn, first_review, "review")
+        _set_task_status(conn, second_review, "review")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_in_progress_per_profile=2,
+        )
+        alice_running = conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status = 'running' AND assignee = 'alice'"
+        ).fetchone()[0]
+
+    assert spawns == [first_review]
+    assert alice_running == 2
+    assert result.skipped_per_profile_capped == [
+        (second_review, "alice", 2),
+    ]
+
+
+def test_dispatch_review_dry_run_respects_per_profile_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    """Dry-run previews stop where the live profile cap would stop."""
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        kb.claim_task(conn, running)
+        first_review = kb.create_task(conn, title="review 1", assignee="alice")
+        second_review = kb.create_task(conn, title="review 2", assignee="alice")
+        _set_task_status(conn, first_review, "review")
+        _set_task_status(conn, second_review, "review")
+
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress_per_profile=2,
+        )
+        review_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status = 'review' AND assignee = 'alice'"
+        ).fetchone()[0]
+
+    assert [task_id for task_id, _, _ in result.spawned] == [first_review]
+    assert review_count == 2
+    assert result.skipped_per_profile_capped == [
+        (second_review, "alice", 2),
+    ]
+
+
 def test_dispatch_review_spawns_when_ready_empty(
     kanban_home, all_assignees_spawnable,
 ):
