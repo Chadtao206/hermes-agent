@@ -2363,6 +2363,131 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
+def test_cleanup_failure_is_visible_and_gc_retries_it(
+    kanban_home,
+    monkeypatch,
+    caplog,
+):
+    """A failed completion cleanup is auditable and remains GC-eligible."""
+    real_rmtree = kb.shutil.rmtree
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sticky scratch")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        (workspace / "artifact.bin").write_bytes(b"still here")
+
+        def fail_this_workspace(path, *args, **kwargs):
+            if Path(path).resolve() == workspace.resolve():
+                raise PermissionError("simulated cleanup denial")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(kb.shutil, "rmtree", fail_this_workspace)
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            assert kb.complete_task(conn, task_id, result="done")
+
+        assert workspace.exists(), "failed cleanup must remain available for retry"
+        failures = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_cleanup_failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0].payload["path"] == str(workspace.resolve())
+        assert failures[0].payload["source"] == "task_completion"
+        assert "simulated cleanup denial" in failures[0].payload["error"]
+        assert "Could not remove scratch workspace" in caplog.text
+
+        monkeypatch.setattr(kb.shutil, "rmtree", real_rmtree)
+        result = kb.gc_scratch_workspaces(conn)
+
+    assert workspace.resolve() in result.removed
+    assert not workspace.exists(), "GC must retry a failed completion cleanup"
+
+
+def test_gc_scratch_workspaces_is_status_aware_and_protects_references(
+    kanban_home,
+):
+    """GC removes terminal scratch roots without touching live/referenced paths."""
+    root = kb.workspaces_root()
+    root.mkdir(parents=True, exist_ok=True)
+
+    with kb.connect() as conn:
+        done_id = kb.create_task(conn, title="done scratch")
+        archived_id = kb.create_task(conn, title="archived scratch")
+        active_id = kb.create_task(conn, title="active scratch")
+        dir_id = kb.create_task(
+            conn,
+            title="persistent dir",
+            workspace_kind="dir",
+            workspace_path=str(root / "dir-owned"),
+        )
+        nested_id = kb.create_task(
+            conn,
+            title="nested reference",
+            workspace_kind="dir",
+            workspace_path=str(root / "container" / "nested"),
+        )
+
+        paths = {
+            "done": root / done_id,
+            "archived": root / archived_id,
+            "active": root / active_id,
+            "dir": root / "dir-owned",
+            "container": root / "container",
+            "nested": root / "container" / "nested",
+            "orphan": root / "orphaned-task-root",
+        }
+        for path in paths.values():
+            path.mkdir(parents=True, exist_ok=True)
+
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, status = 'done' WHERE id = ?",
+            (str(paths["done"]), done_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, status = 'archived' WHERE id = ?",
+            (str(paths["archived"]), archived_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, status = 'running' WHERE id = ?",
+            (str(paths["active"]), active_id),
+        )
+        conn.commit()
+
+        preview = kb.gc_scratch_workspaces(
+            conn,
+            dry_run=True,
+            include_unreferenced=True,
+        )
+        assert set(preview.eligible) == {
+            paths["done"].resolve(),
+            paths["archived"].resolve(),
+            paths["orphan"].resolve(),
+        }
+        assert preview.removed == []
+        assert all(path.exists() for path in paths.values())
+
+        terminal_only = kb.gc_scratch_workspaces(conn)
+        assert set(terminal_only.removed) == {
+            paths["done"].resolve(),
+            paths["archived"].resolve(),
+        }
+        assert paths["orphan"].exists()
+
+        orphan_sweep = kb.gc_scratch_workspaces(
+            conn,
+            include_unreferenced=True,
+        )
+        assert orphan_sweep.removed == [paths["orphan"].resolve()]
+
+    assert paths["active"].exists(), "active scratch roots are never collected"
+    assert paths["dir"].exists(), "non-scratch task paths are never collected"
+    assert paths["container"].exists(), "a root containing a nested reference is protected"
+    assert paths["nested"].exists()
+
+
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
@@ -2731,6 +2856,82 @@ def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
     task_dir = board_workspaces / "task-42"
     task_dir.mkdir(parents=True, exist_ok=True)
     assert kb._is_managed_scratch_path(task_dir)
+
+
+def test_low_disk_watermark_blocks_new_scratch_but_allows_existing(
+    kanban_home,
+    monkeypatch,
+):
+    """The watermark stops growth without stranding an existing workspace."""
+    gib = 1024 ** 3
+    monkeypatch.setattr(
+        kb,
+        "_configured_min_free_disk_gb",
+        lambda: 20.0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kb.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(total=100 * gib, used=90 * gib, free=10 * gib),
+    )
+
+    with kb.connect() as conn:
+        new_id = kb.create_task(conn, title="new scratch")
+        new_task = kb.get_task(conn, new_id)
+        assert new_task is not None
+        new_path = kb.workspaces_root() / new_id
+        with pytest.raises(kb.WorkspaceDiskSpaceError, match="20.*GiB"):
+            kb.resolve_workspace(new_task)
+        assert not new_path.exists()
+
+        existing_id = kb.create_task(conn, title="existing scratch")
+        existing_path = kb.workspaces_root() / existing_id
+        existing_path.mkdir(parents=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(existing_path), existing_id),
+        )
+        conn.commit()
+        existing_task = kb.get_task(conn, existing_id)
+        assert existing_task is not None
+        assert kb.resolve_workspace(existing_task) == existing_path
+
+
+def test_low_disk_watermark_blocks_new_git_worktree(
+    kanban_home,
+    tmp_path,
+    monkeypatch,
+):
+    """Automated worktree materialization uses the same disk-growth guard."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    gib = 1024 ** 3
+    monkeypatch.setattr(
+        kb,
+        "_configured_min_free_disk_gb",
+        lambda: 20.0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kb.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(total=100 * gib, used=90 * gib, free=10 * gib),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="new worktree",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        with pytest.raises(kb.WorkspaceDiskSpaceError, match="20.*GiB"):
+            kb.resolve_workspace(task)
+
+    assert not (repo / ".worktrees" / task_id).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -3839,6 +4040,33 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=3)
 
     assert len(spawns) == 2, f"expected 2 spawns (cap 3 - 1 running), got {len(spawns)}"
+
+
+def test_dispatch_max_spawn_and_max_in_progress_share_total_cap(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    """Both live caps allow dispatch to fill the same total capacity."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        for title in ["running-a", "running-b", "running-c"]:
+            task_id = kb.create_task(conn, title=title, assignee="alice")
+            kb.claim_task(conn, task_id)
+        ready_a = kb.create_task(conn, title="ready-a", assignee="bob")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="bob")
+
+        kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=5,
+            max_in_progress=5,
+        )
+
+    assert spawns == [ready_a, ready_b]
 
 
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):

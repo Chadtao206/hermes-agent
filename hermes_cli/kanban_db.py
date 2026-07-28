@@ -136,6 +136,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_MIN_FREE_DISK_GB = 5.0
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -4025,6 +4026,10 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class WorkspaceDiskSpaceError(RuntimeError):
+    """Raised before materializing a workspace below the free-disk floor."""
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4518,11 +4523,89 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _record_workspace_cleanup_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    path: Path,
+    exc: BaseException,
+    *,
+    source: str,
+) -> None:
+    """Log and persist a best-effort scratch-cleanup failure."""
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path
+    error = f"{type(exc).__name__}: {exc}"
+    _log.warning(
+        "Could not remove scratch workspace for task %s at %s (%s): %s",
+        task_id,
+        resolved,
+        source,
+        error,
+    )
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "workspace_cleanup_failed",
+                {
+                    "path": str(resolved),
+                    "error": error,
+                    "source": source,
+                    "retry": "hermes kanban gc",
+                },
+            )
+    except Exception as event_exc:
+        _log.warning(
+            "Could not persist workspace_cleanup_failed event for task %s: %s",
+            task_id,
+            event_exc,
+        )
+
+
+def _remove_managed_scratch_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    path: Path,
+    *,
+    source: str,
+) -> bool:
+    """Remove one managed scratch directory, reporting every failure."""
+    try:
+        resolved = path.resolve(strict=False)
+        if not path.exists():
+            return True
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError("workspace path is not a real directory")
+        if not _is_managed_scratch_path(path):
+            raise ValueError(
+                "workspace_kind='scratch' but path is outside every "
+                "kanban-managed workspaces root"
+            )
+        shutil.rmtree(path)
+        if path.exists():
+            raise OSError("workspace still exists after recursive removal")
+        _log.debug("Removed scratch workspace for task %s: %s", task_id, resolved)
+        return True
+    except Exception as exc:
+        _record_workspace_cleanup_failure(
+            conn,
+            task_id,
+            path,
+            exc,
+            source=source,
+        )
+        return False
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
-    Best-effort — any error is swallowed so cleanup never blocks task completion.
+    Best-effort — cleanup never blocks task completion, but failures are logged
+    and recorded as ``workspace_cleanup_failed`` events for later GC retry.
     Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
     are intentionally preserved.
     """
@@ -4558,24 +4641,13 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 task_id, path,
             )
             return
-        import shutil
         wp = Path(path)
-        if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
+        _remove_managed_scratch_workspace(
+            conn,
+            task_id,
+            wp,
+            source="task_completion",
+        )
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
@@ -4583,8 +4655,12 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # tasks now have all children done — their deferred cleanup can
         # proceed (#33774).
         _try_cleanup_parent_workspaces(conn, task_id)
-    except Exception:
-        pass  # best-effort — never block completion
+    except Exception as exc:
+        _log.warning(
+            "Scratch workspace cleanup bookkeeping failed for task %s: %s",
+            task_id,
+            exc,
+        )
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -4617,14 +4693,146 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
-            # All children done — safe to clean up parent workspace
-            import shutil
+            # All children done — safe to clean up parent workspace.
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
-    except Exception:
-        pass  # best-effort
+            _remove_managed_scratch_workspace(
+                conn,
+                parent_id,
+                wp,
+                source="deferred_parent_cleanup",
+            )
+    except Exception as exc:
+        _log.warning(
+            "Deferred parent workspace cleanup bookkeeping failed after task %s: %s",
+            task_id,
+            exc,
+        )
+
+
+@dataclass
+class ScratchWorkspaceGcResult:
+    """Paths considered and acted on by :func:`gc_scratch_workspaces`."""
+
+    eligible: list[Path] = field(default_factory=list)
+    removed: list[Path] = field(default_factory=list)
+    protected: list[Path] = field(default_factory=list)
+    failures: list[tuple[Path, str]] = field(default_factory=list)
+
+
+def _workspace_paths_overlap(first: Path, second: Path) -> bool:
+    """Return true when either resolved path contains the other."""
+    return (
+        first == second
+        or first.is_relative_to(second)
+        or second.is_relative_to(first)
+    )
+
+
+def gc_scratch_workspaces(
+    conn: sqlite3.Connection,
+    *,
+    dry_run: bool = False,
+    include_unreferenced: bool = False,
+) -> ScratchWorkspaceGcResult:
+    """Collect safe terminal scratch roots, optionally including orphans.
+
+    By default, only existing managed scratch directories referenced by
+    ``done`` or ``archived`` tasks are eligible. ``include_unreferenced`` also
+    scans immediate children of the active board's workspaces root. Any path
+    overlapping another task reference is protected, including non-scratch and
+    nested references. Symlinks and paths outside managed scratch storage are
+    never removed.
+    """
+    root = workspaces_root().resolve(strict=False)
+    rows = conn.execute(
+        "SELECT id, status, workspace_kind, workspace_path FROM tasks"
+    ).fetchall()
+
+    references: list[tuple[str, Path]] = []
+    terminal_candidates: dict[Path, str] = {}
+    for row in rows:
+        raw_path = row["workspace_path"]
+        if raw_path:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                continue
+        elif row["workspace_kind"] == "scratch":
+            path = root / row["id"]
+        else:
+            continue
+        try:
+            path = path.resolve(strict=False)
+        except OSError:
+            continue
+        references.append((row["id"], path))
+        if (
+            row["workspace_kind"] == "scratch"
+            and row["status"] in {"done", "archived"}
+            and path.exists()
+            and path.is_dir()
+            and not path.is_symlink()
+            and _is_managed_scratch_path(path)
+        ):
+            terminal_candidates.setdefault(path, row["id"])
+
+    candidates: dict[Path, Optional[str]] = dict(terminal_candidates)
+    if include_unreferenced:
+        try:
+            children = sorted(root.iterdir(), key=lambda path: str(path))
+        except OSError as exc:
+            _log.warning("Could not scan scratch workspace root %s: %s", root, exc)
+            children = []
+        for child in children:
+            try:
+                resolved = child.resolve(strict=False)
+                if (
+                    child.is_dir()
+                    and not child.is_symlink()
+                    and _is_managed_scratch_path(resolved)
+                ):
+                    candidates.setdefault(resolved, None)
+            except OSError:
+                continue
+
+    result = ScratchWorkspaceGcResult()
+    eligible_with_owner: list[tuple[Path, Optional[str]]] = []
+    for candidate, owner_id in sorted(candidates.items(), key=lambda item: str(item[0])):
+        overlaps = [
+            referenced
+            for task_id, referenced in references
+            if task_id != owner_id and _workspace_paths_overlap(candidate, referenced)
+        ]
+        if overlaps:
+            result.protected.append(candidate)
+            continue
+        result.eligible.append(candidate)
+        eligible_with_owner.append((candidate, owner_id))
+
+    if dry_run:
+        return result
+
+    for candidate, owner_id in eligible_with_owner:
+        try:
+            shutil.rmtree(candidate)
+            result.removed.append(candidate)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            result.failures.append((candidate, error))
+            if owner_id is not None:
+                _record_workspace_cleanup_failure(
+                    conn,
+                    owner_id,
+                    candidate,
+                    exc,
+                    source="kanban_gc",
+                )
+            else:
+                _log.warning(
+                    "Could not remove unreferenced scratch workspace at %s: %s",
+                    candidate,
+                    error,
+                )
+    return result
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
@@ -5659,6 +5867,51 @@ def _nearest_existing_path(path: Path) -> Path:
     return current
 
 
+def _configured_min_free_disk_gb() -> float:
+    """Return the configured workspace creation floor in GiB."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        raw = (cfg.get("kanban", {}) or {}).get(
+            "min_free_disk_gb",
+            DEFAULT_MIN_FREE_DISK_GB,
+        )
+        value = float(raw)
+        if value < 0:
+            raise ValueError("must be non-negative")
+        return value
+    except Exception as exc:
+        _log.warning(
+            "Invalid kanban.min_free_disk_gb; using %.1f GiB default: %s",
+            DEFAULT_MIN_FREE_DISK_GB,
+            exc,
+        )
+        return DEFAULT_MIN_FREE_DISK_GB
+
+
+def _ensure_workspace_capacity(path: Path) -> None:
+    """Reject a new workspace when its filesystem is below the disk floor."""
+    if path.exists():
+        return
+    minimum_gb = _configured_min_free_disk_gb()
+    if minimum_gb <= 0:
+        return
+    probe = _nearest_existing_path(path.parent)
+    usage = shutil.disk_usage(probe)
+    gib = 1024 ** 3
+    minimum_bytes = minimum_gb * gib
+    if usage.free >= minimum_bytes:
+        return
+    free_gb = usage.free / gib
+    raise WorkspaceDiskSpaceError(
+        f"refusing to create workspace {path}: {free_gb:.1f} GiB free; "
+        f"kanban.min_free_disk_gb requires at least {minimum_gb:g} GiB. "
+        "Run `hermes kanban gc --dry-run --include-unreferenced`, remove "
+        "unneeded data, or lower the configured watermark."
+    )
+
+
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
     current = _nearest_existing_path(path).resolve(strict=False)
     while True:
@@ -5678,6 +5931,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         target_common = _git_common_dir(target)
         if target_common == repo_common:
             return
+    _ensure_workspace_capacity(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -5811,6 +6065,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
+        _ensure_workspace_capacity(p)
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
@@ -5825,6 +6080,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
+        _ensure_workspace_capacity(p)
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
@@ -7942,7 +8198,7 @@ def _dispatch_once_locked(
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
-    if max_spawn is not None:
+    if max_spawn is not None or max_in_progress is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -7964,10 +8220,11 @@ def _dispatch_once_locked(
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+        # Both max_spawn and max_in_progress are live concurrency caps: the
+        # loop below compares existing running workers plus this tick's spawns
+        # against max_spawn. Clamp to the total cap, not remaining headroom.
+        if max_spawn is None or max_spawn > max_in_progress:
+            max_spawn = max_in_progress
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn

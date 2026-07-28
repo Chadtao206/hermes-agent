@@ -2733,6 +2733,11 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Refuse to materialize a new scratch/dir/git-worktree workspace when
+        # the target filesystem has less than this many GiB free. Existing
+        # workspaces remain usable so in-flight tasks are never stranded.
+        # Set to 0 to disable; operators with large disks should raise it.
+        "min_free_disk_gb": 5,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
@@ -5231,7 +5236,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "kanban",
 }
 
 # Valid fields inside a custom_providers list entry

@@ -862,7 +862,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- gc ---
     p_gc = sub.add_parser(
-        "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+        "gc", help="Garbage-collect completed scratch workspaces, old events, and old logs",
+    )
+    p_gc.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show removable workspaces without deleting workspaces, events, or logs",
+    )
+    p_gc.add_argument(
+        "--include-unreferenced",
+        action="store_true",
+        help="Also remove scratch-root directories not referenced by any task",
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
@@ -2711,31 +2721,29 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
-    import shutil
-    scratch_root = kb.workspaces_root()
-    removed_ws = 0
+    """Remove terminal scratch workspaces, prune old events and worker logs."""
+    dry_run = bool(getattr(args, "dry_run", False))
+    include_unreferenced = bool(getattr(args, "include_unreferenced", False))
     with kb.connect_closing() as conn:
-        rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
-        ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        workspace_gc = kb.gc_scratch_workspaces(
+            conn,
+            dry_run=dry_run,
+            include_unreferenced=include_unreferenced,
+        )
+
+    if dry_run:
+        print(
+            f"GC dry run: {len(workspace_gc.eligible)} workspace(s) would be removed; "
+            "events and logs unchanged"
+        )
+        for path in workspace_gc.eligible:
+            print(f"  {path}")
+        if workspace_gc.protected:
+            print(
+                f"Protected {len(workspace_gc.protected)} referenced/overlapping "
+                "workspace path(s)"
+            )
+        return 0
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
@@ -2746,8 +2754,15 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
-    print(f"GC complete: {removed_ws} workspace(s), "
+    print(f"GC complete: {len(workspace_gc.removed)} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    if workspace_gc.failures:
+        print(
+            f"GC warning: {len(workspace_gc.failures)} workspace(s) could not be removed; "
+            "see logs and workspace_cleanup_failed task events",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

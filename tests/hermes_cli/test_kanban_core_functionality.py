@@ -886,6 +886,39 @@ def test_cli_gc_reports_counts(kanban_home):
     assert "GC complete" in out
 
 
+def test_cli_gc_dry_run_and_optional_orphan_collection(kanban_home):
+    root = kb.workspaces_root()
+    root.mkdir(parents=True, exist_ok=True)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="completed scratch")
+        completed = root / tid
+        completed.mkdir()
+        orphan = root / "unreferenced-root"
+        orphan.mkdir()
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, status = 'done' WHERE id = ?",
+            (str(completed), tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    preview = run_slash("gc --dry-run --include-unreferenced")
+    assert "GC dry run" in preview
+    assert "2 workspace(s) would be removed" in preview
+    assert completed.exists() and orphan.exists()
+
+    terminal_only = run_slash("gc")
+    assert "1 workspace(s)" in terminal_only
+    assert not completed.exists()
+    assert orphan.exists(), "orphan collection must remain explicit"
+
+    orphan_sweep = run_slash("gc --include-unreferenced")
+    assert "1 workspace(s)" in orphan_sweep
+    assert not orphan.exists()
+
+
 # ---------------------------------------------------------------------------
 # run_slash parity — every verb returns a sensible, non-crashy string
 # ---------------------------------------------------------------------------
