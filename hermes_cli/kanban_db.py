@@ -8757,11 +8757,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         completion — that's a re-run request.
 
     ``"active_pr"``
-        After the task has run at least once, a GitHub PR URL appears in a
-        recent task comment (within ``_RESPAWN_GUARD_PR_WINDOW`` seconds).
-        A prior worker may already have opened a PR, so re-spawning risks a
-        duplicate PR on the same task.  A never-run remediation card is not
-        guarded merely because its initial context names an existing PR.
+        After the task has run at least once, a profile that ran the task posts
+        a GitHub PR URL in a recent task comment (within
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  That worker may already have
+        opened a PR, so re-spawning risks a duplicate PR on the same task.  A
+        never-run remediation card is not guarded merely because its initial
+        context names an existing PR, and later reviewer/cron context does not
+        re-arm a guard that a deliberate requeue already released.
         Bypassed on the same terms as ``recent_success``, with two
         differences that keep duplicate-PR safety intact where the two
         guards differ in consequence (a wasted respawn vs a second PR on
@@ -8877,8 +8879,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? "
+        "AND author IN ("
+        "    SELECT DISTINCT profile FROM task_runs "
+        "    WHERE task_id = ? AND profile IS NOT NULL"
+        ") "
         "ORDER BY created_at DESC, id DESC",
-        (task_id, pr_cutoff),
+        (task_id, pr_cutoff, task_id),
     ).fetchall():
         urls = (
             _RESPAWN_GUARD_PR_URL_RE.findall(c["body"]) if c["body"] else []
@@ -8898,7 +8904,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile and whose respawn guard is
+    clear.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
@@ -8906,12 +8913,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    If ``profile_exists`` is not importable (e.g. a partial install), fall
+    back to any guard-clear ready+assigned task so the warning still fires
+    for real work in degraded environments without mislabeling deliberately
+    protected cards as stuck.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -8920,10 +8928,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        return any(check_respawn_guard(conn, row["id"]) is None for row in rows)
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if (
+            profile_exists(row["assignee"])
+            and check_respawn_guard(conn, row["id"]) is None
+        ):
             return True
     return False
 

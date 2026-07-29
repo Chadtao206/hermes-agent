@@ -1703,6 +1703,31 @@ def test_has_spawnable_ready_true_when_real_profile_present(kanban_home, monkeyp
         assert kb.has_spawnable_ready(conn) is True
 
 
+def test_has_spawnable_ready_false_when_every_real_profile_task_is_guarded(
+    kanban_home, monkeypatch,
+):
+    """A guard-held card is not spawnable and must not trigger the gateway's
+    repeated "ready queue stuck" warning."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="awaiting PR review", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'alice', 'done', 'blocked', ?, ?)",
+            (task_id, now - 120, now - 60),
+        )
+        kb.add_comment(
+            conn, task_id, "alice",
+            "Opened https://github.com/acme/widgets/pull/7",
+        )
+
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.has_spawnable_ready(conn) is False
+
+
 def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
     """Empty queue is the trivial false case — no ready tasks at all."""
     with kb.connect() as conn:
@@ -1921,12 +1946,12 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
         now = int(time.time())
         conn.execute(
             "INSERT INTO task_runs "
-            "(task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'blocked', ?, ?)",
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'alice', 'done', 'blocked', ?, ?)",
             (t, now - 120, now - 60),
         )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
@@ -2033,12 +2058,12 @@ def test_dispatch_respawn_guard_skips_active_pr(
         now = int(time.time())
         conn.execute(
             "INSERT INTO task_runs "
-            "(task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'blocked', ?, ?)",
+            "(task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'alice', 'done', 'blocked', ?, ?)",
             (t, now - 120, now - 60),
         )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)

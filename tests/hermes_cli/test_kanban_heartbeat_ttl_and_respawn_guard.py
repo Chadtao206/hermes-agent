@@ -553,13 +553,13 @@ def test_spawn_write_never_takes_over_a_dead_recorded_pid(
 # 5. active_pr respawn guard
 # ---------------------------------------------------------------------------
 
-def _park_ready_with_pr_comment(conn, *, title, pr_at, author="cron"):
+def _park_ready_with_pr_comment(conn, *, title, pr_at, author="alice"):
     """Create a previously-run ready task whose history contains a PR URL."""
     tid = kb.create_task(conn, title=title, assignee="alice")
     conn.execute(
         "INSERT INTO task_runs "
-        "(task_id, status, outcome, started_at, ended_at) "
-        "VALUES (?, 'done', 'blocked', ?, ?)",
+        "(task_id, profile, status, outcome, started_at, ended_at) "
+        "VALUES (?, 'alice', 'done', 'blocked', ?, ?)",
         (tid, pr_at - 120, pr_at - 60),
     )
     kb.add_comment(
@@ -626,6 +626,32 @@ def test_explicit_requeue_after_pr_comment_permits_respawn(
             (tid, json.dumps({"status": "ready"}), now - 60),
         )
         conn.commit()
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_pr_link_from_non_runner_does_not_rearm_after_deliberate_requeue(
+    kanban_home, monkeypatch,
+):
+    """Reviewer feedback often links the PR it is reviewing.  When that
+    reviewer has never run this card, its link is context rather than evidence
+    that the assignee opened a fresh duplicate PR."""
+    now = 7_825_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = _park_ready_with_pr_comment(
+            conn, title="review feedback", pr_at=now - 900,
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'status', ?, ?)",
+            (tid, json.dumps({"status": "ready"}), now - 600),
+        )
+        kb.add_comment(
+            conn, tid, "reviewer",
+            "Needs fixes on https://github.com/acme/widgets/pull/7",
+        )
+        conn.commit()
+
         assert kb.check_respawn_guard(conn, tid) is None
 
 
@@ -828,7 +854,7 @@ def test_pr_comment_newer_than_requeue_rearms_the_guard(kanban_home, monkeypatch
 
         # A newer PR comment lands after the re-queue.
         kb.add_comment(
-            conn, tid, "cron",
+            conn, tid, "alice",
             "opened https://github.com/acme/widgets/pull/8 (second PR)",
         )
         conn.execute(
