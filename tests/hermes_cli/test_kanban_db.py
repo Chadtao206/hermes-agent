@@ -1915,9 +1915,16 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A PR URL posted after a prior run triggers active_pr."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
         kb.add_comment(
             conn, t, "worker",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
@@ -2015,7 +2022,7 @@ def test_dispatch_respawn_guard_skips_recent_success(
 def test_dispatch_respawn_guard_skips_active_pr(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """dispatch_once skips a previously-run task with an active PR comment."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2023,6 +2030,13 @@ def test_dispatch_respawn_guard_skips_active_pr(
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
         kb.add_comment(
             conn, t, "worker",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",

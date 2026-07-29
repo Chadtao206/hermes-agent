@@ -8757,9 +8757,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         completion — that's a re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        After the task has run at least once, a GitHub PR URL appears in a
+        recent task comment (within ``_RESPAWN_GUARD_PR_WINDOW`` seconds).
+        A prior worker may already have opened a PR, so re-spawning risks a
+        duplicate PR on the same task.  A never-run remediation card is not
+        guarded merely because its initial context names an existing PR.
         Bypassed on the same terms as ``recent_success``, with two
         differences that keep duplicate-PR safety intact where the two
         guards differ in consequence (a wasted respawn vs a second PR on
@@ -8855,6 +8857,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A never-run task often names an existing PR as its input; that is
+    #    context, not evidence that this task produced a PR.  Require at
+    #    least one run before enabling duplicate-PR protection.
+    prior_run = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior_run is None:
+        return None
+
     #    Same deliberate-rerun exception as ``recent_success``: keyed off the
     #    NEWEST matching comment, so a requeue after the PR comment permits
     #    the run, and a PR comment posted after that requeue re-arms the

@@ -554,8 +554,14 @@ def test_spawn_write_never_takes_over_a_dead_recorded_pid(
 # ---------------------------------------------------------------------------
 
 def _park_ready_with_pr_comment(conn, *, title, pr_at, author="cron"):
-    """Create a ready task whose comment history contains a PR URL."""
+    """Create a previously-run ready task whose history contains a PR URL."""
     tid = kb.create_task(conn, title=title, assignee="alice")
+    conn.execute(
+        "INSERT INTO task_runs "
+        "(task_id, status, outcome, started_at, ended_at) "
+        "VALUES (?, 'done', 'blocked', ?, ?)",
+        (tid, pr_at - 120, pr_at - 60),
+    )
     kb.add_comment(
         conn, tid, author,
         "opened https://github.com/acme/widgets/pull/7 for review",
@@ -568,9 +574,32 @@ def _park_ready_with_pr_comment(conn, *, title, pr_at, author="cron"):
     return tid
 
 
+def test_never_run_task_that_mentions_existing_pr_is_spawnable(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A remediation card often names its target PR before its first run.
+
+    That context is not evidence that this task already produced a PR, so it
+    must not activate the duplicate-PR respawn guard.
+    """
+    now = 7_740_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="remediate existing PR", assignee="alice")
+        kb.add_comment(
+            conn, tid, "cron",
+            "Fix review feedback on https://github.com/acme/widgets/pull/7",
+        )
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert [task_id for task_id, _, _ in result.spawned] == [tid]
+        assert result.respawn_guarded == []
+
+
 def test_pr_comment_alone_still_guards_respawn(kanban_home, monkeypatch):
-    """Duplicate-PR safety is the default: with no deliberate re-run, a
-    recent PR comment still defers the spawn."""
+    """After a prior run, duplicate-PR safety is the default: with no
+    deliberate re-run, a recent PR comment still defers the respawn."""
     now = 7_750_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     with kb.connect() as conn:
