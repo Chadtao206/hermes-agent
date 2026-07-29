@@ -2515,6 +2515,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
             ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
