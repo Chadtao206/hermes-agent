@@ -5425,13 +5425,21 @@ class ScratchWorkspaceGcResult:
     failures: list[tuple[Path, str]] = field(default_factory=list)
 
 
-def _workspace_paths_overlap(first: Path, second: Path) -> bool:
-    """Return true when either resolved path contains the other."""
-    return (
-        first == second
-        or first.is_relative_to(second)
-        or second.is_relative_to(first)
-    )
+def _workspace_reference_protects_candidate(
+    candidate: Path,
+    referenced: Path,
+    root: Path,
+) -> bool:
+    """Return whether a task reference makes a managed candidate unsafe.
+
+    Exact references and references nested inside a candidate always protect
+    it. A containing reference protects the candidate only when that reference
+    is itself managed scratch storage; unrelated broad roots such as
+    ``HERMES_HOME`` must not pin every managed child forever.
+    """
+    if referenced == candidate or referenced.is_relative_to(candidate):
+        return True
+    return referenced.is_relative_to(root) and candidate.is_relative_to(referenced)
 
 
 def gc_scratch_workspaces(
@@ -5445,9 +5453,10 @@ def gc_scratch_workspaces(
     By default, only existing managed scratch directories referenced by
     ``done`` or ``archived`` tasks are eligible. ``include_unreferenced`` also
     scans immediate children of the active board's workspaces root. Any path
-    overlapping another task reference is protected, including non-scratch and
-    nested references. Symlinks and paths outside managed scratch storage are
-    never removed.
+    equal to or containing another task reference is protected. Containing task
+    references protect candidates only when the reference itself is within the
+    managed root. Symlinks and paths outside managed scratch storage are never
+    removed.
     """
     root = workspaces_root().resolve(strict=False)
     rows = conn.execute(
@@ -5506,7 +5515,8 @@ def gc_scratch_workspaces(
         overlaps = [
             referenced
             for task_id, referenced in references
-            if task_id != owner_id and _workspace_paths_overlap(candidate, referenced)
+            if task_id != owner_id
+            and _workspace_reference_protects_candidate(candidate, referenced, root)
         ]
         if overlaps:
             result.protected.append(candidate)
@@ -6290,16 +6300,11 @@ def decompose_triage_task(
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
-            elif child_ws_kind == "worktree":
-                # Never share one worktree checkout between siblings: the
-                # root's literal path would put every child in the same
-                # directory on the first-dispatched sibling's branch, with
-                # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
-                child_ws_path = None
             elif child_ws_kind == root_ws_kind:
+                # For worktree children this is a repository anchor, not a
+                # shared runtime checkout. The resolver sees the root's
+                # foreign branch and materializes a unique
+                # <repo>/.worktrees/<child-id> checkout for each child.
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None

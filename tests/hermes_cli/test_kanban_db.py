@@ -2465,6 +2465,12 @@ def test_gc_scratch_workspaces_is_status_aware_and_protects_references(
             workspace_kind="dir",
             workspace_path=str(root / "container" / "nested"),
         )
+        kb.create_task(
+            conn,
+            title="persistent Hermes home",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
 
         paths = {
             "done": root / done_id,

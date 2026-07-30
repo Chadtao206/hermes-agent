@@ -1387,6 +1387,29 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_prefers_request_scoped_session_over_foreign_process_env(
+    monkeypatch,
+    worker_env,
+):
+    """A concurrent cron must not steal another request's child attribution."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-cron")
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    set_session_vars(session_id="origin-cron")
+    try:
+        result = json.loads(
+            kt._handle_create({"title": "child", "assignee": "peer"})
+        )
+        with kb.connect() as conn:
+            child = kb.get_task(conn, result["task_id"])
+        assert child is not None
+        assert child.session_id == "origin-cron"
+    finally:
+        reset_session_vars()
+
+
 def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
     """An explicit ``session_id`` arg from the model wins over the env
     propagation. Edge case but exercised: a tool call could carry a

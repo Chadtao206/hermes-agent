@@ -1154,12 +1154,14 @@ def _handle_create(args: dict, **kw) -> str:
     # is clobbered with a subagent's internal id whenever a child agent is
     # constructed in-process (agent_init calls set_current_session_id), which
     # would stamp — and later wake — the wrong session.
+    from gateway.session_context import get_session_env
     from tools.async_delegation import _current_origin_session_id
 
     session_id = (
         args.get("session_id")
         or _current_origin_session_id()
-        or os.environ.get("HERMES_SESSION_ID")
+        or get_session_env("HERMES_SESSION_ID", "")
+        or None
     )
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
