@@ -383,6 +383,12 @@ class TestFailureAttribution:
     """
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
+        # These tests define the complete pool under test.  Keep a developer's
+        # Claude Code file or macOS Keychain entry from adding another row.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: None,
+        )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
@@ -532,6 +538,7 @@ class TestFailureAttribution:
             tmp_path, monkeypatch,
             [self._entry(0, "new-runtime-key")],
         )
+        assert [entry.id for entry in pool.entries()] == ["cred-0"]
         selected = pool.select()
         assert selected.id == "cred-0"
         assert pool.entry_id_for_api_key("new-runtime-key") == "cred-0"
@@ -562,6 +569,7 @@ class TestFailureAttribution:
             tmp_path, monkeypatch,
             [self._entry(0, "pool-runtime-key")],
         )
+        assert [entry.id for entry in pool.entries()] == ["cred-0"]
         agent = self._agent(pool, failing_key="wrapper-runtime-key")
         agent._is_entitlement_failure = MagicMock(return_value=False)
 

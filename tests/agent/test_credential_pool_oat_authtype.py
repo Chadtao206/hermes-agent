@@ -107,6 +107,13 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
 
 
 def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, monkeypatch):
+    # The test exercises profile fallback persistence, not ambient Claude Code
+    # discovery.  Unlike HOME-backed files, the macOS Keychain is not isolated
+    # by Path.home(), so neutralize that external singleton explicitly.
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     global_root = tmp_path / ".hermes"
     global_root.mkdir()
