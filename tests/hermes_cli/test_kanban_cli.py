@@ -142,6 +142,9 @@ def test_run_slash_show_includes_comments(kanban_home):
 def test_run_slash_recovery_control_set_board_returns_json(kanban_home):
     from hermes_cli.kanban_recovery_config import load_recovery_control
 
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  blocked_recovery:\n    rollout_mode: live\n", encoding="utf-8"
+    )
     current = load_recovery_control()
     out = kc.run_slash(
         "recovery-control set-board "

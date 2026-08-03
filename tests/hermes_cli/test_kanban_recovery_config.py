@@ -112,6 +112,9 @@ def test_control_update_writes_exact_review_and_transient_modes(tmp_path, monkey
     )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "kanban:\n  blocked_recovery:\n    rollout_mode: live\n", encoding="utf-8"
+    )
     current = load_recovery_control()
     result = guarded_update_recovery_control(
         RecoveryControlUpdate(
@@ -254,3 +257,133 @@ def test_invalid_transition_leaves_recovery_control_unchanged(tmp_path, monkeypa
 
     assert result.outcome == "invalid"
     assert load_recovery_control().digest() == current.digest()
+
+
+def test_guarded_update_rejects_unrelated_invalid_full_config(tmp_path, monkeypatch):
+    from hermes_cli.kanban_recovery_config import (
+        RecoveryControlUpdate,
+        guarded_update_recovery_control,
+        load_recovery_control,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("fallback_model: bad-string\n", encoding="utf-8")
+    before = config_path.read_text(encoding="utf-8")
+    current = load_recovery_control()
+
+    result = guarded_update_recovery_control(
+        RecoveryControlUpdate(
+            expected_digest=current.digest(),
+            operation="set_review_allowlist",
+            values={"board": "default", "review_allowlist": ["reviewer-a"]},
+        )
+    )
+
+    assert result.outcome == "invalid"
+    assert config_path.read_text(encoding="utf-8") == before
+    assert load_recovery_control().digest() == current.digest()
+
+
+def test_shadow_rollout_disables_all_live_recovery_mutation_modes():
+    control = RecoveryControl.from_config(
+        {
+            "kanban": {
+                "blocked_recovery": {
+                    "rollout_mode": "shadow",
+                    "managed_boards": {
+                        "default": {"review_mode": "live", "transient_mode": "live"}
+                    },
+                    "controller_jobs": {
+                        "router": {
+                            "role": "router",
+                            "job_id": "fef26eedc8da",
+                            "role_tag": "blocked-recovery-router",
+                            "source_manifest": ["scripts/review_delegator/runner.py"],
+                            "source_manifest_digest": "a" * 64,
+                            "schedule_digest": "b" * 64,
+                            "delivery_scope": "kanban:default",
+                            "desired_mode": "live",
+                        }
+                    },
+                }
+            }
+        }
+    )
+
+    assert control.mutation_enabled is False
+    assert "default.review_mode cannot be live while rollout_mode is shadow" in control.errors
+    assert "router.desired_mode cannot be live while rollout_mode is shadow" in control.errors
+
+
+def test_shared_control_uses_default_root_not_active_profile(tmp_path, monkeypatch):
+    from hermes_cli.kanban_recovery_config import load_recovery_control
+
+    root = tmp_path / "shared-root"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "kanban:\n  blocked_recovery:\n    rollout_mode: live\n", encoding="utf-8"
+    )
+    (profile / "config.yaml").write_text(
+        "kanban:\n  blocked_recovery:\n    rollout_mode: shadow\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    assert load_recovery_control().rollout_mode == "live"
+
+
+def test_guarded_update_writes_shared_root_not_active_profile(tmp_path, monkeypatch):
+    from hermes_cli.kanban_recovery_config import (
+        RecoveryControlUpdate,
+        guarded_update_recovery_control,
+        load_recovery_control,
+    )
+
+    root = tmp_path / "shared-root"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    root_config = root / "config.yaml"
+    profile_config = profile / "config.yaml"
+    root_config.write_text(
+        "kanban:\n  blocked_recovery:\n    rollout_mode: live\n", encoding="utf-8"
+    )
+    profile_config.write_text("display:\n  skin: midnight\n", encoding="utf-8")
+    profile_before = profile_config.read_text(encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    current = load_recovery_control()
+
+    result = guarded_update_recovery_control(
+        RecoveryControlUpdate(
+            expected_digest=current.digest(),
+            operation="set_board",
+            values={"board": "default", "review_mode": "live", "transient_mode": "shadow"},
+        )
+    )
+
+    assert result.outcome == "committed"
+    assert load_recovery_control().boards["default"].review_mode == "live"
+    assert "review_mode: live" in root_config.read_text(encoding="utf-8")
+    assert profile_config.read_text(encoding="utf-8") == profile_before
+
+
+def test_cold_load_downgrades_unadmitted_board_live_modes(tmp_path, monkeypatch):
+    from hermes_cli.kanban_recovery_config import load_recovery_control
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "kanban:\n"
+        "  blocked_recovery:\n"
+        "    rollout_mode: live\n"
+        "    managed_boards:\n"
+        "      default: {}\n"
+        "      new-board:\n"
+        "        review_mode: live\n"
+        "        transient_mode: live\n",
+        encoding="utf-8",
+    )
+
+    control = load_recovery_control()
+
+    assert control.boards["new-board"].review_mode == "shadow"
+    assert control.boards["new-board"].transient_mode == "shadow"

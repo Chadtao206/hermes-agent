@@ -263,6 +263,21 @@ class RecoveryControl:
             rollout_mode = "shadow"
         if rollout_mode in {"shadow", "canary"} and mutation_cap != 1:
             errors.append("mutation_cap must be 1 while rollout_mode is shadow or canary")
+        if rollout_mode in {"paused", "shadow", "canary"}:
+            for board, control in parsed.items():
+                if control.review_mode == "live":
+                    errors.append(
+                        f"{board}.review_mode cannot be live while rollout_mode is {rollout_mode}"
+                    )
+                if control.transient_mode == "live":
+                    errors.append(
+                        f"{board}.transient_mode cannot be live while rollout_mode is {rollout_mode}"
+                    )
+            for role, controller in parsed_controllers.items():
+                if controller.desired_mode == "live":
+                    errors.append(
+                        f"{role}.desired_mode cannot be live while rollout_mode is {rollout_mode}"
+                    )
         return cls(
             parsed, not errors, tuple(errors), parsed_controllers,
             router_lease_seconds, target_stability_seconds,
@@ -271,11 +286,36 @@ class RecoveryControl:
         )
 
 
-def load_recovery_control() -> RecoveryControl:
-    """Load and validate the effective profile-scoped recovery controls."""
-    from hermes_cli.config import load_config
+def _shared_config_path() -> Path:
+    from hermes_constants import get_default_hermes_root
 
-    return RecoveryControl.from_config(load_config())
+    return get_default_hermes_root() / "config.yaml"
+
+
+def _trusted_baseline_control() -> RecoveryControl:
+    """Return the only board set allowed to be live after a cold start."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    return RecoveryControl.from_config(DEFAULT_CONFIG)
+
+
+def _control_from_raw(raw: Mapping[str, object]) -> RecoveryControl:
+    """Validate a shared config against the cold-start admission baseline."""
+    return RecoveryControl.from_config(
+        _effective_config(raw), previous=_trusted_baseline_control()
+    )
+
+
+def load_recovery_control() -> RecoveryControl:
+    """Load and validate the shared root recovery controls."""
+    config_path = _shared_config_path()
+    try:
+        raw = _read_raw_config_for_update(config_path)
+    except (OSError, ValueError, yaml.YAMLError):
+        return RecoveryControl.from_config(
+            {"kanban": {"blocked_recovery": {"managed_boards": []}}}
+        )
+    return _control_from_raw(raw)
 
 
 @contextmanager
@@ -308,8 +348,9 @@ def _config_lock(config_path: Path) -> Iterator[None]:
 
 def _effective_config(raw: Mapping[str, object]) -> dict[str, object]:
     from hermes_cli.config import DEFAULT_CONFIG, _deep_merge
+    from hermes_cli.managed_scope import apply_managed_overlay
 
-    return _deep_merge(copy.deepcopy(DEFAULT_CONFIG), dict(raw))
+    return apply_managed_overlay(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), dict(raw)))
 
 
 def _read_raw_config_for_update(config_path: Path) -> dict[str, object]:
@@ -420,26 +461,38 @@ def _clear_config_caches(config_path: Path) -> None:
 
 def guarded_update_recovery_control(request: RecoveryControlUpdate) -> ControlUpdateResult:
     """Compare-and-swap a validated recovery-control-only config update."""
-    from hermes_cli.config import ensure_hermes_home, get_config_path, require_readable_config_before_write
+    from hermes_cli.config import (
+        require_readable_config_before_write,
+        validate_config_structure,
+    )
 
-    ensure_hermes_home()
-    config_path = get_config_path()
+    config_path = _shared_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     with _config_lock(config_path):
         try:
             require_readable_config_before_write(config_path)
             raw = _read_raw_config_for_update(config_path)
         except (OSError, ValueError, yaml.YAMLError) as exc:
             return ControlUpdateResult("invalid", "", "", str(exc))
-        current = RecoveryControl.from_config(_effective_config(raw))
+        current = _control_from_raw(raw)
         previous_digest = current.digest()
         if request.expected_digest != previous_digest:
             return ControlUpdateResult("precondition_changed", previous_digest, previous_digest)
         candidate = copy.deepcopy(raw)
         try:
             _apply_update(candidate, request, current)
-            validated = RecoveryControl.from_config(_effective_config(candidate), previous=current)
+            validated = _control_from_raw(candidate)
         except (TypeError, ValueError) as exc:
             return ControlUpdateResult("invalid", previous_digest, previous_digest, str(exc))
+        config_errors = [
+            issue.message
+            for issue in validate_config_structure(_effective_config(candidate))
+            if issue.severity == "error"
+        ]
+        if config_errors:
+            return ControlUpdateResult(
+                "invalid", previous_digest, previous_digest, "; ".join(config_errors)
+            )
         if not validated.mutation_enabled:
             return ControlUpdateResult(
                 "invalid", previous_digest, previous_digest, "; ".join(validated.errors)
