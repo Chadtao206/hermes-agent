@@ -505,18 +505,23 @@ current default board. It enumerates each managed board independently and passes
 that board identity explicitly to every read and mutation. Every blocked card on
 a managed board must resolve through the ownership census; cards on unmanaged
 boards are reported as outside automation scope rather than ownerless.
-The allowlist and rollout mode live in nonsecret `config.yaml` under
+The allowlist and rollout controls live in nonsecret `config.yaml` under
 `kanban.blocked_recovery`; no new environment-variable configuration is added.
-An empty, malformed, or unknown-board allowlist fails closed for mutation and is
+Each managed board has separate `review_mode` and `transient_mode` values so
+review routing can pass its production canary while transient retry remains in
+shadow. Both use `paused`, `shadow`, or `live`; `transient_mode=live` is invalid
+unless `review_mode=live`. The controller job's desired mode separately governs
+whether the process should run and does not collapse these feature gates. An
+empty, malformed, or unknown-board allowlist fails closed for mutation and is
 reported in health.
 
 Only this recovery-control section is narrowly hot-reloaded by the gateway
 supervisor on a validated config revision; it does not rebuild prompts, toolsets,
 or conversation state. Guarded CLI mode/allowlist updates write config atomically.
 A malformed reload retains the last validated control snapshot for observation,
-disables new recovery mutation, and alerts. A newly added board begins in
-`shadow` and must pass two clean ownership censuses before its mode can become
-`live`.
+disables new recovery mutation, and alerts. A newly added board begins with both
+feature modes in `shadow` and must pass two clean ownership censuses before
+either mode can become `live`.
 
 The same section contains a declarative controller-job manifest. Each required
 role (initially blocked router, remediation actuator, and adjudicator) binds one
@@ -693,6 +698,15 @@ new unacknowledged signature, while disappearance of the underlying condition
 resolves it automatically. Prose comments are not acknowledgements. Initial,
 24-hour, and 72-hour notices are change-gated rather than emitted every tick.
 
+The router atomically publishes a checksummed, schema-versioned public health
+snapshot under the shared default Hermes root. It contains only bounded trusted
+reason codes and exact board/task/escalation/precondition signatures—never task
+bodies, comments, patches, artifact text, or raw errors. The Kanban dashboard
+reads that snapshot and invokes the same guarded core acknowledgement operation
+as the CLI; a missing, corrupt, stale, cross-board, or unknown signature is
+nonmutating. Dashboard acknowledgement records actor `dashboard` and remains
+lifecycle- and budget-neutral.
+
 At startup the gateway atomically writes
 `state/gateway-runtime-fingerprint.json`. One authoritative manifest contains
 `gateway/run.py`, `gateway/kanban_watchers.py`, `gateway/status.py`,
@@ -799,6 +813,11 @@ enabled bit changed by another actor is not claimed as the supervisor's success.
 - Reviewer creation remains generation-idempotency-keyed.
 - Reviewer-generation idempotency is enforced atomically and permanently across
   active and archived tasks in core Kanban.
+- Transient retry uses a guarded `hermes kanban retry-transient` operation bound
+  to the exact current terminal-event signature, next monotonic retry ordinal,
+  and stable operation id. Each committed retry appends a permanent
+  `transient_retry_authorized` event, so sidecar loss or elapsed absence cannot
+  reset the per-card budget.
 - Mutations use durable operation ids and reconcile unknown subprocess outcomes
   before any retry or later mutation.
 - Manual parent lifecycle changes win; automation never reinstates an old block.
@@ -875,7 +894,9 @@ Local review-router behavioral tests cover:
   operational/invariant failures (nonzero).
 - Escalation acknowledgement bound to the exact current signature, including
   automatic resolution, higher-tier re-escalation, and proof that an
-  acknowledgement cannot mutate a task or carry forward to changed evidence.
+  acknowledgement cannot mutate a task or carry forward to changed evidence;
+  the dashboard action exercises the same core guard as the CLI against a
+  checksummed board-filtered public health snapshot.
 - Gateway startup fingerprint creation and dirty/committed restart-sensitive
   module drift detection without docs-only or fresh-script false positives.
 - Cron provider startup readiness, dead-thread/stale-heartbeat detection,
@@ -891,6 +912,10 @@ Local review-router behavioral tests cover:
   disabled-job visibility in health/status.
 - Caching a judge rejection until evidence changes.
 - Preserving and surfacing reviewer rejection.
+- Typed or structurally verified transient retry with separate review/transient
+  feature modes, exact terminal-event and ownership guards, one shared
+  mutation-per-tick cap, permanent event-derived budget reconstruction after
+  sidecar loss, manual precedence, and refusal of freeform failure prose.
 - A 60-minute reviewer attempt cap, no dispatcher retry, one guarded router retry
   only for the current unchanged generation after structured timeout/crash/give-up,
   and exhaustion after the second operational failure.
