@@ -12,6 +12,8 @@ Covers three layers:
 
 from __future__ import annotations
 
+from dataclasses import asdict
+import json
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +21,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import goals
+from hermes_cli import kanban as kc
+from hermes_cli import strict_goal_judge as strict
 
 
 @pytest.fixture
@@ -381,3 +385,114 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+
+def _strict_completion_cli_fixture() -> tuple[str, str]:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="ship reviewed change", body="tests pass")
+        assert kb.block_task(conn, parent, reason="review", kind="review")
+        parent_event = kb.list_events(conn, parent)[-1]
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        assert kb.claim_task(conn, reviewer, claimer="reviewer") is not None
+        metadata = {
+            "review": {
+                "schema_version": 1,
+                "verdict": "APPROVED",
+                "target": {
+                    "kind": "git",
+                    "identity": "example/repository",
+                    "revision": "a" * 40,
+                },
+                "findings": [],
+            }
+        }
+        assert kb.complete_task(conn, reviewer, summary="approved", metadata=metadata)
+        reviewer_event = [
+            event for event in kb.list_events(conn, reviewer) if event.kind == "completed"
+        ][-1]
+        target = metadata["review"]["target"]
+        preconditions = kb.ReviewedCompletionPreconditions(
+            parent_block_event_id=parent_event.id,
+            parent_block_event_signature=kb.canonical_event_signature(parent_event),
+            review_input_digest=kb.review_input_digest(conn, parent),
+            target_signature=kb.canonical_payload_signature(target),
+            reviewer_task_id=reviewer,
+            reviewer_completion_event_id=reviewer_event.id,
+            reviewer_completion_event_signature=kb.canonical_event_signature(
+                reviewer_event
+            ),
+            reviewer_approval_signature=kb.canonical_payload_signature(
+                reviewer_event.payload["review"]
+            ),
+            operation_id="strict-cli-completion",
+        )
+    envelope = asdict(preconditions)
+    envelope["target_verification"] = target
+    command = (
+        f"complete {parent} --result shipped --summary verified "
+        "--require-goal-judge --automation-preconditions "
+        f"'{json.dumps(envelope, separators=(',', ':'))}' --json"
+    )
+    return parent, command
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "unavailable", "parse_failed"])
+def test_strict_completion_nonacceptance_never_mutates(
+    kanban_home,
+    monkeypatch,
+    outcome,
+):
+    parent, command = _strict_completion_cli_fixture()
+    monkeypatch.setattr(
+        strict,
+        "judge_goal_strict",
+        lambda value: strict.StrictJudgeResult(outcome=outcome, reason="not accepted"),
+    )
+
+    payload = json.loads(kc.run_slash(command))
+
+    assert payload["outcome"] == outcome
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, parent).status == "blocked"
+
+
+def test_strict_completion_rechecks_after_judge_acceptance(
+    kanban_home,
+    monkeypatch,
+):
+    parent, command = _strict_completion_cli_fixture()
+
+    def mutate_then_accept(value):
+        with kb.connect_closing() as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET body = ? WHERE id = ?",
+                    ("changed during judge", parent),
+                )
+        return strict.StrictJudgeResult(outcome="accepted", reason="accepted")
+
+    monkeypatch.setattr(strict, "judge_goal_strict", mutate_then_accept)
+
+    payload = json.loads(kc.run_slash(command))
+
+    assert payload["outcome"] == "precondition_changed"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, parent).status == "blocked"
+
+
+def test_strict_completion_exact_acceptance_completes_plain_parent(
+    kanban_home,
+    monkeypatch,
+):
+    parent, command = _strict_completion_cli_fixture()
+    monkeypatch.setattr(
+        strict,
+        "judge_goal_strict",
+        lambda value: strict.StrictJudgeResult(outcome="accepted", reason="accepted"),
+    )
+
+    payload = json.loads(kc.run_slash(command))
+
+    assert payload["outcome"] == "accepted"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, parent).status == "done"

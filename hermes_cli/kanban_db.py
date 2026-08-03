@@ -1293,6 +1293,30 @@ class RecoverySnapshot:
 
 
 @dataclass(frozen=True)
+class ReviewedCompletionPreconditions:
+    parent_block_event_id: int
+    parent_block_event_signature: str
+    review_input_digest: str
+    target_signature: str
+    reviewer_task_id: str
+    reviewer_completion_event_id: int
+    reviewer_completion_event_signature: str
+    reviewer_approval_signature: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class ReviewedCompletionRequest:
+    task_id: str
+    result: Optional[str]
+    summary: Optional[str]
+    metadata: Optional[dict[str, object]]
+    target_verification: Mapping[str, object]
+    preconditions: ReviewedCompletionPreconditions
+    judge_input_signature: str
+
+
+@dataclass(frozen=True)
 class ReviewCompletionEvidence:
     """Validated review verdict copied onto a terminal completion event."""
 
@@ -6959,7 +6983,7 @@ def reclassify_block(
         source = _latest_task_event(
             conn,
             request.task_id,
-            kinds=("blocked", "gave_up"),
+            kinds=("blocked", "gave_up", "block_reclassified"),
         )
         if (
             source is None
@@ -7807,6 +7831,249 @@ def read_recovery_snapshot(
             pass
         raise
     return replace(snapshot, revision_signature=snapshot_signature(snapshot))
+
+
+def canonical_payload_signature(payload: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        dict(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def review_input_digest(conn: sqlite3.Connection, task_id: str) -> str:
+    row = conn.execute(
+        "SELECT id, title, body, assignee, priority, tenant, project_id, "
+        "status, block_kind FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"task {task_id} not found")
+    payload = {key: row[key] for key in row.keys()}
+    payload["parents"] = parent_ids(conn, task_id)
+    return canonical_payload_signature(payload)
+
+
+def _event_by_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event_id: int,
+) -> Optional[Event]:
+    row = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND id = ?",
+        (task_id, int(event_id)),
+    ).fetchone()
+    return _event_from_row(row) if row is not None else None
+
+
+def build_reviewed_completion_judge_input(
+    conn: sqlite3.Connection,
+    request: ReviewedCompletionRequest,
+):
+    from hermes_cli.strict_goal_judge import StrictJudgeInput
+
+    task = get_task(conn, request.task_id)
+    reviewer_event = _event_by_id(
+        conn,
+        request.preconditions.reviewer_task_id,
+        request.preconditions.reviewer_completion_event_id,
+    )
+    if task is None or reviewer_event is None:
+        return None
+    return StrictJudgeInput(
+        task={
+            "id": task.id,
+            "title": task.title,
+            "body": task.body,
+            "status": task.status,
+            "block_kind": task.block_kind,
+        },
+        proposed_completion={
+            "result": request.result,
+            "summary": request.summary,
+            "metadata": dict(request.metadata or {}),
+        },
+        reviewer_event={
+            "id": reviewer_event.id,
+            "task_id": reviewer_event.task_id,
+            "kind": reviewer_event.kind,
+            "payload": reviewer_event.payload,
+            "run_id": reviewer_event.run_id,
+            "created_at": reviewer_event.created_at,
+            "signature": canonical_event_signature(reviewer_event),
+        },
+        target_verification=dict(request.target_verification),
+        preconditions=asdict(request.preconditions),
+    )
+
+
+def complete_reviewed_task_guarded(
+    conn: sqlite3.Connection,
+    request: ReviewedCompletionRequest,
+) -> GuardedMutationResult:
+    pre = request.preconditions
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=pre.operation_id,
+            event_kind="completed",
+        )
+        if replay is not None:
+            return replay
+        task = get_task(conn, request.task_id)
+        if task is None:
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="parent task not found",
+            )
+        if task.status != "blocked" or task.block_kind != "review":
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="parent is no longer blocked for review",
+            )
+        parent_event = _event_by_id(
+            conn,
+            request.task_id,
+            pre.parent_block_event_id,
+        )
+        latest_block = _latest_task_event(
+            conn,
+            request.task_id,
+            kinds=("blocked", "gave_up", "block_reclassified"),
+        )
+        if (
+            parent_event is None
+            or latest_block is None
+            or parent_event.id != latest_block.id
+            or canonical_event_signature(parent_event)
+            != pre.parent_block_event_signature
+            or review_input_digest(conn, request.task_id) != pre.review_input_digest
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="parent review input changed",
+            )
+        if canonical_payload_signature(request.target_verification) != pre.target_signature:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="target verification changed",
+            )
+        reviewer_event = _event_by_id(
+            conn,
+            pre.reviewer_task_id,
+            pre.reviewer_completion_event_id,
+        )
+        evidence = get_terminal_review_evidence(
+            conn,
+            pre.reviewer_task_id,
+            pre.reviewer_completion_event_id,
+        )
+        if (
+            reviewer_event is None
+            or canonical_event_signature(reviewer_event)
+            != pre.reviewer_completion_event_signature
+            or evidence is None
+            or not evidence.approved
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="reviewer approval changed or is unusable",
+            )
+        approval_payload = _canonical_review_payload(evidence)
+        target_payload = approval_payload["target"]
+        if (
+            canonical_payload_signature(approval_payload)
+            != pre.reviewer_approval_signature
+            or target_payload != dict(request.target_verification)
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="review approval or target binding changed",
+            )
+        judge_input = build_reviewed_completion_judge_input(conn, request)
+        if (
+            judge_input is None
+            or judge_input.signature() != request.judge_input_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="strict judge input changed",
+            )
+        now = int(time.time())
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'done', result = ?, completed_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0,
+                   consecutive_failures = 0, last_failure_error = NULL
+             WHERE id = ? AND status = 'blocked' AND block_kind = 'review'
+            """,
+            (request.result, now, request.task_id),
+        )
+        if cur.rowcount != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="parent changed during guarded completion",
+            )
+        run_id = _end_run(
+            conn,
+            request.task_id,
+            outcome="completed",
+            status="done",
+            summary=request.summary if request.summary is not None else request.result,
+            metadata=dict(request.metadata or {}),
+        )
+        if run_id is None and (request.summary or request.result or request.metadata):
+            run_id = _synthesize_ended_run(
+                conn,
+                request.task_id,
+                outcome="completed",
+                summary=request.summary if request.summary is not None else request.result,
+                metadata=dict(request.metadata or {}),
+            )
+        event_id = _append_event(
+            conn,
+            request.task_id,
+            "completed",
+            {
+                "operation_id": pre.operation_id,
+                "result_len": len(request.result) if request.result else 0,
+                "summary": (request.summary or request.result or "")[:400] or None,
+                "judge_input_signature": request.judge_input_signature,
+                "reviewer_task_id": pre.reviewer_task_id,
+                "reviewer_completion_event_id": pre.reviewer_completion_event_id,
+                "target_signature": pre.target_signature,
+            },
+            run_id=run_id,
+        )
+    recompute_ready(conn)
+    _cleanup_workspace(conn, request.task_id)
+    return GuardedMutationResult(
+        outcome="committed",
+        task_id=request.task_id,
+        operation_id=pre.operation_id,
+        event_id=event_id,
+    )
 
 
 def specify_triage_task(

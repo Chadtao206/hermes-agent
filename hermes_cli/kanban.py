@@ -606,6 +606,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--require-goal-judge",
+        action="store_true",
+        help="Require the strict automation goal judge before guarded completion",
+    )
+    p_complete.add_argument(
+        "--automation-preconditions",
+        default=None,
+        metavar="<json>",
+        help="Exact guarded-completion preconditions (automation only)",
+    )
+    p_complete.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the strict automation outcome as JSON",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -2217,6 +2233,153 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _strict_completion_payload(
+    *,
+    outcome: str,
+    task_id: str,
+    operation_id: str,
+    reason: str = "",
+    event_id: Optional[int] = None,
+) -> dict[str, object]:
+    return {
+        "outcome": outcome,
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "event_id": event_id,
+        "reason": reason,
+    }
+
+
+def _parse_reviewed_completion_preconditions(
+    raw: str,
+) -> tuple[kb.ReviewedCompletionPreconditions, dict[str, object]]:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("must be a JSON object")
+    precondition_fields = {
+        "parent_block_event_id",
+        "parent_block_event_signature",
+        "review_input_digest",
+        "target_signature",
+        "reviewer_task_id",
+        "reviewer_completion_event_id",
+        "reviewer_completion_event_signature",
+        "reviewer_approval_signature",
+        "operation_id",
+    }
+    expected_fields = precondition_fields | {"target_verification"}
+    if set(payload) != expected_fields:
+        missing = sorted(expected_fields - set(payload))
+        extra = sorted(set(payload) - expected_fields)
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected {', '.join(extra)}")
+        raise ValueError("invalid fields: " + "; ".join(details))
+    target = payload["target_verification"]
+    if not isinstance(target, dict):
+        raise ValueError("target_verification must be a JSON object")
+    try:
+        preconditions = kb.ReviewedCompletionPreconditions(
+            **{key: payload[key] for key in precondition_fields}
+        )
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
+    return preconditions, target
+
+
+def _cmd_complete_strict(
+    args: argparse.Namespace,
+    *,
+    task_id: str,
+    metadata: Optional[dict[str, object]],
+) -> int:
+    if len(args.task_ids) != 1:
+        print("kanban: --require-goal-judge accepts exactly one task id", file=sys.stderr)
+        return 2
+    if not args.json:
+        print("kanban: --require-goal-judge requires --json", file=sys.stderr)
+        return 2
+    if os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_TASK_ID"):
+        print(
+            "kanban: --require-goal-judge is automation-only and cannot run in a worker task",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.automation_preconditions:
+        print(
+            "kanban: --require-goal-judge requires --automation-preconditions",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        preconditions, target_verification = _parse_reviewed_completion_preconditions(
+            args.automation_preconditions
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"kanban: --automation-preconditions: {exc}", file=sys.stderr)
+        return 2
+
+    request = kb.ReviewedCompletionRequest(
+        task_id=task_id,
+        result=args.result,
+        summary=args.summary,
+        metadata=metadata,
+        target_verification=target_verification,
+        preconditions=preconditions,
+        judge_input_signature="",
+    )
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None or task.status != "blocked" or task.block_kind != "review":
+            print(
+                "kanban: --require-goal-judge requires a parent blocked for review",
+                file=sys.stderr,
+            )
+            return 2
+        judge_input = kb.build_reviewed_completion_judge_input(conn, request)
+    if judge_input is None:
+        print(
+            "kanban: strict completion evidence is missing or no longer available",
+            file=sys.stderr,
+        )
+        return 2
+
+    from hermes_cli import strict_goal_judge as strict
+
+    judge_result = strict.judge_goal_strict(judge_input)
+    if judge_result.outcome != "accepted":
+        print(json.dumps(_strict_completion_payload(
+            outcome=judge_result.outcome,
+            task_id=task_id,
+            operation_id=preconditions.operation_id,
+            reason=judge_result.reason,
+        ), ensure_ascii=False))
+        return 0
+
+    guarded_request = kb.ReviewedCompletionRequest(
+        task_id=request.task_id,
+        result=request.result,
+        summary=request.summary,
+        metadata=request.metadata,
+        target_verification=request.target_verification,
+        preconditions=request.preconditions,
+        judge_input_signature=judge_input.signature(),
+    )
+    with kb.connect_closing() as conn:
+        result = kb.complete_reviewed_task_guarded(conn, guarded_request)
+    outcome = "accepted" if result.outcome == "committed" else "precondition_changed"
+    print(json.dumps(_strict_completion_payload(
+        outcome=outcome,
+        task_id=result.task_id,
+        operation_id=result.operation_id,
+        event_id=result.event_id,
+        reason=result.reason,
+    ), ensure_ascii=False))
+    return 0
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2245,6 +2408,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    if getattr(args, "require_goal_judge", False):
+        return _cmd_complete_strict(
+            args,
+            task_id=ids[0],
+            metadata=metadata,
+        )
+    if getattr(args, "automation_preconditions", None) or getattr(args, "json", False):
+        print(
+            "kanban: --automation-preconditions / --json require --require-goal-judge",
+            file=sys.stderr,
+        )
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:

@@ -489,6 +489,45 @@ def test_operation_replay_returns_original_committed_event(conn):
     assert kb.get_task(conn, task_id).block_kind == "review"
 
 
+def test_reclassify_fences_against_the_latest_reclassification(conn):
+    task_id = _blocked_task(conn)
+    original_signature = _latest_event_signature(conn, task_id)
+    first = kb.reclassify_block(
+        conn,
+        kb.BlockReclassification(
+            task_id=task_id,
+            expected_block_event_signature=original_signature,
+            block_kind="review",
+            operation_id="reclassify-review",
+        ),
+    )
+    assert first.outcome == "committed"
+    reclassified_signature = _latest_event_signature(conn, task_id)
+
+    stale = kb.reclassify_block(
+        conn,
+        kb.BlockReclassification(
+            task_id=task_id,
+            expected_block_event_signature=original_signature,
+            block_kind="needs_input",
+            operation_id="reclassify-stale-source",
+        ),
+    )
+    current = kb.reclassify_block(
+        conn,
+        kb.BlockReclassification(
+            task_id=task_id,
+            expected_block_event_signature=reclassified_signature,
+            block_kind="needs_input",
+            operation_id="reclassify-current-source",
+        ),
+    )
+
+    assert stale.outcome == "precondition_changed"
+    assert current.outcome == "committed"
+    assert kb.get_task(conn, task_id).block_kind == "needs_input"
+
+
 def test_reclassify_cannot_create_blocked_dependency_state(conn):
     task_id = _blocked_task(conn)
     request = kb.BlockReclassification(
@@ -873,3 +912,97 @@ def test_recovery_snapshot_reads_board_state_with_reproducible_signature(
     assert any(task["id"] == task_id for task in snapshot.tasks)
     assert snapshot.revision_signature == kb.snapshot_signature(snapshot)
     assert conn.in_transaction is False
+
+
+def _reviewed_completion_request(
+    conn,
+    *,
+    reclassified_parent: bool = False,
+) -> kb.ReviewedCompletionRequest:
+    parent = kb.create_task(conn, title="ship reviewed change", body="all tests pass")
+    block_kind = None if reclassified_parent else "review"
+    assert kb.block_task(conn, parent, reason="review handoff", kind=block_kind)
+    if reclassified_parent:
+        result = kb.reclassify_block(
+            conn,
+            kb.BlockReclassification(
+                task_id=parent,
+                expected_block_event_signature=_latest_event_signature(conn, parent),
+                block_kind="review",
+                operation_id="classify-parent-review",
+            ),
+        )
+        assert result.outcome == "committed"
+    parent_event = _latest_event(conn, parent)
+    reviewer = _running_task(conn, title="review parent")
+    assert kb.complete_task(conn, reviewer, summary="approved", metadata=_review_metadata())
+    reviewer_event = _completed_event(conn, reviewer)
+    target = {
+        "kind": "git",
+        "identity": "example/repository",
+        "revision": "a" * 40,
+    }
+    preconditions = kb.ReviewedCompletionPreconditions(
+        parent_block_event_id=parent_event.id,
+        parent_block_event_signature=kb.canonical_event_signature(parent_event),
+        review_input_digest=kb.review_input_digest(conn, parent),
+        target_signature=kb.canonical_payload_signature(target),
+        reviewer_task_id=reviewer,
+        reviewer_completion_event_id=reviewer_event.id,
+        reviewer_completion_event_signature=kb.canonical_event_signature(reviewer_event),
+        reviewer_approval_signature=kb.canonical_payload_signature(
+            reviewer_event.payload["review"]
+        ),
+        operation_id="reviewed-completion-1",
+    )
+    request = kb.ReviewedCompletionRequest(
+        task_id=parent,
+        result="shipped",
+        summary="reviewed and verified",
+        metadata={"tests_run": 12},
+        target_verification=target,
+        preconditions=preconditions,
+        judge_input_signature="",
+    )
+    judge_input = kb.build_reviewed_completion_judge_input(conn, request)
+    assert judge_input is not None
+    return replace(request, judge_input_signature=judge_input.signature())
+
+
+def test_guarded_reviewed_completion_accepts_exact_signed_inputs(conn):
+    request = _reviewed_completion_request(conn)
+
+    first = kb.complete_reviewed_task_guarded(conn, request)
+    replay = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert first == replay
+    assert first.outcome == "committed"
+    assert kb.get_task(conn, request.task_id).status == "done"
+    event = _operation_events(conn, request.task_id, request.preconditions.operation_id)[0]
+    assert event.kind == "completed"
+    assert event.payload["judge_input_signature"] == request.judge_input_signature
+
+
+def test_guarded_reviewed_completion_accepts_reclassified_review_block(conn):
+    request = _reviewed_completion_request(conn, reclassified_parent=True)
+
+    result = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert result.outcome == "committed"
+    assert kb.get_task(conn, request.task_id).status == "done"
+
+
+def test_guarded_reviewed_completion_rechecks_state_after_judging(conn):
+    request = _reviewed_completion_request(conn)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            ("acceptance changed after judging", request.task_id),
+        )
+    events_before = kb.list_events(conn, request.task_id)
+
+    result = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, request.task_id).status == "blocked"
+    assert kb.list_events(conn, request.task_id) == events_before
