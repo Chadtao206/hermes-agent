@@ -2765,12 +2765,29 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
 
     # Older versions rewrote duplicate tasks one autocommit statement at a
     # time. Recover any group left half-quarantined by a process crash before
-    # considering its remaining original key authoritative.
-    partial_duplicate_keys: set[str] = set()
+    # considering its remaining original key authoritative. Correlate audit
+    # event ordering with the current task's creation event so completed
+    # historical quarantines do not poison legitimate replacement generations.
+    original_rows_by_key: dict[str, list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        "SELECT task.id, task.idempotency_key, "
+        "(SELECT MIN(event.id) FROM task_events event "
+        " WHERE event.task_id = task.id AND event.kind = 'created') "
+        "AS created_event_id "
+        "FROM tasks task WHERE task.idempotency_key LIKE 'review-lane:%' "
+        "ORDER BY task.id"
+    ).fetchall():
+        original_rows_by_key.setdefault(row["idempotency_key"], []).append(row)
+
+    audited_quarantines: set[tuple[str, str]] = set()
+    quarantine_event_orders: dict[tuple[str, str], list[Optional[int]]] = {}
+    audited_original_keys: set[str] = set()
     for event_row in conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE kind = 'review_generation_key_quarantined' "
-        "AND payload IS NOT NULL ORDER BY id"
+        "SELECT event.id AS event_id, event.task_id, event.payload, "
+        "task.idempotency_key AS current_key "
+        "FROM task_events event JOIN tasks task ON task.id = event.task_id "
+        "WHERE event.kind = 'review_generation_key_quarantined' "
+        "AND event.payload IS NOT NULL ORDER BY event.id"
     ).fetchall():
         try:
             payload = json.loads(event_row["payload"])
@@ -2784,14 +2801,98 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
             and isinstance(original_key, str)
             and original_key.startswith("review-lane:")
         ):
-            partial_duplicate_keys.add(original_key)
+            task_id = event_row["task_id"]
+            quarantined_key = _quarantined_review_generation_key(
+                original_key,
+                task_id,
+            )
+            if (
+                payload.get("quarantined_key") != quarantined_key
+                or event_row["current_key"] != quarantined_key
+            ):
+                continue
+            identity = (task_id, original_key)
+            audited_quarantines.add(identity)
+            audited_original_keys.add(original_key)
+            try:
+                event_order: Optional[int] = int(event_row["event_id"])
+            except (TypeError, ValueError):
+                event_order = None
+            quarantine_event_orders.setdefault(identity, []).append(event_order)
 
-    for key in sorted(duplicate_keys | partial_duplicate_keys):
+    partial_duplicate_keys: set[str] = set()
+    for (_task_id, original_key), event_orders in quarantine_event_orders.items():
+        for original_row in original_rows_by_key.get(original_key, ()):
+            try:
+                created_order: Optional[int] = int(original_row["created_event_id"])
+            except (TypeError, ValueError):
+                created_order = None
+            if any(
+                event_order is None
+                or created_order is None
+                or created_order < event_order
+                for event_order in event_orders
+            ):
+                partial_duplicate_keys.add(original_key)
+                break
+
+    # The old UPDATE and audit append were separate autocommit statements.
+    # Detect the narrower crash between them by matching the deterministic
+    # quarantine key. The repair transaction below synthesizes the missing
+    # audit event so future legitimate replacements are not poisoned.
+    missing_audits_by_key: dict[str, list[tuple[str, str]]] = {}
+    candidate_original_keys = set(original_rows_by_key) | audited_original_keys
+    if candidate_original_keys:
+        quarantined_rows = conn.execute(
+            "SELECT id, idempotency_key FROM tasks "
+            "WHERE idempotency_key LIKE 'quarantined-review-lane:%' "
+            "ORDER BY id"
+        ).fetchall()
+        for quarantined_row in quarantined_rows:
+            task_id = quarantined_row["id"]
+            current_key = quarantined_row["idempotency_key"]
+            for original_key in candidate_original_keys:
+                if current_key != _quarantined_review_generation_key(
+                    original_key,
+                    task_id,
+                ):
+                    continue
+                if (task_id, original_key) not in audited_quarantines:
+                    missing_audits_by_key.setdefault(original_key, []).append(
+                        (task_id, current_key)
+                    )
+                    if original_key in original_rows_by_key:
+                        partial_duplicate_keys.add(original_key)
+                break
+
+    repair_keys = (
+        duplicate_keys | partial_duplicate_keys | set(missing_audits_by_key)
+    )
+    for key in sorted(repair_keys):
         with _migration_write_txn(conn):
             task_rows = conn.execute(
                 "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
                 (key,),
             ).fetchall()
+            for task_id, quarantined_key in missing_audits_by_key.get(key, ()):
+                current = conn.execute(
+                    "SELECT idempotency_key FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                if current is None or current["idempotency_key"] != quarantined_key:
+                    raise ReviewGenerationMigrationConflict(
+                        f"quarantined review generation key changed for task {task_id}"
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_generation_key_quarantined",
+                    {
+                        "original_key": key,
+                        "quarantined_key": quarantined_key,
+                        "reason": "duplicate reserved review generation key",
+                    },
+                )
             if len(task_rows) <= 1 and key not in partial_duplicate_keys:
                 continue
             conn.execute(

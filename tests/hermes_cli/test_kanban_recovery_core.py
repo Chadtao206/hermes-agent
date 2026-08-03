@@ -536,6 +536,103 @@ def test_duplicate_review_key_quarantine_repairs_partial_legacy_migration(conn):
     ) is None
 
 
+def test_historical_duplicate_quarantine_does_not_poison_replacement(conn):
+    key = "review-lane:default::t_parent:replacement"
+    first = kb.create_task(conn, title="first duplicate", idempotency_key=key)
+    assert kb.archive_task(conn, first)
+    kb.create_task(conn, title="second duplicate", idempotency_key=key)
+    kb._migrate_review_generation_registry(conn)
+    replacement = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(key=key),
+    )
+
+    kb._migrate_review_generation_registry(conn)
+
+    assert kb.get_task(conn, replacement.task_id).idempotency_key == key
+    record = kb.lookup_review_generation(
+        conn,
+        board="default",
+        tenant=None,
+        key=key,
+    )
+    assert record is not None
+    assert record.task_id == replacement.task_id
+
+
+def test_duplicate_quarantine_repairs_eventless_partial_legacy_migration(conn):
+    key = "review-lane:default::t_parent:eventless-partial"
+    first = kb.create_task(conn, title="first duplicate", idempotency_key=key)
+    assert kb.archive_task(conn, first)
+    second = kb.create_task(conn, title="second duplicate", idempotency_key=key)
+    digest = hashlib.sha256(f"{key}\0{first}".encode()).hexdigest()
+    quarantined_key = f"quarantined-review-lane:{digest}:{first}"
+    conn.execute(
+        "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+        (quarantined_key, first),
+    )
+    conn.commit()
+
+    kb._migrate_review_generation_registry(conn)
+
+    assert kb.get_task(conn, second).idempotency_key.startswith(
+        "quarantined-review-lane:"
+    )
+    assert kb.lookup_review_generation(
+        conn,
+        board="default",
+        tenant=None,
+        key=key,
+    ) is None
+    event = kb.list_events(conn, first)[-1]
+    assert event.kind == "review_generation_key_quarantined"
+    assert event.payload["original_key"] == key
+    replacement = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(key=key),
+    )
+
+    kb._migrate_review_generation_registry(conn)
+
+    assert kb.get_task(conn, replacement.task_id).idempotency_key == key
+
+
+def test_eventless_final_duplicate_rewrite_does_not_poison_replacement(conn):
+    key = "review-lane:default::t_parent:eventless-final"
+    first = kb.create_task(conn, title="first duplicate", idempotency_key=key)
+    assert kb.archive_task(conn, first)
+    second = kb.create_task(conn, title="second duplicate", idempotency_key=key)
+    for task_id in (first, second):
+        digest = hashlib.sha256(f"{key}\0{task_id}".encode()).hexdigest()
+        quarantined_key = f"quarantined-review-lane:{digest}:{task_id}"
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+            (quarantined_key, task_id),
+        )
+        if task_id == first:
+            kb._append_event(
+                conn,
+                first,
+                "review_generation_key_quarantined",
+                {
+                    "original_key": key,
+                    "quarantined_key": quarantined_key,
+                    "reason": "duplicate reserved review generation key",
+                },
+            )
+    conn.commit()
+
+    kb._migrate_review_generation_registry(conn)
+    replacement = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(key=key),
+    )
+
+    kb._migrate_review_generation_registry(conn)
+
+    assert kb.get_task(conn, replacement.task_id).idempotency_key == key
+
+
 def test_cross_board_legacy_review_key_is_quarantined(conn):
     key = "review-lane:other-board::t_parent:g1"
     task_id = kb.create_task(conn, title="mislabeled reviewer", idempotency_key=key)
