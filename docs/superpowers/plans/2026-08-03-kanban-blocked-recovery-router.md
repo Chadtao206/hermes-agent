@@ -24,6 +24,24 @@
 - Unknown subprocess results stop later mutation until reconciled.
 - Router, transient retry, and controller-job self-heal remain shadow-only until the rollout plan enables them.
 
+## Approved Execution Amendment: Stage Local Automation Sources
+
+The absolute `/Users/ctao/.hermes/scripts/...` paths below identify deployment
+destinations, not development write targets. The actuator, adjudicator, and
+specialized PR watchdog are enabled and load those files in fresh cron
+subprocesses, so editing them during implementation would deploy unreviewed
+code.
+
+For this plan, copy the relevant local automation tree into the plan-owned SDD
+workspace and map every local-script create/modify/test path to
+`<sdd-workspace>/staged-hermes/scripts/...`. Run local automation tests with
+that staged `scripts` directory first on `PYTHONPATH`; repository imports must
+come from the isolated Git worktree. Preserve a read-only source snapshot and
+include a `diff --no-index` patch plus SHA-256 manifest in every affected task's
+review evidence. Do not write the staged files back to the live Hermes root in
+this plan. Installation belongs exclusively to the guarded maintenance and
+rollout plan after its pause, backup, fingerprint, and approval gates pass.
+
 ---
 
 ## File Structure
