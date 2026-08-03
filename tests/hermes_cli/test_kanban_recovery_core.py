@@ -449,6 +449,112 @@ def test_duplicate_legacy_review_generation_keys_are_quarantined(conn):
         assert replay.task_id == replacement.task_id
 
 
+def test_duplicate_review_key_quarantine_rolls_back_as_one_group(conn, monkeypatch):
+    key = "review-lane:default::t_parent:crash-group"
+    first = kb.create_task(conn, title="first duplicate", idempotency_key=key)
+    assert kb.archive_task(conn, first)
+    second = kb.create_task(conn, title="second duplicate", idempotency_key=key)
+    real_append = kb._append_event
+    quarantine_events = 0
+
+    def fail_after_first_quarantine(
+        connection,
+        task_id,
+        kind,
+        payload=None,
+        *,
+        run_id=None,
+    ):
+        nonlocal quarantine_events
+        event_id = real_append(
+            connection,
+            task_id,
+            kind,
+            payload,
+            run_id=run_id,
+        )
+        if kind == "review_generation_key_quarantined":
+            quarantine_events += 1
+            if quarantine_events == 1:
+                raise RuntimeError("simulated migration crash")
+        return event_id
+
+    monkeypatch.setattr(kb, "_append_event", fail_after_first_quarantine)
+
+    with pytest.raises(RuntimeError, match="simulated migration crash"):
+        kb._migrate_review_generation_registry(conn)
+
+    rows = conn.execute(
+        "SELECT id, idempotency_key FROM tasks WHERE id IN (?, ?) ORDER BY id",
+        (first, second),
+    ).fetchall()
+    assert [row["idempotency_key"] for row in rows] == [key, key]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM kanban_scoped_idempotency WHERE key = ?",
+        (key,),
+    ).fetchone()[0] == 0
+    assert not any(
+        event.kind == "review_generation_key_quarantined"
+        for task_id in (first, second)
+        for event in kb.list_events(conn, task_id)
+    )
+
+
+def test_duplicate_review_key_quarantine_repairs_partial_legacy_migration(conn):
+    key = "review-lane:default::t_parent:partial-migration"
+    first = kb.create_task(conn, title="first duplicate", idempotency_key=key)
+    assert kb.archive_task(conn, first)
+    second = kb.create_task(conn, title="second duplicate", idempotency_key=key)
+    digest = hashlib.sha256(f"{key}\0{first}".encode()).hexdigest()
+    quarantined_key = f"quarantined-review-lane:{digest}:{first}"
+    conn.execute(
+        "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+        (quarantined_key, first),
+    )
+    kb._append_event(
+        conn,
+        first,
+        "review_generation_key_quarantined",
+        {
+            "original_key": key,
+            "quarantined_key": quarantined_key,
+            "reason": "duplicate reserved review generation key",
+        },
+    )
+    conn.commit()
+
+    kb._migrate_review_generation_registry(conn)
+
+    assert kb.get_task(conn, second).idempotency_key.startswith(
+        "quarantined-review-lane:"
+    )
+    assert kb.lookup_review_generation(
+        conn,
+        board="default",
+        tenant=None,
+        key=key,
+    ) is None
+
+
+def test_cross_board_legacy_review_key_is_quarantined(conn):
+    key = "review-lane:other-board::t_parent:g1"
+    task_id = kb.create_task(conn, title="mislabeled reviewer", idempotency_key=key)
+
+    kb._migrate_review_generation_registry(conn)
+
+    task = kb.get_task(conn, task_id)
+    assert task.idempotency_key.startswith("quarantined-review-lane:")
+    event = kb.list_events(conn, task_id)[-1]
+    assert event.kind == "review_generation_key_quarantined"
+    assert event.payload["reason"] == "review generation board mismatch"
+    assert kb.lookup_review_generation(
+        conn,
+        board="other-board",
+        tenant=None,
+        key=key,
+    ) is None
+
+
 def test_canonical_event_signature_is_stable_for_canonical_payload_order():
     first = kb.Event(
         id=42,
@@ -982,6 +1088,14 @@ def test_operation_keyed_completion_replay_repairs_child_readiness(
     parent = kb.create_task(conn, title="parent")
     child = kb.create_task(conn, title="child", parents=[parent])
     real_recompute = kb.recompute_ready
+    cleanup_transactions: list[bool] = []
+    monkeypatch.setattr(
+        kb,
+        "_cleanup_workspace",
+        lambda connection, _task_id: cleanup_transactions.append(
+            connection.in_transaction
+        ),
+    )
     monkeypatch.setattr(
         kb,
         "recompute_ready",
@@ -1007,6 +1121,7 @@ def test_operation_keyed_completion_replay_repairs_child_readiness(
         operation_id="complete-crash-replay",
     )
     assert kb.get_task(conn, child).status == "ready"
+    assert cleanup_transactions == [False]
 
 
 def _lease_request(holder_token: str, *, operation_id: str) -> kb.LeaseRequest:
@@ -1208,6 +1323,42 @@ def test_recovery_snapshot_includes_ended_terminal_run_and_current_generation(co
     assert after.revision_signature != before.revision_signature
 
 
+def test_recovery_snapshot_filters_legacy_cross_board_control_rows(conn):
+    task_id = kb.create_task(conn, title="cross-board claim target")
+    generation_key = "review-lane:other-board::t_parent:g1"
+    conn.execute(
+        "INSERT INTO kanban_scoped_idempotency "
+        "(namespace, board, tenant, key, task_id, created_at) "
+        "VALUES ('review-lane', 'other-board', '', ?, ?, 100)",
+        (generation_key, task_id),
+    )
+    conn.execute(
+        "INSERT INTO kanban_controller_leases "
+        "(controller_id, board, holder_token, holder_epoch, issued_at, "
+        "expires_at, census_signature, operation_id) "
+        "VALUES ('router', 'other-board', 'holder', 1, 100, 400, ?, 'lease')",
+        ("a" * 64,),
+    )
+    conn.execute(
+        "INSERT INTO kanban_controller_claims "
+        "(controller_id, board, task_id, generation_signature, authority, "
+        "input_signature, lease_epoch, expires_at, operation_id) "
+        "VALUES ('router', 'other-board', ?, '', 'mutate', ?, 1, 400, 'claim')",
+        (task_id, "b" * 64),
+    )
+    conn.commit()
+
+    snapshot = kb.read_recovery_snapshot(conn, now=200)
+
+    assert snapshot.board == "default"
+    assert snapshot.review_generations == ()
+    assert snapshot.claims == ()
+    assert snapshot.leases == ()
+    assert any(
+        "other-board" in violation for violation in snapshot.invariant_violations
+    )
+
+
 def _reviewed_completion_request(
     conn,
     *,
@@ -1333,6 +1484,14 @@ def test_guarded_completion_replay_repairs_child_readiness(conn, monkeypatch):
     request = _reviewed_completion_request(conn)
     child = kb.create_task(conn, title="dependent child", parents=[request.task_id])
     real_recompute = kb.recompute_ready
+    cleanup_transactions: list[bool] = []
+    monkeypatch.setattr(
+        kb,
+        "_cleanup_workspace",
+        lambda connection, _task_id: cleanup_transactions.append(
+            connection.in_transaction
+        ),
+    )
     monkeypatch.setattr(
         kb,
         "recompute_ready",
@@ -1350,6 +1509,7 @@ def test_guarded_completion_replay_repairs_child_readiness(conn, monkeypatch):
 
     assert replay.outcome == "committed"
     assert kb.get_task(conn, child).status == "ready"
+    assert cleanup_transactions == [False]
 
 
 def test_guarded_reviewed_completion_accepts_exact_signed_inputs(conn):

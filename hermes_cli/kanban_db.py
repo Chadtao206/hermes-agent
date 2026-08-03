@@ -1328,6 +1328,7 @@ class RecoverySnapshot:
     review_generations: tuple[ReviewGenerationSnapshot, ...]
     claims: tuple[ControllerClaimRecord, ...]
     leases: tuple[ControllerLeaseRecord, ...]
+    invariant_violations: tuple[str, ...]
     revision_signature: str
 
 
@@ -2709,6 +2710,36 @@ def _review_generation_scope_from_key(key: str) -> tuple[str, str]:
     return board, tenant
 
 
+@contextlib.contextmanager
+def _migration_write_txn(conn: sqlite3.Connection):
+    """Run one migration repair atomically without worker mutation guards."""
+    if conn.in_transaction:
+        raise RuntimeError("migration transaction cannot be nested")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+    else:
+        try:
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+
+
+def _quarantined_review_generation_key(key: str, task_id: str) -> str:
+    digest = hashlib.sha256(f"{key}\0{task_id}".encode("utf-8")).hexdigest()
+    return f"quarantined-review-lane:{digest}:{task_id}"
+
+
 def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
     """Backfill unambiguous legacy review-lane keys into the permanent registry."""
     conn.execute(
@@ -2724,44 +2755,72 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    duplicates = conn.execute(
+    duplicate_rows = conn.execute(
         "SELECT idempotency_key, COUNT(*) AS task_count "
         "FROM tasks WHERE idempotency_key LIKE 'review-lane:%' "
         "GROUP BY idempotency_key HAVING COUNT(*) > 1 "
         "ORDER BY idempotency_key"
     ).fetchall()
-    for duplicate in duplicates:
-        key = duplicate["idempotency_key"]
-        task_rows = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
-            (key,),
-        ).fetchall()
-        conn.execute(
-            "DELETE FROM kanban_scoped_idempotency "
-            "WHERE namespace = 'review-lane' AND key = ?",
-            (key,),
-        )
-        for task_row in task_rows:
-            task_id = task_row["id"]
-            digest = hashlib.sha256(
-                f"{key}\0{task_id}".encode("utf-8")
-            ).hexdigest()
-            quarantined_key = f"quarantined-review-lane:{digest}:{task_id}"
+    duplicate_keys = {row["idempotency_key"] for row in duplicate_rows}
+
+    # Older versions rewrote duplicate tasks one autocommit statement at a
+    # time. Recover any group left half-quarantined by a process crash before
+    # considering its remaining original key authoritative.
+    partial_duplicate_keys: set[str] = set()
+    for event_row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE kind = 'review_generation_key_quarantined' "
+        "AND payload IS NOT NULL ORDER BY id"
+    ).fetchall():
+        try:
+            payload = json.loads(event_row["payload"])
+        except (TypeError, ValueError, RecursionError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        original_key = payload.get("original_key")
+        if (
+            payload.get("reason") == "duplicate reserved review generation key"
+            and isinstance(original_key, str)
+            and original_key.startswith("review-lane:")
+        ):
+            partial_duplicate_keys.add(original_key)
+
+    for key in sorted(duplicate_keys | partial_duplicate_keys):
+        with _migration_write_txn(conn):
+            task_rows = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
+                (key,),
+            ).fetchall()
+            if len(task_rows) <= 1 and key not in partial_duplicate_keys:
+                continue
             conn.execute(
-                "UPDATE tasks SET idempotency_key = ? "
-                "WHERE id = ? AND idempotency_key = ?",
-                (quarantined_key, task_id, key),
+                "DELETE FROM kanban_scoped_idempotency "
+                "WHERE namespace = 'review-lane' AND key = ?",
+                (key,),
             )
-            _append_event(
-                conn,
-                task_id,
-                "review_generation_key_quarantined",
-                {
-                    "original_key": key,
-                    "quarantined_key": quarantined_key,
-                    "reason": "duplicate reserved review generation key",
-                },
-            )
+            for task_row in task_rows:
+                task_id = task_row["id"]
+                quarantined_key = _quarantined_review_generation_key(key, task_id)
+                updated = conn.execute(
+                    "UPDATE tasks SET idempotency_key = ? "
+                    "WHERE id = ? AND idempotency_key = ?",
+                    (quarantined_key, task_id, key),
+                )
+                if updated.rowcount != 1:
+                    raise ReviewGenerationMigrationConflict(
+                        f"reserved review generation key changed for task {task_id}"
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_generation_key_quarantined",
+                    {
+                        "original_key": key,
+                        "quarantined_key": quarantined_key,
+                        "reason": "duplicate reserved review generation key",
+                    },
+                )
 
     task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     created_at_column = "created_at" if "created_at" in task_columns else "0"
@@ -2770,9 +2829,39 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
         "FROM tasks WHERE idempotency_key LIKE 'review-lane:%' "
         "ORDER BY id"
     ).fetchall()
+    connected_board = _connection_board(conn) if rows else None
     for row in rows:
         key = row["idempotency_key"]
         board, key_tenant = _review_generation_scope_from_key(key)
+        if board != connected_board:
+            task_id = row["id"]
+            quarantined_key = _quarantined_review_generation_key(key, task_id)
+            with _migration_write_txn(conn):
+                conn.execute(
+                    "DELETE FROM kanban_scoped_idempotency "
+                    "WHERE namespace = 'review-lane' AND key = ?",
+                    (key,),
+                )
+                updated = conn.execute(
+                    "UPDATE tasks SET idempotency_key = ? "
+                    "WHERE id = ? AND idempotency_key = ?",
+                    (quarantined_key, task_id, key),
+                )
+                if updated.rowcount != 1:
+                    raise ReviewGenerationMigrationConflict(
+                        f"reserved review generation key changed for task {task_id}"
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_generation_key_quarantined",
+                    {
+                        "original_key": key,
+                        "quarantined_key": quarantined_key,
+                        "reason": "review generation board mismatch",
+                    },
+                )
+            continue
         task_tenant = str(row["tenant"] or "").strip()
         if task_tenant != key_tenant:
             raise ReviewGenerationMigrationConflict(
@@ -4776,6 +4865,35 @@ def _guarded_result(
     )
 
 
+def _repair_completion_replay_effects(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> None:
+    """Repair completion side effects only after the write transaction ends."""
+    _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+
+
+@contextlib.contextmanager
+def _post_transaction_completion_replay(
+    conn: sqlite3.Connection,
+    task_id: str,
+):
+    """Schedule replay repair after an inner transaction context exits."""
+    scheduled = False
+
+    def schedule() -> None:
+        nonlocal scheduled
+        scheduled = True
+
+    try:
+        yield schedule
+    finally:
+        if scheduled:
+            _repair_completion_replay_effects(conn, task_id)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5748,6 +5866,19 @@ def complete_task(
         if operation_id is not None
         else None
     )
+    if operation_id is not None:
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=task_id,
+            operation_id=operation_id,
+            event_kind="completed",
+            operation_signature=operation_signature,
+        )
+        if replay is not None:
+            if replay.outcome == "committed":
+                _repair_completion_replay_effects(conn, task_id)
+                return True
+            raise ValueError(replay.reason)
     now = int(time.time())
     review_evidence: Optional[ReviewCompletionEvidence] = None
     if isinstance(metadata, Mapping) and "review" in metadata:
@@ -5783,7 +5914,10 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with (
+        _post_transaction_completion_replay(conn, task_id) as schedule_replay,
+        write_txn(conn),
+    ):
         if operation_id is not None:
             replay = _guarded_operation_replay(
                 conn,
@@ -5794,11 +5928,7 @@ def complete_task(
             )
             if replay is not None:
                 if replay.outcome == "committed":
-                    # Repair idempotent post-commit effects that may have been
-                    # skipped by a crash after the completed event committed.
-                    _clear_failure_counter(conn, task_id)
-                    recompute_ready(conn)
-                    _cleanup_workspace(conn, task_id)
+                    schedule_replay()
                     return True
                 raise ValueError(replay.reason)
         if expected_run_id is None:
@@ -8094,17 +8224,65 @@ def read_recovery_snapshot(
                    ) AS created_event_id
               FROM kanban_scoped_idempotency registry
              WHERE registry.namespace = 'review-lane'
+               AND registry.board = ?
              ORDER BY registry.board, registry.tenant, registry.key
-            """
+            """,
+            (board,),
+        ).fetchall()
+        mismatched_generation_rows = conn.execute(
+            "SELECT board, tenant, key, task_id "
+            "FROM kanban_scoped_idempotency "
+            "WHERE namespace = 'review-lane' AND board <> ? "
+            "ORDER BY board, tenant, key, task_id",
+            (board,),
         ).fetchall()
         claim_rows = conn.execute(
-            "SELECT * FROM kanban_controller_claims "
-            "ORDER BY controller_id, board, task_id, generation_signature"
+            "SELECT * FROM kanban_controller_claims WHERE board = ? "
+            "ORDER BY controller_id, board, task_id, generation_signature",
+            (board,),
+        ).fetchall()
+        mismatched_claim_rows = conn.execute(
+            "SELECT controller_id, board, task_id, generation_signature "
+            "FROM kanban_controller_claims WHERE board <> ? "
+            "ORDER BY controller_id, board, task_id, generation_signature",
+            (board,),
         ).fetchall()
         lease_rows = conn.execute(
-            "SELECT * FROM kanban_controller_leases "
-            "ORDER BY controller_id, board"
+            "SELECT * FROM kanban_controller_leases WHERE board = ? "
+            "ORDER BY controller_id, board",
+            (board,),
         ).fetchall()
+        mismatched_lease_rows = conn.execute(
+            "SELECT controller_id, board, holder_epoch "
+            "FROM kanban_controller_leases WHERE board <> ? "
+            "ORDER BY controller_id, board, holder_epoch",
+            (board,),
+        ).fetchall()
+        invariant_violations = [
+            (
+                "review generation board mismatch: "
+                f"connected={board!r}, row={row['board']!r}, key={row['key']!r}, "
+                f"task={row['task_id']!r}"
+            )
+            for row in mismatched_generation_rows
+        ]
+        invariant_violations.extend(
+            (
+                "controller claim board mismatch: "
+                f"connected={board!r}, row={row['board']!r}, "
+                f"controller={row['controller_id']!r}, task={row['task_id']!r}, "
+                f"generation={row['generation_signature']!r}"
+            )
+            for row in mismatched_claim_rows
+        )
+        invariant_violations.extend(
+            (
+                "controller lease board mismatch: "
+                f"connected={board!r}, row={row['board']!r}, "
+                f"controller={row['controller_id']!r}, epoch={int(row['holder_epoch'])}"
+            )
+            for row in mismatched_lease_rows
+        )
         generations: list[ReviewGenerationSnapshot] = []
         newest_generation_events: dict[tuple[str, str, str], int] = {}
         for row in generation_rows:
@@ -8201,6 +8379,7 @@ def read_recovery_snapshot(
                 )
                 for row in lease_rows
             ),
+            invariant_violations=tuple(invariant_violations),
             revision_signature="",
         )
         conn.execute("COMMIT")
@@ -8385,7 +8564,24 @@ def complete_reviewed_task_guarded(
             "judge_input_signature": request.judge_input_signature,
         },
     )
-    with write_txn(conn):
+    replay = _guarded_operation_replay(
+        conn,
+        task_id=request.task_id,
+        operation_id=pre.operation_id,
+        event_kind="completed",
+        operation_signature=operation_signature,
+    )
+    if replay is not None:
+        if replay.outcome == "committed":
+            _repair_completion_replay_effects(conn, request.task_id)
+        return replay
+    with (
+        _post_transaction_completion_replay(
+            conn,
+            request.task_id,
+        ) as schedule_replay,
+        write_txn(conn),
+    ):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
@@ -8395,8 +8591,7 @@ def complete_reviewed_task_guarded(
         )
         if replay is not None:
             if replay.outcome == "committed":
-                recompute_ready(conn)
-                _cleanup_workspace(conn, request.task_id)
+                schedule_replay()
             return replay
         task = get_task(conn, request.task_id)
         if task is None:
