@@ -116,13 +116,21 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``review``       — implementation is intentionally parked for a separate
+#                        reviewer lane and recovery controller.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency",
+    "needs_input",
+    "capability",
+    "transient",
+    "review",
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1127,6 +1135,102 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ReviewCompletionEvidence:
+    """Validated review verdict copied onto a terminal completion event."""
+
+    schema_version: int
+    verdict: str
+    target_kind: str
+    target_identity: str
+    target_revision: str
+    findings: tuple[dict[str, object], ...]
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: Mapping[str, object],
+    ) -> "ReviewCompletionEvidence":
+        if not isinstance(metadata, Mapping):
+            raise ValueError("metadata.review must be an object")
+        review = metadata.get("review")
+        if not isinstance(review, Mapping):
+            raise ValueError("metadata.review must be an object")
+        if set(review) != {"schema_version", "verdict", "target", "findings"}:
+            raise ValueError("metadata.review must contain the exact review fields")
+
+        schema_version = review["schema_version"]
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValueError("metadata.review.schema_version must be 1")
+
+        verdict = review["verdict"]
+        if not isinstance(verdict, str) or verdict not in {
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "REJECTED",
+        }:
+            raise ValueError("metadata.review.verdict is invalid")
+
+        target = review["target"]
+        if not isinstance(target, Mapping) or set(target) != {
+            "kind",
+            "identity",
+            "revision",
+        }:
+            raise ValueError("metadata.review.target must contain the exact target fields")
+        target_kind = target["kind"]
+        target_identity = target["identity"]
+        target_revision = target["revision"]
+        if not isinstance(target_kind, str) or target_kind not in {
+            "pull_request",
+            "git",
+            "artifact",
+        }:
+            raise ValueError("metadata.review.target.kind is invalid")
+        for field_name, value in (
+            ("identity", target_identity),
+            ("revision", target_revision),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"metadata.review.target.{field_name} must be a nonempty string"
+                )
+
+        findings = review["findings"]
+        if not isinstance(findings, list) or not all(
+            isinstance(finding, Mapping) for finding in findings
+        ):
+            raise ValueError("metadata.review.findings must be a list of objects")
+
+        return cls(
+            schema_version=schema_version,
+            verdict=verdict,
+            target_kind=target_kind,
+            target_identity=target_identity.strip(),
+            target_revision=target_revision.strip(),
+            findings=tuple(dict(finding) for finding in findings),
+        )
+
+    @property
+    def approved(self) -> bool:
+        return self.verdict == "APPROVED" and not self.findings
+
+
+def _canonical_review_payload(
+    evidence: ReviewCompletionEvidence,
+) -> dict[str, object]:
+    return {
+        "schema_version": evidence.schema_version,
+        "verdict": evidence.verdict,
+        "target": {
+            "kind": evidence.target_kind,
+            "identity": evidence.target_identity,
+            "revision": evidence.target_revision,
+        },
+        "findings": [dict(finding) for finding in evidence.findings],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3805,6 +3909,62 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def get_terminal_review_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event_id: int,
+) -> Optional[ReviewCompletionEvidence]:
+    """Read review evidence only from the selected terminal completion event."""
+    row = conn.execute(
+        """
+        SELECT e.payload,
+               e.run_id,
+               t.status AS task_status,
+               r.task_id AS run_task_id,
+               r.status AS run_status,
+               r.outcome AS run_outcome,
+               r.ended_at AS run_ended_at
+          FROM task_events e
+          JOIN tasks t ON t.id = e.task_id
+          LEFT JOIN task_runs r ON r.id = e.run_id
+         WHERE e.id = ?
+           AND e.task_id = ?
+           AND e.kind = 'completed'
+        """,
+        (int(event_id), task_id),
+    ).fetchone()
+    if row is None or row["task_status"] != "done":
+        return None
+
+    latest = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is None or int(latest["id"]) != int(event_id):
+        return None
+
+    if (
+        row["run_id"] is None
+        or row["run_task_id"] != task_id
+        or row["run_status"] != "done"
+        or row["run_outcome"] != "completed"
+        or row["run_ended_at"] is None
+    ):
+        return None
+
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+        evidence = ReviewCompletionEvidence.from_metadata(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if evidence.verdict == "APPROVED" and evidence.findings:
+        return None
+    return evidence
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4775,6 +4935,9 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    review_evidence: Optional[ReviewCompletionEvidence] = None
+    if isinstance(metadata, Mapping) and "review" in metadata:
+        review_evidence = ReviewCompletionEvidence.from_metadata(metadata)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4899,6 +5062,8 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        if review_evidence is not None:
+            completed_payload["review"] = _canonical_review_payload(review_evidence)
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -5762,6 +5927,9 @@ def block_task(
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
+
+    * ``review`` — a sticky review handoff. It remains in ``blocked`` until the
+      recovery controller consumes terminal reviewer evidence.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.

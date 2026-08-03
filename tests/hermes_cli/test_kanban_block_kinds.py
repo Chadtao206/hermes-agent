@@ -65,6 +65,19 @@ def test_first_typed_block_lands_in_blocked(kanban_home: Path) -> None:
         assert t.block_recurrences == 1
 
 
+def test_review_block_is_sticky_and_routes_to_blocked(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+
+        assert kb.block_task(conn, tid, reason="review handoff", kind="review")
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "review"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_unblock_does_not_reset_recurrence_counter(kanban_home: Path) -> None:
     """The crux of the fix: unblock must preserve the loop counter."""
     with kb.connect_closing() as conn:
