@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shlex
@@ -704,6 +705,52 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_reclassify = sub.add_parser(
+        "reclassify-block",
+        help="Guardedly classify the exact current blocked event",
+    )
+    p_reclassify.add_argument("task_id")
+    p_reclassify.add_argument("--expected-block-event-signature", required=True)
+    p_reclassify.add_argument(
+        "--kind",
+        dest="block_kind",
+        required=True,
+        choices=sorted(kb.VALID_BLOCK_KINDS - {"dependency"}),
+    )
+    p_reclassify.add_argument("--operation-id", required=True)
+    p_reclassify.add_argument("--json", action="store_true", required=True)
+
+    for command, help_text in (
+        ("requeue-review", "Guardedly requeue a failed reviewer generation"),
+        ("archive-review", "Guardedly archive a reviewer generation"),
+    ):
+        parser = sub.add_parser(command, help=help_text)
+        parser.add_argument("task_id")
+        parser.add_argument("--expected-status", required=True)
+        parser.add_argument("--expected-event-signature", required=True)
+        parser.add_argument("--operation-id", required=True)
+        parser.add_argument("--json", action="store_true", required=True)
+
+    p_retry_transient = sub.add_parser(
+        "retry-transient",
+        help="Authorize the next guarded retry for a transient block",
+    )
+    p_retry_transient.add_argument("task_id")
+    p_retry_transient.add_argument("--expected-terminal-signature", required=True)
+    p_retry_transient.add_argument("--retry-ordinal", type=int, required=True)
+    p_retry_transient.add_argument("--operation-id", required=True)
+    p_retry_transient.add_argument("--json", action="store_true", required=True)
+
+    p_ack_escalation = sub.add_parser(
+        "acknowledge-escalation",
+        help="Acknowledge an escalation without changing task lifecycle state",
+    )
+    p_ack_escalation.add_argument("task_id")
+    p_ack_escalation.add_argument("--signature", required=True)
+    p_ack_escalation.add_argument("--expected-event-signature", default=None)
+    p_ack_escalation.add_argument("--operation-id", default=None)
+    p_ack_escalation.add_argument("--json", action="store_true")
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1089,6 +1136,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "reclassify-block": _cmd_reclassify_block,
+            "requeue-review": _cmd_requeue_review,
+            "archive-review": _cmd_archive_review,
+            "retry-transient": _cmd_retry_transient,
+            "acknowledge-escalation": _cmd_acknowledge_escalation,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1154,6 +1206,11 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "archive",
+    "reclassify-block",
+    "requeue-review",
+    "archive-review",
+    "retry-transient",
+    "acknowledge-escalation",
     "dispatch",
     "daemon",
     "repair",
@@ -2435,6 +2492,124 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _guarded_result_payload(result: kb.GuardedMutationResult) -> dict[str, object]:
+    return {
+        "outcome": result.outcome,
+        "task_id": result.task_id,
+        "operation_id": result.operation_id,
+        "event_id": result.event_id,
+        "reason": result.reason,
+    }
+
+
+def _emit_guarded_result(
+    result: kb.GuardedMutationResult,
+    *,
+    as_json: bool,
+    label: str,
+) -> int:
+    if as_json:
+        print(json.dumps(_guarded_result_payload(result), ensure_ascii=False))
+    elif result.outcome == "committed":
+        print(f"{label} {result.task_id}")
+    else:
+        suffix = f": {result.reason}" if result.reason else ""
+        print(f"{label} {result.task_id}: {result.outcome}{suffix}")
+    return 1 if result.outcome == "conflict" else 0
+
+
+def _cmd_reclassify_block(args: argparse.Namespace) -> int:
+    request = kb.BlockReclassification(
+        task_id=args.task_id,
+        expected_block_event_signature=args.expected_block_event_signature,
+        block_kind=args.block_kind,
+        operation_id=args.operation_id,
+    )
+    with kb.connect_closing() as conn:
+        result = kb.reclassify_block(conn, request)
+    return _emit_guarded_result(result, as_json=True, label="Reclassified")
+
+
+def _review_lane_request(args: argparse.Namespace) -> kb.ReviewLaneMutation:
+    return kb.ReviewLaneMutation(
+        task_id=args.task_id,
+        expected_status=args.expected_status,
+        expected_event_signature=args.expected_event_signature,
+        operation_id=args.operation_id,
+    )
+
+
+def _cmd_requeue_review(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.requeue_review_lane(conn, _review_lane_request(args))
+    return _emit_guarded_result(result, as_json=True, label="Requeued review")
+
+
+def _cmd_archive_review(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.archive_review_lane(conn, _review_lane_request(args))
+    return _emit_guarded_result(result, as_json=True, label="Archived review")
+
+
+def _cmd_retry_transient(args: argparse.Namespace) -> int:
+    request = kb.TransientRetryRequest(
+        task_id=args.task_id,
+        expected_terminal_signature=args.expected_terminal_signature,
+        retry_ordinal=args.retry_ordinal,
+        operation_id=args.operation_id,
+    )
+    with kb.connect_closing() as conn:
+        result = kb.retry_transient_task(conn, request)
+    return _emit_guarded_result(result, as_json=True, label="Authorized retry")
+
+
+def _acknowledgement_operation_id(
+    task_id: str,
+    escalation_signature: str,
+    actor: str,
+) -> str:
+    encoded = json.dumps(
+        {
+            "task_id": task_id,
+            "escalation_signature": escalation_signature,
+            "actor": actor,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "ack-escalation:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _cmd_acknowledge_escalation(args: argparse.Namespace) -> int:
+    actor = _profile_author()
+    operation_id = args.operation_id or _acknowledgement_operation_id(
+        args.task_id,
+        args.signature,
+        actor,
+    )
+    with kb.connect_closing() as conn:
+        expected_signature = args.expected_event_signature
+        if expected_signature is None:
+            events = kb.list_events(conn, args.task_id)
+            expected_signature = (
+                kb.canonical_event_signature(events[-1]) if events else ""
+            )
+        request = kb.EscalationAcknowledgement(
+            task_id=args.task_id,
+            escalation_signature=args.signature,
+            expected_event_signature=expected_signature,
+            actor=actor,
+            operation_id=operation_id,
+        )
+        result = kb.acknowledge_escalation(conn, request)
+    return _emit_guarded_result(
+        result,
+        as_json=bool(args.json),
+        label="Acknowledged escalation for",
+    )
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

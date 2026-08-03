@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1135,6 +1135,75 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+
+
+def canonical_event_signature(event: Event) -> str:
+    """Return the canonical SHA-256 signature for one immutable event."""
+    canonical = {
+        "task_id": event.task_id,
+        "event_id": event.id,
+        "kind": event.kind,
+        "payload": event.payload,
+        "run_id": event.run_id,
+        "created_at": event.created_at,
+    }
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+GuardedOutcome = Literal[
+    "committed",
+    "not_applied",
+    "precondition_changed",
+    "conflict",
+]
+
+
+@dataclass(frozen=True)
+class GuardedMutationResult:
+    outcome: GuardedOutcome
+    task_id: str
+    operation_id: str
+    event_id: Optional[int] = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class BlockReclassification:
+    task_id: str
+    expected_block_event_signature: str
+    block_kind: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class ReviewLaneMutation:
+    task_id: str
+    expected_status: str
+    expected_event_signature: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class TransientRetryRequest:
+    task_id: str
+    expected_terminal_signature: str
+    retry_ordinal: int
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class EscalationAcknowledgement:
+    task_id: str
+    escalation_signature: str
+    expected_event_signature: str
+    actor: str
+    operation_id: str
 
 
 @dataclass(frozen=True)
@@ -3799,10 +3868,25 @@ def set_model_override(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    operation_id: Optional[str] = None,
+) -> Optional[GuardedMutationResult]:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
+        if operation_id is not None:
+            replay = _guarded_operation_replay(
+                conn,
+                task_id=child_id,
+                operation_id=operation_id,
+                event_kind="linked",
+            )
+            if replay is not None:
+                return replay
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -3810,10 +3894,17 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
+        inserted = conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
+        if operation_id is not None and inserted.rowcount != 1:
+            return _guarded_result(
+                "not_applied",
+                task_id=child_id,
+                operation_id=operation_id,
+                reason="dependency link already exists",
+            )
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
@@ -3823,11 +3914,22 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
-        _append_event(
+        payload = {"parent": parent_id, "child": child_id}
+        if operation_id is not None:
+            payload["operation_id"] = operation_id
+        event_id = _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            payload,
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
+        if operation_id is not None:
+            return GuardedMutationResult(
+                outcome="committed",
+                task_id=child_id,
+                operation_id=operation_id,
+                event_id=event_id,
+            )
+    return None
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -3853,24 +3955,56 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    operation_id: Optional[str] = None,
+) -> bool | GuardedMutationResult:
     with write_txn(conn):
+        if operation_id is not None:
+            replay = _guarded_operation_replay(
+                conn,
+                task_id=child_id,
+                operation_id=operation_id,
+                event_kind="unlinked",
+            )
+            if replay is not None:
+                return replay
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
         )
         if cur.rowcount:
-            _append_event(
+            payload = {"parent": parent_id, "child": child_id}
+            if operation_id is not None:
+                payload["operation_id"] = operation_id
+            event_id = _append_event(
                 conn, child_id, "unlinked",
-                {"parent": parent_id, "child": child_id},
+                payload,
             )
         removed = cur.rowcount > 0
+        if operation_id is not None and not removed:
+            return _guarded_result(
+                "not_applied",
+                task_id=child_id,
+                operation_id=operation_id,
+                reason="dependency link does not exist",
+            )
     if removed:
         # Dependency edge removed — re-evaluate promotion eligibility for the
         # child immediately.  Matches the contract of complete_task and
         # unblock_task; without this the child stays stuck in todo until the
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
         recompute_ready(conn)
+    if operation_id is not None:
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=child_id,
+            operation_id=operation_id,
+            event_id=event_id,
+        )
     return removed
 
 
@@ -4174,28 +4308,31 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     return att
 
 
+def _event_from_row(row: sqlite3.Row) -> Event:
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+    except Exception:
+        payload = None
+    return Event(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        kind=row["kind"],
+        payload=payload,
+        created_at=int(row["created_at"]),
+        run_id=(
+            int(row["run_id"])
+            if "run_id" in row.keys() and row["run_id"] is not None
+            else None
+        ),
+    )
+
+
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
-    out = []
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(
-            Event(
-                id=r["id"],
-                task_id=r["task_id"],
-                kind=r["kind"],
-                payload=payload,
-                created_at=r["created_at"],
-                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-            )
-        )
-    return out
+    return [_event_from_row(row) for row in rows]
 
 
 def get_terminal_review_evidence(
@@ -4261,7 +4398,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4271,10 +4408,87 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
+    )
+    return int(cur.lastrowid)
+
+
+def _latest_task_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kinds: Optional[Iterable[str]] = None,
+) -> Optional[Event]:
+    params: list[Any] = [task_id]
+    where = "task_id = ?"
+    if kinds is not None:
+        kind_values = tuple(kinds)
+        if not kind_values:
+            return None
+        where += f" AND kind IN ({','.join('?' for _ in kind_values)})"
+        params.extend(kind_values)
+    row = conn.execute(
+        f"SELECT * FROM task_events WHERE {where} ORDER BY id DESC LIMIT 1",
+        params,
+    ).fetchone()
+    return _event_from_row(row) if row is not None else None
+
+
+def _guarded_operation_replay(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    operation_id: str,
+    event_kind: str,
+) -> Optional[GuardedMutationResult]:
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise ValueError("operation_id must be a nonempty string")
+    matches: list[Event] = []
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE payload IS NOT NULL ORDER BY id ASC"
+    ).fetchall()
+    for row in rows:
+        event = _event_from_row(row)
+        if (
+            isinstance(event.payload, Mapping)
+            and event.payload.get("operation_id") == operation_id
+        ):
+            matches.append(event)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        event = matches[0]
+        if event.task_id == task_id and event.kind == event_kind:
+            return GuardedMutationResult(
+                outcome="committed",
+                task_id=task_id,
+                operation_id=operation_id,
+                event_id=event.id,
+            )
+    return GuardedMutationResult(
+        outcome="conflict",
+        task_id=task_id,
+        operation_id=operation_id,
+        event_id=matches[0].id,
+        reason="operation_id is already bound to another mutation",
+    )
+
+
+def _guarded_result(
+    outcome: GuardedOutcome,
+    *,
+    task_id: str,
+    operation_id: str,
+    reason: str,
+) -> GuardedMutationResult:
+    return GuardedMutationResult(
+        outcome=outcome,
+        task_id=task_id,
+        operation_id=operation_id,
+        reason=reason,
     )
 
 
@@ -5194,6 +5408,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    operation_id: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5259,6 +5474,17 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if operation_id is not None:
+            replay = _guarded_operation_replay(
+                conn,
+                task_id=task_id,
+                operation_id=operation_id,
+                event_kind="completed",
+            )
+            if replay is not None:
+                if replay.outcome == "committed":
+                    return True
+                raise ValueError(replay.reason)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5353,6 +5579,8 @@ def complete_task(
                     completed_payload["artifacts"] = cleaned_artifacts
         if review_evidence is not None:
             completed_payload["review"] = _canonical_review_payload(review_evidence)
+        if operation_id is not None:
+            completed_payload["operation_id"] = operation_id
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -6538,6 +6766,500 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+def _is_review_generation_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM kanban_scoped_idempotency "
+        "WHERE namespace = 'review-lane' AND task_id = ? LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _current_review_terminal_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[Event]:
+    event = _latest_task_event(
+        conn,
+        task_id,
+        kinds=("timed_out", "crashed", "gave_up"),
+    )
+    if event is None or not isinstance(event.payload, Mapping):
+        return None
+    run = latest_run(conn, task_id)
+    if run is None or run.ended_at is None:
+        return None
+    if event.run_id is not None:
+        if event.run_id != run.id:
+            return None
+        if event.kind == "gave_up":
+            return event if run.outcome == "gave_up" else None
+        return event if run.outcome == event.kind else None
+    if event.kind != "gave_up":
+        return None
+    trigger = event.payload.get("trigger_outcome")
+    if trigger not in {"timed_out", "crashed"} or run.outcome != trigger:
+        return None
+    return event
+
+
+def reclassify_block(
+    conn: sqlite3.Connection,
+    request: BlockReclassification,
+) -> GuardedMutationResult:
+    if request.block_kind not in VALID_BLOCK_KINDS:
+        raise ValueError(f"block_kind must be one of {sorted(VALID_BLOCK_KINDS)}")
+    if request.block_kind == "dependency":
+        raise ValueError(
+            "dependency blocks must route through block_task and cannot remain blocked"
+        )
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_kind="block_reclassified",
+        )
+        if replay is not None:
+            return replay
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
+            (request.task_id,),
+        ).fetchone()
+        if row is None:
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task not found",
+            )
+        if row["status"] != "blocked":
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason=f"task status is {row['status']!r}, not 'blocked'",
+            )
+        source = _latest_task_event(
+            conn,
+            request.task_id,
+            kinds=("blocked", "gave_up"),
+        )
+        if (
+            source is None
+            or canonical_event_signature(source)
+            != request.expected_block_event_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="latest block event signature changed",
+            )
+        if row["block_kind"] == request.block_kind:
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="block already has the requested classification",
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET block_kind = ? WHERE id = ? AND status = 'blocked'",
+            (request.block_kind, request.task_id),
+        )
+        if cur.rowcount != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task status changed during reclassification",
+            )
+        event_id = _append_event(
+            conn,
+            request.task_id,
+            "block_reclassified",
+            {
+                "operation_id": request.operation_id,
+                "source_block_signature": request.expected_block_event_signature,
+                "previous_kind": row["block_kind"],
+                "kind": request.block_kind,
+            },
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_id=event_id,
+        )
+
+
+def requeue_review_lane(
+    conn: sqlite3.Connection,
+    request: ReviewLaneMutation,
+) -> GuardedMutationResult:
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_kind="review_requeued",
+        )
+        if replay is not None:
+            return replay
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (request.task_id,),
+        ).fetchone()
+        if row is None or not _is_review_generation_task(conn, request.task_id):
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review generation task not found",
+            )
+        if row["status"] != request.expected_status:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane status changed",
+            )
+        if row["status"] not in {"ready", "blocked"}:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane is not in a requeueable failed state",
+            )
+        terminal = _current_review_terminal_event(conn, request.task_id)
+        if (
+            terminal is None
+            or canonical_event_signature(terminal) != request.expected_event_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane terminal event changed",
+            )
+        later_recovery = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            "AND kind IN ('review_requeued', 'review_archived') LIMIT 1",
+            (request.task_id, terminal.id),
+        ).fetchone()
+        if later_recovery is not None:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review terminal generation was already consumed",
+            )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL,
+                   current_run_id = NULL,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL
+             WHERE id = ? AND status = ?
+            """,
+            (request.task_id, request.expected_status),
+        )
+        if cur.rowcount != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane status changed during requeue",
+            )
+        event_id = _append_event(
+            conn,
+            request.task_id,
+            "review_requeued",
+            {
+                "operation_id": request.operation_id,
+                "source_terminal_signature": request.expected_event_signature,
+                "previous_status": request.expected_status,
+            },
+            run_id=terminal.run_id,
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_id=event_id,
+        )
+
+
+def archive_review_lane(
+    conn: sqlite3.Connection,
+    request: ReviewLaneMutation,
+) -> GuardedMutationResult:
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_kind="review_archived",
+        )
+        if replay is not None:
+            return replay
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (request.task_id,),
+        ).fetchone()
+        if row is None or not _is_review_generation_task(conn, request.task_id):
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review generation task not found",
+            )
+        if row["status"] != request.expected_status:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane status changed",
+            )
+        source = _latest_task_event(conn, request.task_id)
+        if (
+            source is None
+            or canonical_event_signature(source) != request.expected_event_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane event changed",
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = ?",
+            (request.task_id, request.expected_status),
+        )
+        if cur.rowcount != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane status changed during archive",
+            )
+        run_id = _end_run(
+            conn,
+            request.task_id,
+            outcome="reclaimed",
+            status="reclaimed",
+            summary="review lane archived by recovery controller",
+        )
+        event_id = _append_event(
+            conn,
+            request.task_id,
+            "review_archived",
+            {
+                "operation_id": request.operation_id,
+                "source_event_signature": request.expected_event_signature,
+                "previous_status": request.expected_status,
+            },
+            run_id=run_id,
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_id=event_id,
+        )
+
+
+def retry_transient_task(
+    conn: sqlite3.Connection,
+    request: TransientRetryRequest,
+) -> GuardedMutationResult:
+    if type(request.retry_ordinal) is not int or request.retry_ordinal < 1:
+        raise ValueError("retry_ordinal must be a positive integer")
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_kind="transient_retry_authorized",
+        )
+        if replay is not None:
+            return replay
+        row = conn.execute(
+            "SELECT status, block_kind, current_run_id FROM tasks WHERE id = ?",
+            (request.task_id,),
+        ).fetchone()
+        if row is None:
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task not found",
+            )
+        if row["status"] != "blocked" or row["block_kind"] != "transient":
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task is no longer blocked as transient",
+            )
+        terminal = _latest_task_event(
+            conn,
+            request.task_id,
+            kinds=("blocked", "gave_up", "timed_out", "crashed"),
+        )
+        if (
+            terminal is None
+            or canonical_event_signature(terminal)
+            != request.expected_terminal_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="transient terminal event changed",
+            )
+        prior_ordinals: list[int] = []
+        for event_row in conn.execute(
+            "SELECT * FROM task_events "
+            "WHERE task_id = ? AND kind = 'transient_retry_authorized' "
+            "ORDER BY id ASC",
+            (request.task_id,),
+        ).fetchall():
+            event = _event_from_row(event_row)
+            ordinal = event.payload.get("retry_ordinal") if event.payload else None
+            if type(ordinal) is int and ordinal > 0:
+                prior_ordinals.append(ordinal)
+        next_ordinal = max(prior_ordinals, default=0) + 1
+        if request.retry_ordinal != next_ordinal:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason=f"next retry ordinal is {next_ordinal}",
+            )
+        if row["current_run_id"] is not None:
+            _end_run(
+                conn,
+                request.task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="invariant recovery on transient retry",
+            )
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (request.task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parent else "ready"
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?,
+                   current_run_id = NULL,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL
+             WHERE id = ? AND status = 'blocked' AND block_kind = 'transient'
+            """,
+            (new_status, request.task_id),
+        )
+        if cur.rowcount != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task changed during transient retry",
+            )
+        event_id = _append_event(
+            conn,
+            request.task_id,
+            "transient_retry_authorized",
+            {
+                "operation_id": request.operation_id,
+                "retry_ordinal": request.retry_ordinal,
+                "source_terminal_signature": request.expected_terminal_signature,
+                "status": new_status,
+            },
+            run_id=terminal.run_id,
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_id=event_id,
+        )
+
+
+def acknowledge_escalation(
+    conn: sqlite3.Connection,
+    request: EscalationAcknowledgement,
+) -> GuardedMutationResult:
+    if not re.fullmatch(r"[0-9a-f]{64}", request.escalation_signature):
+        raise ValueError("escalation_signature must be a lowercase SHA-256 digest")
+    actor = request.actor.strip() if isinstance(request.actor, str) else ""
+    if not actor:
+        raise ValueError("actor must be a nonempty string")
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_kind="escalation_acknowledged",
+        )
+        if replay is not None:
+            return replay
+        task = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?",
+            (request.task_id,),
+        ).fetchone()
+        if task is None:
+            return _guarded_result(
+                "not_applied",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task not found",
+            )
+        source = _latest_task_event(conn, request.task_id)
+        if (
+            source is None
+            or canonical_event_signature(source) != request.expected_event_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task event changed",
+            )
+        event_id = _append_event(
+            conn,
+            request.task_id,
+            "escalation_acknowledged",
+            {
+                "operation_id": request.operation_id,
+                "signature": request.escalation_signature,
+                "source_event_signature": request.expected_event_signature,
+                "actor": actor,
+            },
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_id=event_id,
+        )
 
 
 def specify_triage_task(

@@ -264,6 +264,163 @@ def test_run_slash_link_unlink(kanban_home):
     assert "Unlinked" in kc.run_slash(f"unlink {ta} {tb}")
 
 
+def _kanban_args(*tokens: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    return parser.parse_args(["kanban", *tokens])
+
+
+def _latest_signature(conn, task_id: str) -> str:
+    return kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "reclassify-block t_x --expected-block-event-signature " + "0" * 64
+        + " --kind review --operation-id op-1",
+        "requeue-review t_x --expected-status blocked --expected-event-signature "
+        + "0" * 64 + " --operation-id op-2",
+        "archive-review t_x --expected-status ready --expected-event-signature "
+        + "0" * 64 + " --operation-id op-3",
+        "retry-transient t_x --expected-terminal-signature " + "0" * 64
+        + " --retry-ordinal 1 --operation-id op-4",
+    ],
+)
+def test_automation_recovery_commands_require_json(kanban_home, command):
+    assert "usage error" in kc.run_slash(command).lower()
+
+
+def test_reclassify_block_cli_serializes_handled_precondition_change(
+    kanban_home,
+    capsys,
+):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="legacy blocked")
+        assert kb.block_task(conn, task_id, reason="legacy")
+    args = _kanban_args(
+        "reclassify-block",
+        task_id,
+        "--expected-block-event-signature",
+        "0" * 64,
+        "--kind",
+        "review",
+        "--operation-id",
+        "cli-reclassify-stale",
+        "--json",
+    )
+
+    assert kc.kanban_command(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {
+        "outcome",
+        "task_id",
+        "operation_id",
+        "event_id",
+        "reason",
+    }
+    assert payload["outcome"] == "precondition_changed"
+    assert payload["event_id"] is None
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).block_kind is None
+
+
+def test_requeue_review_cli_returns_guarded_json(kanban_home):
+    with kb.connect_closing() as conn:
+        request = kb.ReviewGenerationCreate(
+            board="default",
+            tenant=None,
+            key="review-lane:default::t_parent:cli-requeue",
+            title="review lane",
+            assignee="reviewer",
+        )
+        task_id = kb.create_review_generation_task(conn, request).task_id
+        assert kb.claim_task(conn, task_id, claimer="reviewer") is not None
+        assert kb._record_spawn_failure(conn, task_id, "failed", failure_limit=1)
+        signature = _latest_signature(conn, task_id)
+
+    payload = json.loads(
+        kc.run_slash(
+            f"requeue-review {task_id} --expected-status blocked "
+            f"--expected-event-signature {signature} "
+            "--operation-id cli-review-requeue --json"
+        )
+    )
+
+    assert payload["outcome"] == "committed"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_archive_review_cli_returns_guarded_json(kanban_home):
+    with kb.connect_closing() as conn:
+        request = kb.ReviewGenerationCreate(
+            board="default",
+            tenant=None,
+            key="review-lane:default::t_parent:cli-archive",
+            title="review lane",
+            assignee="reviewer",
+        )
+        task_id = kb.create_review_generation_task(conn, request).task_id
+        signature = _latest_signature(conn, task_id)
+
+    payload = json.loads(
+        kc.run_slash(
+            f"archive-review {task_id} --expected-status ready "
+            f"--expected-event-signature {signature} "
+            "--operation-id cli-review-archive --json"
+        )
+    )
+
+    assert payload["outcome"] == "committed"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "archived"
+
+
+def test_retry_transient_cli_returns_guarded_json(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="flaky operation")
+        assert kb.block_task(conn, task_id, reason="temporary", kind="transient")
+        signature = _latest_signature(conn, task_id)
+
+    payload = json.loads(
+        kc.run_slash(
+            f"retry-transient {task_id} --expected-terminal-signature {signature} "
+            "--retry-ordinal 1 --operation-id cli-transient-1 --json"
+        )
+    )
+
+    assert payload["outcome"] == "committed"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_acknowledge_escalation_cli_derives_local_guard_and_operation(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "local-operator")
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="human escalation")
+        assert kb.block_task(conn, task_id, reason="decision", kind="needs_input")
+        status_before = kb.get_task(conn, task_id).status
+
+    payload = json.loads(
+        kc.run_slash(f"acknowledge-escalation {task_id} --signature {'b' * 64} --json")
+    )
+
+    assert payload["outcome"] == "committed"
+    assert payload["operation_id"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        event = kb.list_events(conn, task_id)[-1]
+    assert task.status == status_before
+    assert event.kind == "escalation_acknowledged"
+    assert event.payload["actor"] == "local-operator"
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

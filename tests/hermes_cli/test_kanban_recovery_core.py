@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,42 @@ def _review_metadata(
 
 def _completed_event(conn, task_id: str) -> kb.Event:
     return [event for event in kb.list_events(conn, task_id) if event.kind == "completed"][-1]
+
+
+def _latest_event(conn, task_id: str) -> kb.Event:
+    return kb.list_events(conn, task_id)[-1]
+
+
+def _latest_event_signature(conn, task_id: str) -> str:
+    return kb.canonical_event_signature(_latest_event(conn, task_id))
+
+
+def _operation_events(conn, task_id: str, operation_id: str) -> list[kb.Event]:
+    return [
+        event
+        for event in kb.list_events(conn, task_id)
+        if event.payload and event.payload.get("operation_id") == operation_id
+    ]
+
+
+def _blocked_task(conn, *, kind: str | None = None) -> str:
+    task_id = kb.create_task(conn, title="blocked recovery target")
+    assert kb.block_task(conn, task_id, reason="recovery fixture", kind=kind)
+    return task_id
+
+
+def _failed_review_generation(conn) -> tuple[str, kb.Event]:
+    created = kb.create_review_generation_task(conn, _review_generation_request())
+    assert kb.claim_task(conn, created.task_id, claimer="reviewer") is not None
+    assert kb._record_spawn_failure(
+        conn,
+        created.task_id,
+        "review worker exited",
+        failure_limit=1,
+    )
+    event = _latest_event(conn, created.task_id)
+    assert event.kind == "gave_up"
+    return created.task_id, event
 
 
 def _review_generation_request(
@@ -369,3 +406,337 @@ def test_duplicate_legacy_review_generation_keys_fail_migration_preflight(conn):
     finally:
         raw.close()
     assert count == 2
+
+
+def test_canonical_event_signature_is_stable_for_canonical_payload_order():
+    first = kb.Event(
+        id=42,
+        task_id="t_example",
+        kind="blocked",
+        payload={"z": "last", "a": 1},
+        created_at=1_700_000_000,
+        run_id=7,
+    )
+    second = replace(first, payload={"a": 1, "z": "last"})
+
+    assert kb.canonical_event_signature(first) == (
+        "0a26d8de65aaa3c1a13809e06158e1f59518ea69854f14c5b3a5d3bdddb3983a"
+    )
+    assert kb.canonical_event_signature(second) == kb.canonical_event_signature(first)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"task_id": "t_other"},
+        {"id": 43},
+        {"kind": "gave_up"},
+        {"payload": {"a": 2, "z": "last"}},
+        {"run_id": 8},
+        {"created_at": 1_700_000_001},
+    ],
+)
+def test_canonical_event_signature_covers_every_signed_field(changed):
+    event = kb.Event(
+        id=42,
+        task_id="t_example",
+        kind="blocked",
+        payload={"a": 1, "z": "last"},
+        created_at=1_700_000_000,
+        run_id=7,
+    )
+
+    assert kb.canonical_event_signature(replace(event, **changed)) != (
+        kb.canonical_event_signature(event)
+    )
+
+
+def test_reclassify_requires_exact_latest_block_signature(conn):
+    task_id = _blocked_task(conn)
+    events_before = kb.list_events(conn, task_id)
+    request = kb.BlockReclassification(
+        task_id=task_id,
+        expected_block_event_signature="0" * 64,
+        block_kind="review",
+        operation_id="reclassify-stale",
+    )
+
+    result = kb.reclassify_block(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).block_kind is None
+    assert kb.list_events(conn, task_id) == events_before
+
+
+def test_operation_replay_returns_original_committed_event(conn):
+    task_id = _blocked_task(conn)
+    request = kb.BlockReclassification(
+        task_id=task_id,
+        expected_block_event_signature=_latest_event_signature(conn, task_id),
+        block_kind="review",
+        operation_id="reclassify-once",
+    )
+
+    first = kb.reclassify_block(conn, request)
+    second = kb.reclassify_block(conn, request)
+
+    assert first == second
+    assert first.outcome == "committed"
+    assert first.event_id is not None
+    assert len(_operation_events(conn, task_id, "reclassify-once")) == 1
+    assert kb.get_task(conn, task_id).block_kind == "review"
+
+
+def test_reclassify_cannot_create_blocked_dependency_state(conn):
+    task_id = _blocked_task(conn)
+    request = kb.BlockReclassification(
+        task_id=task_id,
+        expected_block_event_signature=_latest_event_signature(conn, task_id),
+        block_kind="dependency",
+        operation_id="invalid-dependency-classification",
+    )
+
+    with pytest.raises(ValueError, match="dependency"):
+        kb.reclassify_block(conn, request)
+
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.block_kind) == ("blocked", None)
+
+
+def test_guarded_requeue_preserves_review_attempt_history(conn):
+    task_id, terminal_event = _failed_review_generation(conn)
+    runs_before = kb.list_runs(conn, task_id)
+    request = kb.ReviewLaneMutation(
+        task_id=task_id,
+        expected_status="blocked",
+        expected_event_signature=kb.canonical_event_signature(terminal_event),
+        operation_id="review-requeue-1",
+    )
+
+    result = kb.requeue_review_lane(conn, request)
+
+    task = kb.get_task(conn, task_id)
+    assert result.outcome == "committed"
+    assert kb.list_runs(conn, task_id) == runs_before
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert task.consecutive_failures == 0
+    event = _operation_events(conn, task_id, "review-requeue-1")[0]
+    assert event.kind == "review_requeued"
+    assert event.payload["source_terminal_signature"] == request.expected_event_signature
+
+
+def test_review_terminal_generation_cannot_be_requeued_twice(conn):
+    task_id, terminal_event = _failed_review_generation(conn)
+    terminal_signature = kb.canonical_event_signature(terminal_event)
+    first = kb.ReviewLaneMutation(
+        task_id=task_id,
+        expected_status="blocked",
+        expected_event_signature=terminal_signature,
+        operation_id="review-requeue-first",
+    )
+    assert kb.requeue_review_lane(conn, first).outcome == "committed"
+    second = kb.ReviewLaneMutation(
+        task_id=task_id,
+        expected_status="ready",
+        expected_event_signature=terminal_signature,
+        operation_id="review-requeue-second",
+    )
+
+    result = kb.requeue_review_lane(conn, second)
+
+    assert result.outcome == "precondition_changed"
+    assert len(
+        [event for event in kb.list_events(conn, task_id) if event.kind == "review_requeued"]
+    ) == 1
+
+
+def test_archived_review_generation_cannot_be_resurrected_by_requeue(conn):
+    task_id, terminal_event = _failed_review_generation(conn)
+    assert kb.archive_task(conn, task_id)
+    request = kb.ReviewLaneMutation(
+        task_id=task_id,
+        expected_status="archived",
+        expected_event_signature=kb.canonical_event_signature(terminal_event),
+        operation_id="review-requeue-archived",
+    )
+
+    result = kb.requeue_review_lane(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "archived"
+
+
+def test_guarded_archive_requires_exact_review_generation_state(conn):
+    created = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(key="review-lane:default::t_parent:archive"),
+    )
+    request = kb.ReviewLaneMutation(
+        task_id=created.task_id,
+        expected_status="ready",
+        expected_event_signature=_latest_event_signature(conn, created.task_id),
+        operation_id="review-archive-1",
+    )
+
+    first = kb.archive_review_lane(conn, request)
+    replay = kb.archive_review_lane(conn, request)
+
+    assert first == replay
+    assert first.outcome == "committed"
+    assert kb.get_task(conn, created.task_id).status == "archived"
+    event = _operation_events(conn, created.task_id, "review-archive-1")[0]
+    assert event.kind == "review_archived"
+    assert event.payload["source_event_signature"] == request.expected_event_signature
+
+
+def test_transient_retry_requires_exact_terminal_signature(conn):
+    task_id = _blocked_task(conn, kind="transient")
+    events_before = kb.list_events(conn, task_id)
+    request = kb.TransientRetryRequest(
+        task_id=task_id,
+        expected_terminal_signature="0" * 64,
+        retry_ordinal=1,
+        operation_id="transient-stale",
+    )
+
+    result = kb.retry_transient_task(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert kb.list_events(conn, task_id) == events_before
+
+
+def test_transient_retry_ordinal_is_permanent_and_monotonic(conn):
+    task_id = _blocked_task(conn, kind="transient")
+    first = kb.TransientRetryRequest(
+        task_id=task_id,
+        expected_terminal_signature=_latest_event_signature(conn, task_id),
+        retry_ordinal=1,
+        operation_id="transient-1",
+    )
+    assert kb.retry_transient_task(conn, first).outcome == "committed"
+    # A different human-block cycle resets the recurrence cause, but it must
+    # not reset the permanent transient-retry ordinal reconstructed from events.
+    assert kb.block_task(conn, task_id, reason="needs a decision", kind="needs_input")
+    assert kb.unblock_task(conn, task_id)
+    assert kb.block_task(conn, task_id, reason="transient again", kind="transient")
+
+    repeated_ordinal = kb.TransientRetryRequest(
+        task_id=task_id,
+        expected_terminal_signature=_latest_event_signature(conn, task_id),
+        retry_ordinal=1,
+        operation_id="transient-repeated-ordinal",
+    )
+    assert kb.retry_transient_task(conn, repeated_ordinal).outcome == (
+        "precondition_changed"
+    )
+
+    second = replace(
+        repeated_ordinal,
+        retry_ordinal=2,
+        operation_id="transient-2",
+    )
+    assert kb.retry_transient_task(conn, second).outcome == "committed"
+    retry_events = [
+        event
+        for event in kb.list_events(conn, task_id)
+        if event.kind == "transient_retry_authorized"
+    ]
+    assert [event.payload["retry_ordinal"] for event in retry_events] == [1, 2]
+    assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_escalation_acknowledgement_is_exact_and_lifecycle_neutral(conn):
+    task_id = _blocked_task(conn, kind="needs_input")
+    before = kb.get_task(conn, task_id)
+    runs_before = kb.list_runs(conn, task_id)
+    request = kb.EscalationAcknowledgement(
+        task_id=task_id,
+        escalation_signature="a" * 64,
+        expected_event_signature=_latest_event_signature(conn, task_id),
+        actor="operator",
+        operation_id="ack-1",
+    )
+
+    result = kb.acknowledge_escalation(conn, request)
+
+    after = kb.get_task(conn, task_id)
+    assert result.outcome == "committed"
+    assert (
+        after.status,
+        after.block_kind,
+        after.block_recurrences,
+        after.consecutive_failures,
+        after.current_run_id,
+        after.claim_lock,
+        after.claim_expires,
+        after.worker_pid,
+        after.assignee,
+    ) == (
+        before.status,
+        before.block_kind,
+        before.block_recurrences,
+        before.consecutive_failures,
+        before.current_run_id,
+        before.claim_lock,
+        before.claim_expires,
+        before.worker_pid,
+        before.assignee,
+    )
+    assert kb.list_runs(conn, task_id) == runs_before
+    event = _operation_events(conn, task_id, "ack-1")[0]
+    assert event.kind == "escalation_acknowledged"
+    assert event.payload["signature"] == "a" * 64
+    assert event.payload["actor"] == "operator"
+
+
+def test_operation_keyed_link_and_unlink_replay_original_events(conn):
+    parent = kb.create_task(conn, title="parent")
+    child = kb.create_task(conn, title="child")
+
+    linked = kb.link_tasks(conn, parent, child, operation_id="link-once")
+    linked_replay = kb.link_tasks(conn, parent, child, operation_id="link-once")
+
+    assert linked == linked_replay
+    assert linked.outcome == "committed"
+    assert kb.parent_ids(conn, child) == [parent]
+    assert len(_operation_events(conn, child, "link-once")) == 1
+
+    unlinked = kb.unlink_tasks(conn, parent, child, operation_id="unlink-once")
+    unlinked_replay = kb.unlink_tasks(
+        conn,
+        parent,
+        child,
+        operation_id="unlink-once",
+    )
+
+    assert unlinked == unlinked_replay
+    assert unlinked.outcome == "committed"
+    assert kb.parent_ids(conn, child) == []
+    assert len(_operation_events(conn, child, "unlink-once")) == 1
+
+
+def test_operation_keyed_completion_replays_without_second_terminal_event(conn):
+    task_id = kb.create_task(conn, title="automation completion")
+
+    first = kb.complete_task(
+        conn,
+        task_id,
+        result="done",
+        operation_id="complete-once",
+    )
+    second = kb.complete_task(
+        conn,
+        task_id,
+        result="done",
+        operation_id="complete-once",
+    )
+
+    assert first is True
+    assert second is True
+    completed = [
+        event for event in kb.list_events(conn, task_id) if event.kind == "completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0].payload["operation_id"] == "complete-once"
