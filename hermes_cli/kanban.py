@@ -767,6 +767,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_ack_escalation.add_argument("--operation-id", default=None)
     p_ack_escalation.add_argument("--json", action="store_true")
 
+    p_recovery_manifest = sub.add_parser(
+        "apply-recovery-manifest",
+        help="Atomically apply one approved legacy review recovery manifest",
+    )
+    p_recovery_manifest.add_argument("path")
+    p_recovery_manifest.add_argument("--approval-signature", required=True)
+    p_recovery_manifest.add_argument("--json", action="store_true", required=True)
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1157,6 +1165,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "archive-review": _cmd_archive_review,
             "retry-transient": _cmd_retry_transient,
             "acknowledge-escalation": _cmd_acknowledge_escalation,
+            "apply-recovery-manifest": _cmd_apply_recovery_manifest,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1227,6 +1236,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "archive-review",
     "retry-transient",
     "acknowledge-escalation",
+    "apply-recovery-manifest",
     "dispatch",
     "daemon",
     "repair",
@@ -2784,6 +2794,79 @@ def _cmd_acknowledge_escalation(args: argparse.Namespace) -> int:
         result,
         as_json=bool(args.json),
         label="Acknowledged escalation for",
+    )
+
+
+def _load_recovery_manifest(path: str) -> kb.RecoveryManifest:
+    manifest_path = Path(path).expanduser()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_fields = {
+        "schema_version",
+        "reviewer_task_id",
+        "reviewer_status",
+        "reviewer_event_signature",
+        "child_task_id",
+        "child_status",
+        "child_event_signature",
+        "expected_parent_ids",
+        "target_evidence",
+        "approval_signature",
+        "operation_id",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise ValueError("manifest must contain the exact recovery manifest fields")
+    parent_ids = payload["expected_parent_ids"]
+    target_evidence = payload["target_evidence"]
+    if not isinstance(parent_ids, list):
+        raise ValueError("expected_parent_ids must be a JSON array")
+    if not isinstance(target_evidence, list) or not all(
+        isinstance(item, dict) for item in target_evidence
+    ):
+        raise ValueError("target_evidence must be a JSON array of objects")
+    return kb.RecoveryManifest(
+        schema_version=payload["schema_version"],
+        reviewer_task_id=payload["reviewer_task_id"],
+        reviewer_status=payload["reviewer_status"],
+        reviewer_event_signature=payload["reviewer_event_signature"],
+        child_task_id=payload["child_task_id"],
+        child_status=payload["child_status"],
+        child_event_signature=payload["child_event_signature"],
+        expected_parent_ids=tuple(parent_ids),
+        target_evidence=tuple(dict(item) for item in target_evidence),
+        approval_signature=payload["approval_signature"],
+        operation_id=payload["operation_id"],
+    )
+
+
+def _cmd_apply_recovery_manifest(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_TASK_ID"):
+        print(
+            "kanban: apply-recovery-manifest is automation-only and cannot run in a worker task",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        manifest = _load_recovery_manifest(args.path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"kanban: invalid recovery manifest: {exc}", file=sys.stderr)
+        return 2
+    if (
+        args.approval_signature != manifest.approval_signature
+        or kb.recovery_manifest_signature(manifest) != args.approval_signature
+    ):
+        result = kb.GuardedMutationResult(
+            outcome="precondition_changed",
+            task_id=manifest.child_task_id,
+            operation_id=manifest.operation_id,
+            reason="--approval-signature does not match the canonical manifest",
+        )
+    else:
+        with kb.connect_closing() as conn:
+            result = kb.apply_recovery_manifest(conn, manifest)
+    return _emit_guarded_result(
+        result,
+        as_json=True,
+        label="Applied recovery manifest for",
     )
 
 

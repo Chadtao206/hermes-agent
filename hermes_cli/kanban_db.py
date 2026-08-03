@@ -1317,6 +1317,21 @@ class ReviewedCompletionRequest:
 
 
 @dataclass(frozen=True)
+class RecoveryManifest:
+    schema_version: int
+    reviewer_task_id: str
+    reviewer_status: str
+    reviewer_event_signature: str
+    child_task_id: str
+    child_status: str
+    child_event_signature: str
+    expected_parent_ids: tuple[str, ...]
+    target_evidence: tuple[dict[str, object], ...]
+    approval_signature: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
 class ReviewCompletionEvidence:
     """Validated review verdict copied onto a terminal completion event."""
 
@@ -8073,6 +8088,340 @@ def complete_reviewed_task_guarded(
         task_id=request.task_id,
         operation_id=pre.operation_id,
         event_id=event_id,
+    )
+
+
+def recovery_manifest_unsigned_payload(
+    manifest: RecoveryManifest,
+) -> dict[str, object]:
+    return {
+        "schema_version": manifest.schema_version,
+        "reviewer_task_id": manifest.reviewer_task_id,
+        "reviewer_status": manifest.reviewer_status,
+        "reviewer_event_signature": manifest.reviewer_event_signature,
+        "child_task_id": manifest.child_task_id,
+        "child_status": manifest.child_status,
+        "child_event_signature": manifest.child_event_signature,
+        "expected_parent_ids": list(manifest.expected_parent_ids),
+        "target_evidence": [dict(item) for item in manifest.target_evidence],
+        "operation_id": manifest.operation_id,
+    }
+
+
+def recovery_manifest_signature(manifest: RecoveryManifest) -> str:
+    return canonical_payload_signature(recovery_manifest_unsigned_payload(manifest))
+
+
+def _recovery_manifest_targets(
+    manifest: RecoveryManifest,
+) -> tuple[dict[str, str], ...]:
+    if not manifest.target_evidence:
+        raise ValueError("target_evidence must contain at least one attestation")
+    targets: list[dict[str, str]] = []
+    for item in manifest.target_evidence:
+        if not isinstance(item, Mapping) or set(item) != {
+            "kind",
+            "identity",
+            "revision",
+            "signature",
+        }:
+            raise ValueError(
+                "each target_evidence item must contain kind, identity, revision, and signature"
+            )
+        target = {
+            "kind": item["kind"],
+            "identity": item["identity"],
+            "revision": item["revision"],
+        }
+        ReviewCompletionEvidence.from_metadata({
+            "review": {
+                "schema_version": 1,
+                "verdict": "APPROVED",
+                "target": target,
+                "findings": [],
+            }
+        })
+        signature = item["signature"]
+        if (
+            not isinstance(signature, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", signature)
+            or canonical_payload_signature(target) != signature
+        ):
+            raise ValueError("target evidence signature changed or is invalid")
+        targets.append(target)
+    return tuple(targets)
+
+
+def _validate_recovery_manifest_shape(manifest: RecoveryManifest) -> None:
+    if type(manifest.schema_version) is not int or manifest.schema_version != 1:
+        raise ValueError("recovery manifest schema_version must be 1")
+    for name, value in (
+        ("reviewer_task_id", manifest.reviewer_task_id),
+        ("child_task_id", manifest.child_task_id),
+        ("operation_id", manifest.operation_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a nonempty string")
+    if manifest.reviewer_task_id == manifest.child_task_id:
+        raise ValueError("reviewer_task_id and child_task_id must differ")
+    if manifest.reviewer_status not in VALID_STATUSES - {"done", "archived"}:
+        raise ValueError("reviewer_status must be nonterminal")
+    if manifest.child_status != "todo":
+        raise ValueError("child_status must be 'todo'")
+    if (
+        not manifest.expected_parent_ids
+        or tuple(sorted(set(manifest.expected_parent_ids)))
+        != manifest.expected_parent_ids
+        or manifest.reviewer_task_id not in manifest.expected_parent_ids
+    ):
+        raise ValueError(
+            "expected_parent_ids must be sorted, unique, and include the reviewer"
+        )
+    for name, value in (
+        ("reviewer_event_signature", manifest.reviewer_event_signature),
+        ("child_event_signature", manifest.child_event_signature),
+        ("approval_signature", manifest.approval_signature),
+    ):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"{name} must be a lowercase SHA-256 signature")
+
+
+def _recovery_manifest_replay(
+    conn: sqlite3.Connection,
+    manifest: RecoveryManifest,
+) -> Optional[GuardedMutationResult]:
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE payload IS NOT NULL ORDER BY id ASC"
+    ).fetchall()
+    matches = []
+    for row in rows:
+        event = _event_from_row(row)
+        if (
+            isinstance(event.payload, Mapping)
+            and event.payload.get("operation_id") == manifest.operation_id
+        ):
+            matches.append(event)
+    if not matches:
+        return None
+    expected = {
+        (manifest.reviewer_task_id, "completed"),
+        (manifest.child_task_id, "blocked"),
+    }
+    if (
+        len(matches) == 2
+        and {(event.task_id, event.kind) for event in matches} == expected
+        and all(
+            event.payload.get("recovery_manifest_signature")
+            == manifest.approval_signature
+            for event in matches
+        )
+    ):
+        child_event = next(
+            event for event in matches if event.task_id == manifest.child_task_id
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=manifest.child_task_id,
+            operation_id=manifest.operation_id,
+            event_id=child_event.id,
+        )
+    return GuardedMutationResult(
+        outcome="conflict",
+        task_id=manifest.child_task_id,
+        operation_id=manifest.operation_id,
+        event_id=matches[0].id,
+        reason="operation_id is already bound to another mutation",
+    )
+
+
+def apply_recovery_manifest(
+    conn: sqlite3.Connection,
+    manifest: RecoveryManifest,
+) -> GuardedMutationResult:
+    _validate_recovery_manifest_shape(manifest)
+    try:
+        targets = _recovery_manifest_targets(manifest)
+    except ValueError as exc:
+        return _guarded_result(
+            "precondition_changed",
+            task_id=manifest.child_task_id,
+            operation_id=manifest.operation_id,
+            reason=str(exc),
+        )
+    if recovery_manifest_signature(manifest) != manifest.approval_signature:
+        return _guarded_result(
+            "precondition_changed",
+            task_id=manifest.child_task_id,
+            operation_id=manifest.operation_id,
+            reason="recovery manifest approval signature changed",
+        )
+
+    with write_txn(conn):
+        replay = _recovery_manifest_replay(conn, manifest)
+        if replay is not None:
+            return replay
+        try:
+            transaction_targets = _recovery_manifest_targets(manifest)
+        except ValueError as exc:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=manifest.child_task_id,
+                operation_id=manifest.operation_id,
+                reason=str(exc),
+            )
+        if (
+            transaction_targets != targets
+            or recovery_manifest_signature(manifest) != manifest.approval_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=manifest.child_task_id,
+                operation_id=manifest.operation_id,
+                reason="recovery manifest evidence changed",
+            )
+
+        reviewer = get_task(conn, manifest.reviewer_task_id)
+        child = get_task(conn, manifest.child_task_id)
+        reviewer_event = _latest_task_event(conn, manifest.reviewer_task_id)
+        child_event = _latest_task_event(conn, manifest.child_task_id)
+        current_parents = tuple(parent_ids(conn, manifest.child_task_id))
+        if (
+            reviewer is None
+            or child is None
+            or reviewer.status != manifest.reviewer_status
+            or child.status != manifest.child_status
+            or child.current_run_id is not None
+            or reviewer_event is None
+            or child_event is None
+            or canonical_event_signature(reviewer_event)
+            != manifest.reviewer_event_signature
+            or canonical_event_signature(child_event) != manifest.child_event_signature
+            or current_parents != manifest.expected_parent_ids
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=manifest.child_task_id,
+                operation_id=manifest.operation_id,
+                reason="recovery manifest task, event, or graph preconditions changed",
+            )
+
+        now = int(time.time())
+        result_summary = "Adopted approved legacy review recovery manifest"
+        review_payload = {
+            "schema_version": 1,
+            "verdict": "APPROVED",
+            "target": dict(targets[0]),
+            "findings": [],
+        }
+        run_metadata = {
+            "review": review_payload,
+            "recovery_manifest": {
+                "approval_signature": manifest.approval_signature,
+                "target_evidence": [dict(item) for item in manifest.target_evidence],
+            },
+        }
+        conn.execute("SAVEPOINT recovery_manifest_task_updates")
+        reviewer_update = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'done', result = ?, completed_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0,
+                   consecutive_failures = 0, last_failure_error = NULL
+             WHERE id = ? AND status = ?
+            """,
+            (
+                result_summary,
+                now,
+                manifest.reviewer_task_id,
+                manifest.reviewer_status,
+            ),
+        )
+        child_update = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked', block_kind = 'needs_input',
+                   block_recurrences = 1,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+             WHERE id = ? AND status = 'todo' AND current_run_id IS NULL
+            """,
+            (manifest.child_task_id,),
+        )
+        if reviewer_update.rowcount != 1 or child_update.rowcount != 1:
+            conn.execute("ROLLBACK TO recovery_manifest_task_updates")
+            conn.execute("RELEASE recovery_manifest_task_updates")
+            return _guarded_result(
+                "precondition_changed",
+                task_id=manifest.child_task_id,
+                operation_id=manifest.operation_id,
+                reason="recovery manifest task state changed during commit",
+            )
+        conn.execute("RELEASE recovery_manifest_task_updates")
+
+        reviewer_run_id = _end_run(
+            conn,
+            manifest.reviewer_task_id,
+            outcome="completed",
+            status="done",
+            summary=result_summary,
+            metadata=run_metadata,
+        )
+        if reviewer_run_id is None:
+            reviewer_run_id = _synthesize_ended_run(
+                conn,
+                manifest.reviewer_task_id,
+                outcome="completed",
+                summary=result_summary,
+                metadata=run_metadata,
+            )
+            conn.execute(
+                "UPDATE task_runs SET status = 'done' WHERE id = ?",
+                (reviewer_run_id,),
+            )
+        reviewer_event_id = _append_event(
+            conn,
+            manifest.reviewer_task_id,
+            "completed",
+            {
+                "operation_id": manifest.operation_id,
+                "recovery_manifest_signature": manifest.approval_signature,
+                "result_len": len(result_summary),
+                "summary": result_summary,
+                "review": review_payload,
+                "target_evidence": [dict(item) for item in manifest.target_evidence],
+            },
+            run_id=reviewer_run_id,
+        )
+        child_summary = "Parked for operator input by legacy recovery manifest"
+        child_run_id = _synthesize_ended_run(
+            conn,
+            manifest.child_task_id,
+            outcome="blocked",
+            summary=child_summary,
+            metadata={
+                "recovery_manifest_signature": manifest.approval_signature,
+                "reviewer_task_id": manifest.reviewer_task_id,
+            },
+        )
+        child_event_id = _append_event(
+            conn,
+            manifest.child_task_id,
+            "blocked",
+            {
+                "operation_id": manifest.operation_id,
+                "recovery_manifest_signature": manifest.approval_signature,
+                "reason": child_summary,
+                "kind": "needs_input",
+                "reviewer_task_id": manifest.reviewer_task_id,
+                "reviewer_completion_event_id": reviewer_event_id,
+            },
+            run_id=child_run_id,
+        )
+    return GuardedMutationResult(
+        outcome="committed",
+        task_id=manifest.child_task_id,
+        operation_id=manifest.operation_id,
+        event_id=child_event_id,
     )
 
 

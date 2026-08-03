@@ -5,12 +5,15 @@ from __future__ import annotations
 import concurrent.futures
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 import hermes_time
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban as kc
 
 
 @pytest.fixture
@@ -1006,3 +1009,204 @@ def test_guarded_reviewed_completion_rechecks_state_after_judging(conn):
     assert result.outcome == "precondition_changed"
     assert kb.get_task(conn, request.task_id).status == "blocked"
     assert kb.list_events(conn, request.task_id) == events_before
+
+
+def _test_payload_signature(payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_recovery_pair(conn) -> tuple[str, str, kb.RecoveryManifest]:
+    reviewer = kb.create_task(conn, title="legacy approved review", assignee="reviewer")
+    child = kb.create_task(conn, title="legacy child awaiting review")
+    kb.link_tasks(conn, reviewer, child)
+    target = {
+        "kind": "git",
+        "identity": "example/repository",
+        "revision": "b" * 40,
+    }
+    target_evidence = ({**target, "signature": _test_payload_signature(target)},)
+    unsigned_payload = {
+        "schema_version": 1,
+        "reviewer_task_id": reviewer,
+        "reviewer_status": kb.get_task(conn, reviewer).status,
+        "reviewer_event_signature": _latest_event_signature(conn, reviewer),
+        "child_task_id": child,
+        "child_status": "todo",
+        "child_event_signature": _latest_event_signature(conn, child),
+        "expected_parent_ids": [reviewer],
+        "target_evidence": [dict(item) for item in target_evidence],
+        "operation_id": "legacy-recovery-manifest-1",
+    }
+    manifest = kb.RecoveryManifest(
+        schema_version=1,
+        reviewer_task_id=reviewer,
+        reviewer_status=unsigned_payload["reviewer_status"],
+        reviewer_event_signature=unsigned_payload["reviewer_event_signature"],
+        child_task_id=child,
+        child_status="todo",
+        child_event_signature=unsigned_payload["child_event_signature"],
+        expected_parent_ids=(reviewer,),
+        target_evidence=target_evidence,
+        approval_signature=_test_payload_signature(unsigned_payload),
+        operation_id="legacy-recovery-manifest-1",
+    )
+    return reviewer, child, manifest
+
+
+def _legacy_pair_snapshot(conn, reviewer: str, child: str) -> dict[str, object]:
+    return {
+        "reviewer": kb.get_task(conn, reviewer),
+        "child": kb.get_task(conn, child),
+        "reviewer_events": kb.list_events(conn, reviewer),
+        "child_events": kb.list_events(conn, child),
+        "reviewer_runs": kb.list_runs(conn, reviewer),
+        "child_runs": kb.list_runs(conn, child),
+        "parents": kb.parent_ids(conn, child),
+    }
+
+
+def test_manifest_finalizes_reviewer_and_parks_child_atomically(conn):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+
+    first = kb.apply_recovery_manifest(conn, manifest)
+    replay = kb.apply_recovery_manifest(conn, manifest)
+
+    assert first == replay
+    assert first.outcome == "committed"
+    assert kb.get_task(conn, reviewer).status == "done"
+    parked = kb.get_task(conn, child)
+    assert (parked.status, parked.block_kind) == ("blocked", "needs_input")
+    reviewer_event = _completed_event(conn, reviewer)
+    evidence = kb.get_terminal_review_evidence(conn, reviewer, reviewer_event.id)
+    assert evidence is not None and evidence.approved
+    assert (evidence.target_kind, evidence.target_identity, evidence.target_revision) == (
+        "git",
+        "example/repository",
+        "b" * 40,
+    )
+    assert len(_operation_events(conn, reviewer, manifest.operation_id)) == 1
+    assert len(_operation_events(conn, child, manifest.operation_id)) == 1
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["reviewer", "child", "graph", "target", "reviewer_event", "child_event"],
+)
+def test_manifest_stale_precondition_changes_nothing(conn, boundary):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+    if boundary == "reviewer":
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (reviewer,))
+    elif boundary == "child":
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+    elif boundary == "graph":
+        other = kb.create_task(conn, title="unexpected parent")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (other, child),
+            )
+    elif boundary == "target":
+        changed = dict(manifest.target_evidence[0])
+        changed["revision"] = "c" * 40
+        manifest = replace(manifest, target_evidence=(changed,))
+    elif boundary == "reviewer_event":
+        kb.add_comment(conn, reviewer, "operator", "reviewer changed")
+    else:
+        kb.add_comment(conn, child, "operator", "child changed")
+    before = _legacy_pair_snapshot(conn, reviewer, child)
+
+    result = kb.apply_recovery_manifest(conn, manifest)
+
+    assert result.outcome == "precondition_changed"
+    assert _legacy_pair_snapshot(conn, reviewer, child) == before
+
+
+def test_manifest_exception_rolls_back_both_tasks(conn, monkeypatch):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+    before = _legacy_pair_snapshot(conn, reviewer, child)
+    real_append = kb._append_event
+
+    def fail_on_child(connection, task_id, kind, payload=None, *, run_id=None):
+        if task_id == child:
+            raise RuntimeError("simulated child-event failure")
+        return real_append(
+            connection,
+            task_id,
+            kind,
+            payload,
+            run_id=run_id,
+        )
+
+    monkeypatch.setattr(kb, "_append_event", fail_on_child)
+
+    with pytest.raises(RuntimeError, match="simulated child-event failure"):
+        kb.apply_recovery_manifest(conn, manifest)
+
+    assert _legacy_pair_snapshot(conn, reviewer, child) == before
+
+
+def _write_recovery_manifest(path: Path, manifest: kb.RecoveryManifest) -> None:
+    payload = kb.recovery_manifest_unsigned_payload(manifest)
+    payload["approval_signature"] = manifest.approval_signature
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_apply_recovery_manifest_cli_emits_structured_result(conn, tmp_path):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+    path = tmp_path / "recovery-manifest.json"
+    _write_recovery_manifest(path, manifest)
+
+    output = kc.run_slash(
+        f"apply-recovery-manifest '{path}' "
+        f"--approval-signature {manifest.approval_signature} --json"
+    )
+
+    payload = json.loads(output)
+    assert payload["outcome"] == "committed"
+    assert payload["task_id"] == child
+    assert kb.get_task(conn, reviewer).status == "done"
+    assert kb.get_task(conn, child).status == "blocked"
+
+
+def test_apply_recovery_manifest_cli_rejects_unapproved_file(conn, tmp_path):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+    path = tmp_path / "recovery-manifest.json"
+    _write_recovery_manifest(path, manifest)
+    before = _legacy_pair_snapshot(conn, reviewer, child)
+
+    output = kc.run_slash(
+        f"apply-recovery-manifest '{path}' "
+        f"--approval-signature {'0' * 64} --json"
+    )
+
+    payload = json.loads(output)
+    assert payload["outcome"] == "precondition_changed"
+    assert _legacy_pair_snapshot(conn, reviewer, child) == before
+
+
+def test_apply_recovery_manifest_cli_rejects_worker_context(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+    path = tmp_path / "recovery-manifest.json"
+    _write_recovery_manifest(path, manifest)
+    before = _legacy_pair_snapshot(conn, reviewer, child)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
+
+    output = kc.run_slash(
+        f"apply-recovery-manifest '{path}' "
+        f"--approval-signature {manifest.approval_signature} --json"
+    )
+
+    assert "cannot run in a worker task" in output
+    assert _legacy_pair_snapshot(conn, reviewer, child) == before
