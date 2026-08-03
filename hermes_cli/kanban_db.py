@@ -85,10 +85,11 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Optional
 
+import hermes_time
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -1207,6 +1208,91 @@ class EscalationAcknowledgement:
 
 
 @dataclass(frozen=True)
+class LeaseRequest:
+    controller_id: str
+    board: str
+    holder_token: str
+    ttl_seconds: int
+    census_signature: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class LeaseRenewal:
+    controller_id: str
+    board: str
+    holder_token: str
+    holder_epoch: int
+    ttl_seconds: int
+    census_signature: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class LeaseResult:
+    acquired: bool
+    controller_id: str
+    board: str
+    holder_token: str
+    holder_epoch: int
+    issued_at: int
+    expires_at: int
+    operation_id: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ControllerClaim:
+    controller_id: str
+    board: str
+    task_id: str
+    generation_signature: str
+    authority: str
+    input_signature: str
+    lease_epoch: int
+    expires_at: int
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class ControllerClaimRecord:
+    controller_id: str
+    board: str
+    task_id: str
+    generation_signature: str
+    authority: str
+    input_signature: str
+    lease_epoch: int
+    expires_at: int
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class ControllerLeaseRecord:
+    controller_id: str
+    board: str
+    holder_token: str
+    holder_epoch: int
+    issued_at: int
+    expires_at: int
+    census_signature: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class RecoverySnapshot:
+    board: str
+    observed_at: int
+    tasks: tuple[dict[str, object], ...]
+    latest_events: tuple[Event, ...]
+    links: tuple[tuple[str, str], ...]
+    current_runs: tuple[Run, ...]
+    claims: tuple[ControllerClaimRecord, ...]
+    leases: tuple[ControllerLeaseRecord, ...]
+    revision_signature: str
+
+
+@dataclass(frozen=True)
 class ReviewCompletionEvidence:
     """Validated review verdict copied onto a terminal completion event."""
 
@@ -1442,6 +1528,31 @@ CREATE TABLE IF NOT EXISTS kanban_scoped_idempotency (
     PRIMARY KEY (namespace, board, tenant, key)
 );
 
+CREATE TABLE IF NOT EXISTS kanban_controller_leases (
+    controller_id     TEXT NOT NULL,
+    board             TEXT NOT NULL,
+    holder_token      TEXT NOT NULL,
+    holder_epoch      INTEGER NOT NULL,
+    issued_at         INTEGER NOT NULL,
+    expires_at        INTEGER NOT NULL,
+    census_signature TEXT NOT NULL,
+    operation_id      TEXT NOT NULL,
+    PRIMARY KEY (controller_id, board)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_controller_claims (
+    controller_id        TEXT NOT NULL,
+    board                TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    generation_signature TEXT NOT NULL DEFAULT '',
+    authority            TEXT NOT NULL,
+    input_signature      TEXT NOT NULL,
+    lease_epoch          INTEGER NOT NULL,
+    expires_at           INTEGER NOT NULL,
+    operation_id         TEXT NOT NULL,
+    PRIMARY KEY (controller_id, board, task_id, generation_signature)
+);
+
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
@@ -1531,6 +1642,9 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_controller_claims_task ON kanban_controller_claims(task_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_controller_claims_expiry ON kanban_controller_claims(expires_at);
+CREATE INDEX IF NOT EXISTS idx_controller_leases_expiry ON kanban_controller_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
@@ -7260,6 +7374,439 @@ def acknowledge_escalation(
             operation_id=request.operation_id,
             event_id=event_id,
         )
+
+
+def _controller_epoch_now() -> int:
+    return int(hermes_time.now().timestamp())
+
+
+def _validated_controller_scope(
+    controller_id: str,
+    board: str,
+    holder_token: str,
+    ttl_seconds: int,
+    census_signature: str,
+    operation_id: str,
+) -> tuple[str, str, str, int, str, str]:
+    controller = controller_id.strip() if isinstance(controller_id, str) else ""
+    normalized_board = _normalize_board_slug(board)
+    token = holder_token.strip() if isinstance(holder_token, str) else ""
+    operation = operation_id.strip() if isinstance(operation_id, str) else ""
+    if not controller:
+        raise ValueError("controller_id must be a nonempty string")
+    if normalized_board is None:
+        raise ValueError("board must be a valid board slug")
+    if not token:
+        raise ValueError("holder_token must be a nonempty string")
+    if type(ttl_seconds) is not int or ttl_seconds < 1:
+        raise ValueError("ttl_seconds must be a positive integer")
+    if not re.fullmatch(r"[0-9a-f]{64}", census_signature or ""):
+        raise ValueError("census_signature must be a lowercase SHA-256 digest")
+    if not operation:
+        raise ValueError("operation_id must be a nonempty string")
+    return (
+        controller,
+        normalized_board,
+        token,
+        ttl_seconds,
+        census_signature,
+        operation,
+    )
+
+
+def _lease_result_from_row(
+    row: sqlite3.Row,
+    *,
+    acquired: bool,
+    operation_id: str,
+    reason: str = "",
+) -> LeaseResult:
+    return LeaseResult(
+        acquired=acquired,
+        controller_id=row["controller_id"],
+        board=row["board"],
+        holder_token=row["holder_token"],
+        holder_epoch=int(row["holder_epoch"]),
+        issued_at=int(row["issued_at"]),
+        expires_at=int(row["expires_at"]),
+        operation_id=operation_id,
+        reason=reason,
+    )
+
+
+def acquire_controller_lease(
+    conn: sqlite3.Connection,
+    request: LeaseRequest,
+) -> LeaseResult:
+    (
+        controller_id,
+        board,
+        holder_token,
+        ttl_seconds,
+        census_signature,
+        operation_id,
+    ) = _validated_controller_scope(
+        request.controller_id,
+        request.board,
+        request.holder_token,
+        request.ttl_seconds,
+        request.census_signature,
+        request.operation_id,
+    )
+    now = _controller_epoch_now()
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM kanban_controller_leases "
+            "WHERE controller_id = ? AND board = ?",
+            (controller_id, board),
+        ).fetchone()
+        if row is not None and int(row["expires_at"]) > now:
+            return _lease_result_from_row(
+                row,
+                acquired=row["holder_token"] == holder_token,
+                operation_id=operation_id,
+                reason=(
+                    "lease already held by this token"
+                    if row["holder_token"] == holder_token
+                    else "lease is held by another token"
+                ),
+            )
+        holder_epoch = 1 if row is None else int(row["holder_epoch"]) + 1
+        expires_at = now + ttl_seconds
+        conn.execute(
+            """
+            INSERT INTO kanban_controller_leases (
+                controller_id, board, holder_token, holder_epoch,
+                issued_at, expires_at, census_signature, operation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(controller_id, board) DO UPDATE SET
+                holder_token = excluded.holder_token,
+                holder_epoch = excluded.holder_epoch,
+                issued_at = excluded.issued_at,
+                expires_at = excluded.expires_at,
+                census_signature = excluded.census_signature,
+                operation_id = excluded.operation_id
+            """,
+            (
+                controller_id,
+                board,
+                holder_token,
+                holder_epoch,
+                now,
+                expires_at,
+                census_signature,
+                operation_id,
+            ),
+        )
+        current = conn.execute(
+            "SELECT * FROM kanban_controller_leases "
+            "WHERE controller_id = ? AND board = ?",
+            (controller_id, board),
+        ).fetchone()
+        return _lease_result_from_row(
+            current,
+            acquired=True,
+            operation_id=operation_id,
+        )
+
+
+def renew_controller_lease(
+    conn: sqlite3.Connection,
+    request: LeaseRenewal,
+) -> LeaseResult:
+    (
+        controller_id,
+        board,
+        holder_token,
+        ttl_seconds,
+        census_signature,
+        operation_id,
+    ) = _validated_controller_scope(
+        request.controller_id,
+        request.board,
+        request.holder_token,
+        request.ttl_seconds,
+        request.census_signature,
+        request.operation_id,
+    )
+    if type(request.holder_epoch) is not int or request.holder_epoch < 1:
+        raise ValueError("holder_epoch must be a positive integer")
+    now = _controller_epoch_now()
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM kanban_controller_leases "
+            "WHERE controller_id = ? AND board = ?",
+            (controller_id, board),
+        ).fetchone()
+        if row is None:
+            return LeaseResult(
+                acquired=False,
+                controller_id=controller_id,
+                board=board,
+                holder_token=holder_token,
+                holder_epoch=0,
+                issued_at=0,
+                expires_at=0,
+                operation_id=operation_id,
+                reason="lease does not exist",
+            )
+        if (
+            row["holder_token"] != holder_token
+            or int(row["holder_epoch"]) != request.holder_epoch
+            or int(row["expires_at"]) <= now
+        ):
+            return _lease_result_from_row(
+                row,
+                acquired=False,
+                operation_id=operation_id,
+                reason="lease holder, epoch, or expiry changed",
+            )
+        expires_at = now + ttl_seconds
+        cur = conn.execute(
+            """
+            UPDATE kanban_controller_leases
+               SET expires_at = ?, census_signature = ?, operation_id = ?
+             WHERE controller_id = ? AND board = ?
+               AND holder_token = ? AND holder_epoch = ? AND expires_at > ?
+            """,
+            (
+                expires_at,
+                census_signature,
+                operation_id,
+                controller_id,
+                board,
+                holder_token,
+                request.holder_epoch,
+                now,
+            ),
+        )
+        if cur.rowcount != 1:
+            current = conn.execute(
+                "SELECT * FROM kanban_controller_leases "
+                "WHERE controller_id = ? AND board = ?",
+                (controller_id, board),
+            ).fetchone()
+            return _lease_result_from_row(
+                current,
+                acquired=False,
+                operation_id=operation_id,
+                reason="lease changed during renewal",
+            )
+        current = conn.execute(
+            "SELECT * FROM kanban_controller_leases "
+            "WHERE controller_id = ? AND board = ?",
+            (controller_id, board),
+        ).fetchone()
+        return _lease_result_from_row(
+            current,
+            acquired=True,
+            operation_id=operation_id,
+        )
+
+
+def publish_controller_claim(
+    conn: sqlite3.Connection,
+    claim: ControllerClaim,
+) -> GuardedMutationResult:
+    if claim.authority not in {"mutate", "monitor", "escalate_only"}:
+        raise ValueError("authority must be mutate, monitor, or escalate_only")
+    controller_id = claim.controller_id.strip()
+    board = _normalize_board_slug(claim.board)
+    generation_signature = claim.generation_signature.strip()
+    if not controller_id or board is None:
+        raise ValueError("controller_id and board are required")
+    if generation_signature and not re.fullmatch(
+        r"[0-9a-f]{64}", generation_signature
+    ):
+        raise ValueError("generation_signature must be empty or a SHA-256 digest")
+    if not re.fullmatch(r"[0-9a-f]{64}", claim.input_signature or ""):
+        raise ValueError("input_signature must be a lowercase SHA-256 digest")
+    if type(claim.lease_epoch) is not int or claim.lease_epoch < 1:
+        raise ValueError("lease_epoch must be a positive integer")
+    now = _controller_epoch_now()
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=claim.task_id,
+            operation_id=claim.operation_id,
+            event_kind="controller_claim_published",
+        )
+        if replay is not None:
+            return replay
+        task = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?",
+            (claim.task_id,),
+        ).fetchone()
+        if task is None:
+            return _guarded_result(
+                "not_applied",
+                task_id=claim.task_id,
+                operation_id=claim.operation_id,
+                reason="task not found",
+            )
+        lease = conn.execute(
+            "SELECT holder_epoch, expires_at FROM kanban_controller_leases "
+            "WHERE controller_id = ? AND board = ?",
+            (controller_id, board),
+        ).fetchone()
+        if (
+            lease is None
+            or int(lease["holder_epoch"]) != claim.lease_epoch
+            or int(lease["expires_at"]) <= now
+            or claim.expires_at <= now
+            or claim.expires_at > int(lease["expires_at"])
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=claim.task_id,
+                operation_id=claim.operation_id,
+                reason="controller lease no longer authorizes this claim",
+            )
+        conn.execute(
+            """
+            INSERT INTO kanban_controller_claims (
+                controller_id, board, task_id, generation_signature,
+                authority, input_signature, lease_epoch, expires_at, operation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(controller_id, board, task_id, generation_signature)
+            DO UPDATE SET
+                authority = excluded.authority,
+                input_signature = excluded.input_signature,
+                lease_epoch = excluded.lease_epoch,
+                expires_at = excluded.expires_at,
+                operation_id = excluded.operation_id
+            """,
+            (
+                controller_id,
+                board,
+                claim.task_id,
+                generation_signature,
+                claim.authority,
+                claim.input_signature,
+                claim.lease_epoch,
+                claim.expires_at,
+                claim.operation_id,
+            ),
+        )
+        event_id = _append_event(
+            conn,
+            claim.task_id,
+            "controller_claim_published",
+            {
+                "operation_id": claim.operation_id,
+                "controller_id": controller_id,
+                "board": board,
+                "generation_signature": generation_signature,
+                "authority": claim.authority,
+                "input_signature": claim.input_signature,
+                "lease_epoch": claim.lease_epoch,
+                "expires_at": claim.expires_at,
+            },
+        )
+        return GuardedMutationResult(
+            outcome="committed",
+            task_id=claim.task_id,
+            operation_id=claim.operation_id,
+            event_id=event_id,
+        )
+
+
+def snapshot_signature(snapshot: RecoverySnapshot) -> str:
+    payload = asdict(snapshot)
+    payload.pop("revision_signature", None)
+    payload.pop("observed_at", None)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def read_recovery_snapshot(
+    conn: sqlite3.Connection,
+    now: int,
+) -> RecoverySnapshot:
+    if type(now) is not int or now < 0:
+        raise ValueError("now must be a nonnegative epoch integer")
+    board = get_current_board()
+    conn.execute("BEGIN")
+    try:
+        task_rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        event_rows = conn.execute(
+            """
+            SELECT event.* FROM task_events event
+            JOIN (
+                SELECT task_id, MAX(id) AS event_id
+                  FROM task_events GROUP BY task_id
+            ) latest ON latest.event_id = event.id
+            ORDER BY event.task_id
+            """
+        ).fetchall()
+        link_rows = conn.execute(
+            "SELECT parent_id, child_id FROM task_links "
+            "ORDER BY parent_id, child_id"
+        ).fetchall()
+        run_rows = conn.execute(
+            "SELECT run.* FROM task_runs run "
+            "JOIN tasks task ON task.current_run_id = run.id "
+            "ORDER BY run.task_id, run.id"
+        ).fetchall()
+        claim_rows = conn.execute(
+            "SELECT * FROM kanban_controller_claims "
+            "ORDER BY controller_id, board, task_id, generation_signature"
+        ).fetchall()
+        lease_rows = conn.execute(
+            "SELECT * FROM kanban_controller_leases "
+            "ORDER BY controller_id, board"
+        ).fetchall()
+        snapshot = RecoverySnapshot(
+            board=board,
+            observed_at=now,
+            tasks=tuple(
+                {key: row[key] for key in row.keys()} for row in task_rows
+            ),
+            latest_events=tuple(_event_from_row(row) for row in event_rows),
+            links=tuple((row["parent_id"], row["child_id"]) for row in link_rows),
+            current_runs=tuple(Run.from_row(row) for row in run_rows),
+            claims=tuple(
+                ControllerClaimRecord(
+                    controller_id=row["controller_id"],
+                    board=row["board"],
+                    task_id=row["task_id"],
+                    generation_signature=row["generation_signature"],
+                    authority=row["authority"],
+                    input_signature=row["input_signature"],
+                    lease_epoch=int(row["lease_epoch"]),
+                    expires_at=int(row["expires_at"]),
+                    operation_id=row["operation_id"],
+                )
+                for row in claim_rows
+            ),
+            leases=tuple(
+                ControllerLeaseRecord(
+                    controller_id=row["controller_id"],
+                    board=row["board"],
+                    holder_token=row["holder_token"],
+                    holder_epoch=int(row["holder_epoch"]),
+                    issued_at=int(row["issued_at"]),
+                    expires_at=int(row["expires_at"]),
+                    census_signature=row["census_signature"],
+                    operation_id=row["operation_id"],
+                )
+                for row in lease_rows
+            ),
+            revision_signature="",
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+    return replace(snapshot, revision_signature=snapshot_signature(snapshot))
 
 
 def specify_triage_task(

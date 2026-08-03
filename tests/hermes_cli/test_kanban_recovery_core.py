@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import concurrent.futures
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import hermes_time
 
 from hermes_cli import kanban_db as kb
 
@@ -740,3 +742,134 @@ def test_operation_keyed_completion_replays_without_second_terminal_event(conn):
     ]
     assert len(completed) == 1
     assert completed[0].payload["operation_id"] == "complete-once"
+
+
+def _lease_request(holder_token: str, *, operation_id: str) -> kb.LeaseRequest:
+    return kb.LeaseRequest(
+        controller_id="blocked-recovery",
+        board="default",
+        holder_token=holder_token,
+        ttl_seconds=300,
+        census_signature="c" * 64,
+        operation_id=operation_id,
+    )
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, epoch: int) -> list[int]:
+    current = [epoch]
+    monkeypatch.setattr(
+        hermes_time,
+        "now",
+        lambda: datetime.fromtimestamp(current[0], tz=timezone.utc),
+    )
+    return current
+
+
+def test_second_holder_cannot_replace_fresh_controller_lease(conn, monkeypatch):
+    now = _clock(monkeypatch, 100)
+    first = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-a", operation_id="lease-a"),
+    )
+    now[0] = 101
+
+    second = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-b", operation_id="lease-b"),
+    )
+
+    assert first.acquired is True
+    assert second.acquired is False
+    assert second.holder_token == "router-a"
+    assert second.holder_epoch == first.holder_epoch
+    assert second.expires_at == first.expires_at
+
+
+def test_stale_epoch_cannot_renew_after_controller_lease_takeover(conn, monkeypatch):
+    now = _clock(monkeypatch, 100)
+    old = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-a", operation_id="lease-old"),
+    )
+    now[0] = 401
+    new = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-b", operation_id="lease-new"),
+    )
+    now[0] = 402
+
+    renewed = kb.renew_controller_lease(
+        conn,
+        kb.LeaseRenewal(
+            controller_id="blocked-recovery",
+            board="default",
+            holder_token="router-a",
+            holder_epoch=old.holder_epoch,
+            ttl_seconds=300,
+            census_signature="d" * 64,
+            operation_id="renew-stale",
+        ),
+    )
+
+    assert old.acquired is True
+    assert new.acquired is True
+    assert new.holder_epoch > old.holder_epoch
+    assert renewed.acquired is False
+    assert renewed.holder_token == "router-b"
+    assert renewed.holder_epoch == new.holder_epoch
+
+
+def test_stale_controller_epoch_cannot_publish_claim(conn, monkeypatch):
+    now = _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="claim target")
+    old = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-a", operation_id="claim-lease-old"),
+    )
+    claim = kb.ControllerClaim(
+        controller_id="blocked-recovery",
+        board="default",
+        task_id=task_id,
+        generation_signature="e" * 64,
+        authority="mutate",
+        input_signature="f" * 64,
+        lease_epoch=old.holder_epoch,
+        expires_at=350,
+        operation_id="claim-old",
+    )
+    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    now[0] = 401
+    new = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-b", operation_id="claim-lease-new"),
+    )
+    now[0] = 402
+
+    stale = kb.publish_controller_claim(
+        conn,
+        replace(claim, operation_id="claim-stale-after-takeover", expires_at=500),
+    )
+
+    assert new.holder_epoch > old.holder_epoch
+    assert stale.outcome == "precondition_changed"
+    assert not _operation_events(conn, task_id, "claim-stale-after-takeover")
+
+
+def test_recovery_snapshot_reads_board_state_with_reproducible_signature(
+    conn,
+    monkeypatch,
+):
+    _clock(monkeypatch, 200)
+    task_id = kb.create_task(conn, title="snapshot target")
+    lease = kb.acquire_controller_lease(
+        conn,
+        _lease_request("router-a", operation_id="snapshot-lease"),
+    )
+    assert lease.acquired is True
+
+    snapshot = kb.read_recovery_snapshot(conn, now=200)
+
+    assert snapshot.board == "default"
+    assert any(task["id"] == task_id for task in snapshot.tasks)
+    assert snapshot.revision_signature == kb.snapshot_signature(snapshot)
+    assert conn.in_transaction is False
