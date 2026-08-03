@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import threading
 
 import pytest
 import hermes_time
@@ -631,6 +633,89 @@ def test_eventless_final_duplicate_rewrite_does_not_poison_replacement(conn):
     kb._migrate_review_generation_registry(conn)
 
     assert kb.get_task(conn, replacement.task_id).idempotency_key == key
+
+
+def test_replacement_cannot_race_between_quarantine_classification_and_repair(
+    conn,
+    monkeypatch,
+):
+    key = "review-lane:default::t_parent:classification-race"
+    first = kb.create_task(conn, title="first duplicate", idempotency_key=key)
+    assert kb.archive_task(conn, first)
+    second = kb.create_task(conn, title="second duplicate", idempotency_key=key)
+    for task_id in (first, second):
+        digest = hashlib.sha256(f"{key}\0{task_id}".encode()).hexdigest()
+        quarantined_key = f"quarantined-review-lane:{digest}:{task_id}"
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+            (quarantined_key, task_id),
+        )
+        if task_id == first:
+            kb._append_event(
+                conn,
+                first,
+                "review_generation_key_quarantined",
+                {
+                    "original_key": key,
+                    "quarantined_key": quarantined_key,
+                    "reason": "duplicate reserved review generation key",
+                },
+            )
+    conn.commit()
+
+    classification_reached = threading.Event()
+    writer_attempted = threading.Event()
+    thread_role = threading.local()
+    real_quarantine_key = kb._quarantined_review_generation_key
+    real_write_txn = kb.write_txn
+    paused = False
+
+    def pause_during_classification(original_key, task_id):
+        nonlocal paused
+        result = real_quarantine_key(original_key, task_id)
+        if original_key == key and not paused:
+            paused = True
+            classification_reached.set()
+            assert writer_attempted.wait(timeout=5)
+        return result
+
+    @contextlib.contextmanager
+    def observed_write_txn(connection):
+        if getattr(thread_role, "replacement_writer", False):
+            writer_attempted.set()
+        with real_write_txn(connection) as transaction:
+            yield transaction
+
+    monkeypatch.setattr(
+        kb,
+        "_quarantined_review_generation_key",
+        pause_during_classification,
+    )
+    monkeypatch.setattr(kb, "write_txn", observed_write_txn)
+    db_path = kb.kanban_db_path(board="default")
+
+    def migrate_once() -> None:
+        with kb.connect_closing(db_path) as migration_conn:
+            kb._migrate_review_generation_registry(migration_conn)
+
+    def create_replacement() -> str:
+        thread_role.replacement_writer = True
+        assert classification_reached.wait(timeout=5)
+        with kb.connect_closing(db_path) as writer_conn:
+            return kb.create_review_generation_task(
+                writer_conn,
+                _review_generation_request(key=key),
+            ).task_id
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        migration = executor.submit(migrate_once)
+        replacement = executor.submit(create_replacement)
+        migration.result(timeout=10)
+        replacement_id = replacement.result(timeout=10)
+
+    kb._migrate_review_generation_registry(conn)
+
+    assert kb.get_task(conn, replacement_id).idempotency_key == key
 
 
 def test_cross_board_legacy_review_key_is_quarantined(conn):

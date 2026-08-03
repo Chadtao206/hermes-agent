@@ -2712,24 +2712,42 @@ def _review_generation_scope_from_key(key: str) -> tuple[str, str]:
 
 @contextlib.contextmanager
 def _migration_write_txn(conn: sqlite3.Connection):
-    """Run one migration repair atomically without worker mutation guards."""
-    if conn.in_transaction:
-        raise RuntimeError("migration transaction cannot be nested")
-    conn.execute("BEGIN IMMEDIATE")
+    """Run one migration repair atomically without worker mutation guards.
+
+    Direct legacy-migration callers may already own a write transaction from
+    an earlier additive-column backfill. Preserve that transaction boundary
+    and use a savepoint for local rollback instead of committing their work.
+    """
+    nested = conn.in_transaction
+    if nested:
+        conn.execute("SAVEPOINT review_generation_migration")
+    else:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
         try:
-            conn.execute("ROLLBACK")
+            if nested:
+                conn.execute("ROLLBACK TO review_generation_migration")
+                conn.execute("RELEASE review_generation_migration")
+            else:
+                conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
             pass
         raise
     else:
         try:
-            conn.execute("COMMIT")
+            if nested:
+                conn.execute("RELEASE review_generation_migration")
+            else:
+                conn.execute("COMMIT")
         except Exception:
             try:
-                conn.execute("ROLLBACK")
+                if nested:
+                    conn.execute("ROLLBACK TO review_generation_migration")
+                    conn.execute("RELEASE review_generation_migration")
+                else:
+                    conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
@@ -2741,7 +2759,13 @@ def _quarantined_review_generation_key(key: str, task_id: str) -> str:
 
 
 def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
-    """Backfill unambiguous legacy review-lane keys into the permanent registry."""
+    """Backfill legacy review keys from one stable, write-fenced census."""
+    with _migration_write_txn(conn):
+        _migrate_review_generation_registry_locked(conn)
+
+
+def _migrate_review_generation_registry_locked(conn: sqlite3.Connection) -> None:
+    """Classify and repair review keys while the migration write fence is held."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS kanban_scoped_idempotency (
@@ -2755,6 +2779,11 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # A nested savepoint may sit inside a caller-owned DEFERRED transaction.
+    # Force that transaction to acquire SQLite's write reservation before the
+    # census below; a concurrent registry/task writer must not slip between
+    # classification and repair.
+    conn.execute("DELETE FROM kanban_scoped_idempotency WHERE 0")
     duplicate_rows = conn.execute(
         "SELECT idempotency_key, COUNT(*) AS task_count "
         "FROM tasks WHERE idempotency_key LIKE 'review-lane:%' "
@@ -2869,59 +2898,58 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
         duplicate_keys | partial_duplicate_keys | set(missing_audits_by_key)
     )
     for key in sorted(repair_keys):
-        with _migration_write_txn(conn):
-            task_rows = conn.execute(
-                "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
-                (key,),
-            ).fetchall()
-            for task_id, quarantined_key in missing_audits_by_key.get(key, ()):
-                current = conn.execute(
-                    "SELECT idempotency_key FROM tasks WHERE id = ?",
-                    (task_id,),
-                ).fetchone()
-                if current is None or current["idempotency_key"] != quarantined_key:
-                    raise ReviewGenerationMigrationConflict(
-                        f"quarantined review generation key changed for task {task_id}"
-                    )
-                _append_event(
-                    conn,
-                    task_id,
-                    "review_generation_key_quarantined",
-                    {
-                        "original_key": key,
-                        "quarantined_key": quarantined_key,
-                        "reason": "duplicate reserved review generation key",
-                    },
+        task_rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
+            (key,),
+        ).fetchall()
+        for task_id, quarantined_key in missing_audits_by_key.get(key, ()):
+            current = conn.execute(
+                "SELECT idempotency_key FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if current is None or current["idempotency_key"] != quarantined_key:
+                raise ReviewGenerationMigrationConflict(
+                    f"quarantined review generation key changed for task {task_id}"
                 )
-            if len(task_rows) <= 1 and key not in partial_duplicate_keys:
-                continue
-            conn.execute(
-                "DELETE FROM kanban_scoped_idempotency "
-                "WHERE namespace = 'review-lane' AND key = ?",
-                (key,),
+            _append_event(
+                conn,
+                task_id,
+                "review_generation_key_quarantined",
+                {
+                    "original_key": key,
+                    "quarantined_key": quarantined_key,
+                    "reason": "duplicate reserved review generation key",
+                },
             )
-            for task_row in task_rows:
-                task_id = task_row["id"]
-                quarantined_key = _quarantined_review_generation_key(key, task_id)
-                updated = conn.execute(
-                    "UPDATE tasks SET idempotency_key = ? "
-                    "WHERE id = ? AND idempotency_key = ?",
-                    (quarantined_key, task_id, key),
+        if len(task_rows) <= 1 and key not in partial_duplicate_keys:
+            continue
+        conn.execute(
+            "DELETE FROM kanban_scoped_idempotency "
+            "WHERE namespace = 'review-lane' AND key = ?",
+            (key,),
+        )
+        for task_row in task_rows:
+            task_id = task_row["id"]
+            quarantined_key = _quarantined_review_generation_key(key, task_id)
+            updated = conn.execute(
+                "UPDATE tasks SET idempotency_key = ? "
+                "WHERE id = ? AND idempotency_key = ?",
+                (quarantined_key, task_id, key),
+            )
+            if updated.rowcount != 1:
+                raise ReviewGenerationMigrationConflict(
+                    f"reserved review generation key changed for task {task_id}"
                 )
-                if updated.rowcount != 1:
-                    raise ReviewGenerationMigrationConflict(
-                        f"reserved review generation key changed for task {task_id}"
-                    )
-                _append_event(
-                    conn,
-                    task_id,
-                    "review_generation_key_quarantined",
-                    {
-                        "original_key": key,
-                        "quarantined_key": quarantined_key,
-                        "reason": "duplicate reserved review generation key",
-                    },
-                )
+            _append_event(
+                conn,
+                task_id,
+                "review_generation_key_quarantined",
+                {
+                    "original_key": key,
+                    "quarantined_key": quarantined_key,
+                    "reason": "duplicate reserved review generation key",
+                },
+            )
 
     task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     created_at_column = "created_at" if "created_at" in task_columns else "0"
@@ -2937,31 +2965,30 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
         if board != connected_board:
             task_id = row["id"]
             quarantined_key = _quarantined_review_generation_key(key, task_id)
-            with _migration_write_txn(conn):
-                conn.execute(
-                    "DELETE FROM kanban_scoped_idempotency "
-                    "WHERE namespace = 'review-lane' AND key = ?",
-                    (key,),
+            conn.execute(
+                "DELETE FROM kanban_scoped_idempotency "
+                "WHERE namespace = 'review-lane' AND key = ?",
+                (key,),
+            )
+            updated = conn.execute(
+                "UPDATE tasks SET idempotency_key = ? "
+                "WHERE id = ? AND idempotency_key = ?",
+                (quarantined_key, task_id, key),
+            )
+            if updated.rowcount != 1:
+                raise ReviewGenerationMigrationConflict(
+                    f"reserved review generation key changed for task {task_id}"
                 )
-                updated = conn.execute(
-                    "UPDATE tasks SET idempotency_key = ? "
-                    "WHERE id = ? AND idempotency_key = ?",
-                    (quarantined_key, task_id, key),
-                )
-                if updated.rowcount != 1:
-                    raise ReviewGenerationMigrationConflict(
-                        f"reserved review generation key changed for task {task_id}"
-                    )
-                _append_event(
-                    conn,
-                    task_id,
-                    "review_generation_key_quarantined",
-                    {
-                        "original_key": key,
-                        "quarantined_key": quarantined_key,
-                        "reason": "review generation board mismatch",
-                    },
-                )
+            _append_event(
+                conn,
+                task_id,
+                "review_generation_key_quarantined",
+                {
+                    "original_key": key,
+                    "quarantined_key": quarantined_key,
+                    "reason": "review generation board mismatch",
+                },
+            )
             continue
         task_tenant = str(row["tenant"] or "").strip()
         if task_tenant != key_tenant:
