@@ -139,6 +139,21 @@ def test_run_slash_show_includes_comments(kanban_home):
     assert "performance section" in show
 
 
+def test_run_slash_recovery_control_set_board_returns_json(kanban_home):
+    from hermes_cli.kanban_recovery_config import load_recovery_control
+
+    current = load_recovery_control()
+    out = kc.run_slash(
+        "recovery-control set-board "
+        f"--expected-digest {current.digest()} --board default "
+        "--review-mode live --transient-mode shadow --json"
+    )
+
+    result = json.loads(out)
+    assert result["outcome"] == "committed"
+    assert load_recovery_control().boards["default"].review_mode == "live"
+
+
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     out = kc.run_slash("create 'x'")
     import re

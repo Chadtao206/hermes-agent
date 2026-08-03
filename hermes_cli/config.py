@@ -3069,6 +3069,31 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Blocked-recovery routing is independently validated and defaults to
+        # shadow mode.  This is intentionally additive: existing config files
+        # receive it through the normal deep merge without a schema bump.
+        "blocked_recovery": {
+            "managed_boards": {
+                "default": {
+                    "review_mode": "shadow",
+                    "transient_mode": "shadow",
+                    "human_owner": None,
+                    "review_allowlist": [],
+                    "transient_retry_budget": 2,
+                    "transient_allow_engineer_lane_idle": False,
+                    "clean_censuses_required": 2,
+                },
+            },
+            "controller_jobs": {},
+            "router_lease_seconds": 300,
+            "target_stability_seconds": 300,
+            "verifier_retry_delays_seconds": [300, 900, 1800, 3600],
+            "judge_retry_delays_seconds": [300, 900, 1800, 3600],
+            "verification_deadline_seconds": 7200,
+            "judge_deadline_seconds": 7200,
+            "mutation_cap": 1,
+            "rollout_mode": "shadow",
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

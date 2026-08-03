@@ -775,6 +775,53 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_recovery_manifest.add_argument("--approval-signature", required=True)
     p_recovery_manifest.add_argument("--json", action="store_true", required=True)
 
+    # --- recovery-control ---
+    p_recovery_control = sub.add_parser(
+        "recovery-control",
+        help="Inspect and guardedly update blocked-recovery controls",
+    )
+    recovery_sub = p_recovery_control.add_subparsers(dest="recovery_control_action", required=True)
+    p_set_board = recovery_sub.add_parser(
+        "set-board", help="Set explicit recovery modes or board controls",
+    )
+    p_set_board.add_argument("--expected-digest", required=True)
+    p_set_board.add_argument("--board", required=True)
+    p_set_board.add_argument("--review-mode", choices=("paused", "shadow", "live"))
+    p_set_board.add_argument("--transient-mode", choices=("paused", "shadow", "live"))
+    p_set_board.add_argument("--human-owner")
+    p_set_board.add_argument("--review-allowlist", action="append")
+    p_set_board.add_argument("--transient-retry-budget", type=int)
+    p_set_board.add_argument(
+        "--transient-allow-engineer-lane-idle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    p_set_board.add_argument("--clean-censuses-required", type=int)
+    p_set_board.add_argument("--json", action="store_true", required=True)
+
+    p_set_allowlist = recovery_sub.add_parser(
+        "set-review-allowlist", help="Replace one board's review allowlist",
+    )
+    p_set_allowlist.add_argument("--expected-digest", required=True)
+    p_set_allowlist.add_argument("--board", required=True)
+    p_set_allowlist.add_argument("--reviewer", action="append", dest="review_allowlist", required=True)
+    p_set_allowlist.add_argument("--json", action="store_true", required=True)
+
+    p_set_controller = recovery_sub.add_parser(
+        "set-controller", help="Replace one complete controller job manifest",
+    )
+    p_set_controller.add_argument("--expected-digest", required=True)
+    p_set_controller.add_argument("--controller-role", required=True)
+    p_set_controller.add_argument("--role", dest="job_role", required=True)
+    p_set_controller.add_argument("--job-id", required=True)
+    p_set_controller.add_argument("--role-tag", required=True)
+    p_set_controller.add_argument("--source-manifest", action="append", required=True)
+    p_set_controller.add_argument("--source-manifest-digest", required=True)
+    p_set_controller.add_argument("--schedule-digest", required=True)
+    p_set_controller.add_argument("--delivery-scope", required=True)
+    p_set_controller.add_argument("--desired-mode", choices=("paused", "shadow", "live"), required=True)
+    p_set_controller.add_argument("--json", action="store_true", required=True)
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1086,6 +1133,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    # Recovery controls are config-only.  They intentionally do not touch or
+    # initialize the board database merely because they share this CLI tree.
+    if action == "recovery-control":
+        return _cmd_recovery_control(args)
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -1275,6 +1327,71 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         return is_delegated_child_process_context()
     except Exception:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+def _cmd_recovery_control(args: argparse.Namespace) -> int:
+    """Run one digest-guarded blocked-recovery configuration update."""
+    from hermes_cli.kanban_recovery_config import (
+        RecoveryControlUpdate,
+        guarded_update_recovery_control,
+    )
+
+    action = args.recovery_control_action
+    if action == "set-board":
+        values: dict[str, object] = {"board": args.board}
+        for arg_name, config_name in (
+            ("review_mode", "review_mode"),
+            ("transient_mode", "transient_mode"),
+            ("human_owner", "human_owner"),
+            ("review_allowlist", "review_allowlist"),
+            ("transient_retry_budget", "transient_retry_budget"),
+            ("transient_allow_engineer_lane_idle", "transient_allow_engineer_lane_idle"),
+            ("clean_censuses_required", "clean_censuses_required"),
+        ):
+            value = getattr(args, arg_name)
+            if value is not None:
+                values[config_name] = value
+        request = RecoveryControlUpdate(args.expected_digest, "set_board", values)
+    elif action == "set-review-allowlist":
+        request = RecoveryControlUpdate(
+            args.expected_digest,
+            "set_review_allowlist",
+            {"board": args.board, "review_allowlist": args.review_allowlist},
+        )
+    elif action == "set-controller":
+        request = RecoveryControlUpdate(
+            args.expected_digest,
+            "set_controller",
+            {
+                "controller_role": args.controller_role,
+                "role": args.job_role,
+                "job_id": args.job_id,
+                "role_tag": args.role_tag,
+                "source_manifest": args.source_manifest,
+                "source_manifest_digest": args.source_manifest_digest,
+                "schedule_digest": args.schedule_digest,
+                "delivery_scope": args.delivery_scope,
+                "desired_mode": args.desired_mode,
+            },
+        )
+    else:
+        print(f"kanban recovery-control: unknown action {action!r}", file=sys.stderr)
+        return 2
+
+    result = guarded_update_recovery_control(request)
+    payload = {
+        "outcome": result.outcome,
+        "previous_digest": result.previous_digest,
+        "current_digest": result.current_digest,
+        "reason": result.reason,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False))
+    elif result.outcome == "committed":
+        print(f"Recovery control updated: {result.current_digest}")
+    else:
+        print(f"Recovery control update {result.outcome}: {result.reason}", file=sys.stderr)
+    return 0 if result.outcome == "committed" else 1
 
 
 # ---------------------------------------------------------------------------
