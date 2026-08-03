@@ -222,6 +222,25 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_generic_idempotency_duplicates_remain_compatible_after_archival(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="first", idempotency_key="generic-key")
+        assert kb.archive_task(conn, first)
+        second = kb.create_task(conn, title="second", idempotency_key="generic-key")
+        assert second != first
+
+    kb.init_db()
+
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
+            ("generic-key",),
+        ).fetchall()
+    assert {row["id"] for row in rows} == {first, second}
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

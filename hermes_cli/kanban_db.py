@@ -1218,6 +1218,41 @@ class ReviewCompletionEvidence:
         return self.verdict == "APPROVED" and not self.findings
 
 
+@dataclass(frozen=True)
+class ReviewGenerationCreate:
+    board: str
+    key: str
+    title: str
+    tenant: Optional[str] = None
+    body: Optional[str] = None
+    assignee: Optional[str] = None
+    created_by: Optional[str] = None
+    workspace_kind: str = "scratch"
+    workspace_path: Optional[str] = None
+    branch_name: Optional[str] = None
+    priority: int = 0
+
+
+@dataclass(frozen=True)
+class ReviewGenerationCreateResult:
+    task_id: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class ReviewGenerationRecord:
+    namespace: str
+    board: str
+    tenant: str
+    key: str
+    task_id: str
+    created_at: int
+
+
+class ReviewGenerationMigrationConflict(RuntimeError):
+    """A reserved legacy review-generation key cannot be migrated safely."""
+
+
 def _canonical_review_payload(
     evidence: ReviewCompletionEvidence,
 ) -> dict[str, object]:
@@ -1326,6 +1361,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS kanban_scoped_idempotency (
+    namespace  TEXT NOT NULL,
+    board      TEXT NOT NULL,
+    tenant     TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (namespace, board, tenant, key)
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2374,6 +2419,86 @@ def init_db(
     return path
 
 
+def _review_generation_scope_from_key(key: str) -> tuple[str, str]:
+    parts = key.split(":")
+    if (
+        len(parts) != 5
+        or parts[0] != "review-lane"
+        or not parts[1]
+        or not parts[3]
+        or not parts[4]
+    ):
+        raise ReviewGenerationMigrationConflict(
+            f"reserved review generation key is malformed: {key!r}"
+        )
+    board = _normalize_board_slug(parts[1])
+    if board is None:
+        raise ReviewGenerationMigrationConflict(
+            f"reserved review generation key has invalid board: {key!r}"
+        )
+    return board, parts[2]
+
+
+def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
+    """Backfill unambiguous legacy review-lane keys into the permanent registry."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_scoped_idempotency (
+            namespace  TEXT NOT NULL,
+            board      TEXT NOT NULL,
+            tenant     TEXT NOT NULL,
+            key        TEXT NOT NULL,
+            task_id    TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (namespace, board, tenant, key)
+        )
+        """
+    )
+    duplicates = conn.execute(
+        "SELECT idempotency_key, COUNT(*) AS task_count "
+        "FROM tasks WHERE idempotency_key LIKE 'review-lane:%' "
+        "GROUP BY idempotency_key HAVING COUNT(*) > 1 "
+        "ORDER BY idempotency_key"
+    ).fetchall()
+    if duplicates:
+        keys = ", ".join(repr(row["idempotency_key"]) for row in duplicates)
+        raise ReviewGenerationMigrationConflict(
+            "duplicate reserved review generation keys require explicit repair: "
+            f"{keys}"
+        )
+
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    created_at_column = "created_at" if "created_at" in task_columns else "0"
+    rows = conn.execute(
+        f"SELECT id, tenant, idempotency_key, {created_at_column} AS created_at "
+        "FROM tasks WHERE idempotency_key LIKE 'review-lane:%' "
+        "ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        key = row["idempotency_key"]
+        board, key_tenant = _review_generation_scope_from_key(key)
+        task_tenant = str(row["tenant"] or "").strip()
+        if task_tenant != key_tenant:
+            raise ReviewGenerationMigrationConflict(
+                f"reserved review generation key tenant conflicts with task {row['id']}"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_scoped_idempotency "
+            "(namespace, board, tenant, key, task_id, created_at) "
+            "VALUES ('review-lane', ?, ?, ?, ?, ?)",
+            (board, key_tenant, key, row["id"], int(row["created_at"])),
+        )
+        registered = conn.execute(
+            "SELECT task_id FROM kanban_scoped_idempotency "
+            "WHERE namespace = 'review-lane' AND board = ? AND tenant = ? AND key = ?",
+            (board, key_tenant, key),
+        ).fetchone()
+        if registered is None or registered["task_id"] != row["id"]:
+            raise ReviewGenerationMigrationConflict(
+                f"reserved review generation registry conflicts for key {key!r}"
+            )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2532,6 +2657,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    _migrate_review_generation_registry(conn)
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2920,6 +3047,168 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def lookup_review_generation(
+    conn: sqlite3.Connection,
+    board: str,
+    tenant: Optional[str],
+    key: str,
+) -> Optional[ReviewGenerationRecord]:
+    normalized_board = _normalize_board_slug(board)
+    if normalized_board is None:
+        raise ValueError("board is required for review generation lookup")
+    normalized_tenant = str(tenant or "").strip()
+    row = conn.execute(
+        "SELECT namespace, board, tenant, key, task_id, created_at "
+        "FROM kanban_scoped_idempotency "
+        "WHERE namespace = 'review-lane' AND board = ? AND tenant = ? AND key = ?",
+        (normalized_board, normalized_tenant, key),
+    ).fetchone()
+    if row is None:
+        return None
+    return ReviewGenerationRecord(
+        namespace=row["namespace"],
+        board=row["board"],
+        tenant=row["tenant"],
+        key=row["key"],
+        task_id=row["task_id"],
+        created_at=int(row["created_at"]),
+    )
+
+
+def _require_connection_board(conn: sqlite3.Connection, board: str) -> None:
+    row = next(
+        (
+            item
+            for item in conn.execute("PRAGMA database_list")
+            if item["name"] == "main"
+        ),
+        None,
+    )
+    if row is None or not row["file"]:
+        return
+    actual = Path(row["file"]).resolve()
+    expected = kanban_db_path(board=board).resolve()
+    if actual != expected:
+        raise ValueError(
+            f"review generation board {board!r} does not match connected database"
+        )
+
+
+def create_review_generation_task(
+    conn: sqlite3.Connection,
+    request: ReviewGenerationCreate,
+) -> ReviewGenerationCreateResult:
+    """Atomically create one permanent, single-attempt reviewer lane."""
+    board = _normalize_board_slug(request.board)
+    if board is None:
+        raise ValueError("review generation board is required")
+    tenant = str(request.tenant or "").strip()
+    key = str(request.key or "").strip()
+    try:
+        key_board, key_tenant = _review_generation_scope_from_key(key)
+    except ReviewGenerationMigrationConflict as exc:
+        raise ValueError(f"invalid review generation key: {key!r}") from exc
+    if (key_board, key_tenant) != (board, tenant):
+        raise ValueError("review generation key does not match its board and tenant")
+    if not request.title or not request.title.strip():
+        raise ValueError("review generation title is required")
+    if request.workspace_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}"
+        )
+    branch_name = (request.branch_name or "").strip() or None
+    if branch_name and request.workspace_kind != "worktree":
+        raise ValueError("branch_name is only valid for worktree workspaces")
+    assignee = _canonical_assignee(request.assignee)
+    _require_connection_board(conn, board)
+
+    now = int(time.time())
+    with write_txn(conn):
+        claimed = conn.execute(
+            "INSERT OR IGNORE INTO kanban_scoped_idempotency "
+            "(namespace, board, tenant, key, task_id, created_at) "
+            "VALUES ('review-lane', ?, ?, ?, '', ?)",
+            (board, tenant, key, now),
+        )
+        if claimed.rowcount != 1:
+            existing = lookup_review_generation(conn, board, tenant, key)
+            if existing is None or get_task(conn, existing.task_id) is None:
+                raise RuntimeError(
+                    f"review generation registry is corrupt for key {key!r}"
+                )
+            return ReviewGenerationCreateResult(
+                task_id=existing.task_id,
+                created=False,
+            )
+
+        task_id: Optional[str] = None
+        for attempt in range(2):
+            candidate = _new_task_id()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, body, assignee, status, priority,
+                        created_by, created_at, workspace_kind, workspace_path,
+                        branch_name, tenant, idempotency_key,
+                        max_runtime_seconds, max_retries
+                    ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, 3600, 1)
+                    """,
+                    (
+                        candidate,
+                        request.title.strip(),
+                        request.body,
+                        assignee,
+                        int(request.priority),
+                        request.created_by,
+                        now,
+                        request.workspace_kind,
+                        request.workspace_path,
+                        branch_name,
+                        tenant or None,
+                        key,
+                    ),
+                )
+                task_id = candidate
+                break
+            except sqlite3.IntegrityError:
+                if attempt == 1:
+                    raise
+        if task_id is None:
+            raise RuntimeError("could not allocate review generation task id")
+
+        bound = conn.execute(
+            "UPDATE kanban_scoped_idempotency SET task_id = ? "
+            "WHERE namespace = 'review-lane' AND board = ? AND tenant = ? "
+            "AND key = ? AND task_id = ''",
+            (task_id, board, tenant, key),
+        )
+        if bound.rowcount != 1:
+            raise RuntimeError(f"could not bind review generation key {key!r}")
+
+        _append_event(
+            conn,
+            task_id,
+            "created",
+            {
+                "assignee": assignee,
+                "status": "ready",
+                "parents": [],
+                "board": board,
+                "tenant": tenant or None,
+                "workspace_kind": request.workspace_kind,
+                "workspace_path": request.workspace_path,
+                "branch_name": branch_name,
+                "idempotency_namespace": "review-lane",
+                "idempotency_key": key,
+                "max_runtime_seconds": 3600,
+                "max_retries": 1,
+            },
+        )
+
+    return ReviewGenerationCreateResult(task_id=task_id, created=True)
 
 
 def create_task(
