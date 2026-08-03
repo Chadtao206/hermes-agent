@@ -144,6 +144,19 @@ def test_review_approval_is_copied_to_exact_completed_event_and_run(conn):
     assert evidence.approved is True
 
 
+def test_ready_review_completion_synthesizes_usable_terminal_run(conn):
+    reviewer = kb.create_task(conn, title="manual reviewer", assignee="reviewer")
+
+    assert kb.complete_task(conn, reviewer, metadata=_review_metadata())
+
+    event = _completed_event(conn, reviewer)
+    run = kb.get_run(conn, event.run_id)
+    evidence = kb.get_terminal_review_evidence(conn, reviewer, event.id)
+    assert run is not None
+    assert (run.status, run.outcome) == ("done", "completed")
+    assert evidence is not None and evidence.approved
+
+
 def test_post_completion_edit_cannot_rewrite_terminal_review_evidence(conn):
     reviewer = _running_task(conn)
     assert kb.complete_task(conn, reviewer, metadata=_review_metadata())
@@ -390,27 +403,50 @@ def test_unique_legacy_review_generation_key_is_backfilled(conn):
     assert record.task_id == legacy_task
 
 
-def test_duplicate_legacy_review_generation_keys_fail_migration_preflight(conn):
+def test_duplicate_legacy_review_generation_keys_are_quarantined(conn):
     key = "review-lane:default::t_parent:duplicate"
     first = kb.create_task(conn, title="first legacy reviewer", idempotency_key=key)
     assert kb.archive_task(conn, first)
     second = kb.create_task(conn, title="second legacy reviewer", idempotency_key=key)
     assert second != first
     db_path = kb.kanban_db_path(board="default")
+    conn.execute("DROP INDEX IF EXISTS idx_events_run")
+    conn.execute("ALTER TABLE task_events DROP COLUMN run_id")
     conn.commit()
 
-    with pytest.raises(kb.ReviewGenerationMigrationConflict, match="duplicate"):
-        kb.init_db(db_path)
+    kb.init_db(db_path)
 
-    raw = kb._sqlite_connect(db_path)
-    try:
-        count = raw.execute(
-            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
-            (key,),
-        ).fetchone()[0]
-    finally:
-        raw.close()
-    assert count == 2
+    with kb.connect_closing(db_path) as migrated:
+        rows = migrated.execute(
+            "SELECT id, idempotency_key FROM tasks WHERE id IN (?, ?) ORDER BY id",
+            (first, second),
+        ).fetchall()
+        assert all(
+            row["idempotency_key"].startswith("quarantined-review-lane:")
+            for row in rows
+        )
+        assert len({row["idempotency_key"] for row in rows}) == 2
+        assert kb.lookup_review_generation(
+            migrated,
+            board="default",
+            tenant=None,
+            key=key,
+        ) is None
+        for task_id in (first, second):
+            event = kb.list_events(migrated, task_id)[-1]
+            assert event.kind == "review_generation_key_quarantined"
+            assert event.payload["original_key"] == key
+
+        replacement = kb.create_review_generation_task(
+            migrated,
+            _review_generation_request(key=key),
+        )
+        replay = kb.create_review_generation_task(
+            migrated,
+            _review_generation_request(key=key),
+        )
+        assert replacement.created is True
+        assert replay.task_id == replacement.task_id
 
 
 def test_canonical_event_signature_is_stable_for_canonical_payload_order():
@@ -489,6 +525,24 @@ def test_operation_replay_returns_original_committed_event(conn):
     assert first.outcome == "committed"
     assert first.event_id is not None
     assert len(_operation_events(conn, task_id, "reclassify-once")) == 1
+    assert kb.get_task(conn, task_id).block_kind == "review"
+
+
+def test_operation_replay_conflicts_when_mutation_intent_changes(conn):
+    task_id = _blocked_task(conn)
+    original_signature = _latest_event_signature(conn, task_id)
+    first = kb.BlockReclassification(
+        task_id=task_id,
+        expected_block_event_signature=original_signature,
+        block_kind="review",
+        operation_id="reclassify-bound-intent",
+    )
+    changed = replace(first, block_kind="needs_input")
+
+    assert kb.reclassify_block(conn, first).outcome == "committed"
+    replay = kb.reclassify_block(conn, changed)
+
+    assert replay.outcome == "conflict"
     assert kb.get_task(conn, task_id).block_kind == "review"
 
 
@@ -595,6 +649,33 @@ def test_review_terminal_generation_cannot_be_requeued_twice(conn):
     ) == 1
 
 
+def test_review_requeue_rejects_a_later_manual_reclassification(conn):
+    task_id, terminal_event = _failed_review_generation(conn)
+    terminal_signature = kb.canonical_event_signature(terminal_event)
+    reclassified = kb.reclassify_block(
+        conn,
+        kb.BlockReclassification(
+            task_id=task_id,
+            expected_block_event_signature=terminal_signature,
+            block_kind="needs_input",
+            operation_id="manual-review-lane-reclassification",
+        ),
+    )
+    assert reclassified.outcome == "committed"
+    request = kb.ReviewLaneMutation(
+        task_id=task_id,
+        expected_status="blocked",
+        expected_event_signature=terminal_signature,
+        operation_id="stale-review-requeue",
+    )
+
+    result = kb.requeue_review_lane(conn, request)
+
+    task = kb.get_task(conn, task_id)
+    assert result.outcome == "precondition_changed"
+    assert (task.status, task.block_kind) == ("blocked", "needs_input")
+
+
 def test_archived_review_generation_cannot_be_resurrected_by_requeue(conn):
     task_id, terminal_event = _failed_review_generation(conn)
     assert kb.archive_task(conn, task_id)
@@ -691,6 +772,43 @@ def test_transient_retry_ordinal_is_permanent_and_monotonic(conn):
     assert kb.get_task(conn, task_id).status == "ready"
 
 
+def test_transient_retry_rejects_reclassification_aba(conn):
+    task_id = _blocked_task(conn, kind="transient")
+    terminal_signature = _latest_event_signature(conn, task_id)
+    first = kb.reclassify_block(
+        conn,
+        kb.BlockReclassification(
+            task_id=task_id,
+            expected_block_event_signature=terminal_signature,
+            block_kind="needs_input",
+            operation_id="transient-to-human",
+        ),
+    )
+    assert first.outcome == "committed"
+    second = kb.reclassify_block(
+        conn,
+        kb.BlockReclassification(
+            task_id=task_id,
+            expected_block_event_signature=_latest_event_signature(conn, task_id),
+            block_kind="transient",
+            operation_id="human-back-to-transient",
+        ),
+    )
+    assert second.outcome == "committed"
+    request = kb.TransientRetryRequest(
+        task_id=task_id,
+        expected_terminal_signature=terminal_signature,
+        retry_ordinal=1,
+        operation_id="stale-transient-retry",
+    )
+
+    result = kb.retry_transient_task(conn, request)
+
+    task = kb.get_task(conn, task_id)
+    assert result.outcome == "precondition_changed"
+    assert (task.status, task.block_kind) == ("blocked", "transient")
+
+
 def test_escalation_acknowledgement_is_exact_and_lifecycle_neutral(conn):
     task_id = _blocked_task(conn, kind="needs_input")
     before = kb.get_task(conn, task_id)
@@ -761,6 +879,57 @@ def test_operation_keyed_link_and_unlink_replay_original_events(conn):
     assert len(_operation_events(conn, child, "unlink-once")) == 1
 
 
+def test_operation_keyed_unlink_replay_repairs_child_readiness(conn, monkeypatch):
+    parent = kb.create_task(conn, title="blocking parent")
+    child = kb.create_task(conn, title="child", parents=[parent])
+    assert kb.get_task(conn, child).status == "todo"
+    real_recompute = kb.recompute_ready
+    monkeypatch.setattr(
+        kb,
+        "recompute_ready",
+        lambda connection: (_ for _ in ()).throw(RuntimeError("post-commit crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="post-commit crash"):
+        kb.unlink_tasks(conn, parent, child, operation_id="unlink-crash-replay")
+
+    assert kb.parent_ids(conn, child) == []
+    assert kb.get_task(conn, child).status == "todo"
+    monkeypatch.setattr(kb, "recompute_ready", real_recompute)
+
+    replay = kb.unlink_tasks(
+        conn,
+        parent,
+        child,
+        operation_id="unlink-crash-replay",
+    )
+
+    assert replay.outcome == "committed"
+    assert kb.get_task(conn, child).status == "ready"
+
+
+def test_operation_keyed_link_replay_rejects_a_different_parent(conn):
+    first_parent = kb.create_task(conn, title="first parent")
+    second_parent = kb.create_task(conn, title="second parent")
+    child = kb.create_task(conn, title="child")
+
+    assert kb.link_tasks(
+        conn,
+        first_parent,
+        child,
+        operation_id="link-bound-intent",
+    ).outcome == "committed"
+    replay = kb.link_tasks(
+        conn,
+        second_parent,
+        child,
+        operation_id="link-bound-intent",
+    )
+
+    assert replay.outcome == "conflict"
+    assert kb.parent_ids(conn, child) == [first_parent]
+
+
 def test_operation_keyed_completion_replays_without_second_terminal_event(conn):
     task_id = kb.create_task(conn, title="automation completion")
 
@@ -784,6 +953,60 @@ def test_operation_keyed_completion_replays_without_second_terminal_event(conn):
     ]
     assert len(completed) == 1
     assert completed[0].payload["operation_id"] == "complete-once"
+
+
+def test_operation_keyed_completion_rejects_a_different_result(conn):
+    task_id = kb.create_task(conn, title="automation completion")
+    assert kb.complete_task(
+        conn,
+        task_id,
+        result="original",
+        operation_id="complete-bound-intent",
+    )
+
+    with pytest.raises(ValueError, match="already bound"):
+        kb.complete_task(
+            conn,
+            task_id,
+            result="changed",
+            operation_id="complete-bound-intent",
+        )
+
+    assert kb.get_task(conn, task_id).result == "original"
+
+
+def test_operation_keyed_completion_replay_repairs_child_readiness(
+    conn,
+    monkeypatch,
+):
+    parent = kb.create_task(conn, title="parent")
+    child = kb.create_task(conn, title="child", parents=[parent])
+    real_recompute = kb.recompute_ready
+    monkeypatch.setattr(
+        kb,
+        "recompute_ready",
+        lambda connection: (_ for _ in ()).throw(RuntimeError("post-commit crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="post-commit crash"):
+        kb.complete_task(
+            conn,
+            parent,
+            result="done",
+            operation_id="complete-crash-replay",
+        )
+
+    assert kb.get_task(conn, parent).status == "done"
+    assert kb.get_task(conn, child).status == "todo"
+    monkeypatch.setattr(kb, "recompute_ready", real_recompute)
+
+    assert kb.complete_task(
+        conn,
+        parent,
+        result="done",
+        operation_id="complete-crash-replay",
+    )
+    assert kb.get_task(conn, child).status == "ready"
 
 
 def _lease_request(holder_token: str, *, operation_id: str) -> kb.LeaseRequest:
@@ -825,6 +1048,22 @@ def test_second_holder_cannot_replace_fresh_controller_lease(conn, monkeypatch):
     assert second.holder_token == "router-a"
     assert second.holder_epoch == first.holder_epoch
     assert second.expires_at == first.expires_at
+
+
+def test_controller_lease_rejects_connection_board_mismatch(conn, monkeypatch):
+    _clock(monkeypatch, 100)
+    kb.create_board("other-board")
+    request = replace(
+        _lease_request("router-a", operation_id="wrong-board-lease"),
+        board="other-board",
+    )
+
+    with pytest.raises(ValueError, match="connected database"):
+        kb.acquire_controller_lease(conn, request)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM kanban_controller_leases"
+    ).fetchone()[0] == 0
 
 
 def test_stale_epoch_cannot_renew_after_controller_lease_takeover(conn, monkeypatch):
@@ -917,6 +1156,58 @@ def test_recovery_snapshot_reads_board_state_with_reproducible_signature(
     assert conn.in_transaction is False
 
 
+def test_recovery_snapshot_uses_connected_board_not_ambient_selection(
+    conn,
+    monkeypatch,
+):
+    kb.create_board("other-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    with kb.connect_closing(kb.kanban_db_path(board="other-board")) as other:
+        task_id = kb.create_task(other, title="other board task")
+
+        snapshot = kb.read_recovery_snapshot(other, now=200)
+
+    assert snapshot.board == "other-board"
+    assert any(task["id"] == task_id for task in snapshot.tasks)
+
+
+def test_recovery_snapshot_preserves_block_event_after_later_comment(conn):
+    task_id = _blocked_task(conn, kind="needs_input")
+    block_event = _latest_event(conn, task_id)
+    before = kb.read_recovery_snapshot(conn, now=200)
+
+    kb.add_comment(conn, task_id, "operator", "still waiting")
+    after = kb.read_recovery_snapshot(conn, now=201)
+
+    latest = {event.task_id: event for event in after.latest_events}
+    blocks = {event.task_id: event for event in after.latest_block_events}
+    assert latest[task_id].id != block_event.id
+    assert blocks[task_id] == block_event
+    assert after.revision_signature != before.revision_signature
+
+
+def test_recovery_snapshot_includes_ended_terminal_run_and_current_generation(conn):
+    task_id, terminal_event = _failed_review_generation(conn)
+    terminal_run = kb.latest_run(conn, task_id)
+    before = kb.read_recovery_snapshot(conn, now=200)
+
+    kb.add_comment(conn, task_id, "operator", "failure acknowledged")
+    after = kb.read_recovery_snapshot(conn, now=201)
+
+    terminals = {event.task_id: event for event in after.latest_terminal_events}
+    ended_runs = {run.task_id: run for run in after.latest_terminal_runs}
+    generations = {
+        generation.task_id: generation for generation in after.review_generations
+    }
+    assert terminals[task_id] == terminal_event
+    assert ended_runs[task_id].id == terminal_run.id
+    assert ended_runs[task_id].ended_at is not None
+    assert generations[task_id].parent_task_id == "t_parent"
+    assert generations[task_id].generation == "g1"
+    assert generations[task_id].current is True
+    assert after.revision_signature != before.revision_signature
+
+
 def _reviewed_completion_request(
     conn,
     *,
@@ -937,7 +1228,12 @@ def _reviewed_completion_request(
         )
         assert result.outcome == "committed"
     parent_event = _latest_event(conn, parent)
-    reviewer = _running_task(conn, title="review parent")
+    reviewer = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(
+            key=f"review-lane:default::{parent}:g1",
+        ),
+    ).task_id
     assert kb.complete_task(conn, reviewer, summary="approved", metadata=_review_metadata())
     reviewer_event = _completed_event(conn, reviewer)
     target = {
@@ -972,6 +1268,90 @@ def _reviewed_completion_request(
     return replace(request, judge_input_signature=judge_input.signature())
 
 
+def test_review_generation_for_one_parent_cannot_authorize_another(conn):
+    first = _reviewed_completion_request(conn)
+    second_parent = kb.create_task(conn, title="different reviewed change")
+    assert kb.block_task(
+        conn,
+        second_parent,
+        reason="review handoff",
+        kind="review",
+    )
+    second_event = _latest_event(conn, second_parent)
+    forged = replace(
+        first,
+        task_id=second_parent,
+        preconditions=replace(
+            first.preconditions,
+            parent_block_event_id=second_event.id,
+            parent_block_event_signature=kb.canonical_event_signature(second_event),
+            review_input_digest=kb.review_input_digest(conn, second_parent),
+            operation_id="cross-parent-review-completion",
+        ),
+    )
+
+    assert kb.build_reviewed_completion_judge_input(conn, forged) is None
+    result = kb.complete_reviewed_task_guarded(
+        conn,
+        replace(forged, judge_input_signature="0" * 64),
+    )
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, second_parent).status == "blocked"
+
+
+def test_review_generation_must_remain_unparented_after_judging(conn):
+    request = _reviewed_completion_request(conn)
+    unrelated = kb.create_task(conn, title="unrelated completed parent")
+    assert kb.complete_task(conn, unrelated)
+    kb.link_tasks(conn, unrelated, request.preconditions.reviewer_task_id)
+
+    result = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, request.task_id).status == "blocked"
+
+
+def test_older_review_generation_cannot_complete_after_successor_exists(conn):
+    request = _reviewed_completion_request(conn)
+    successor = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(
+            key=f"review-lane:default::{request.task_id}:g2",
+        ),
+    )
+    assert successor.created is True
+
+    assert kb.build_reviewed_completion_judge_input(conn, request) is None
+    result = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, request.task_id).status == "blocked"
+
+
+def test_guarded_completion_replay_repairs_child_readiness(conn, monkeypatch):
+    request = _reviewed_completion_request(conn)
+    child = kb.create_task(conn, title="dependent child", parents=[request.task_id])
+    real_recompute = kb.recompute_ready
+    monkeypatch.setattr(
+        kb,
+        "recompute_ready",
+        lambda connection: (_ for _ in ()).throw(RuntimeError("post-commit crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="post-commit crash"):
+        kb.complete_reviewed_task_guarded(conn, request)
+
+    assert kb.get_task(conn, request.task_id).status == "done"
+    assert kb.get_task(conn, child).status == "todo"
+    monkeypatch.setattr(kb, "recompute_ready", real_recompute)
+
+    replay = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert replay.outcome == "committed"
+    assert kb.get_task(conn, child).status == "ready"
+
+
 def test_guarded_reviewed_completion_accepts_exact_signed_inputs(conn):
     request = _reviewed_completion_request(conn)
 
@@ -984,6 +1364,25 @@ def test_guarded_reviewed_completion_accepts_exact_signed_inputs(conn):
     event = _operation_events(conn, request.task_id, request.preconditions.operation_id)[0]
     assert event.kind == "completed"
     assert event.payload["judge_input_signature"] == request.judge_input_signature
+
+
+def test_guarded_reviewed_completion_fires_completion_hook_once(conn, monkeypatch):
+    request = _reviewed_completion_request(conn)
+    fired: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, task_id, **fields: fired.append((event, task_id, fields)),
+    )
+
+    first = kb.complete_reviewed_task_guarded(conn, request)
+    replay = kb.complete_reviewed_task_guarded(conn, request)
+
+    assert first == replay
+    assert [(event, task_id) for event, task_id, _fields in fired] == [
+        ("kanban_task_completed", request.task_id)
+    ]
+    assert fired[0][2]["summary"] == request.summary
 
 
 def test_guarded_reviewed_completion_accepts_reclassified_review_block(conn):
@@ -1124,6 +1523,27 @@ def test_manifest_stale_precondition_changes_nothing(conn, boundary):
     before = _legacy_pair_snapshot(conn, reviewer, child)
 
     result = kb.apply_recovery_manifest(conn, manifest)
+
+    assert result.outcome == "precondition_changed"
+    assert _legacy_pair_snapshot(conn, reviewer, child) == before
+
+
+def test_manifest_cannot_finalize_an_actively_running_reviewer(conn):
+    reviewer, child, manifest = _legacy_recovery_pair(conn)
+    assert kb.claim_task(conn, reviewer, claimer="reviewer") is not None
+    candidate = replace(
+        manifest,
+        reviewer_status="running",
+        reviewer_event_signature=_latest_event_signature(conn, reviewer),
+        approval_signature="0" * 64,
+    )
+    candidate = replace(
+        candidate,
+        approval_signature=kb.recovery_manifest_signature(candidate),
+    )
+    before = _legacy_pair_snapshot(conn, reviewer, child)
+
+    result = kb.apply_recovery_manifest(conn, candidate)
 
     assert result.outcome == "precondition_changed"
     assert _legacy_pair_snapshot(conn, reviewer, child) == before

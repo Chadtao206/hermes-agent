@@ -1542,6 +1542,29 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
+def test_delete_archived_review_generation_preserves_permanent_registry(kanban_home):
+    with kb.connect() as conn:
+        key = "review-lane:default::t_deleted_parent:g1"
+        request = kb.ReviewGenerationCreate(
+            board="default",
+            tenant=None,
+            key=key,
+            title="review generation",
+            body="review target",
+            assignee="reviewer",
+            created_by="blocked-recovery-router",
+        )
+        first = kb.create_review_generation_task(conn, request)
+        assert kb.archive_task(conn, first.task_id)
+
+        assert kb.delete_archived_task(conn, first.task_id) is False
+        replay = kb.create_review_generation_task(conn, request)
+
+        assert replay.created is False
+        assert replay.task_id == first.task_id
+        assert kb.get_task(conn, first.task_id).status == "archived"
+
+
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="live")
@@ -1591,6 +1614,26 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
         assert len(kb.list_runs(conn, t)) == 0
+
+
+def test_delete_task_removes_controller_claims(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="claimed recovery task")
+        conn.execute(
+            "INSERT INTO kanban_controller_claims "
+            "(controller_id, board, task_id, generation_signature, authority, "
+            "input_signature, lease_epoch, expires_at, operation_id) "
+            "VALUES ('router', 'default', ?, '', 'mutate', ?, 1, 9999999999, 'claim')",
+            (task_id, "a" * 64),
+        )
+        conn.commit()
+
+        assert kb.delete_task(conn, task_id)
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_controller_claims WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
 
 
 def test_delete_task_returns_false_for_missing_task(kanban_home):

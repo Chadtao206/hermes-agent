@@ -114,6 +114,15 @@ def test_strict_parser_maps_exact_continue_object_to_rejected():
     )
 
 
+def test_strict_parser_classifies_excessive_json_nesting_as_parse_failed():
+    raw = "[" * 2_000 + "0" + "]" * 2_000
+
+    result = strict.parse_strict_judge_response(raw)
+
+    assert result.outcome == "parse_failed"
+    assert result.raw == raw
+
+
 def test_untrusted_evidence_cannot_replace_the_fixed_contract():
     judge_input = strict.StrictJudgeInput(
         task={

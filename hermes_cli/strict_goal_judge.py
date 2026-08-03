@@ -127,7 +127,7 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
 def parse_strict_judge_response(raw: str) -> StrictJudgeResult:
     try:
         data = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
-    except (json.JSONDecodeError, TypeError, _DuplicateJsonKey):
+    except (json.JSONDecodeError, TypeError, RecursionError, _DuplicateJsonKey):
         return StrictJudgeResult(
             outcome="parse_failed",
             reason="strict judge response was not one exact JSON object",

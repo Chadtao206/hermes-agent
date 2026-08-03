@@ -392,8 +392,18 @@ def _strict_completion_cli_fixture() -> tuple[str, str]:
         parent = kb.create_task(conn, title="ship reviewed change", body="tests pass")
         assert kb.block_task(conn, parent, reason="review", kind="review")
         parent_event = kb.list_events(conn, parent)[-1]
-        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
-        assert kb.claim_task(conn, reviewer, claimer="reviewer") is not None
+        reviewer = kb.create_review_generation_task(
+            conn,
+            kb.ReviewGenerationCreate(
+                board="default",
+                tenant=None,
+                key=f"review-lane:default::{parent}:g1",
+                title="review",
+                body="Review the immutable target.",
+                assignee="reviewer",
+                created_by="blocked-recovery-router",
+            ),
+        ).task_id
         metadata = {
             "review": {
                 "schema_version": 1,

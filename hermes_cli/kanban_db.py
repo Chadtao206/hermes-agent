@@ -1157,6 +1157,27 @@ def canonical_event_signature(event: Event) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _canonical_operation_signature(
+    event_kind: str,
+    task_id: str,
+    intent: Mapping[str, object],
+) -> str:
+    """Bind an operation id replay to the exact requested mutation."""
+    canonical = {
+        "schema_version": 1,
+        "event_kind": event_kind,
+        "task_id": task_id,
+        "intent": dict(intent),
+    }
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 GuardedOutcome = Literal[
     "committed",
     "not_applied",
@@ -1280,13 +1301,31 @@ class ControllerLeaseRecord:
 
 
 @dataclass(frozen=True)
+class ReviewGenerationSnapshot:
+    namespace: str
+    board: str
+    tenant: str
+    key: str
+    task_id: str
+    parent_task_id: str
+    generation: str
+    created_at: int
+    created_event_id: int
+    current: bool
+
+
+@dataclass(frozen=True)
 class RecoverySnapshot:
     board: str
     observed_at: int
     tasks: tuple[dict[str, object], ...]
     latest_events: tuple[Event, ...]
+    latest_block_events: tuple[Event, ...]
+    latest_terminal_events: tuple[Event, ...]
     links: tuple[tuple[str, str], ...]
     current_runs: tuple[Run, ...]
+    latest_terminal_runs: tuple[Run, ...]
+    review_generations: tuple[ReviewGenerationSnapshot, ...]
     claims: tuple[ControllerClaimRecord, ...]
     leases: tuple[ControllerLeaseRecord, ...]
     revision_signature: str
@@ -2641,7 +2680,9 @@ def init_db(
     return path
 
 
-def _review_generation_scope_from_key(key: str) -> tuple[str, str]:
+def _review_generation_identity_from_key(
+    key: str,
+) -> tuple[str, str, str, str]:
     parts = key.split(":")
     if (
         len(parts) != 5
@@ -2658,7 +2699,14 @@ def _review_generation_scope_from_key(key: str) -> tuple[str, str]:
         raise ReviewGenerationMigrationConflict(
             f"reserved review generation key has invalid board: {key!r}"
         )
-    return board, parts[2]
+    return board, parts[2], parts[3], parts[4]
+
+
+def _review_generation_scope_from_key(key: str) -> tuple[str, str]:
+    board, tenant, _parent_id, _generation = (
+        _review_generation_identity_from_key(key)
+    )
+    return board, tenant
 
 
 def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
@@ -2682,12 +2730,38 @@ def _migrate_review_generation_registry(conn: sqlite3.Connection) -> None:
         "GROUP BY idempotency_key HAVING COUNT(*) > 1 "
         "ORDER BY idempotency_key"
     ).fetchall()
-    if duplicates:
-        keys = ", ".join(repr(row["idempotency_key"]) for row in duplicates)
-        raise ReviewGenerationMigrationConflict(
-            "duplicate reserved review generation keys require explicit repair: "
-            f"{keys}"
+    for duplicate in duplicates:
+        key = duplicate["idempotency_key"]
+        task_rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? ORDER BY id",
+            (key,),
+        ).fetchall()
+        conn.execute(
+            "DELETE FROM kanban_scoped_idempotency "
+            "WHERE namespace = 'review-lane' AND key = ?",
+            (key,),
         )
+        for task_row in task_rows:
+            task_id = task_row["id"]
+            digest = hashlib.sha256(
+                f"{key}\0{task_id}".encode("utf-8")
+            ).hexdigest()
+            quarantined_key = f"quarantined-review-lane:{digest}:{task_id}"
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? "
+                "WHERE id = ? AND idempotency_key = ?",
+                (quarantined_key, task_id, key),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "review_generation_key_quarantined",
+                {
+                    "original_key": key,
+                    "quarantined_key": quarantined_key,
+                    "reason": "duplicate reserved review generation key",
+                },
+            )
 
     task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     created_at_column = "created_at" if "created_at" in task_columns else "0"
@@ -2880,8 +2954,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
 
-    _migrate_review_generation_registry(conn)
-
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
@@ -2895,6 +2967,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    _migrate_review_generation_registry(conn)
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3299,7 +3373,7 @@ def lookup_review_generation(
     )
 
 
-def _require_connection_board(conn: sqlite3.Connection, board: str) -> None:
+def _connection_main_path(conn: sqlite3.Connection) -> Optional[Path]:
     row = next(
         (
             item
@@ -3309,12 +3383,36 @@ def _require_connection_board(conn: sqlite3.Connection, board: str) -> None:
         None,
     )
     if row is None or not row["file"]:
+        return None
+    return Path(row["file"]).resolve()
+
+
+def _connection_board(conn: sqlite3.Connection) -> str:
+    actual = _connection_main_path(conn)
+    if actual is None:
+        return get_current_board()
+    if actual == kanban_db_path(board=DEFAULT_BOARD).resolve():
+        return DEFAULT_BOARD
+    try:
+        relative = actual.relative_to(boards_root().resolve())
+    except ValueError as exc:
+        raise ValueError(f"connected database is not a Kanban board: {actual}") from exc
+    if len(relative.parts) != 2 or relative.parts[1] != "kanban.db":
+        raise ValueError(f"connected database is not a Kanban board: {actual}")
+    board = _normalize_board_slug(relative.parts[0])
+    if board is None:
+        raise ValueError(f"connected database has an invalid board path: {actual}")
+    return board
+
+
+def _require_connection_board(conn: sqlite3.Connection, board: str) -> None:
+    actual = _connection_main_path(conn)
+    if actual is None:
         return
-    actual = Path(row["file"]).resolve()
     expected = kanban_db_path(board=board).resolve()
     if actual != expected:
         raise ValueError(
-            f"review generation board {board!r} does not match connected database"
+            f"board {board!r} does not match connected database"
         )
 
 
@@ -4030,6 +4128,15 @@ def link_tasks(
 ) -> Optional[GuardedMutationResult]:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    operation_signature = (
+        _canonical_operation_signature(
+            "linked",
+            child_id,
+            {"parent": parent_id, "child": child_id},
+        )
+        if operation_id is not None
+        else None
+    )
     with write_txn(conn):
         if operation_id is not None:
             replay = _guarded_operation_replay(
@@ -4037,6 +4144,7 @@ def link_tasks(
                 task_id=child_id,
                 operation_id=operation_id,
                 event_kind="linked",
+                operation_signature=operation_signature,
             )
             if replay is not None:
                 return replay
@@ -4070,6 +4178,7 @@ def link_tasks(
         payload = {"parent": parent_id, "child": child_id}
         if operation_id is not None:
             payload["operation_id"] = operation_id
+            payload["operation_signature"] = operation_signature
         event_id = _append_event(
             conn, child_id, "linked",
             payload,
@@ -4115,6 +4224,15 @@ def unlink_tasks(
     *,
     operation_id: Optional[str] = None,
 ) -> bool | GuardedMutationResult:
+    operation_signature = (
+        _canonical_operation_signature(
+            "unlinked",
+            child_id,
+            {"parent": parent_id, "child": child_id},
+        )
+        if operation_id is not None
+        else None
+    )
     with write_txn(conn):
         if operation_id is not None:
             replay = _guarded_operation_replay(
@@ -4122,8 +4240,14 @@ def unlink_tasks(
                 task_id=child_id,
                 operation_id=operation_id,
                 event_kind="unlinked",
+                operation_signature=operation_signature,
             )
             if replay is not None:
+                if replay.outcome == "committed":
+                    # The edge/event transaction may have committed before a
+                    # crash in the post-commit readiness pass. Replays repair
+                    # that derived state before reporting success.
+                    recompute_ready(conn)
                 return replay
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -4133,6 +4257,7 @@ def unlink_tasks(
             payload = {"parent": parent_id, "child": child_id}
             if operation_id is not None:
                 payload["operation_id"] = operation_id
+                payload["operation_signature"] = operation_signature
             event_id = _append_event(
                 conn, child_id, "unlinked",
                 payload,
@@ -4596,6 +4721,7 @@ def _guarded_operation_replay(
     task_id: str,
     operation_id: str,
     event_kind: str,
+    operation_signature: Optional[str],
 ) -> Optional[GuardedMutationResult]:
     if not isinstance(operation_id, str) or not operation_id.strip():
         raise ValueError("operation_id must be a nonempty string")
@@ -4614,7 +4740,12 @@ def _guarded_operation_replay(
         return None
     if len(matches) == 1:
         event = matches[0]
-        if event.task_id == task_id and event.kind == event_kind:
+        if (
+            event.task_id == task_id
+            and event.kind == event_kind
+            and operation_signature is not None
+            and event.payload.get("operation_signature") == operation_signature
+        ):
             return GuardedMutationResult(
                 outcome="committed",
                 task_id=task_id,
@@ -4714,6 +4845,7 @@ def _synthesize_ended_run(
     task_id: str,
     *,
     outcome: str,
+    status: Optional[str] = None,
     summary: Optional[str] = None,
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
@@ -4751,7 +4883,7 @@ def _synthesize_ended_run(
         """,
         (
             task_id, profile, step_key,
-            outcome, outcome,
+            status or outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now, now,
@@ -4835,8 +4967,9 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
-    promoted = 0
-    with write_txn(conn):
+
+    def _recompute_in_current_transaction() -> int:
+        promoted = 0
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -4886,6 +5019,14 @@ def recompute_ready(
                     )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
+        return promoted
+
+    if conn.in_transaction:
+        return _recompute_in_current_transaction()
+
+    promoted = 0
+    with write_txn(conn):
+        promoted = _recompute_in_current_transaction()
     return promoted
 
 
@@ -5591,6 +5732,22 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    created_card_ids = tuple(created_cards or ())
+    operation_signature = (
+        _canonical_operation_signature(
+            "completed",
+            task_id,
+            {
+                "result": result,
+                "summary": summary,
+                "metadata": dict(metadata or {}),
+                "created_cards": list(created_card_ids),
+                "expected_run_id": expected_run_id,
+            },
+        )
+        if operation_id is not None
+        else None
+    )
     now = int(time.time())
     review_evidence: Optional[ReviewCompletionEvidence] = None
     if isinstance(metadata, Mapping) and "review" in metadata:
@@ -5601,9 +5758,9 @@ def complete_task(
     # tiny dedicated txn, then raise. The caller is responsible for
     # surfacing HallucinatedCardsError to the worker; this function
     # never mutates task state on a phantom-card rejection.
-    if created_cards:
+    if created_card_ids:
         verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
+            conn, task_id, created_card_ids
         )
         if phantom_cards:
             with write_txn(conn):
@@ -5633,9 +5790,15 @@ def complete_task(
                 task_id=task_id,
                 operation_id=operation_id,
                 event_kind="completed",
+                operation_signature=operation_signature,
             )
             if replay is not None:
                 if replay.outcome == "committed":
+                    # Repair idempotent post-commit effects that may have been
+                    # skipped by a crash after the completed event committed.
+                    _clear_failure_counter(conn, task_id)
+                    recompute_ready(conn)
+                    _cleanup_workspace(conn, task_id)
                     return True
                 raise ValueError(replay.reason)
         if expected_run_id is None:
@@ -5701,6 +5864,7 @@ def complete_task(
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
+                status="done",
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
@@ -5734,6 +5898,7 @@ def complete_task(
             completed_payload["review"] = _canonical_review_payload(review_evidence)
         if operation_id is not None:
             completed_payload["operation_id"] = operation_id
+            completed_payload["operation_signature"] = operation_signature
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -6968,12 +7133,21 @@ def reclassify_block(
         raise ValueError(
             "dependency blocks must route through block_task and cannot remain blocked"
         )
+    operation_signature = _canonical_operation_signature(
+        "block_reclassified",
+        request.task_id,
+        {
+            "expected_block_event_signature": request.expected_block_event_signature,
+            "block_kind": request.block_kind,
+        },
+    )
     with write_txn(conn):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
             operation_id=request.operation_id,
             event_kind="block_reclassified",
+            operation_signature=operation_signature,
         )
         if replay is not None:
             return replay
@@ -7035,6 +7209,7 @@ def reclassify_block(
             "block_reclassified",
             {
                 "operation_id": request.operation_id,
+                "operation_signature": operation_signature,
                 "source_block_signature": request.expected_block_event_signature,
                 "previous_kind": row["block_kind"],
                 "kind": request.block_kind,
@@ -7052,12 +7227,21 @@ def requeue_review_lane(
     conn: sqlite3.Connection,
     request: ReviewLaneMutation,
 ) -> GuardedMutationResult:
+    operation_signature = _canonical_operation_signature(
+        "review_requeued",
+        request.task_id,
+        {
+            "expected_status": request.expected_status,
+            "expected_event_signature": request.expected_event_signature,
+        },
+    )
     with write_txn(conn):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
             operation_id=request.operation_id,
             event_kind="review_requeued",
+            operation_signature=operation_signature,
         )
         if replay is not None:
             return replay
@@ -7097,17 +7281,28 @@ def requeue_review_lane(
                 operation_id=request.operation_id,
                 reason="review lane terminal event changed",
             )
-        later_recovery = conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
-            "AND kind IN ('review_requeued', 'review_archived') LIMIT 1",
-            (request.task_id, terminal.id),
-        ).fetchone()
-        if later_recovery is not None:
+        latest_boundary = _latest_task_event(
+            conn,
+            request.task_id,
+            kinds=(
+                "timed_out",
+                "crashed",
+                "gave_up",
+                "blocked",
+                "block_reclassified",
+                "unblocked",
+                "review_requeued",
+                "review_archived",
+                "completed",
+                "archived",
+            ),
+        )
+        if latest_boundary is None or latest_boundary.id != terminal.id:
             return _guarded_result(
                 "precondition_changed",
                 task_id=request.task_id,
                 operation_id=request.operation_id,
-                reason="review terminal generation was already consumed",
+                reason="review terminal generation is no longer current",
             )
         cur = conn.execute(
             """
@@ -7137,6 +7332,7 @@ def requeue_review_lane(
             "review_requeued",
             {
                 "operation_id": request.operation_id,
+                "operation_signature": operation_signature,
                 "source_terminal_signature": request.expected_event_signature,
                 "previous_status": request.expected_status,
             },
@@ -7154,12 +7350,21 @@ def archive_review_lane(
     conn: sqlite3.Connection,
     request: ReviewLaneMutation,
 ) -> GuardedMutationResult:
+    operation_signature = _canonical_operation_signature(
+        "review_archived",
+        request.task_id,
+        {
+            "expected_status": request.expected_status,
+            "expected_event_signature": request.expected_event_signature,
+        },
+    )
     with write_txn(conn):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
             operation_id=request.operation_id,
             event_kind="review_archived",
+            operation_signature=operation_signature,
         )
         if replay is not None:
             return replay
@@ -7218,6 +7423,7 @@ def archive_review_lane(
             "review_archived",
             {
                 "operation_id": request.operation_id,
+                "operation_signature": operation_signature,
                 "source_event_signature": request.expected_event_signature,
                 "previous_status": request.expected_status,
             },
@@ -7237,12 +7443,21 @@ def retry_transient_task(
 ) -> GuardedMutationResult:
     if type(request.retry_ordinal) is not int or request.retry_ordinal < 1:
         raise ValueError("retry_ordinal must be a positive integer")
+    operation_signature = _canonical_operation_signature(
+        "transient_retry_authorized",
+        request.task_id,
+        {
+            "expected_terminal_signature": request.expected_terminal_signature,
+            "retry_ordinal": request.retry_ordinal,
+        },
+    )
     with write_txn(conn):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
             operation_id=request.operation_id,
             event_kind="transient_retry_authorized",
+            operation_signature=operation_signature,
         )
         if replay is not None:
             return replay
@@ -7267,10 +7482,17 @@ def retry_transient_task(
         terminal = _latest_task_event(
             conn,
             request.task_id,
-            kinds=("blocked", "gave_up", "timed_out", "crashed"),
+            kinds=(
+                "blocked",
+                "gave_up",
+                "timed_out",
+                "crashed",
+                "block_reclassified",
+            ),
         )
         if (
             terminal is None
+            or terminal.kind == "block_reclassified"
             or canonical_event_signature(terminal)
             != request.expected_terminal_signature
         ):
@@ -7342,6 +7564,7 @@ def retry_transient_task(
             "transient_retry_authorized",
             {
                 "operation_id": request.operation_id,
+                "operation_signature": operation_signature,
                 "retry_ordinal": request.retry_ordinal,
                 "source_terminal_signature": request.expected_terminal_signature,
                 "status": new_status,
@@ -7365,12 +7588,22 @@ def acknowledge_escalation(
     actor = request.actor.strip() if isinstance(request.actor, str) else ""
     if not actor:
         raise ValueError("actor must be a nonempty string")
+    operation_signature = _canonical_operation_signature(
+        "escalation_acknowledged",
+        request.task_id,
+        {
+            "escalation_signature": request.escalation_signature,
+            "expected_event_signature": request.expected_event_signature,
+            "actor": actor,
+        },
+    )
     with write_txn(conn):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
             operation_id=request.operation_id,
             event_kind="escalation_acknowledged",
+            operation_signature=operation_signature,
         )
         if replay is not None:
             return replay
@@ -7402,6 +7635,7 @@ def acknowledge_escalation(
             "escalation_acknowledged",
             {
                 "operation_id": request.operation_id,
+                "operation_signature": operation_signature,
                 "signature": request.escalation_signature,
                 "source_event_signature": request.expected_event_signature,
                 "actor": actor,
@@ -7492,6 +7726,7 @@ def acquire_controller_lease(
         request.census_signature,
         request.operation_id,
     )
+    _require_connection_board(conn, board)
     now = _controller_epoch_now()
     with write_txn(conn):
         row = conn.execute(
@@ -7568,6 +7803,7 @@ def renew_controller_lease(
         request.census_signature,
         request.operation_id,
     )
+    _require_connection_board(conn, board)
     if type(request.holder_epoch) is not int or request.holder_epoch < 1:
         raise ValueError("holder_epoch must be a positive integer")
     now = _controller_epoch_now()
@@ -7654,6 +7890,7 @@ def publish_controller_claim(
     generation_signature = claim.generation_signature.strip()
     if not controller_id or board is None:
         raise ValueError("controller_id and board are required")
+    _require_connection_board(conn, board)
     if generation_signature and not re.fullmatch(
         r"[0-9a-f]{64}", generation_signature
     ):
@@ -7662,6 +7899,19 @@ def publish_controller_claim(
         raise ValueError("input_signature must be a lowercase SHA-256 digest")
     if type(claim.lease_epoch) is not int or claim.lease_epoch < 1:
         raise ValueError("lease_epoch must be a positive integer")
+    operation_signature = _canonical_operation_signature(
+        "controller_claim_published",
+        claim.task_id,
+        {
+            "controller_id": controller_id,
+            "board": board,
+            "generation_signature": generation_signature,
+            "authority": claim.authority,
+            "input_signature": claim.input_signature,
+            "lease_epoch": claim.lease_epoch,
+            "expires_at": claim.expires_at,
+        },
+    )
     now = _controller_epoch_now()
     with write_txn(conn):
         replay = _guarded_operation_replay(
@@ -7669,6 +7919,7 @@ def publish_controller_claim(
             task_id=claim.task_id,
             operation_id=claim.operation_id,
             event_kind="controller_claim_published",
+            operation_signature=operation_signature,
         )
         if replay is not None:
             return replay
@@ -7733,6 +7984,7 @@ def publish_controller_claim(
             "controller_claim_published",
             {
                 "operation_id": claim.operation_id,
+                "operation_signature": operation_signature,
                 "controller_id": controller_id,
                 "board": board,
                 "generation_signature": generation_signature,
@@ -7769,7 +8021,7 @@ def read_recovery_snapshot(
 ) -> RecoverySnapshot:
     if type(now) is not int or now < 0:
         raise ValueError("now must be a nonnegative epoch integer")
-    board = get_current_board()
+    board = _connection_board(conn)
     conn.execute("BEGIN")
     try:
         task_rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
@@ -7783,6 +8035,33 @@ def read_recovery_snapshot(
             ORDER BY event.task_id
             """
         ).fetchall()
+        block_event_rows = conn.execute(
+            """
+            SELECT event.* FROM task_events event
+            JOIN (
+                SELECT task_id, MAX(id) AS event_id
+                  FROM task_events
+                 WHERE kind IN ('blocked', 'gave_up', 'block_reclassified')
+                 GROUP BY task_id
+            ) latest ON latest.event_id = event.id
+            ORDER BY event.task_id
+            """
+        ).fetchall()
+        terminal_event_rows = conn.execute(
+            """
+            SELECT event.* FROM task_events event
+            JOIN (
+                SELECT task_id, MAX(id) AS event_id
+                  FROM task_events
+                 WHERE kind IN (
+                     'blocked', 'timed_out', 'crashed', 'gave_up',
+                     'completed', 'archived'
+                 )
+                 GROUP BY task_id
+            ) latest ON latest.event_id = event.id
+            ORDER BY event.task_id
+            """
+        ).fetchall()
         link_rows = conn.execute(
             "SELECT parent_id, child_id FROM task_links "
             "ORDER BY parent_id, child_id"
@@ -7792,6 +8071,32 @@ def read_recovery_snapshot(
             "JOIN tasks task ON task.current_run_id = run.id "
             "ORDER BY run.task_id, run.id"
         ).fetchall()
+        terminal_run_rows = conn.execute(
+            """
+            SELECT run.* FROM task_runs run
+            JOIN (
+                SELECT task_id, MAX(id) AS run_id
+                  FROM task_runs
+                 WHERE ended_at IS NOT NULL
+                 GROUP BY task_id
+            ) latest ON latest.run_id = run.id
+            ORDER BY run.task_id, run.id
+            """
+        ).fetchall()
+        generation_rows = conn.execute(
+            """
+            SELECT registry.*,
+                   (
+                       SELECT MIN(event.id)
+                         FROM task_events event
+                        WHERE event.task_id = registry.task_id
+                          AND event.kind = 'created'
+                   ) AS created_event_id
+              FROM kanban_scoped_idempotency registry
+             WHERE registry.namespace = 'review-lane'
+             ORDER BY registry.board, registry.tenant, registry.key
+            """
+        ).fetchall()
         claim_rows = conn.execute(
             "SELECT * FROM kanban_controller_claims "
             "ORDER BY controller_id, board, task_id, generation_signature"
@@ -7800,6 +8105,56 @@ def read_recovery_snapshot(
             "SELECT * FROM kanban_controller_leases "
             "ORDER BY controller_id, board"
         ).fetchall()
+        generations: list[ReviewGenerationSnapshot] = []
+        newest_generation_events: dict[tuple[str, str, str], int] = {}
+        for row in generation_rows:
+            key_board, key_tenant, parent_task_id, generation = (
+                _review_generation_identity_from_key(row["key"])
+            )
+            if (
+                key_board != row["board"]
+                or key_tenant != str(row["tenant"] or "").strip()
+                or row["created_event_id"] is None
+            ):
+                raise ValueError(
+                    f"invalid review generation registry row for {row['key']!r}"
+                )
+            created_event_id = int(row["created_event_id"])
+            scope = (key_board, key_tenant, parent_task_id)
+            newest_generation_events[scope] = max(
+                newest_generation_events.get(scope, 0),
+                created_event_id,
+            )
+            generations.append(
+                ReviewGenerationSnapshot(
+                    namespace=row["namespace"],
+                    board=key_board,
+                    tenant=key_tenant,
+                    key=row["key"],
+                    task_id=row["task_id"],
+                    parent_task_id=parent_task_id,
+                    generation=generation,
+                    created_at=int(row["created_at"]),
+                    created_event_id=created_event_id,
+                    current=False,
+                )
+            )
+        generations = [
+            replace(
+                generation,
+                current=(
+                    generation.created_event_id
+                    == newest_generation_events[
+                        (
+                            generation.board,
+                            generation.tenant,
+                            generation.parent_task_id,
+                        )
+                    ]
+                ),
+            )
+            for generation in generations
+        ]
         snapshot = RecoverySnapshot(
             board=board,
             observed_at=now,
@@ -7807,8 +8162,18 @@ def read_recovery_snapshot(
                 {key: row[key] for key in row.keys()} for row in task_rows
             ),
             latest_events=tuple(_event_from_row(row) for row in event_rows),
+            latest_block_events=tuple(
+                _event_from_row(row) for row in block_event_rows
+            ),
+            latest_terminal_events=tuple(
+                _event_from_row(row) for row in terminal_event_rows
+            ),
             links=tuple((row["parent_id"], row["child_id"]) for row in link_rows),
             current_runs=tuple(Run.from_row(row) for row in run_rows),
+            latest_terminal_runs=tuple(
+                Run.from_row(row) for row in terminal_run_rows
+            ),
+            review_generations=tuple(generations),
             claims=tuple(
                 ControllerClaimRecord(
                     controller_id=row["controller_id"],
@@ -7883,6 +8248,79 @@ def _event_by_id(
     return _event_from_row(row) if row is not None else None
 
 
+def _review_generation_is_bound_to_parent(
+    conn: sqlite3.Connection,
+    reviewer_task_id: str,
+    parent_task_id: str,
+) -> bool:
+    rows = conn.execute(
+        """
+        SELECT registry.board,
+               registry.tenant,
+               registry.key,
+               registry.task_id,
+               reviewer.tenant AS reviewer_tenant,
+               parent.tenant AS parent_tenant,
+               (
+                   SELECT MIN(event.id)
+                     FROM task_events event
+                    WHERE event.task_id = registry.task_id
+                      AND event.kind = 'created'
+               ) AS created_event_id
+          FROM kanban_scoped_idempotency registry
+          JOIN tasks reviewer ON reviewer.id = registry.task_id
+          JOIN tasks parent ON parent.id = ?
+         WHERE registry.namespace = 'review-lane'
+        """,
+        (parent_task_id,),
+    ).fetchall()
+    selected = [row for row in rows if row["task_id"] == reviewer_task_id]
+    if len(selected) != 1 or parent_ids(conn, reviewer_task_id):
+        return False
+    row = selected[0]
+    try:
+        key_board, key_tenant, key_parent, generation = (
+            _review_generation_identity_from_key(row["key"])
+        )
+        connection_board = _connection_board(conn)
+    except (ReviewGenerationMigrationConflict, ValueError):
+        return False
+    parent_tenant = str(row["parent_tenant"] or "").strip()
+    reviewer_tenant = str(row["reviewer_tenant"] or "").strip()
+    registry_tenant = str(row["tenant"] or "").strip()
+    if not (
+        row["board"] == connection_board
+        and key_board == connection_board
+        and key_tenant == registry_tenant == parent_tenant == reviewer_tenant
+        and key_parent == parent_task_id
+        and generation
+        and row["created_event_id"] is not None
+    ):
+        return False
+
+    current_event_id = int(row["created_event_id"])
+    for candidate in rows:
+        try:
+            candidate_board, candidate_tenant, candidate_parent, _candidate_generation = (
+                _review_generation_identity_from_key(candidate["key"])
+            )
+        except ReviewGenerationMigrationConflict:
+            return False
+        if (
+            candidate_board != connection_board
+            or candidate["board"] != connection_board
+            or candidate_tenant != parent_tenant
+            or str(candidate["tenant"] or "").strip() != parent_tenant
+            or str(candidate["reviewer_tenant"] or "").strip() != parent_tenant
+            or candidate_parent != parent_task_id
+        ):
+            continue
+        if candidate["created_event_id"] is None:
+            return False
+        current_event_id = max(current_event_id, int(candidate["created_event_id"]))
+    return int(row["created_event_id"]) == current_event_id
+
+
 def build_reviewed_completion_judge_input(
     conn: sqlite3.Connection,
     request: ReviewedCompletionRequest,
@@ -7896,6 +8334,12 @@ def build_reviewed_completion_judge_input(
         request.preconditions.reviewer_completion_event_id,
     )
     if task is None or reviewer_event is None:
+        return None
+    if not _review_generation_is_bound_to_parent(
+        conn,
+        request.preconditions.reviewer_task_id,
+        request.task_id,
+    ):
         return None
     return StrictJudgeInput(
         task={
@@ -7929,14 +8373,30 @@ def complete_reviewed_task_guarded(
     request: ReviewedCompletionRequest,
 ) -> GuardedMutationResult:
     pre = request.preconditions
+    operation_signature = _canonical_operation_signature(
+        "completed",
+        request.task_id,
+        {
+            "result": request.result,
+            "summary": request.summary,
+            "metadata": dict(request.metadata or {}),
+            "target_verification": dict(request.target_verification),
+            "preconditions": asdict(pre),
+            "judge_input_signature": request.judge_input_signature,
+        },
+    )
     with write_txn(conn):
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
             operation_id=pre.operation_id,
             event_kind="completed",
+            operation_signature=operation_signature,
         )
         if replay is not None:
+            if replay.outcome == "committed":
+                recompute_ready(conn)
+                _cleanup_workspace(conn, request.task_id)
             return replay
         task = get_task(conn, request.task_id)
         if task is None:
@@ -7952,6 +8412,17 @@ def complete_reviewed_task_guarded(
                 task_id=request.task_id,
                 operation_id=pre.operation_id,
                 reason="parent is no longer blocked for review",
+            )
+        if not _review_generation_is_bound_to_parent(
+            conn,
+            pre.reviewer_task_id,
+            request.task_id,
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="review generation is not bound to this parent",
             )
         parent_event = _event_by_id(
             conn,
@@ -8063,6 +8534,7 @@ def complete_reviewed_task_guarded(
                 conn,
                 request.task_id,
                 outcome="completed",
+                status="done",
                 summary=request.summary if request.summary is not None else request.result,
                 metadata=dict(request.metadata or {}),
             )
@@ -8072,6 +8544,7 @@ def complete_reviewed_task_guarded(
             "completed",
             {
                 "operation_id": pre.operation_id,
+                "operation_signature": operation_signature,
                 "result_len": len(request.result) if request.result else 0,
                 "summary": (request.summary or request.result or "")[:400] or None,
                 "judge_input_signature": request.judge_input_signature,
@@ -8083,6 +8556,15 @@ def complete_reviewed_task_guarded(
         )
     recompute_ready(conn)
     _cleanup_workspace(conn, request.task_id)
+    done_task = get_task(conn, request.task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_completed",
+        request.task_id,
+        board=_connection_board(conn),
+        assignee=done_task.assignee if done_task else None,
+        run_id=run_id,
+        summary=(request.summary if request.summary is not None else request.result),
+    )
     return GuardedMutationResult(
         outcome="committed",
         task_id=request.task_id,
@@ -8290,6 +8772,11 @@ def apply_recovery_manifest(
             or child is None
             or reviewer.status != manifest.reviewer_status
             or child.status != manifest.child_status
+            or reviewer.status == "running"
+            or reviewer.current_run_id is not None
+            or reviewer.claim_lock is not None
+            or reviewer.claim_expires is not None
+            or reviewer.worker_pid is not None
             or child.current_run_id is not None
             or reviewer_event is None
             or child_event is None
@@ -8371,12 +8858,9 @@ def apply_recovery_manifest(
                 conn,
                 manifest.reviewer_task_id,
                 outcome="completed",
+                status="done",
                 summary=result_summary,
                 metadata=run_metadata,
-            )
-            conn.execute(
-                "UPDATE task_runs SET status = 'done' WHERE id = ?",
-                (reviewer_run_id,),
             )
         reviewer_event_id = _append_event(
             conn,
@@ -8782,7 +9266,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if not row or row["status"] != "archived":
+        if (
+            not row
+            or row["status"] != "archived"
+            or _is_review_generation_task(conn, task_id)
+        ):
             return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
@@ -8792,6 +9280,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM kanban_controller_claims WHERE task_id = ?",
+            (task_id,),
+        )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -8807,6 +9299,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if _is_review_generation_task(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8815,6 +9309,10 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM kanban_controller_claims WHERE task_id = ?",
+            (task_id,),
+        )
     recompute_ready(conn)
     return True
 
@@ -11052,6 +11550,13 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.
     """
+    if conn.in_transaction:
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ?",
+            (task_id,),
+        )
+        return
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
