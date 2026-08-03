@@ -42,6 +42,13 @@ review evidence. Do not write the staged files back to the live Hermes root in
 this plan. Installation belongs exclusively to the guarded maintenance and
 rollout plan after its pause, backup, fingerprint, and approval gates pass.
 
+## Approved Execution Ordering Amendment
+
+Execute Task 8 before Task 5. Task 5 consumes `PlannedOperation` and verifies
+the operation journal, so the journal contract must exist before transient
+retry is routed through it. The resulting task order is:
+`1, 2, 3, 4, 8, 5, 6, 7, 9, 10, 11, 12, 13, 14`.
+
 ---
 
 ## File Structure
@@ -1275,7 +1282,10 @@ git status --short
 python -m compileall -q /Users/ctao/.hermes/scripts/review_delegator /Users/ctao/.hermes/scripts/kanban_remediation
 ```
 
-Expected: compilation exits 0; repository changes are limited to shared config/tests and plan files.
+Expected: compilation exits 0; repository changes are limited to the planned
+shared config, recovery health, dashboard, tests, and plan files. Local
+automation changes remain confined to the staged SDD tree until guarded
+rollout.
 
 - [ ] **Step 5: Request code review before any live mode change**
 
