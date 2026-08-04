@@ -1495,6 +1495,8 @@ class ReviewGenerationCreate:
     workspace_path: Optional[str] = None
     branch_name: Optional[str] = None
     priority: int = 0
+    project_id: Optional[str] = None
+    project_source_task_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -3691,6 +3693,70 @@ def create_review_generation_task(
     assignee = _canonical_assignee(request.assignee)
     _require_connection_board(conn, board)
 
+    # A permanent registry binding wins before any mutable project lookup.  In
+    # particular, an archived lane must replay its original id even after an
+    # implementation task or project configuration has changed.
+    existing = lookup_review_generation(conn, board, tenant, key)
+    if existing is not None and get_task(conn, existing.task_id) is not None:
+        return ReviewGenerationCreateResult(task_id=existing.task_id, created=False)
+
+    # Keep reviewer worktrees isolated while using the identical project source
+    # fallback as ordinary task creation.  We bind only a fresh task-id-keyed
+    # path; a source task's concrete worktree is evidence, never reusable state.
+    workspace_kind = request.workspace_kind
+    workspace_path = request.workspace_path
+    project_id = str(request.project_id or "").strip() or None
+    source_id = str(request.project_source_task_id or "").strip() or None
+    project_obj = None
+    project_repo: Optional[str] = None
+    if project_id:
+        from hermes_cli import projects_db as _pdb
+
+        try:
+            with _pdb.connect_closing() as project_conn:
+                project_obj = _pdb.get_project(project_conn, project_id)
+        except Exception:
+            project_obj = None
+        if project_obj is None and source_id:
+            source_task = get_task(conn, source_id)
+            if (
+                source_task is not None
+                and source_task.project_id == project_id
+                and source_task.workspace_kind == "worktree"
+                and source_task.workspace_path
+            ):
+                source_path = Path(source_task.workspace_path)
+                if source_path.is_absolute() and source_path.name == source_task.id and source_path.parent.name == ".worktrees":
+                    project_slug = None
+                    if source_task.branch_name:
+                        prefix, separator, leaf = source_task.branch_name.partition("/")
+                        if separator and (leaf == source_task.id or leaf.startswith(f"{source_task.id}-")):
+                            try:
+                                project_slug = _pdb.normalize_slug(prefix)
+                            except ValueError:
+                                project_slug = None
+                    if project_slug is None:
+                        try:
+                            project_slug = _pdb.normalize_slug(project_id)
+                        except ValueError:
+                            project_slug = None
+                    if project_slug:
+                        project_repo = str(source_path.parent.parent)
+                        project_obj = _pdb.Project(
+                            id=project_id,
+                            slug=project_slug,
+                            name=project_slug,
+                            created_at=0,
+                            primary_path=project_repo,
+                        )
+        if project_obj is None:
+            raise ValueError("review generation project could not be resolved")
+        project_id = project_obj.id
+        if workspace_kind == "scratch" and project_obj.primary_path:
+            workspace_kind = "worktree"
+        if workspace_kind == "worktree" and workspace_path is None and project_obj.primary_path:
+            project_repo = str(project_obj.primary_path)
+
     now = int(time.time())
     with write_txn(conn):
         claimed = conn.execute(
@@ -3713,15 +3779,22 @@ def create_review_generation_task(
         task_id: Optional[str] = None
         for attempt in range(2):
             candidate = _new_task_id()
+            candidate_workspace_path = workspace_path
+            candidate_branch = branch_name
+            if project_obj is not None and workspace_kind == "worktree":
+                if project_repo and candidate_workspace_path is None:
+                    candidate_workspace_path = os.path.join(project_repo, ".worktrees", candidate)
+                if not candidate_branch:
+                    candidate_branch = _pdb.branch_name_for(project_obj, candidate, title=request.title)
             try:
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, tenant, idempotency_key,
+                        branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds, max_retries
-                    ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, 3600, 1)
+                    ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, 3600, 1)
                     """,
                     (
                         candidate,
@@ -3731,14 +3804,17 @@ def create_review_generation_task(
                         int(request.priority),
                         request.created_by,
                         now,
-                        request.workspace_kind,
-                        request.workspace_path,
-                        branch_name,
+                        workspace_kind,
+                        candidate_workspace_path,
+                        candidate_branch,
+                        project_id,
                         tenant or None,
                         key,
                     ),
                 )
                 task_id = candidate
+                workspace_path = candidate_workspace_path
+                branch_name = candidate_branch
                 break
             except sqlite3.IntegrityError:
                 if attempt == 1:
@@ -3765,9 +3841,10 @@ def create_review_generation_task(
                 "parents": [],
                 "board": board,
                 "tenant": tenant or None,
-                "workspace_kind": request.workspace_kind,
-                "workspace_path": request.workspace_path,
+                "workspace_kind": workspace_kind,
+                "workspace_path": workspace_path,
                 "branch_name": branch_name,
+                "project_id": project_id,
                 "idempotency_namespace": "review-lane",
                 "idempotency_key": key,
                 "max_runtime_seconds": 3600,

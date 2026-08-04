@@ -130,6 +130,42 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     assert "child" in ready_list
 
 
+def test_create_review_generation_cli_replays_archived_lane_and_isolates_project_workspace(kanban_home, tmp_path):
+    repository = tmp_path / "repository"
+    with kb.connect_closing() as conn:
+        source = kb.create_task(
+            conn,
+            title="implementation",
+            project_id="project-1",
+            workspace_kind="worktree",
+            workspace_path=str(repository / ".worktrees" / "placeholder"),
+            branch_name="project-1/placeholder",
+        )
+        source_path = repository / ".worktrees" / source
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path = ?, branch_name = ?, project_id = ? WHERE id = ?",
+                (str(source_path), f"project-1/{source}", "project-1", source),
+            )
+    key = f"review-lane:default::${source}:g-cli".replace("$", "")
+    command = (
+        "create-review-generation 'review immutable target' "
+        f"--key {key} --assignee reviewer --project project-1 "
+        f"--project-source-task {source} --json"
+    )
+    first = json.loads(kc.run_slash(command))
+    assert first["created"] is True
+    with kb.connect_closing() as conn:
+        reviewer = kb.get_task(conn, first["task_id"])
+        assert reviewer is not None
+        assert reviewer.workspace_path == str(repository / ".worktrees" / reviewer.id)
+        assert reviewer.workspace_path != str(source_path)
+        assert kb.archive_task(conn, reviewer.id)
+
+    replay = json.loads(kc.run_slash(command))
+    assert replay == {"task_id": first["task_id"], "created": False}
+
+
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re

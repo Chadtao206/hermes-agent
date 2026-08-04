@@ -332,6 +332,43 @@ def test_review_generation_key_survives_archival(conn):
     assert kb.get_task(conn, replay.task_id).status == "archived"
 
 
+def test_review_generation_project_source_gets_fresh_task_keyed_worktree(conn, tmp_path):
+    repository = tmp_path / "repository"
+    source = kb.create_task(
+        conn,
+        title="implementation",
+        project_id="project-1",
+        workspace_kind="worktree",
+        workspace_path=str(repository / ".worktrees" / "placeholder"),
+        branch_name="project-1/placeholder",
+    )
+    source_path = repository / ".worktrees" / source
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, branch_name = ?, project_id = ? WHERE id = ?",
+            (str(source_path), f"project-1/{source}", "project-1", source),
+        )
+    request = _review_generation_request(
+        key=f"review-lane:default::${source}:g-project".replace("$", ""),
+    )
+    request = replace(
+        request,
+        project_id="project-1",
+        project_source_task_id=source,
+    )
+
+    created = kb.create_review_generation_task(conn, request)
+    task = kb.get_task(conn, created.task_id)
+
+    assert task is not None
+    assert task.project_id == "project-1"
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repository / ".worktrees" / created.task_id)
+    assert task.workspace_path != str(source_path)
+    assert task.branch_name is not None
+    assert task.branch_name.startswith(f"project-1/{created.task_id}-")
+
+
 def test_review_generation_lookup_is_scoped_by_tenant(conn):
     request = _review_generation_request(
         key="review-lane:default:acme:t_parent:g1",

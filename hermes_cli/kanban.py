@@ -403,6 +403,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    p_review_generation = sub.add_parser(
+        "create-review-generation",
+        help="Create or replay one permanent isolated reviewer lane",
+    )
+    p_review_generation.add_argument("title", help="Reviewer-lane title")
+    p_review_generation.add_argument("--key", required=True, help="Permanent review generation key")
+    p_review_generation.add_argument("--body", default=None, help="Trusted reviewer contract body")
+    p_review_generation.add_argument("--assignee", required=True, help="Reviewer profile")
+    p_review_generation.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_review_generation.add_argument("--workspace", default="scratch", help="scratch | worktree | worktree:<path>")
+    p_review_generation.add_argument("--branch", default=None, help="Optional worktree branch")
+    p_review_generation.add_argument("--project", default=None, help="Project id or slug for isolated worktree")
+    p_review_generation.add_argument("--project-source-task", default=None, help="Same-board implementation task for project fallback")
+    p_review_generation.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_review_generation.add_argument("--created-by", default="review-delegator", help="Recorded author")
+    p_review_generation.add_argument("--max-runtime", default="60m", help="Must be 60m; core enforces 3600 seconds")
+    p_review_generation.add_argument("--max-retries", type=int, default=1, help="Must be 1; core permits one attempt")
+    p_review_generation.add_argument("--json", action="store_true", required=True, help="Emit exact JSON result")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -1188,6 +1207,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "create-review-generation": _cmd_create_review_generation,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1759,6 +1779,38 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_create_review_generation(args: argparse.Namespace) -> int:
+    try:
+        if _parse_duration(args.max_runtime) != 3600 or args.max_retries != 1:
+            raise ValueError("review generation lanes require --max-runtime 60m and --max-retries 1")
+        workspace_kind, workspace_path = _parse_workspace_flag(args.workspace)
+        branch_name = _parse_branch_flag(args.branch)
+        if branch_name and workspace_kind != "worktree":
+            raise argparse.ArgumentTypeError("--branch is only valid with --workspace worktree")
+        request = kb.ReviewGenerationCreate(
+            board=kb.get_current_board(),
+            key=args.key,
+            title=args.title,
+            tenant=args.tenant,
+            body=args.body,
+            assignee=args.assignee,
+            created_by=args.created_by,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            priority=args.priority,
+            project_id=args.project,
+            project_source_task_id=args.project_source_task,
+        )
+        with kb.connect_closing() as conn:
+            result = kb.create_review_generation_task(conn, request)
+    except (argparse.ArgumentTypeError, ValueError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps({"task_id": result.task_id, "created": result.created}, ensure_ascii=False))
     return 0
 
 
