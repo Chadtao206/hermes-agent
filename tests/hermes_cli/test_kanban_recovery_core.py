@@ -1483,6 +1483,98 @@ def test_recovery_snapshot_preserves_block_event_after_later_comment(conn):
     assert after.revision_signature != before.revision_signature
 
 
+def test_recovery_snapshot_exposes_complete_scoped_transient_retry_ledger(
+    conn,
+):
+    first_task = _blocked_task(conn, kind="transient")
+    first_retry = kb.TransientRetryRequest(
+        task_id=first_task,
+        expected_terminal_signature=_latest_event_signature(conn, first_task),
+        retry_ordinal=1,
+        operation_id="snapshot-transient-first-1",
+    )
+    assert kb.retry_transient_task(conn, first_retry).outcome == "committed"
+
+    second_task = _blocked_task(conn, kind="transient")
+    second_retry = kb.TransientRetryRequest(
+        task_id=second_task,
+        expected_terminal_signature=_latest_event_signature(conn, second_task),
+        retry_ordinal=1,
+        operation_id="snapshot-transient-second-1",
+    )
+    assert kb.retry_transient_task(conn, second_retry).outcome == "committed"
+
+    assert kb.block_task(
+        conn,
+        first_task,
+        reason="different human-block cycle",
+        kind="needs_input",
+    )
+    assert kb.unblock_task(conn, first_task)
+    assert kb.block_task(
+        conn,
+        first_task,
+        reason="second transient cycle",
+        kind="transient",
+    )
+    assert kb.retry_transient_task(
+        conn,
+        replace(
+            first_retry,
+            expected_terminal_signature=_latest_event_signature(conn, first_task),
+            retry_ordinal=2,
+            operation_id="snapshot-transient-first-2",
+        ),
+    ).outcome == "committed"
+    kb.add_comment(conn, first_task, "operator", "newer unrelated event")
+
+    kb.create_board("snapshot-other-board")
+    with kb.connect_closing(kb.kanban_db_path(board="snapshot-other-board")) as other:
+        other_task = _blocked_task(other, kind="transient")
+        assert kb.retry_transient_task(
+            other,
+            kb.TransientRetryRequest(
+                task_id=other_task,
+                expected_terminal_signature=_latest_event_signature(other, other_task),
+                retry_ordinal=1,
+                operation_id="snapshot-transient-other-1",
+            ),
+        ).outcome == "committed"
+
+    snapshot = kb.read_recovery_snapshot(conn, now=200)
+    expected = tuple(sorted(
+        (
+            event
+            for task_id in (first_task, second_task)
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "transient_retry_authorized"
+        ),
+        key=lambda event: (event.task_id, event.id),
+    ))
+
+    assert snapshot.transient_retry_events == expected
+    assert [
+        event.payload["retry_ordinal"]
+        for event in snapshot.transient_retry_events
+        if event.task_id == first_task
+    ] == [1, 2]
+    assert all(event.task_id != other_task for event in snapshot.transient_retry_events)
+    assert snapshot.revision_signature == kb.snapshot_signature(snapshot)
+
+    tampered_event = replace(
+        snapshot.transient_retry_events[0],
+        payload={"retry_ordinal": 99},
+    )
+    tampered = replace(
+        snapshot,
+        transient_retry_events=(
+            tampered_event,
+            *snapshot.transient_retry_events[1:],
+        ),
+    )
+    assert kb.snapshot_signature(tampered) != snapshot.revision_signature
+
+
 def test_recovery_snapshot_includes_ended_terminal_run_and_current_generation(conn):
     task_id, terminal_event = _failed_review_generation(conn)
     terminal_run = kb.latest_run(conn, task_id)
