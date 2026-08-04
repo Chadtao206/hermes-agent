@@ -403,6 +403,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    p_controller_lease = sub.add_parser(
+        "controller-lease",
+        help="Acquire or renew a scoped blocked-recovery controller lease",
+    )
+    lease_sub = p_controller_lease.add_subparsers(
+        dest="controller_lease_action", required=True,
+    )
+    for lease_action in ("acquire", "renew"):
+        parser = lease_sub.add_parser(lease_action)
+        parser.add_argument("--controller-id", required=True)
+        parser.add_argument("--holder-token", required=True)
+        if lease_action == "renew":
+            parser.add_argument("--holder-epoch", type=int, required=True)
+        parser.add_argument("--ttl-seconds", type=int, required=True)
+        parser.add_argument("--census-signature", required=True)
+        parser.add_argument("--operation-id", required=True)
+        parser.add_argument("--json", action="store_true", required=True)
+
     p_review_generation = sub.add_parser(
         "create-review-generation",
         help="Create or replay one permanent isolated reviewer lane",
@@ -1207,6 +1225,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "controller-lease": _cmd_controller_lease,
             "create-review-generation": _cmd_create_review_generation,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1286,6 +1305,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
+    "controller-lease",
     "swarm",
     "assign",
     "reclaim",
@@ -1811,6 +1831,49 @@ def _cmd_create_review_generation(args: argparse.Namespace) -> int:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
     print(json.dumps({"task_id": result.task_id, "created": result.created}, ensure_ascii=False))
+    return 0
+
+
+def _lease_result_payload(result: kb.LeaseResult) -> dict[str, object]:
+    return {
+        "acquired": result.acquired,
+        "controller_id": result.controller_id,
+        "board": result.board,
+        "holder_token": result.holder_token,
+        "holder_epoch": result.holder_epoch,
+        "issued_at": result.issued_at,
+        "expires_at": result.expires_at,
+        "operation_id": result.operation_id,
+        "reason": result.reason,
+    }
+
+
+def _cmd_controller_lease(args: argparse.Namespace) -> int:
+    board = getattr(args, "board", None)
+    if not board:
+        raise ValueError("controller-lease requires explicit global --board")
+    normalized_board = kb._normalize_board_slug(board)
+    if normalized_board is None or normalized_board != kb.get_current_board():
+        raise ValueError("controller-lease board does not match the active request scope")
+    common = {
+        "controller_id": args.controller_id,
+        "board": normalized_board,
+        "holder_token": args.holder_token,
+        "ttl_seconds": args.ttl_seconds,
+        "census_signature": args.census_signature,
+        "operation_id": args.operation_id,
+    }
+    with kb.connect_closing(board=normalized_board) as connection:
+        if args.controller_lease_action == "acquire":
+            result = kb.acquire_controller_lease(connection, kb.LeaseRequest(**common))
+        elif args.controller_lease_action == "renew":
+            result = kb.renew_controller_lease(
+                connection,
+                kb.LeaseRenewal(holder_epoch=args.holder_epoch, **common),
+            )
+        else:  # argparse enforces this, keep the mutation boundary fail closed.
+            raise ValueError("unsupported controller lease action")
+    print(json.dumps(_lease_result_payload(result), ensure_ascii=False))
     return 0
 
 

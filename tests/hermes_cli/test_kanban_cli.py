@@ -166,6 +166,103 @@ def test_create_review_generation_cli_replays_archived_lane_and_isolates_project
     assert replay == {"task_id": first["task_id"], "created": False}
 
 
+def _lease_cli(
+    board: str,
+    action: str,
+    *,
+    token: str = "router-token",
+    operation_id: str = "lease-operation-1",
+    holder_epoch: int | None = None,
+) -> dict[str, object]:
+    epoch = "" if holder_epoch is None else f" --holder-epoch {holder_epoch}"
+    return json.loads(kc.run_slash(
+        f"--board {board} controller-lease {action} "
+        "--controller-id blocked-recovery "
+        f"--holder-token {token}{epoch} --ttl-seconds 300 "
+        f"--census-signature {'c' * 64} --operation-id {operation_id} --json"
+    ))
+
+
+def test_controller_lease_cli_uses_explicit_nondefault_board(kanban_home):
+    kb.create_board("alpha")
+
+    result = _lease_cli("alpha", "acquire")
+
+    assert set(result) == {
+        "acquired", "controller_id", "board", "holder_token", "holder_epoch",
+        "issued_at", "expires_at", "operation_id", "reason",
+    }
+    assert result["acquired"] is True
+    assert result["board"] == "alpha"
+    assert result["expires_at"] - result["issued_at"] == 300
+    with kb.connect_closing(board="alpha") as connection:
+        alpha = kb.read_recovery_snapshot(connection, now=result["issued_at"])
+    with kb.connect_closing(board="default") as connection:
+        default = kb.read_recovery_snapshot(connection, now=result["issued_at"])
+    assert len(alpha.leases) == 1
+    assert default.leases == ()
+
+
+def test_controller_lease_cli_contention_and_same_token_replay(kanban_home):
+    first = _lease_cli("default", "acquire")
+
+    replay = _lease_cli("default", "acquire")
+    contended = _lease_cli(
+        "default", "acquire", token="other-token", operation_id="lease-operation-2",
+    )
+
+    assert replay == {
+        **first,
+        "operation_id": "lease-operation-1",
+        "reason": "lease already held by this token",
+    }
+    assert contended["acquired"] is False
+    assert contended["holder_token"] == "router-token"
+    assert contended["holder_epoch"] == first["holder_epoch"]
+    assert contended["expires_at"] == first["expires_at"]
+    assert contended["reason"] == "lease is held by another token"
+
+
+def test_controller_lease_cli_stale_renewal_is_structured_nonacquisition(kanban_home):
+    first = _lease_cli("default", "acquire")
+
+    stale = _lease_cli(
+        "default",
+        "renew",
+        holder_epoch=first["holder_epoch"] + 1,
+        operation_id="lease-renew-stale",
+    )
+
+    assert stale["acquired"] is False
+    assert stale["holder_epoch"] == first["holder_epoch"]
+    assert stale["expires_at"] == first["expires_at"]
+    assert stale["reason"]
+
+
+@pytest.mark.parametrize(
+    ("board", "arguments"),
+    [
+        ("--board default ", "--holder-token token --ttl-seconds 0 --census-signature " + "c" * 64),
+        ("--board default ", "--holder-token token --ttl-seconds 300 --census-signature malformed"),
+        ("", "--holder-token token --ttl-seconds 300 --census-signature " + "c" * 64),
+    ],
+)
+def test_controller_lease_cli_rejects_malformed_or_unscoped_requests(
+    kanban_home,
+    board,
+    arguments,
+):
+    output = kc.run_slash(
+        f"{board}controller-lease acquire --controller-id blocked-recovery "
+        f"{arguments} --operation-id malformed-lease --json"
+    )
+
+    assert "acquired" not in output
+    with kb.connect_closing(board="default") as connection:
+        snapshot = kb.read_recovery_snapshot(connection, now=1)
+    assert snapshot.leases == ()
+
+
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
