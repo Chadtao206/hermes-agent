@@ -1575,6 +1575,65 @@ def test_recovery_snapshot_exposes_complete_scoped_transient_retry_ledger(
     assert kb.snapshot_signature(tampered) != snapshot.revision_signature
 
 
+def test_recovery_snapshot_exposes_complete_scoped_durable_side_effects(conn):
+    first_task = kb.create_task(conn, title="first side-effect task")
+    second_task = kb.create_task(conn, title="second side-effect task")
+    kb.add_comment(conn, first_task, "worker-a", "durable worker note")
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            second_task,
+            "respawn_guarded",
+            {"reason": "structured guard"},
+        )
+        kb._append_event(
+            conn,
+            first_task,
+            "heartbeat",
+            {"source": "newer unrelated event"},
+        )
+
+    kb.create_board("side-effect-other-board")
+    with kb.connect_closing(kb.kanban_db_path(board="side-effect-other-board")) as other:
+        other_task = kb.create_task(other, title="other board side-effect task")
+        kb.add_comment(other, other_task, "worker-other", "other board note")
+
+    snapshot = kb.read_recovery_snapshot(conn, now=200)
+    expected = tuple(sorted(
+        (
+            event
+            for task_id in (first_task, second_task)
+            for event in kb.list_events(conn, task_id)
+            if event.kind in {"commented", "respawn_guarded"}
+        ),
+        key=lambda event: (event.task_id, event.id),
+    ))
+
+    assert snapshot.durable_side_effect_events == expected
+    assert {event.kind for event in snapshot.durable_side_effect_events} == {
+        "commented",
+        "respawn_guarded",
+    }
+    assert all(
+        event.task_id != other_task
+        for event in snapshot.durable_side_effect_events
+    )
+    assert snapshot.revision_signature == kb.snapshot_signature(snapshot)
+
+    tampered_event = replace(
+        snapshot.durable_side_effect_events[0],
+        payload={"author": "tampered"},
+    )
+    tampered = replace(
+        snapshot,
+        durable_side_effect_events=(
+            tampered_event,
+            *snapshot.durable_side_effect_events[1:],
+        ),
+    )
+    assert kb.snapshot_signature(tampered) != snapshot.revision_signature
+
+
 def test_recovery_snapshot_includes_ended_terminal_run_and_current_generation(conn):
     task_id, terminal_event = _failed_review_generation(conn)
     terminal_run = kb.latest_run(conn, task_id)

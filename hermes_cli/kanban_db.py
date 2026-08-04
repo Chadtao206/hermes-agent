@@ -1323,6 +1323,7 @@ class RecoverySnapshot:
     latest_block_events: tuple[Event, ...]
     latest_terminal_events: tuple[Event, ...]
     transient_retry_events: tuple[Event, ...]
+    durable_side_effect_events: tuple[Event, ...]
     links: tuple[tuple[str, str], ...]
     current_runs: tuple[Run, ...]
     latest_terminal_runs: tuple[Run, ...]
@@ -8326,6 +8327,11 @@ def read_recovery_snapshot(
             "WHERE kind = 'transient_retry_authorized' "
             "ORDER BY task_id, id"
         ).fetchall()
+        durable_side_effect_event_rows = conn.execute(
+            "SELECT * FROM task_events "
+            "WHERE kind IN ('commented', 'respawn_guarded') "
+            "ORDER BY task_id, id"
+        ).fetchall()
         link_rows = conn.execute(
             "SELECT parent_id, child_id FROM task_links "
             "ORDER BY parent_id, child_id"
@@ -8482,6 +8488,9 @@ def read_recovery_snapshot(
             ),
             transient_retry_events=tuple(
                 _event_from_row(row) for row in transient_retry_event_rows
+            ),
+            durable_side_effect_events=tuple(
+                _event_from_row(row) for row in durable_side_effect_event_rows
             ),
             links=tuple((row["parent_id"], row["child_id"]) for row in link_rows),
             current_runs=tuple(Run.from_row(row) for row in run_rows),
