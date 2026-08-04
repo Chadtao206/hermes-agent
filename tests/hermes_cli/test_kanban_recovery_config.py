@@ -238,6 +238,76 @@ def test_shadow_or_canary_rollout_rejects_mutation_cap_above_one():
     assert control.errors == ("mutation_cap must be 1 while rollout_mode is shadow or canary",)
 
 
+def test_canary_rollout_authorizes_only_existing_board_review_live():
+    previous = RecoveryControl.from_config(
+        {
+            "kanban": {
+                "blocked_recovery": {
+                    "rollout_mode": "live",
+                    "managed_boards": {
+                        "default": {
+                            "review_mode": "shadow",
+                            "transient_mode": "shadow",
+                        }
+                    },
+                }
+            }
+        }
+    )
+    control = RecoveryControl.from_config(
+        {
+            "kanban": {
+                "blocked_recovery": {
+                    "rollout_mode": "canary",
+                    "mutation_cap": 1,
+                    "managed_boards": {
+                        "default": {
+                            "review_mode": "live",
+                            "transient_mode": "shadow",
+                            "review_allowlist": ["reviewer"],
+                        },
+                        "new": {
+                            "review_mode": "live",
+                            "transient_mode": "shadow",
+                            "review_allowlist": ["reviewer"],
+                        },
+                    },
+                }
+            }
+        },
+        previous=previous,
+    )
+
+    assert control.mutation_enabled is True
+    assert control.boards["default"].review_mode == "live"
+    assert control.boards["default"].transient_mode == "shadow"
+    assert control.boards["new"].review_mode == "shadow"
+    assert control.mutation_cap == 1
+
+
+def test_canary_rollout_rejects_transient_live_even_after_review_live():
+    control = RecoveryControl.from_config(
+        {
+            "kanban": {
+                "blocked_recovery": {
+                    "rollout_mode": "canary",
+                    "mutation_cap": 1,
+                    "managed_boards": {
+                        "default": {
+                            "review_mode": "live",
+                            "transient_mode": "live",
+                            "review_allowlist": ["reviewer"],
+                        }
+                    },
+                }
+            }
+        }
+    )
+
+    assert control.mutation_enabled is False
+    assert "default.transient_mode cannot be live while rollout_mode is canary" in control.errors
+
+
 def test_invalid_transition_leaves_recovery_control_unchanged(tmp_path, monkeypatch):
     from hermes_cli.kanban_recovery_config import (
         RecoveryControlUpdate,

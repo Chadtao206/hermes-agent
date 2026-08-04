@@ -1232,12 +1232,22 @@ class BlockReclassification:
 
 
 @dataclass(frozen=True)
+class ReviewParentPreconditions:
+    task_id: str
+    expected_status: str
+    expected_block_kind: str
+    expected_event_signature: str
+    expected_review_input_digest: str
+
+
+@dataclass(frozen=True)
 class ReviewLaneMutation:
     task_id: str
     expected_tenant: str
     expected_status: str
     expected_event_signature: str
     operation_id: str
+    parent_preconditions: ReviewParentPreconditions | None = None
 
 
 @dataclass(frozen=True)
@@ -1498,12 +1508,23 @@ class ReviewGenerationCreate:
     priority: int = 0
     project_id: Optional[str] = None
     project_source_task_id: Optional[str] = None
+    parent_preconditions: ReviewParentPreconditions | None = None
+    operation_id: str = ""
 
 
 @dataclass(frozen=True)
 class ReviewGenerationCreateResult:
     task_id: str
     created: bool
+    outcome: Literal[
+        "committed",
+        "deduplicated",
+        "not_applied",
+        "precondition_changed",
+        "conflict",
+    ] = "committed"
+    operation_id: str = ""
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -3666,6 +3687,165 @@ def _require_connection_board(conn: sqlite3.Connection, board: str) -> None:
         )
 
 
+def _validated_review_parent_preconditions(
+    preconditions: ReviewParentPreconditions | None,
+) -> ReviewParentPreconditions:
+    if type(preconditions) is not ReviewParentPreconditions:
+        raise ValueError("review parent preconditions are required")
+    if (
+        type(preconditions.task_id) is not str
+        or not preconditions.task_id
+        or preconditions.task_id != preconditions.task_id.strip()
+        or "\x00" in preconditions.task_id
+    ):
+        raise ValueError("review parent task id must be an exact nonempty string")
+    if preconditions.expected_status != "blocked":
+        raise ValueError("review parent expected status must be 'blocked'")
+    if preconditions.expected_block_kind != "review":
+        raise ValueError("review parent expected block kind must be 'review'")
+    for name, value in (
+        ("event signature", preconditions.expected_event_signature),
+        ("review input digest", preconditions.expected_review_input_digest),
+    ):
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"review parent {name} must be a lowercase SHA-256 digest")
+    return preconditions
+
+
+def _review_parent_guard_reason(
+    conn: sqlite3.Connection,
+    preconditions: ReviewParentPreconditions,
+    *,
+    expected_tenant: str,
+) -> tuple[Literal["not_applied", "precondition_changed"], str] | None:
+    row = conn.execute(
+        "SELECT status, block_kind, tenant FROM tasks WHERE id = ?",
+        (preconditions.task_id,),
+    ).fetchone()
+    if row is None:
+        return "not_applied", "review parent task not found"
+    if str(row["tenant"] or "").strip() != expected_tenant:
+        return "precondition_changed", "review parent tenant changed"
+    if row["status"] != preconditions.expected_status:
+        return "precondition_changed", "review parent status changed"
+    if row["block_kind"] != preconditions.expected_block_kind:
+        return "precondition_changed", "review parent block kind changed"
+    latest = _latest_task_event(conn, preconditions.task_id)
+    if (
+        latest is None
+        or canonical_event_signature(latest)
+        != preconditions.expected_event_signature
+    ):
+        return "precondition_changed", "review parent event changed"
+    if (
+        review_input_digest(conn, preconditions.task_id)
+        != preconditions.expected_review_input_digest
+    ):
+        return "precondition_changed", "review parent input changed"
+    return None
+
+
+def _review_generation_create_replay(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    operation_id: str,
+    operation_signature: str,
+) -> ReviewGenerationCreateResult | None:
+    if type(operation_id) is not str or not operation_id.strip():
+        raise ValueError("operation_id must be a nonempty string")
+    matches = [
+        event
+        for row in conn.execute(
+            "SELECT * FROM task_events WHERE payload IS NOT NULL ORDER BY id ASC"
+        ).fetchall()
+        if (
+            (event := _event_from_row(row)).payload is not None
+            and event.payload.get("operation_id") == operation_id
+        )
+    ]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        event = matches[0]
+        existing = conn.execute(
+            "SELECT task_id FROM kanban_scoped_idempotency "
+            "WHERE namespace = 'review-lane' AND key = ?",
+            (key,),
+        ).fetchall()
+        if (
+            event.kind == "created"
+            and event.payload.get("operation_signature") == operation_signature
+            and len(existing) == 1
+            and existing[0]["task_id"] == event.task_id
+        ):
+            return ReviewGenerationCreateResult(
+                task_id=event.task_id,
+                created=False,
+                outcome="deduplicated",
+                operation_id=operation_id,
+            )
+    return ReviewGenerationCreateResult(
+        task_id="",
+        created=False,
+        outcome="conflict",
+        operation_id=operation_id,
+        reason="operation_id is already bound to another mutation",
+    )
+
+
+def _review_generation_nonmutation(
+    outcome: Literal["not_applied", "precondition_changed"],
+    operation_id: str,
+    reason: str,
+) -> ReviewGenerationCreateResult:
+    return ReviewGenerationCreateResult(
+        task_id="",
+        created=False,
+        outcome=outcome,
+        operation_id=operation_id,
+        reason=reason,
+    )
+
+
+def _review_lane_parent_preconditions(
+    conn: sqlite3.Connection,
+    request: ReviewLaneMutation,
+) -> ReviewParentPreconditions:
+    preconditions = _validated_review_parent_preconditions(
+        request.parent_preconditions
+    )
+    rows = conn.execute(
+        "SELECT registry.board, registry.tenant, registry.key, "
+        "       task.tenant AS task_tenant "
+        "FROM kanban_scoped_idempotency registry "
+        "JOIN tasks task ON task.id = registry.task_id "
+        "WHERE registry.namespace = 'review-lane' AND registry.task_id = ?",
+        (request.task_id,),
+    ).fetchall()
+    matching = []
+    for row in rows:
+        try:
+            key_board, key_tenant, key_parent, _generation = (
+                _review_generation_identity_from_key(row["key"])
+            )
+        except ReviewGenerationMigrationConflict:
+            continue
+        if (
+            key_board == row["board"]
+            and key_tenant == row["tenant"]
+            and key_tenant == str(row["task_tenant"] or "").strip()
+            and key_parent == preconditions.task_id
+            and key_board == _connection_board(conn)
+        ):
+            matching.append(row)
+    if len(matching) != 1:
+        raise ValueError(
+            "review lane does not match the exact board, tenant, and parent"
+        )
+    return preconditions
+
+
 def create_review_generation_task(
     conn: sqlite3.Connection,
     request: ReviewGenerationCreate,
@@ -3677,11 +3857,20 @@ def create_review_generation_task(
     tenant = str(request.tenant or "").strip()
     key = str(request.key or "").strip()
     try:
-        key_board, key_tenant = _review_generation_scope_from_key(key)
+        key_board, key_tenant, key_parent, _generation = (
+            _review_generation_identity_from_key(key)
+        )
     except ReviewGenerationMigrationConflict as exc:
         raise ValueError(f"invalid review generation key: {key!r}") from exc
     if (key_board, key_tenant) != (board, tenant):
         raise ValueError("review generation key does not match its board and tenant")
+    parent_preconditions = _validated_review_parent_preconditions(
+        request.parent_preconditions
+    )
+    if key_parent != parent_preconditions.task_id:
+        raise ValueError("review generation key does not match its parent task")
+    if type(request.operation_id) is not str or not request.operation_id.strip():
+        raise ValueError("operation_id must be a nonempty string")
     if not request.title or not request.title.strip():
         raise ValueError("review generation title is required")
     if request.workspace_kind not in VALID_WORKSPACE_KINDS:
@@ -3693,13 +3882,24 @@ def create_review_generation_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     assignee = _canonical_assignee(request.assignee)
     _require_connection_board(conn, board)
-
-    # A permanent registry binding wins before any mutable project lookup.  In
-    # particular, an archived lane must replay its original id even after an
-    # implementation task or project configuration has changed.
-    existing = lookup_review_generation(conn, board, tenant, key)
-    if existing is not None and get_task(conn, existing.task_id) is not None:
-        return ReviewGenerationCreateResult(task_id=existing.task_id, created=False)
+    operation_signature = _canonical_operation_signature(
+        "review_generation_created",
+        parent_preconditions.task_id,
+        {
+            "board": board,
+            "tenant": tenant,
+            "key": key,
+            "parent_task_id": parent_preconditions.task_id,
+            "expected_parent_status": parent_preconditions.expected_status,
+            "expected_parent_block_kind": parent_preconditions.expected_block_kind,
+            "expected_parent_event_signature": (
+                parent_preconditions.expected_event_signature
+            ),
+            "expected_review_input_digest": (
+                parent_preconditions.expected_review_input_digest
+            ),
+        },
+    )
 
     # Keep reviewer worktrees isolated while using the identical project source
     # fallback as ordinary task creation.  We bind only a fresh task-id-keyed
@@ -3760,6 +3960,33 @@ def create_review_generation_task(
 
     now = int(time.time())
     with write_txn(conn):
+        parent_changed = _review_parent_guard_reason(
+            conn,
+            parent_preconditions,
+            expected_tenant=tenant,
+        )
+        if parent_changed is not None:
+            return _review_generation_nonmutation(
+                parent_changed[0],
+                request.operation_id,
+                parent_changed[1],
+            )
+        replay = _review_generation_create_replay(
+            conn,
+            key=key,
+            operation_id=request.operation_id,
+            operation_signature=operation_signature,
+        )
+        if replay is not None:
+            return replay
+        existing = lookup_review_generation(conn, board, tenant, key)
+        if existing is not None and get_task(conn, existing.task_id) is not None:
+            return ReviewGenerationCreateResult(
+                task_id=existing.task_id,
+                created=False,
+                outcome="deduplicated",
+                operation_id=request.operation_id,
+            )
         claimed = conn.execute(
             "INSERT OR IGNORE INTO kanban_scoped_idempotency "
             "(namespace, board, tenant, key, task_id, created_at) "
@@ -3775,6 +4002,8 @@ def create_review_generation_task(
             return ReviewGenerationCreateResult(
                 task_id=existing.task_id,
                 created=False,
+                outcome="deduplicated",
+                operation_id=request.operation_id,
             )
 
         task_id: Optional[str] = None
@@ -3850,10 +4079,24 @@ def create_review_generation_task(
                 "idempotency_key": key,
                 "max_runtime_seconds": 3600,
                 "max_retries": 1,
+                "operation_id": request.operation_id,
+                "operation_signature": operation_signature,
+                "parent_task_id": parent_preconditions.task_id,
+                "parent_event_signature": (
+                    parent_preconditions.expected_event_signature
+                ),
+                "review_input_digest": (
+                    parent_preconditions.expected_review_input_digest
+                ),
             },
         )
 
-    return ReviewGenerationCreateResult(task_id=task_id, created=True)
+    return ReviewGenerationCreateResult(
+        task_id=task_id,
+        created=True,
+        outcome="committed",
+        operation_id=request.operation_id,
+    )
 
 
 def create_task(
@@ -7593,6 +7836,15 @@ def requeue_review_lane(
     conn: sqlite3.Connection,
     request: ReviewLaneMutation,
 ) -> GuardedMutationResult:
+    if (
+        type(request.expected_tenant) is not str
+        or request.expected_tenant != request.expected_tenant.strip()
+        or "\x00" in request.expected_tenant
+    ):
+        raise ValueError("expected tenant must be an exact normalized string")
+    parent_preconditions = _validated_review_parent_preconditions(
+        request.parent_preconditions
+    )
     operation_signature = _canonical_operation_signature(
         "review_requeued",
         request.task_id,
@@ -7600,9 +7852,31 @@ def requeue_review_lane(
             "expected_tenant": request.expected_tenant,
             "expected_status": request.expected_status,
             "expected_event_signature": request.expected_event_signature,
+            "parent_task_id": parent_preconditions.task_id,
+            "expected_parent_status": parent_preconditions.expected_status,
+            "expected_parent_block_kind": parent_preconditions.expected_block_kind,
+            "expected_parent_event_signature": (
+                parent_preconditions.expected_event_signature
+            ),
+            "expected_review_input_digest": (
+                parent_preconditions.expected_review_input_digest
+            ),
         },
     )
     with write_txn(conn):
+        parent_preconditions = _review_lane_parent_preconditions(conn, request)
+        parent_changed = _review_parent_guard_reason(
+            conn,
+            parent_preconditions,
+            expected_tenant=request.expected_tenant,
+        )
+        if parent_changed is not None:
+            return _guarded_result(
+                parent_changed[0],
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason=parent_changed[1],
+            )
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
@@ -7612,12 +7886,6 @@ def requeue_review_lane(
         )
         if replay is not None:
             return replay
-        if (
-            type(request.expected_tenant) is not str
-            or request.expected_tenant != request.expected_tenant.strip()
-            or "\x00" in request.expected_tenant
-        ):
-            raise ValueError("expected tenant must be an exact normalized string")
         row = conn.execute(
             "SELECT status, tenant FROM tasks WHERE id = ?",
             (request.task_id,),
@@ -7715,6 +7983,13 @@ def requeue_review_lane(
                 "operation_signature": operation_signature,
                 "source_terminal_signature": request.expected_event_signature,
                 "previous_status": request.expected_status,
+                "parent_task_id": parent_preconditions.task_id,
+                "parent_event_signature": (
+                    parent_preconditions.expected_event_signature
+                ),
+                "review_input_digest": (
+                    parent_preconditions.expected_review_input_digest
+                ),
             },
             run_id=terminal.run_id,
         )
@@ -7730,6 +8005,15 @@ def archive_review_lane(
     conn: sqlite3.Connection,
     request: ReviewLaneMutation,
 ) -> GuardedMutationResult:
+    if (
+        type(request.expected_tenant) is not str
+        or request.expected_tenant != request.expected_tenant.strip()
+        or "\x00" in request.expected_tenant
+    ):
+        raise ValueError("expected tenant must be an exact normalized string")
+    parent_preconditions = _validated_review_parent_preconditions(
+        request.parent_preconditions
+    )
     operation_signature = _canonical_operation_signature(
         "review_archived",
         request.task_id,
@@ -7737,9 +8021,31 @@ def archive_review_lane(
             "expected_tenant": request.expected_tenant,
             "expected_status": request.expected_status,
             "expected_event_signature": request.expected_event_signature,
+            "parent_task_id": parent_preconditions.task_id,
+            "expected_parent_status": parent_preconditions.expected_status,
+            "expected_parent_block_kind": parent_preconditions.expected_block_kind,
+            "expected_parent_event_signature": (
+                parent_preconditions.expected_event_signature
+            ),
+            "expected_review_input_digest": (
+                parent_preconditions.expected_review_input_digest
+            ),
         },
     )
     with write_txn(conn):
+        parent_preconditions = _review_lane_parent_preconditions(conn, request)
+        parent_changed = _review_parent_guard_reason(
+            conn,
+            parent_preconditions,
+            expected_tenant=request.expected_tenant,
+        )
+        if parent_changed is not None:
+            return _guarded_result(
+                parent_changed[0],
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason=parent_changed[1],
+            )
         replay = _guarded_operation_replay(
             conn,
             task_id=request.task_id,
@@ -7749,12 +8055,6 @@ def archive_review_lane(
         )
         if replay is not None:
             return replay
-        if (
-            type(request.expected_tenant) is not str
-            or request.expected_tenant != request.expected_tenant.strip()
-            or "\x00" in request.expected_tenant
-        ):
-            raise ValueError("expected tenant must be an exact normalized string")
         row = conn.execute(
             "SELECT status, tenant FROM tasks WHERE id = ?",
             (request.task_id,),
@@ -7820,6 +8120,13 @@ def archive_review_lane(
                 "operation_signature": operation_signature,
                 "source_event_signature": request.expected_event_signature,
                 "previous_status": request.expected_status,
+                "parent_task_id": parent_preconditions.task_id,
+                "parent_event_signature": (
+                    parent_preconditions.expected_event_signature
+                ),
+                "review_input_digest": (
+                    parent_preconditions.expected_review_input_digest
+                ),
             },
             run_id=run_id,
         )

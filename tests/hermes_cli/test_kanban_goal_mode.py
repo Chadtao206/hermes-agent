@@ -402,6 +402,14 @@ def _strict_completion_cli_fixture() -> tuple[str, str]:
                 body="Review the immutable target.",
                 assignee="reviewer",
                 created_by="blocked-recovery-router",
+                parent_preconditions=kb.ReviewParentPreconditions(
+                    task_id=parent,
+                    expected_status="blocked",
+                    expected_block_kind="review",
+                    expected_event_signature=kb.canonical_event_signature(parent_event),
+                    expected_review_input_digest=kb.review_input_digest(conn, parent),
+                ),
+                operation_id="goal-mode-review-generation",
             ),
         ).task_id
         metadata = {

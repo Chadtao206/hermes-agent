@@ -88,7 +88,7 @@ def _blocked_task(conn, *, kind: str | None = None) -> str:
 
 
 def _failed_review_generation(conn) -> tuple[str, kb.Event]:
-    created = kb.create_review_generation_task(conn, _review_generation_request())
+    created = kb.create_review_generation_task(conn, _review_generation_request(conn, ))
     assert kb.claim_task(conn, created.task_id, claimer="reviewer") is not None
     assert kb._record_spawn_failure(
         conn,
@@ -102,11 +102,12 @@ def _failed_review_generation(conn) -> tuple[str, kb.Event]:
 
 
 def _review_generation_request(
+    conn,
     *,
     key: str = "review-lane:default::t_parent:g1",
     tenant: str | None = None,
 ) -> kb.ReviewGenerationCreate:
-    return kb.ReviewGenerationCreate(
+    request = kb.ReviewGenerationCreate(
         board="default",
         tenant=tenant,
         key=key,
@@ -114,6 +115,129 @@ def _review_generation_request(
         body="Review the immutable target and report a structured verdict.",
         assignee="reviewer",
         created_by="blocked-recovery-router",
+    )
+    try:
+        _board, normalized_tenant, parent_task_id, _generation = (
+            kb._review_generation_identity_from_key(key)
+        )
+    except kb.ReviewGenerationMigrationConflict:
+        return request
+    parent = kb.get_task(conn, parent_task_id)
+    if parent is None:
+        generated_id = kb.create_task(
+            conn,
+            title="implementation awaiting review",
+            tenant=normalized_tenant,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET id = ? WHERE id = ?",
+                (parent_task_id, generated_id),
+            )
+            conn.execute(
+                "UPDATE task_events SET task_id = ? WHERE task_id = ?",
+                (parent_task_id, generated_id),
+            )
+        parent = kb.get_task(conn, parent_task_id)
+    if parent.status != "blocked":
+        assert kb.block_task(
+            conn,
+            parent_task_id,
+            reason="review handoff",
+            kind="review",
+        )
+    return replace(
+        request,
+        parent_preconditions=_review_parent_preconditions(conn, parent_task_id),
+        operation_id="test-create:" + hashlib.sha256(key.encode()).hexdigest(),
+    )
+
+
+def _review_parent_preconditions(
+    conn,
+    parent_task_id: str,
+) -> kb.ReviewParentPreconditions:
+    latest = _latest_event(conn, parent_task_id)
+    return kb.ReviewParentPreconditions(
+        task_id=parent_task_id,
+        expected_status="blocked",
+        expected_block_kind="review",
+        expected_event_signature=kb.canonical_event_signature(latest),
+        expected_review_input_digest=kb.review_input_digest(conn, parent_task_id),
+    )
+
+
+def _review_lane_parent_preconditions(
+    conn,
+    task_id: str,
+) -> kb.ReviewParentPreconditions:
+    row = conn.execute(
+        "SELECT key FROM kanban_scoped_idempotency "
+        "WHERE namespace = 'review-lane' AND task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    _board, _tenant, parent_task_id, _generation = (
+        kb._review_generation_identity_from_key(row["key"])
+    )
+    return _review_parent_preconditions(conn, parent_task_id)
+
+
+def _guarded_review_generation_request(
+    conn,
+    *,
+    parent_task_id: str | None = None,
+    generation: str = "g1",
+    operation_id: str = "create-review-generation-1",
+    tenant: str | None = None,
+) -> tuple[str, kb.ReviewGenerationCreate]:
+    parent = parent_task_id or kb.create_task(
+        conn,
+        title="implementation awaiting review",
+        tenant=tenant,
+    )
+    if kb.get_task(conn, parent).status != "blocked":
+        assert kb.block_task(conn, parent, reason="review handoff", kind="review")
+    request = replace(
+        _review_generation_request(
+            conn,
+            key=f"review-lane:default:{tenant or ''}:{parent}:{generation}",
+            tenant=tenant,
+        ),
+        parent_preconditions=_review_parent_preconditions(conn, parent),
+        operation_id=operation_id,
+    )
+    return parent, request
+
+
+def _guarded_review_lane_request(
+    conn,
+    *,
+    mutation,
+    operation_id: str,
+) -> tuple[str, str, kb.ReviewLaneMutation]:
+    parent, create_request = _guarded_review_generation_request(
+        conn,
+        operation_id=f"create-for-{operation_id}",
+    )
+    created = kb.create_review_generation_task(conn, create_request)
+    assert created.outcome == "committed"
+    if mutation is kb.requeue_review_lane:
+        assert kb.claim_task(conn, created.task_id, claimer="reviewer") is not None
+        assert kb._record_spawn_failure(
+            conn,
+            created.task_id,
+            "review worker exited",
+            failure_limit=1,
+        )
+    task = kb.get_task(conn, created.task_id)
+    return parent, created.task_id, kb.ReviewLaneMutation(
+        task_id=created.task_id,
+        expected_tenant="",
+        expected_status=task.status,
+        expected_event_signature=_latest_event_signature(conn, created.task_id),
+        operation_id=operation_id,
+        parent_preconditions=create_request.parent_preconditions,
     )
 
 
@@ -290,7 +414,7 @@ def test_terminal_review_evidence_requires_the_selected_completed_event(conn):
 
 
 def test_review_generation_create_is_permanent_and_single_attempt(conn):
-    request = _review_generation_request()
+    request = _review_generation_request(conn, )
 
     result = kb.create_review_generation_task(conn, request)
 
@@ -319,16 +443,16 @@ def test_review_generation_create_is_permanent_and_single_attempt(conn):
 
 
 def test_review_generation_key_survives_archival(conn):
-    request = _review_generation_request()
+    request = _review_generation_request(conn, )
     first = kb.create_review_generation_task(conn, request)
     assert kb.archive_task(conn, first.task_id)
 
     replay = kb.create_review_generation_task(conn, request)
 
-    assert replay == kb.ReviewGenerationCreateResult(
-        task_id=first.task_id,
-        created=False,
-    )
+    assert replay.task_id == first.task_id
+    assert replay.created is False
+    assert replay.outcome == "deduplicated"
+    assert replay.operation_id == request.operation_id
     assert kb.get_task(conn, replay.task_id).status == "archived"
 
 
@@ -349,6 +473,7 @@ def test_review_generation_project_source_gets_fresh_task_keyed_worktree(conn, t
             (str(source_path), f"project-1/{source}", "project-1", source),
         )
     request = _review_generation_request(
+        conn,
         key=f"review-lane:default::${source}:g-project".replace("$", ""),
     )
     request = replace(
@@ -371,6 +496,7 @@ def test_review_generation_project_source_gets_fresh_task_keyed_worktree(conn, t
 
 def test_review_generation_lookup_is_scoped_by_tenant(conn):
     request = _review_generation_request(
+        conn,
         key="review-lane:default:acme:t_parent:g1",
         tenant=" acme ",
     )
@@ -392,7 +518,7 @@ def test_review_generation_lookup_is_scoped_by_tenant(conn):
 
 
 def test_review_generation_create_rejects_malformed_reserved_key(conn):
-    request = _review_generation_request(key="review-lane:malformed")
+    request = _review_generation_request(conn, key="review-lane:malformed")
 
     with pytest.raises(ValueError, match="key"):
         kb.create_review_generation_task(conn, request)
@@ -406,7 +532,7 @@ def test_concurrent_review_generation_create_returns_one_task(
     conn,
     kanban_home: Path,
 ):
-    request = _review_generation_request()
+    request = _review_generation_request(conn, )
     db_path = kb.kanban_db_path(board="default")
 
     def create_once() -> str:
@@ -478,11 +604,11 @@ def test_duplicate_legacy_review_generation_keys_are_quarantined(conn):
 
         replacement = kb.create_review_generation_task(
             migrated,
-            _review_generation_request(key=key),
+            _review_generation_request(conn, key=key),
         )
         replay = kb.create_review_generation_task(
             migrated,
-            _review_generation_request(key=key),
+            _review_generation_request(conn, key=key),
         )
         assert replacement.created is True
         assert replay.task_id == replacement.task_id
@@ -583,7 +709,7 @@ def test_historical_duplicate_quarantine_does_not_poison_replacement(conn):
     kb._migrate_review_generation_registry(conn)
     replacement = kb.create_review_generation_task(
         conn,
-        _review_generation_request(key=key),
+        _review_generation_request(conn, key=key),
     )
 
     kb._migrate_review_generation_registry(conn)
@@ -628,7 +754,7 @@ def test_duplicate_quarantine_repairs_eventless_partial_legacy_migration(conn):
     assert event.payload["original_key"] == key
     replacement = kb.create_review_generation_task(
         conn,
-        _review_generation_request(key=key),
+        _review_generation_request(conn, key=key),
     )
 
     kb._migrate_review_generation_registry(conn)
@@ -664,7 +790,7 @@ def test_eventless_final_duplicate_rewrite_does_not_poison_replacement(conn):
     kb._migrate_review_generation_registry(conn)
     replacement = kb.create_review_generation_task(
         conn,
-        _review_generation_request(key=key),
+        _review_generation_request(conn, key=key),
     )
 
     kb._migrate_review_generation_registry(conn)
@@ -699,6 +825,7 @@ def test_replacement_cannot_race_between_quarantine_classification_and_repair(
                 },
             )
     conn.commit()
+    replacement_request = _review_generation_request(conn, key=key)
 
     classification_reached = threading.Event()
     writer_attempted = threading.Event()
@@ -741,7 +868,7 @@ def test_replacement_cannot_race_between_quarantine_classification_and_repair(
         with kb.connect_closing(db_path) as writer_conn:
             return kb.create_review_generation_task(
                 writer_conn,
-                _review_generation_request(key=key),
+                replacement_request,
             ).task_id
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -935,6 +1062,7 @@ def test_guarded_requeue_preserves_review_attempt_history(conn):
         expected_status="blocked",
         expected_event_signature=kb.canonical_event_signature(terminal_event),
         operation_id="review-requeue-1",
+        parent_preconditions=_review_lane_parent_preconditions(conn, task_id),
     )
 
     result = kb.requeue_review_lane(conn, request)
@@ -959,6 +1087,7 @@ def test_review_terminal_generation_cannot_be_requeued_twice(conn):
         expected_status="blocked",
         expected_event_signature=terminal_signature,
         operation_id="review-requeue-first",
+        parent_preconditions=_review_lane_parent_preconditions(conn, task_id),
     )
     assert kb.requeue_review_lane(conn, first).outcome == "committed"
     second = kb.ReviewLaneMutation(
@@ -967,6 +1096,7 @@ def test_review_terminal_generation_cannot_be_requeued_twice(conn):
         expected_status="ready",
         expected_event_signature=terminal_signature,
         operation_id="review-requeue-second",
+        parent_preconditions=_review_lane_parent_preconditions(conn, task_id),
     )
 
     result = kb.requeue_review_lane(conn, second)
@@ -996,6 +1126,7 @@ def test_review_requeue_rejects_a_later_manual_reclassification(conn):
         expected_status="blocked",
         expected_event_signature=terminal_signature,
         operation_id="stale-review-requeue",
+        parent_preconditions=_review_lane_parent_preconditions(conn, task_id),
     )
 
     result = kb.requeue_review_lane(conn, request)
@@ -1014,6 +1145,7 @@ def test_archived_review_generation_cannot_be_resurrected_by_requeue(conn):
         expected_status="archived",
         expected_event_signature=kb.canonical_event_signature(terminal_event),
         operation_id="review-requeue-archived",
+        parent_preconditions=_review_lane_parent_preconditions(conn, task_id),
     )
 
     result = kb.requeue_review_lane(conn, request)
@@ -1025,7 +1157,7 @@ def test_archived_review_generation_cannot_be_resurrected_by_requeue(conn):
 def test_guarded_archive_requires_exact_review_generation_state(conn):
     created = kb.create_review_generation_task(
         conn,
-        _review_generation_request(key="review-lane:default::t_parent:archive"),
+        _review_generation_request(conn, key="review-lane:default::t_parent:archive"),
     )
     request = kb.ReviewLaneMutation(
         task_id=created.task_id,
@@ -1033,6 +1165,7 @@ def test_guarded_archive_requires_exact_review_generation_state(conn):
         expected_status="ready",
         expected_event_signature=_latest_event_signature(conn, created.task_id),
         operation_id="review-archive-1",
+        parent_preconditions=_review_lane_parent_preconditions(conn, created.task_id),
     )
 
     first = kb.archive_review_lane(conn, request)
@@ -1051,6 +1184,7 @@ def test_review_lane_mutation_rejects_stale_named_tenant_without_event(conn, mut
     created = kb.create_review_generation_task(
         conn,
         _review_generation_request(
+            conn,
             key="review-lane:default:tenant-a:t_parent:tenant-guard",
             tenant="tenant-a",
         ),
@@ -1066,6 +1200,7 @@ def test_review_lane_mutation_rejects_stale_named_tenant_without_event(conn, mut
         expected_status=task.status,
         expected_event_signature=kb.canonical_event_signature(before[-1]),
         operation_id=f"stale-tenant-{mutation.__name__}",
+        parent_preconditions=_review_lane_parent_preconditions(conn, created.task_id),
     )
 
     result = mutation(conn, request)
@@ -1079,13 +1214,17 @@ def test_review_lane_mutation_accepts_exact_named_and_empty_tenants(conn):
     named = kb.create_review_generation_task(
         conn,
         _review_generation_request(
+            conn,
             key="review-lane:default:tenant-a:t_parent:named-tenant",
             tenant="tenant-a",
         ),
     )
     empty = kb.create_review_generation_task(
         conn,
-        _review_generation_request(key="review-lane:default::t_parent:empty-tenant"),
+        _review_generation_request(
+            conn,
+            key="review-lane:default::t_parent_empty:empty-tenant",
+        ),
     )
 
     for task_id, tenant in ((named.task_id, "tenant-a"), (empty.task_id, "")):
@@ -1095,6 +1234,7 @@ def test_review_lane_mutation_accepts_exact_named_and_empty_tenants(conn):
             expected_status="ready",
             expected_event_signature=_latest_event_signature(conn, task_id),
             operation_id=f"exact-tenant-{tenant or 'empty'}",
+            parent_preconditions=_review_lane_parent_preconditions(conn, task_id),
         )
         assert kb.archive_review_lane(conn, request).outcome == "committed"
 
@@ -1927,6 +2067,7 @@ def _reviewed_completion_request(
     reviewer = kb.create_review_generation_task(
         conn,
         _review_generation_request(
+            conn,
             key=f"review-lane:default::{parent}:g1",
         ),
     ).task_id
@@ -1996,6 +2137,71 @@ def test_review_generation_for_one_parent_cannot_authorize_another(conn):
     assert kb.get_task(conn, second_parent).status == "blocked"
 
 
+def test_review_generation_create_rejects_parent_edit_race(conn):
+    parent, request = _guarded_review_generation_request(conn)
+    assert kb.assign_task(conn, parent, "different-engineer")
+
+    result = kb.create_review_generation_task(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert result.created is False
+    assert result.task_id == ""
+    assert kb.lookup_review_generation(
+        conn,
+        "default",
+        "",
+        request.key,
+    ) is None
+
+
+def test_review_generation_permanent_replay_rechecks_parent_lifecycle(conn):
+    parent, request = _guarded_review_generation_request(conn)
+    first = kb.create_review_generation_task(conn, request)
+    assert first.outcome == "committed"
+    assert kb.unblock_task(conn, parent)
+
+    replay = kb.create_review_generation_task(conn, request)
+
+    assert replay.outcome == "precondition_changed"
+    assert replay.created is False
+    assert replay.task_id == ""
+    assert kb.lookup_review_generation(conn, "default", "", request.key).task_id == first.task_id
+
+
+@pytest.mark.parametrize("mutation", [kb.requeue_review_lane, kb.archive_review_lane])
+def test_review_lane_mutation_rejects_parent_edit_race(conn, mutation):
+    parent, task_id, request = _guarded_review_lane_request(
+        conn,
+        mutation=mutation,
+        operation_id=f"parent-race-{mutation.__name__}",
+    )
+    before = kb.list_events(conn, task_id)
+    assert kb.assign_task(conn, parent, "different-engineer")
+
+    result = mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.list_events(conn, task_id) == before
+
+
+@pytest.mark.parametrize("mutation", [kb.requeue_review_lane, kb.archive_review_lane])
+def test_review_lane_replay_rechecks_parent_lifecycle(conn, mutation):
+    parent, task_id, request = _guarded_review_lane_request(
+        conn,
+        mutation=mutation,
+        operation_id=f"parent-replay-{mutation.__name__}",
+    )
+    first = mutation(conn, request)
+    assert first.outcome == "committed"
+    assert kb.unblock_task(conn, parent)
+
+    replay = mutation(conn, request)
+
+    assert replay.outcome == "precondition_changed"
+    assert replay.event_id is None
+    assert len(_operation_events(conn, task_id, request.operation_id)) == 1
+
+
 def test_review_generation_must_remain_unparented_after_judging(conn):
     request = _reviewed_completion_request(conn)
     unrelated = kb.create_task(conn, title="unrelated completed parent")
@@ -2013,6 +2219,7 @@ def test_older_review_generation_cannot_complete_after_successor_exists(conn):
     successor = kb.create_review_generation_task(
         conn,
         _review_generation_request(
+            conn,
             key=f"review-lane:default::{request.task_id}:g2",
         ),
     )

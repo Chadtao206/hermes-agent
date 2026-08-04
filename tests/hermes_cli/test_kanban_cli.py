@@ -147,11 +147,15 @@ def test_create_review_generation_cli_replays_archived_lane_and_isolates_project
                 "UPDATE tasks SET workspace_path = ?, branch_name = ?, project_id = ? WHERE id = ?",
                 (str(source_path), f"project-1/{source}", "project-1", source),
             )
+        assert kb.block_task(conn, source, reason="review handoff", kind="review")
+        parent_preconditions = _review_parent_preconditions(conn, source)
     key = f"review-lane:default::${source}:g-cli".replace("$", "")
     command = (
         "create-review-generation 'review immutable target' "
         f"--key {key} --assignee reviewer --project project-1 "
-        f"--project-source-task {source} --json"
+        f"--project-source-task {source} "
+        f"{_review_parent_cli_flags(parent_preconditions)} "
+        "--operation-id cli-create-review --json"
     )
     first = json.loads(kc.run_slash(command))
     assert first["created"] is True
@@ -163,7 +167,13 @@ def test_create_review_generation_cli_replays_archived_lane_and_isolates_project
         assert kb.archive_task(conn, reviewer.id)
 
     replay = json.loads(kc.run_slash(command))
-    assert replay == {"task_id": first["task_id"], "created": False}
+    assert replay == {
+        "outcome": "deduplicated",
+        "task_id": first["task_id"],
+        "created": False,
+        "operation_id": "cli-create-review",
+        "reason": "",
+    }
 
 
 def _lease_cli(
@@ -426,6 +436,48 @@ def _latest_signature(conn, task_id: str) -> str:
     return kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
 
 
+def _review_parent_preconditions(conn, parent_task_id: str) -> kb.ReviewParentPreconditions:
+    return kb.ReviewParentPreconditions(
+        task_id=parent_task_id,
+        expected_status="blocked",
+        expected_block_kind="review",
+        expected_event_signature=_latest_signature(conn, parent_task_id),
+        expected_review_input_digest=kb.review_input_digest(conn, parent_task_id),
+    )
+
+
+def _review_parent_cli_flags(preconditions: kb.ReviewParentPreconditions) -> str:
+    return (
+        f"--parent-task-id {preconditions.task_id} "
+        f"--expected-parent-status {preconditions.expected_status} "
+        f"--expected-parent-block-kind {preconditions.expected_block_kind} "
+        f"--expected-parent-event-signature {preconditions.expected_event_signature} "
+        f"--expected-review-input-digest {preconditions.expected_review_input_digest}"
+    )
+
+
+def _create_review_lane_fixture(
+    conn,
+    *,
+    tenant: str | None = None,
+    generation: str,
+) -> tuple[str, kb.ReviewParentPreconditions, str]:
+    parent = kb.create_task(conn, title="implementation awaiting review", tenant=tenant)
+    assert kb.block_task(conn, parent, reason="review handoff", kind="review")
+    preconditions = _review_parent_preconditions(conn, parent)
+    request = kb.ReviewGenerationCreate(
+        board="default",
+        tenant=tenant,
+        key=f"review-lane:default:{tenant or ''}:{parent}:{generation}",
+        title="review lane",
+        assignee="reviewer",
+        parent_preconditions=preconditions,
+        operation_id=f"create-{generation}",
+    )
+    task_id = kb.create_review_generation_task(conn, request).task_id
+    return task_id, preconditions, parent
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -480,14 +532,10 @@ def test_reclassify_block_cli_serializes_handled_precondition_change(
 
 def test_requeue_review_cli_returns_guarded_json(kanban_home):
     with kb.connect_closing() as conn:
-        request = kb.ReviewGenerationCreate(
-            board="default",
-            tenant=None,
-            key="review-lane:default::t_parent:cli-requeue",
-            title="review lane",
-            assignee="reviewer",
+        task_id, parent_preconditions, _parent = _create_review_lane_fixture(
+            conn,
+            generation="cli-requeue",
         )
-        task_id = kb.create_review_generation_task(conn, request).task_id
         assert kb.claim_task(conn, task_id, claimer="reviewer") is not None
         assert kb._record_spawn_failure(conn, task_id, "failed", failure_limit=1)
         signature = _latest_signature(conn, task_id)
@@ -496,7 +544,8 @@ def test_requeue_review_cli_returns_guarded_json(kanban_home):
         kc.run_slash(
             f"requeue-review {task_id} --expected-status blocked "
             f"--expected-event-signature {signature} "
-            "--tenant '' --operation-id cli-review-requeue --json"
+            f"--tenant '' {_review_parent_cli_flags(parent_preconditions)} "
+            "--operation-id cli-review-requeue --json"
         )
     )
 
@@ -507,21 +556,18 @@ def test_requeue_review_cli_returns_guarded_json(kanban_home):
 
 def test_archive_review_cli_returns_guarded_json(kanban_home):
     with kb.connect_closing() as conn:
-        request = kb.ReviewGenerationCreate(
-            board="default",
-            tenant=None,
-            key="review-lane:default::t_parent:cli-archive",
-            title="review lane",
-            assignee="reviewer",
+        task_id, parent_preconditions, _parent = _create_review_lane_fixture(
+            conn,
+            generation="cli-archive",
         )
-        task_id = kb.create_review_generation_task(conn, request).task_id
         signature = _latest_signature(conn, task_id)
 
     payload = json.loads(
         kc.run_slash(
             f"archive-review {task_id} --expected-status ready "
             f"--expected-event-signature {signature} "
-            "--tenant '' --operation-id cli-review-archive --json"
+            f"--tenant '' {_review_parent_cli_flags(parent_preconditions)} "
+            "--operation-id cli-review-archive --json"
         )
     )
 
@@ -532,20 +578,18 @@ def test_archive_review_cli_returns_guarded_json(kanban_home):
 
 def test_archive_review_cli_guards_named_tenant(kanban_home):
     with kb.connect_closing() as conn:
-        request = kb.ReviewGenerationCreate(
-            board="default",
+        task_id, parent_preconditions, _parent = _create_review_lane_fixture(
+            conn,
             tenant="tenant-a",
-            key="review-lane:default:tenant-a:t_parent:cli-tenant",
-            title="review lane",
-            assignee="reviewer",
+            generation="cli-tenant",
         )
-        task_id = kb.create_review_generation_task(conn, request).task_id
         signature = _latest_signature(conn, task_id)
         events_before = kb.list_events(conn, task_id)
 
     stale = json.loads(kc.run_slash(
         f"archive-review {task_id} --expected-status ready "
         f"--expected-event-signature {signature} --tenant tenant-b "
+        f"{_review_parent_cli_flags(parent_preconditions)} "
         "--operation-id cli-review-stale-tenant --json"
     ))
 
@@ -557,9 +601,51 @@ def test_archive_review_cli_guards_named_tenant(kanban_home):
     committed = json.loads(kc.run_slash(
         f"archive-review {task_id} --expected-status ready "
         f"--expected-event-signature {signature} --tenant tenant-a "
+        f"{_review_parent_cli_flags(parent_preconditions)} "
         "--operation-id cli-review-exact-tenant --json"
     ))
     assert committed["outcome"] == "committed"
+
+
+def test_create_review_generation_cli_rejects_parent_edit_race(kanban_home):
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="implementation awaiting review")
+        assert kb.block_task(conn, parent, reason="review handoff", kind="review")
+        preconditions = _review_parent_preconditions(conn, parent)
+        assert kb.assign_task(conn, parent, "different-engineer")
+    key = f"review-lane:default::{parent}:cli-parent-race"
+
+    payload = json.loads(kc.run_slash(
+        "create-review-generation 'review immutable target' "
+        f"--key {key} --assignee reviewer "
+        f"{_review_parent_cli_flags(preconditions)} "
+        "--operation-id cli-create-parent-race --json"
+    ))
+
+    assert payload == {
+        "outcome": "precondition_changed",
+        "task_id": "",
+        "created": False,
+        "operation_id": "cli-create-parent-race",
+        "reason": "review parent event changed",
+    }
+    with kb.connect_closing() as conn:
+        assert kb.lookup_review_generation(conn, "default", "", key) is None
+
+
+def test_show_cli_rejects_wrong_explicit_tenant_before_readback(
+    kanban_home,
+    capsys,
+):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="tenant scoped", tenant="tenant-a")
+    args = _kanban_args("show", task_id, "--tenant", "tenant-b", "--json")
+
+    assert kc.kanban_command(args) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "does not belong to tenant" in captured.err
 
 
 def test_retry_transient_cli_returns_guarded_json(kanban_home):

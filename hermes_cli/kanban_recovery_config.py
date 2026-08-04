@@ -265,7 +265,7 @@ class RecoveryControl:
             errors.append("mutation_cap must be 1 while rollout_mode is shadow or canary")
         if rollout_mode in {"paused", "shadow", "canary"}:
             for board, control in parsed.items():
-                if control.review_mode == "live":
+                if rollout_mode in {"paused", "shadow"} and control.review_mode == "live":
                     errors.append(
                         f"{board}.review_mode cannot be live while rollout_mode is {rollout_mode}"
                     )

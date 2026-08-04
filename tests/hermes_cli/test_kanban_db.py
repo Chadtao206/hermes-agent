@@ -1544,7 +1544,10 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
 
 def test_delete_archived_review_generation_preserves_permanent_registry(kanban_home):
     with kb.connect() as conn:
-        key = "review-lane:default::t_deleted_parent:g1"
+        parent = kb.create_task(conn, title="implementation awaiting review")
+        assert kb.block_task(conn, parent, reason="review handoff", kind="review")
+        latest = kb.list_events(conn, parent)[-1]
+        key = f"review-lane:default::{parent}:g1"
         request = kb.ReviewGenerationCreate(
             board="default",
             tenant=None,
@@ -1553,6 +1556,14 @@ def test_delete_archived_review_generation_preserves_permanent_registry(kanban_h
             body="review target",
             assignee="reviewer",
             created_by="blocked-recovery-router",
+            parent_preconditions=kb.ReviewParentPreconditions(
+                task_id=parent,
+                expected_status="blocked",
+                expected_block_kind="review",
+                expected_event_signature=kb.canonical_event_signature(latest),
+                expected_review_input_digest=kb.review_input_digest(conn, parent),
+            ),
+            operation_id="delete-archived-review-generation",
         )
         first = kb.create_review_generation_task(conn, request)
         assert kb.archive_task(conn, first.task_id)

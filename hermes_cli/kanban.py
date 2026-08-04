@@ -438,6 +438,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_review_generation.add_argument("--created-by", default="review-delegator", help="Recorded author")
     p_review_generation.add_argument("--max-runtime", default="60m", help="Must be 60m; core enforces 3600 seconds")
     p_review_generation.add_argument("--max-retries", type=int, default=1, help="Must be 1; core permits one attempt")
+    p_review_generation.add_argument("--parent-task-id", required=True)
+    p_review_generation.add_argument(
+        "--expected-parent-status", required=True, choices=("blocked",)
+    )
+    p_review_generation.add_argument(
+        "--expected-parent-block-kind", required=True, choices=("review",)
+    )
+    p_review_generation.add_argument("--expected-parent-event-signature", required=True)
+    p_review_generation.add_argument("--expected-review-input-digest", required=True)
+    p_review_generation.add_argument("--operation-id", required=True)
     p_review_generation.add_argument("--json", action="store_true", required=True, help="Emit exact JSON result")
 
     # --- swarm ---
@@ -498,6 +508,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
+    p_show.add_argument(
+        "--tenant",
+        default=None,
+        help="Reject the task unless it has this exact tenant namespace",
+    )
     p_show.add_argument("--json", action="store_true")
     p_show.add_argument(
         "--state-type",
@@ -786,6 +801,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         )
         parser.add_argument("--expected-status", required=True)
         parser.add_argument("--expected-event-signature", required=True)
+        parser.add_argument("--parent-task-id", required=True)
+        parser.add_argument(
+            "--expected-parent-status", required=True, choices=("blocked",)
+        )
+        parser.add_argument(
+            "--expected-parent-block-kind", required=True, choices=("review",)
+        )
+        parser.add_argument("--expected-parent-event-signature", required=True)
+        parser.add_argument("--expected-review-input-digest", required=True)
         parser.add_argument("--operation-id", required=True)
         parser.add_argument("--json", action="store_true", required=True)
 
@@ -1829,14 +1853,28 @@ def _cmd_create_review_generation(args: argparse.Namespace) -> int:
             priority=args.priority,
             project_id=args.project,
             project_source_task_id=args.project_source_task,
+            parent_preconditions=kb.ReviewParentPreconditions(
+                task_id=args.parent_task_id,
+                expected_status=args.expected_parent_status,
+                expected_block_kind=args.expected_parent_block_kind,
+                expected_event_signature=args.expected_parent_event_signature,
+                expected_review_input_digest=args.expected_review_input_digest,
+            ),
+            operation_id=args.operation_id,
         )
         with kb.connect_closing() as conn:
             result = kb.create_review_generation_task(conn, request)
     except (argparse.ArgumentTypeError, ValueError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps({"task_id": result.task_id, "created": result.created}, ensure_ascii=False))
-    return 0
+    print(json.dumps({
+        "outcome": result.outcome,
+        "task_id": result.task_id,
+        "created": result.created,
+        "operation_id": result.operation_id,
+        "reason": result.reason,
+    }, ensure_ascii=False))
+    return 1 if result.outcome == "conflict" else 0
 
 
 def _lease_result_payload(result: kb.LeaseResult) -> dict[str, object]:
@@ -1971,6 +2009,21 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
+        expected_tenant = getattr(args, "tenant", None)
+        if expected_tenant is not None:
+            if (
+                type(expected_tenant) is not str
+                or expected_tenant != expected_tenant.strip()
+                or "\x00" in expected_tenant
+            ):
+                print("kanban show: tenant must be an exact normalized string", file=sys.stderr)
+                return 2
+            if str(task.tenant or "").strip() != expected_tenant:
+                print(
+                    f"task {args.task_id} does not belong to tenant {expected_tenant!r}",
+                    file=sys.stderr,
+                )
+                return 1
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
@@ -2961,6 +3014,13 @@ def _review_lane_request(args: argparse.Namespace) -> kb.ReviewLaneMutation:
         expected_status=args.expected_status,
         expected_event_signature=args.expected_event_signature,
         operation_id=args.operation_id,
+        parent_preconditions=kb.ReviewParentPreconditions(
+            task_id=args.parent_task_id,
+            expected_status=args.expected_parent_status,
+            expected_block_kind=args.expected_parent_block_kind,
+            expected_event_signature=args.expected_parent_event_signature,
+            expected_review_input_digest=args.expected_review_input_digest,
+        ),
     )
 
 
