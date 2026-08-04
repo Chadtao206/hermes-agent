@@ -1234,6 +1234,7 @@ class BlockReclassification:
 @dataclass(frozen=True)
 class ReviewLaneMutation:
     task_id: str
+    expected_tenant: str
     expected_status: str
     expected_event_signature: str
     operation_id: str
@@ -7596,6 +7597,7 @@ def requeue_review_lane(
         "review_requeued",
         request.task_id,
         {
+            "expected_tenant": request.expected_tenant,
             "expected_status": request.expected_status,
             "expected_event_signature": request.expected_event_signature,
         },
@@ -7610,8 +7612,14 @@ def requeue_review_lane(
         )
         if replay is not None:
             return replay
+        if (
+            type(request.expected_tenant) is not str
+            or request.expected_tenant != request.expected_tenant.strip()
+            or "\x00" in request.expected_tenant
+        ):
+            raise ValueError("expected tenant must be an exact normalized string")
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, tenant FROM tasks WHERE id = ?",
             (request.task_id,),
         ).fetchone()
         if row is None or not _is_review_generation_task(conn, request.task_id):
@@ -7620,6 +7628,13 @@ def requeue_review_lane(
                 task_id=request.task_id,
                 operation_id=request.operation_id,
                 reason="review generation task not found",
+            )
+        if str(row["tenant"] or "").strip() != request.expected_tenant:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane tenant changed",
             )
         if row["status"] != request.expected_status:
             return _guarded_result(
@@ -7719,6 +7734,7 @@ def archive_review_lane(
         "review_archived",
         request.task_id,
         {
+            "expected_tenant": request.expected_tenant,
             "expected_status": request.expected_status,
             "expected_event_signature": request.expected_event_signature,
         },
@@ -7733,8 +7749,14 @@ def archive_review_lane(
         )
         if replay is not None:
             return replay
+        if (
+            type(request.expected_tenant) is not str
+            or request.expected_tenant != request.expected_tenant.strip()
+            or "\x00" in request.expected_tenant
+        ):
+            raise ValueError("expected tenant must be an exact normalized string")
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, tenant FROM tasks WHERE id = ?",
             (request.task_id,),
         ).fetchone()
         if row is None or not _is_review_generation_task(conn, request.task_id):
@@ -7743,6 +7765,13 @@ def archive_review_lane(
                 task_id=request.task_id,
                 operation_id=request.operation_id,
                 reason="review generation task not found",
+            )
+        if str(row["tenant"] or "").strip() != request.expected_tenant:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="review lane tenant changed",
             )
         if row["status"] != request.expected_status:
             return _guarded_result(

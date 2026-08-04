@@ -432,9 +432,9 @@ def _latest_signature(conn, task_id: str) -> str:
         "reclassify-block t_x --expected-block-event-signature " + "0" * 64
         + " --kind review --operation-id op-1",
         "requeue-review t_x --expected-status blocked --expected-event-signature "
-        + "0" * 64 + " --operation-id op-2",
+        + "0" * 64 + " --tenant '' --operation-id op-2",
         "archive-review t_x --expected-status ready --expected-event-signature "
-        + "0" * 64 + " --operation-id op-3",
+        + "0" * 64 + " --tenant '' --operation-id op-3",
         "retry-transient t_x --expected-terminal-signature " + "0" * 64
         + " --retry-ordinal 1 --operation-id op-4",
     ],
@@ -496,7 +496,7 @@ def test_requeue_review_cli_returns_guarded_json(kanban_home):
         kc.run_slash(
             f"requeue-review {task_id} --expected-status blocked "
             f"--expected-event-signature {signature} "
-            "--operation-id cli-review-requeue --json"
+            "--tenant '' --operation-id cli-review-requeue --json"
         )
     )
 
@@ -521,13 +521,45 @@ def test_archive_review_cli_returns_guarded_json(kanban_home):
         kc.run_slash(
             f"archive-review {task_id} --expected-status ready "
             f"--expected-event-signature {signature} "
-            "--operation-id cli-review-archive --json"
+            "--tenant '' --operation-id cli-review-archive --json"
         )
     )
 
     assert payload["outcome"] == "committed"
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, task_id).status == "archived"
+
+
+def test_archive_review_cli_guards_named_tenant(kanban_home):
+    with kb.connect_closing() as conn:
+        request = kb.ReviewGenerationCreate(
+            board="default",
+            tenant="tenant-a",
+            key="review-lane:default:tenant-a:t_parent:cli-tenant",
+            title="review lane",
+            assignee="reviewer",
+        )
+        task_id = kb.create_review_generation_task(conn, request).task_id
+        signature = _latest_signature(conn, task_id)
+        events_before = kb.list_events(conn, task_id)
+
+    stale = json.loads(kc.run_slash(
+        f"archive-review {task_id} --expected-status ready "
+        f"--expected-event-signature {signature} --tenant tenant-b "
+        "--operation-id cli-review-stale-tenant --json"
+    ))
+
+    assert stale["outcome"] == "precondition_changed"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.list_events(conn, task_id) == events_before
+
+    committed = json.loads(kc.run_slash(
+        f"archive-review {task_id} --expected-status ready "
+        f"--expected-event-signature {signature} --tenant tenant-a "
+        "--operation-id cli-review-exact-tenant --json"
+    ))
+    assert committed["outcome"] == "committed"
 
 
 def test_retry_transient_cli_returns_guarded_json(kanban_home):

@@ -931,6 +931,7 @@ def test_guarded_requeue_preserves_review_attempt_history(conn):
     runs_before = kb.list_runs(conn, task_id)
     request = kb.ReviewLaneMutation(
         task_id=task_id,
+        expected_tenant="",
         expected_status="blocked",
         expected_event_signature=kb.canonical_event_signature(terminal_event),
         operation_id="review-requeue-1",
@@ -954,6 +955,7 @@ def test_review_terminal_generation_cannot_be_requeued_twice(conn):
     terminal_signature = kb.canonical_event_signature(terminal_event)
     first = kb.ReviewLaneMutation(
         task_id=task_id,
+        expected_tenant="",
         expected_status="blocked",
         expected_event_signature=terminal_signature,
         operation_id="review-requeue-first",
@@ -961,6 +963,7 @@ def test_review_terminal_generation_cannot_be_requeued_twice(conn):
     assert kb.requeue_review_lane(conn, first).outcome == "committed"
     second = kb.ReviewLaneMutation(
         task_id=task_id,
+        expected_tenant="",
         expected_status="ready",
         expected_event_signature=terminal_signature,
         operation_id="review-requeue-second",
@@ -989,6 +992,7 @@ def test_review_requeue_rejects_a_later_manual_reclassification(conn):
     assert reclassified.outcome == "committed"
     request = kb.ReviewLaneMutation(
         task_id=task_id,
+        expected_tenant="",
         expected_status="blocked",
         expected_event_signature=terminal_signature,
         operation_id="stale-review-requeue",
@@ -1006,6 +1010,7 @@ def test_archived_review_generation_cannot_be_resurrected_by_requeue(conn):
     assert kb.archive_task(conn, task_id)
     request = kb.ReviewLaneMutation(
         task_id=task_id,
+        expected_tenant="",
         expected_status="archived",
         expected_event_signature=kb.canonical_event_signature(terminal_event),
         operation_id="review-requeue-archived",
@@ -1024,6 +1029,7 @@ def test_guarded_archive_requires_exact_review_generation_state(conn):
     )
     request = kb.ReviewLaneMutation(
         task_id=created.task_id,
+        expected_tenant="",
         expected_status="ready",
         expected_event_signature=_latest_event_signature(conn, created.task_id),
         operation_id="review-archive-1",
@@ -1038,6 +1044,59 @@ def test_guarded_archive_requires_exact_review_generation_state(conn):
     event = _operation_events(conn, created.task_id, "review-archive-1")[0]
     assert event.kind == "review_archived"
     assert event.payload["source_event_signature"] == request.expected_event_signature
+
+
+@pytest.mark.parametrize("mutation", [kb.requeue_review_lane, kb.archive_review_lane])
+def test_review_lane_mutation_rejects_stale_named_tenant_without_event(conn, mutation):
+    created = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(
+            key="review-lane:default:tenant-a:t_parent:tenant-guard",
+            tenant="tenant-a",
+        ),
+    )
+    if mutation is kb.requeue_review_lane:
+        assert kb.claim_task(conn, created.task_id, claimer="reviewer") is not None
+        assert kb._record_spawn_failure(conn, created.task_id, "failed", failure_limit=1)
+    before = kb.list_events(conn, created.task_id)
+    task = kb.get_task(conn, created.task_id)
+    request = kb.ReviewLaneMutation(
+        task_id=created.task_id,
+        expected_tenant="tenant-b",
+        expected_status=task.status,
+        expected_event_signature=kb.canonical_event_signature(before[-1]),
+        operation_id=f"stale-tenant-{mutation.__name__}",
+    )
+
+    result = mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, created.task_id).status == task.status
+    assert kb.list_events(conn, created.task_id) == before
+
+
+def test_review_lane_mutation_accepts_exact_named_and_empty_tenants(conn):
+    named = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(
+            key="review-lane:default:tenant-a:t_parent:named-tenant",
+            tenant="tenant-a",
+        ),
+    )
+    empty = kb.create_review_generation_task(
+        conn,
+        _review_generation_request(key="review-lane:default::t_parent:empty-tenant"),
+    )
+
+    for task_id, tenant in ((named.task_id, "tenant-a"), (empty.task_id, "")):
+        request = kb.ReviewLaneMutation(
+            task_id=task_id,
+            expected_tenant=tenant,
+            expected_status="ready",
+            expected_event_signature=_latest_event_signature(conn, task_id),
+            operation_id=f"exact-tenant-{tenant or 'empty'}",
+        )
+        assert kb.archive_review_lane(conn, request).outcome == "committed"
 
 
 def test_transient_retry_requires_exact_terminal_signature(conn):

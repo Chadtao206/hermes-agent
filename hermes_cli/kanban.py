@@ -779,6 +779,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     ):
         parser = sub.add_parser(command, help=help_text)
         parser.add_argument("task_id")
+        parser.add_argument(
+            "--tenant",
+            required=True,
+            help="Exact tenant namespace; pass an empty string for unnamespaced tasks",
+        )
         parser.add_argument("--expected-status", required=True)
         parser.add_argument("--expected-event-signature", required=True)
         parser.add_argument("--operation-id", required=True)
@@ -2952,6 +2957,7 @@ def _cmd_reclassify_block(args: argparse.Namespace) -> int:
 def _review_lane_request(args: argparse.Namespace) -> kb.ReviewLaneMutation:
     return kb.ReviewLaneMutation(
         task_id=args.task_id,
+        expected_tenant=args.tenant,
         expected_status=args.expected_status,
         expected_event_signature=args.expected_event_signature,
         operation_id=args.operation_id,
