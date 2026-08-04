@@ -1138,6 +1138,34 @@ class Event:
     run_id: Optional[int] = None
 
 
+def has_structured_durable_side_effect(
+    assignee: object,
+    events: Iterable[Event],
+) -> bool:
+    """Return whether structured event history proves durable worker output."""
+    known_assignee = (
+        isinstance(assignee, str)
+        and bool(assignee)
+        and assignee == assignee.strip()
+    )
+    for event in events:
+        if event.kind == "respawn_guarded":
+            return True
+        if event.kind != "commented":
+            continue
+        if not known_assignee or not isinstance(event.payload, Mapping):
+            return True
+        author = event.payload.get("author")
+        if (
+            not isinstance(author, str)
+            or not author
+            or author != author.strip()
+            or author == assignee
+        ):
+            return True
+    return False
+
+
 def canonical_event_signature(event: Event) -> str:
     """Return the canonical SHA-256 signature for one immutable event."""
     canonical = {
@@ -7722,7 +7750,8 @@ def retry_transient_task(
         if replay is not None:
             return replay
         row = conn.execute(
-            "SELECT status, block_kind, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, current_run_id, assignee "
+            "FROM tasks WHERE id = ?",
             (request.task_id,),
         ).fetchone()
         if row is None:
@@ -7780,6 +7809,22 @@ def retry_transient_task(
                 task_id=request.task_id,
                 operation_id=request.operation_id,
                 reason=f"next retry ordinal is {next_ordinal}",
+            )
+        durable_events = tuple(
+            _event_from_row(event_row)
+            for event_row in conn.execute(
+                "SELECT * FROM task_events "
+                "WHERE task_id = ? AND kind IN ('commented', 'respawn_guarded') "
+                "ORDER BY id ASC",
+                (request.task_id,),
+            ).fetchall()
+        )
+        if has_structured_durable_side_effect(row["assignee"], durable_events):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="durable worker side effect recorded",
             )
         if row["current_run_id"] is not None:
             _end_run(

@@ -1097,6 +1097,122 @@ def test_transient_retry_rejects_reclassification_aba(conn):
     assert (task.status, task.block_kind) == ("blocked", "transient")
 
 
+@pytest.mark.parametrize("assignee", [None, ""], ids=["unknown", "empty"])
+def test_transient_retry_fails_closed_on_comment_with_unknown_assignee(
+    conn,
+    assignee,
+):
+    task_id = kb.create_task(
+        conn,
+        title="unknown worker identity",
+        assignee=None,
+    )
+    if assignee == "":
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee = '' WHERE id = ?",
+                (task_id,),
+            )
+    assert kb.block_task(conn, task_id, reason="temporary", kind="transient")
+    terminal_signature = _latest_event_signature(conn, task_id)
+    kb.add_comment(conn, task_id, "operator", "durable note after planning")
+
+    result = kb.retry_transient_task(
+        conn,
+        kb.TransientRetryRequest(
+            task_id=task_id,
+            expected_terminal_signature=terminal_signature,
+            retry_ordinal=1,
+            operation_id=f"unknown-assignee-{assignee!r}",
+        ),
+    )
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, f"unknown-assignee-{assignee!r}")
+
+
+def test_transient_retry_rechecks_assignee_comment_inside_write_transaction(conn):
+    task_id = kb.create_task(
+        conn,
+        title="worker commented after planning",
+        assignee="reviewer",
+    )
+    assert kb.block_task(conn, task_id, reason="temporary", kind="transient")
+    terminal_signature = _latest_event_signature(conn, task_id)
+    kb.add_comment(conn, task_id, "reviewer", "durable work after planning")
+
+    result = kb.retry_transient_task(
+        conn,
+        kb.TransientRetryRequest(
+            task_id=task_id,
+            expected_terminal_signature=terminal_signature,
+            retry_ordinal=1,
+            operation_id="comment-race",
+        ),
+    )
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, "comment-race")
+
+
+def test_transient_retry_rechecks_respawn_guard_inside_write_transaction(conn):
+    task_id = kb.create_task(
+        conn,
+        title="respawn guarded after planning",
+        assignee="reviewer",
+    )
+    assert kb.block_task(conn, task_id, reason="temporary", kind="transient")
+    terminal_signature = _latest_event_signature(conn, task_id)
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            task_id,
+            "respawn_guarded",
+            {"reason": "durable worker side effect"},
+        )
+
+    result = kb.retry_transient_task(
+        conn,
+        kb.TransientRetryRequest(
+            task_id=task_id,
+            expected_terminal_signature=terminal_signature,
+            retry_ordinal=1,
+            operation_id="respawn-race",
+        ),
+    )
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, "respawn-race")
+
+
+def test_transient_retry_allows_demonstrably_foreign_comment(conn):
+    task_id = kb.create_task(
+        conn,
+        title="operator comment is not worker output",
+        assignee="reviewer",
+    )
+    assert kb.block_task(conn, task_id, reason="temporary", kind="transient")
+    terminal_signature = _latest_event_signature(conn, task_id)
+    kb.add_comment(conn, task_id, "operator", "administrative note")
+
+    result = kb.retry_transient_task(
+        conn,
+        kb.TransientRetryRequest(
+            task_id=task_id,
+            expected_terminal_signature=terminal_signature,
+            retry_ordinal=1,
+            operation_id="foreign-comment",
+        ),
+    )
+
+    assert result.outcome == "committed"
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert len(_operation_events(conn, task_id, "foreign-comment")) == 1
+
+
 def test_escalation_acknowledgement_is_exact_and_lifecycle_neutral(conn):
     task_id = _blocked_task(conn, kind="needs_input")
     before = kb.get_task(conn, task_id)
