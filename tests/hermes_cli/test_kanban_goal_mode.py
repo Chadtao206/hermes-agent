@@ -13,6 +13,7 @@ Covers three layers:
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -25,11 +26,18 @@ from hermes_cli import kanban as kc
 from hermes_cli import strict_goal_judge as strict
 
 
+_STAGED_REVIEW_DELEGATOR_SCRIPTS = (
+    Path(__file__).resolve().parents[2]
+    / ".superpowers/sdd/2026-08-03-kanban-blocked-recovery-router/staged-hermes/scripts"
+)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PYTHONPATH", str(_STAGED_REVIEW_DELEGATOR_SCRIPTS))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -387,7 +395,10 @@ class TestCLIJudgeGate:
         assert complete_calls == ["t1"]
 
 
-def _strict_completion_cli_fixture() -> tuple[str, str]:
+def _strict_completion_cli_fixture(
+    tmp_path: Path,
+    target: dict[str, str] | None = None,
+) -> tuple[str, str]:
     with kb.connect_closing() as conn:
         parent = kb.create_task(conn, title="ship reviewed change", body="tests pass")
         assert kb.block_task(conn, parent, reason="review", kind="review")
@@ -412,15 +423,23 @@ def _strict_completion_cli_fixture() -> tuple[str, str]:
                 operation_id="goal-mode-review-generation",
             ),
         ).task_id
+        if target is None:
+            artifact = tmp_path / "review-target.txt"
+            artifact.write_text("immutable target\n", encoding="utf-8")
+            target = {
+                "kind": "artifact",
+                "identity": json.dumps(
+                    {"identifier": "review-target", "path": str(artifact)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "revision": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
         metadata = {
             "review": {
                 "schema_version": 1,
                 "verdict": "APPROVED",
-                "target": {
-                    "kind": "git",
-                    "identity": "example/repository",
-                    "revision": "a" * 40,
-                },
+                "target": target,
                 "findings": [],
             }
         }
@@ -430,6 +449,7 @@ def _strict_completion_cli_fixture() -> tuple[str, str]:
         ][-1]
         target = metadata["review"]["target"]
         preconditions = kb.ReviewedCompletionPreconditions(
+            tenant="",
             parent_block_event_id=parent_event.id,
             parent_block_event_signature=kb.canonical_event_signature(parent_event),
             review_input_digest=kb.review_input_digest(conn, parent),
@@ -449,7 +469,7 @@ def _strict_completion_cli_fixture() -> tuple[str, str]:
     command = (
         f"complete {parent} --result shipped --summary verified "
         "--require-goal-judge --automation-preconditions "
-        f"'{json.dumps(envelope, separators=(',', ':'))}' --json"
+        f"'{json.dumps(envelope, separators=(',', ':'))}' --tenant '' --json"
     )
     return parent, command
 
@@ -458,9 +478,10 @@ def _strict_completion_cli_fixture() -> tuple[str, str]:
 def test_strict_completion_nonacceptance_never_mutates(
     kanban_home,
     monkeypatch,
+    tmp_path,
     outcome,
 ):
-    parent, command = _strict_completion_cli_fixture()
+    parent, command = _strict_completion_cli_fixture(tmp_path)
     monkeypatch.setattr(
         strict,
         "judge_goal_strict",
@@ -477,8 +498,9 @@ def test_strict_completion_nonacceptance_never_mutates(
 def test_strict_completion_rechecks_after_judge_acceptance(
     kanban_home,
     monkeypatch,
+    tmp_path,
 ):
-    parent, command = _strict_completion_cli_fixture()
+    parent, command = _strict_completion_cli_fixture(tmp_path)
 
     def mutate_then_accept(value):
         with kb.connect_closing() as conn:
@@ -498,11 +520,76 @@ def test_strict_completion_rechecks_after_judge_acceptance(
         assert kb.get_task(conn, parent).status == "blocked"
 
 
+def test_strict_completion_rechecks_target_after_judge_acceptance(
+    kanban_home,
+    monkeypatch,
+    tmp_path,
+):
+    artifact = tmp_path / "target.txt"
+    artifact.write_text("immutable target\n", encoding="utf-8")
+    target = {
+        "kind": "artifact",
+        "identity": json.dumps(
+            {"identifier": "release", "path": str(artifact)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "revision": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+    }
+    parent, command = _strict_completion_cli_fixture(tmp_path, target)
+
+    def mutate_target_then_accept(value):
+        artifact.write_text("drifted target\n", encoding="utf-8")
+        return strict.StrictJudgeResult(outcome="accepted", reason="accepted")
+
+    monkeypatch.setattr(strict, "judge_goal_strict", mutate_target_then_accept)
+
+    payload = json.loads(kc.run_slash(command))
+
+    assert payload["outcome"] == "precondition_changed"
+    assert payload["reason"].startswith("target_mismatched:")
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, parent).status == "blocked"
+
+
+def test_strict_completion_exact_replay_bypasses_a_changed_target(
+    kanban_home,
+    monkeypatch,
+    tmp_path,
+):
+    parent, command = _strict_completion_cli_fixture(tmp_path)
+    monkeypatch.setattr(
+        strict,
+        "judge_goal_strict",
+        lambda _value: strict.StrictJudgeResult(outcome="accepted", reason="accepted"),
+    )
+    first = json.loads(kc.run_slash(command))
+    assert first["outcome"] == "accepted"
+
+    (tmp_path / "review-target.txt").write_text("drifted target\n", encoding="utf-8")
+    def verifier_should_not_run(*_args):
+        raise AssertionError("replay invoked verifier")
+
+    monkeypatch.setattr(
+        kc,
+        "_post_judge_target_verifier",
+        verifier_should_not_run,
+    )
+
+    replay = json.loads(kc.run_slash(command))
+
+    assert replay["outcome"] == "accepted"
+    assert replay["reason"] == "replayed"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, parent).status == "done"
+
+
 def test_strict_completion_exact_acceptance_completes_plain_parent(
     kanban_home,
     monkeypatch,
+    tmp_path,
 ):
-    parent, command = _strict_completion_cli_fixture()
+    parent, command = _strict_completion_cli_fixture(tmp_path)
     monkeypatch.setattr(
         strict,
         "judge_goal_strict",

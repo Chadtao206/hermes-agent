@@ -1375,6 +1375,7 @@ class RecoverySnapshot:
 
 @dataclass(frozen=True)
 class ReviewedCompletionPreconditions:
+    tenant: str
     parent_block_event_id: int
     parent_block_event_signature: str
     review_input_digest: str
@@ -1395,6 +1396,7 @@ class ReviewedCompletionRequest:
     target_verification: Mapping[str, object]
     preconditions: ReviewedCompletionPreconditions
     judge_input_signature: str
+    post_judge_verification_signature: str
 
 
 @dataclass(frozen=True)
@@ -9151,11 +9153,102 @@ def build_reviewed_completion_judge_input(
     )
 
 
+def _reviewed_completion_preverification_signature(
+    request: ReviewedCompletionRequest,
+) -> str:
+    return _canonical_operation_signature(
+        "completed",
+        request.task_id,
+        {
+            "result": request.result,
+            "summary": request.summary,
+            "metadata": dict(request.metadata or {}),
+            "target_verification": dict(request.target_verification),
+            "preconditions": asdict(request.preconditions),
+            "judge_input_signature": request.judge_input_signature,
+        },
+    )
+
+
+def _reviewed_completion_prejudge_replay_signature(
+    request: ReviewedCompletionRequest,
+) -> str:
+    return _canonical_operation_signature(
+        "completed_prejudge_replay",
+        request.task_id,
+        {
+            "result": request.result,
+            "summary": request.summary,
+            "metadata": dict(request.metadata or {}),
+            "target_verification": dict(request.target_verification),
+            "preconditions": asdict(request.preconditions),
+        },
+    )
+
+
+def replay_reviewed_completion_before_target_verification(
+    conn: sqlite3.Connection,
+    request: ReviewedCompletionRequest,
+) -> GuardedMutationResult | None:
+    """Return an exact committed replay before a live target must be rechecked."""
+    pre_signature = _reviewed_completion_preverification_signature(request)
+    prejudge_replay_signature = _reviewed_completion_prejudge_replay_signature(request)
+    operation_id = request.preconditions.operation_id
+    matches: list[Event] = []
+    for row in conn.execute(
+        "SELECT * FROM task_events WHERE payload IS NOT NULL ORDER BY id ASC"
+    ).fetchall():
+        event = _event_from_row(row)
+        if isinstance(event.payload, Mapping) and event.payload.get("operation_id") == operation_id:
+            matches.append(event)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        event = matches[0]
+        stored_pre_signature = event.payload.get(
+            "preverification_signature", event.payload.get("operation_signature"),
+        )
+        stored_prejudge_replay_signature = event.payload.get("prejudge_replay_signature")
+        if (
+            event.task_id == request.task_id
+            and event.kind == "completed"
+            and (
+                stored_prejudge_replay_signature == prejudge_replay_signature
+                or stored_pre_signature == pre_signature
+            )
+        ):
+            result = GuardedMutationResult(
+                outcome="committed",
+                task_id=request.task_id,
+                operation_id=operation_id,
+                event_id=event.id,
+            )
+            _repair_completion_replay_effects(conn, request.task_id)
+            return result
+    return GuardedMutationResult(
+        outcome="conflict",
+        task_id=request.task_id,
+        operation_id=operation_id,
+        event_id=matches[0].id,
+        reason="operation_id is already bound to another mutation",
+    )
+
+
 def complete_reviewed_task_guarded(
     conn: sqlite3.Connection,
     request: ReviewedCompletionRequest,
 ) -> GuardedMutationResult:
     pre = request.preconditions
+    if (
+        type(pre.tenant) is not str
+        or pre.tenant != pre.tenant.strip()
+        or "\x00" in pre.tenant
+    ):
+        raise ValueError("reviewed completion tenant must be an exact normalized string")
+    if not re.fullmatch(r"[0-9a-f]{64}", request.post_judge_verification_signature):
+        raise ValueError("post-judge verification signature must be a lowercase SHA-256 digest")
+    preverification_signature = _reviewed_completion_preverification_signature(request)
+    prejudge_replay_signature = _reviewed_completion_prejudge_replay_signature(request)
     operation_signature = _canonical_operation_signature(
         "completed",
         request.task_id,
@@ -9166,6 +9259,7 @@ def complete_reviewed_task_guarded(
             "target_verification": dict(request.target_verification),
             "preconditions": asdict(pre),
             "judge_input_signature": request.judge_input_signature,
+            "post_judge_verification_signature": request.post_judge_verification_signature,
         },
     )
     replay = _guarded_operation_replay(
@@ -9211,6 +9305,13 @@ def complete_reviewed_task_guarded(
                 task_id=request.task_id,
                 operation_id=pre.operation_id,
                 reason="parent is no longer blocked for review",
+            )
+        if (task.tenant or "") != pre.tenant:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=pre.operation_id,
+                reason="parent tenant changed",
             )
         if not _review_generation_is_bound_to_parent(
             conn,
@@ -9344,12 +9445,15 @@ def complete_reviewed_task_guarded(
             {
                 "operation_id": pre.operation_id,
                 "operation_signature": operation_signature,
+                "preverification_signature": preverification_signature,
+                "prejudge_replay_signature": prejudge_replay_signature,
                 "result_len": len(request.result) if request.result else 0,
                 "summary": (request.summary or request.result or "")[:400] or None,
                 "judge_input_signature": request.judge_input_signature,
                 "reviewer_task_id": pre.reviewer_task_id,
                 "reviewer_completion_event_id": pre.reviewer_completion_event_id,
                 "target_signature": pre.target_signature,
+                "post_judge_verification_signature": request.post_judge_verification_signature,
             },
             run_id=run_id,
         )

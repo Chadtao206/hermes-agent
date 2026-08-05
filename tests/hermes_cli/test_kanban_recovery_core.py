@@ -2079,6 +2079,7 @@ def _reviewed_completion_request(
         "revision": "a" * 40,
     }
     preconditions = kb.ReviewedCompletionPreconditions(
+        tenant="",
         parent_block_event_id=parent_event.id,
         parent_block_event_signature=kb.canonical_event_signature(parent_event),
         review_input_digest=kb.review_input_digest(conn, parent),
@@ -2099,6 +2100,7 @@ def _reviewed_completion_request(
         target_verification=target,
         preconditions=preconditions,
         judge_input_signature="",
+        post_judge_verification_signature="c" * 64,
     )
     judge_input = kb.build_reviewed_completion_judge_input(conn, request)
     assert judge_input is not None
@@ -2272,6 +2274,32 @@ def test_guarded_reviewed_completion_accepts_exact_signed_inputs(conn):
 
     assert first == replay
     assert first.outcome == "committed"
+
+
+def test_guarded_reviewed_completion_rejects_a_tenant_change(conn):
+    request = _reviewed_completion_request(conn)
+
+    result = kb.complete_reviewed_task_guarded(
+        conn,
+        replace(request, preconditions=replace(request.preconditions, tenant="other")),
+    )
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, request.task_id).status == "blocked"
+
+
+def test_reviewed_completion_preverification_replay_recovers_an_exact_commit(conn):
+    request = _reviewed_completion_request(conn)
+    assert kb.complete_reviewed_task_guarded(conn, request).outcome == "committed"
+
+    replay = kb.replay_reviewed_completion_before_target_verification(
+        conn,
+        replace(request, post_judge_verification_signature="d" * 64),
+    )
+
+    assert replay is not None
+    assert replay.outcome == "committed"
+    assert replay.task_id == request.task_id
     assert kb.get_task(conn, request.task_id).status == "done"
     event = _operation_events(conn, request.task_id, request.preconditions.operation_id)[0]
     assert event.kind == "completed"

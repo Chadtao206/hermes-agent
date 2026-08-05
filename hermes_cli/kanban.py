@@ -19,9 +19,13 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
+import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -658,6 +662,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--tenant",
+        default=None,
+        help="Exact tenant namespace required for strict automated completion",
+    )
     p_complete.add_argument(
         "--require-goal-judge",
         action="store_true",
@@ -2550,6 +2559,151 @@ def _strict_completion_payload(
     }
 
 
+_STRICT_VERIFIER_TIMEOUT_SECONDS = 20
+_STRICT_VERIFIER_MAX_INPUT_BYTES = 8 * 1024
+_STRICT_VERIFIER_MAX_OUTPUT_BYTES = 8 * 1024
+_STRICT_REASON_MAX_BYTES = 1024
+
+
+@dataclass(frozen=True)
+class _StrictTargetVerification:
+    outcome: str
+    reason: str
+    signature: str
+
+
+def _strict_canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _strict_reason_fingerprint(prefix: str, detail: object) -> str:
+    if type(detail) is not str:
+        encoded = b"invalid"
+    else:
+        encoded = detail.encode("utf-8", errors="replace")
+        if not encoded or len(encoded) > _STRICT_REASON_MAX_BYTES:
+            encoded = b"invalid"
+    return prefix + ":" + hashlib.sha256(encoded).hexdigest()
+
+
+def _read_bounded_verifier_pipe(
+    stream,
+    captured: list[bytes],
+    oversized: list[bool],
+) -> None:
+    retained = 0
+    while True:
+        chunk = stream.read(1024)
+        if not chunk:
+            return
+        remaining = _STRICT_VERIFIER_MAX_OUTPUT_BYTES + 1 - retained
+        if remaining > 0:
+            captured.append(chunk[:remaining])
+            retained += min(len(chunk), remaining)
+        if len(chunk) > remaining or retained > _STRICT_VERIFIER_MAX_OUTPUT_BYTES:
+            oversized[0] = True
+
+
+def _post_judge_target_verifier(
+    target_verification: dict[str, object],
+    operation_id: str,
+) -> _StrictTargetVerification | None:
+    request = {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "target_verification": target_verification,
+    }
+    encoded_request = _strict_canonical_json(request)
+    if len(encoded_request) > _STRICT_VERIFIER_MAX_INPUT_BYTES:
+        return None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "review_delegator.targets", "verify-strict-target"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+    except OSError:
+        return None
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        process.kill()
+        return None
+    stdout: list[bytes] = []
+    stderr: list[bytes] = []
+    stdout_oversized = [False]
+    stderr_oversized = [False]
+    stdout_reader = threading.Thread(
+        target=_read_bounded_verifier_pipe,
+        args=(process.stdout, stdout, stdout_oversized),
+        daemon=True,
+    )
+    stderr_reader = threading.Thread(
+        target=_read_bounded_verifier_pipe,
+        args=(process.stderr, stderr, stderr_oversized),
+        daemon=True,
+    )
+    stdout_reader.start()
+    stderr_reader.start()
+    try:
+        process.stdin.write(encoded_request)
+        process.stdin.close()
+        returncode = process.wait(timeout=_STRICT_VERIFIER_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return None
+    finally:
+        stdout_reader.join(timeout=2)
+        stderr_reader.join(timeout=2)
+    if (
+        returncode != 0
+        or stdout_reader.is_alive()
+        or stderr_reader.is_alive()
+        or stdout_oversized[0]
+        or stderr_oversized[0]
+    ):
+        return None
+    try:
+        payload = json.loads(b"".join(stdout).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    required = {
+        "schema_version", "operation_id", "target_verification", "outcome", "reason",
+        "verification_signature",
+    }
+    if (
+        type(payload) is not dict
+        or set(payload) != required
+        or payload.get("schema_version") != 1
+        or payload.get("operation_id") != operation_id
+        or payload.get("target_verification") != target_verification
+        or payload.get("outcome") not in {"verified", "mismatched", "unavailable"}
+        or type(payload.get("reason")) is not str
+        or re.fullmatch(r"[a-z_]{1,64}", payload["reason"]) is None
+        or type(payload.get("verification_signature")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["verification_signature"]) is None
+    ):
+        return None
+    unsigned = {key: payload[key] for key in required - {"verification_signature"}}
+    signature = hashlib.sha256(_strict_canonical_json(unsigned)).hexdigest()
+    if signature != payload["verification_signature"]:
+        return None
+    return _StrictTargetVerification(
+        outcome=payload["outcome"],
+        reason=_strict_reason_fingerprint("target_" + payload["outcome"], payload["reason"]),
+        signature=signature,
+    )
+
+
 def _parse_reviewed_completion_preconditions(
     raw: str,
 ) -> tuple[kb.ReviewedCompletionPreconditions, dict[str, object]]:
@@ -2557,6 +2711,7 @@ def _parse_reviewed_completion_preconditions(
     if not isinstance(payload, dict):
         raise ValueError("must be a JSON object")
     precondition_fields = {
+        "tenant",
         "parent_block_event_id",
         "parent_block_event_signature",
         "review_input_digest",
@@ -2620,6 +2775,16 @@ def _cmd_complete_strict(
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"kanban: --automation-preconditions: {exc}", file=sys.stderr)
         return 2
+    if (
+        type(args.tenant) is not str
+        or args.tenant != args.tenant.strip()
+        or args.tenant != preconditions.tenant
+    ):
+        print(
+            "kanban: --require-goal-judge requires an exact matching --tenant",
+            file=sys.stderr,
+        )
+        return 2
 
     request = kb.ReviewedCompletionRequest(
         task_id=task_id,
@@ -2629,7 +2794,23 @@ def _cmd_complete_strict(
         target_verification=target_verification,
         preconditions=preconditions,
         judge_input_signature="",
+        post_judge_verification_signature="0" * 64,
     )
+    with kb.connect_closing() as conn:
+        replay = kb.replay_reviewed_completion_before_target_verification(
+            conn,
+            request,
+        )
+    if replay is not None:
+        outcome = "accepted" if replay.outcome == "committed" else "precondition_changed"
+        print(json.dumps(_strict_completion_payload(
+            outcome=outcome,
+            task_id=replay.task_id,
+            operation_id=replay.operation_id,
+            event_id=replay.event_id,
+            reason="replayed" if outcome == "accepted" else "operation_conflict",
+        ), ensure_ascii=False))
+        return 0
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
         if task is None or task.status != "blocked" or task.block_kind != "review":
@@ -2650,11 +2831,14 @@ def _cmd_complete_strict(
 
     judge_result = strict.judge_goal_strict(judge_input)
     if judge_result.outcome != "accepted":
+        outcome = judge_result.outcome
+        if outcome not in {"rejected", "unavailable", "parse_failed"}:
+            outcome = "parse_failed"
         print(json.dumps(_strict_completion_payload(
-            outcome=judge_result.outcome,
+            outcome=outcome,
             task_id=task_id,
             operation_id=preconditions.operation_id,
-            reason=judge_result.reason,
+            reason=_strict_reason_fingerprint("judge_" + outcome, judge_result.reason),
         ), ensure_ascii=False))
         return 0
 
@@ -2666,6 +2850,54 @@ def _cmd_complete_strict(
         target_verification=request.target_verification,
         preconditions=request.preconditions,
         judge_input_signature=judge_input.signature(),
+        post_judge_verification_signature="0" * 64,
+    )
+    with kb.connect_closing() as conn:
+        replay = kb.replay_reviewed_completion_before_target_verification(
+            conn,
+            guarded_request,
+        )
+    if replay is not None:
+        outcome = "accepted" if replay.outcome == "committed" else "precondition_changed"
+        print(json.dumps(_strict_completion_payload(
+            outcome=outcome,
+            task_id=replay.task_id,
+            operation_id=replay.operation_id,
+            event_id=replay.event_id,
+            reason="replayed" if outcome == "accepted" else "operation_conflict",
+        ), ensure_ascii=False))
+        return 0
+    verification = _post_judge_target_verifier(
+        dict(guarded_request.target_verification),
+        preconditions.operation_id,
+    )
+    if verification is None:
+        print(json.dumps(_strict_completion_payload(
+            outcome="unavailable",
+            task_id=task_id,
+            operation_id=preconditions.operation_id,
+            reason="target_verifier_malformed",
+        ), ensure_ascii=False))
+        return 0
+    if verification.outcome == "mismatched":
+        print(json.dumps(_strict_completion_payload(
+            outcome="precondition_changed",
+            task_id=task_id,
+            operation_id=preconditions.operation_id,
+            reason=verification.reason,
+        ), ensure_ascii=False))
+        return 0
+    if verification.outcome != "verified":
+        print(json.dumps(_strict_completion_payload(
+            outcome="unavailable",
+            task_id=task_id,
+            operation_id=preconditions.operation_id,
+            reason=verification.reason,
+        ), ensure_ascii=False))
+        return 0
+    guarded_request = replace(
+        guarded_request,
+        post_judge_verification_signature=verification.signature,
     )
     with kb.connect_closing() as conn:
         result = kb.complete_reviewed_task_guarded(conn, guarded_request)
