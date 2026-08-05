@@ -63,6 +63,16 @@ _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _COUNTER = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _PROCESS_LOCK = threading.RLock()
+TRUSTED_ESCALATION_REASONS: Mapping[str, str] = MappingProxyType({
+    "human_action_required": "ownerless_blocked",
+    "target_unavailable": "target_unavailable",
+    "repair_required": "repair_required",
+    "review_retry_exhausted": "review_retry_exhausted",
+    "verification_exhausted": "verification_exhausted",
+    "judge_exhausted": "judge_exhausted",
+    "reviewer_rejected": "reviewer_rejected",
+    "invalid_review": "invalid_review",
+})
 
 
 class RecoveryHealthError(RuntimeError):
@@ -123,6 +133,10 @@ class PublicEscalation:
         _plain_text(self.task_event_signature, "task event signature", _DIGEST)
         _plain_text(self.outcome_class, "outcome class", _CODE)
         _plain_text(self.reason_code, "reason code", _CODE)
+        if self.outcome_class not in TRUSTED_ESCALATION_REASONS:
+            raise ValueError("unsupported trusted escalation outcome")
+        if self.reason_code != TRUSTED_ESCALATION_REASONS[self.outcome_class]:
+            raise ValueError("invalid escalation outcome/reason mapping")
         if self.tier not in {"initial", "24h", "72h"}:
             raise ValueError("unsupported escalation tier")
         if type(self.acknowledged) is not bool:

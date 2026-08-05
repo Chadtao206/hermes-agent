@@ -222,6 +222,21 @@ def test_public_snapshot_rejects_unvalidated_config_identity():
         replace(value.boards[0], validated_config_digest="not-a-digest").validate()
 
 
+def test_public_escalation_rejects_lexical_but_untrusted_outcome_and_reason():
+    from dataclasses import replace
+
+    value = _snapshot()
+    escalation = value.escalations[0]
+    with pytest.raises(ValueError, match="trusted escalation outcome"):
+        replace(
+            escalation,
+            outcome_class="task_body_comment",
+            reason_code="task_body_comment",
+        ).validate()
+    with pytest.raises(ValueError, match="outcome/reason mapping"):
+        replace(escalation, reason_code="human_action_required").validate()
+
+
 def test_read_rejects_oversized_file_before_json_decode(tmp_path, monkeypatch):
     import hermes_constants
     import hermes_cli.kanban_recovery_health as health
