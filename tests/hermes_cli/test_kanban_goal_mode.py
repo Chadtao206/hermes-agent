@@ -26,10 +26,84 @@ from hermes_cli import kanban as kc
 from hermes_cli import strict_goal_judge as strict
 
 
-_STAGED_REVIEW_DELEGATOR_SCRIPTS = (
-    Path(__file__).resolve().parents[2]
-    / ".superpowers/sdd/2026-08-03-kanban-blocked-recovery-router/staged-hermes/scripts"
-)
+def _write_fixture_target_verifier(tmp_path: Path) -> Path:
+    """Install the fixed strict-verifier module name in test-local PYTHONPATH."""
+    package_root = tmp_path / "strict-target-verifier"
+    package = package_root / "review_delegator"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "targets.py").write_text(
+        '''import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+
+def _canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _verify(target):
+    try:
+        if type(target) is not dict or set(target) != {"kind", "identity", "revision"}:
+            return "mismatched", "invalid_target"
+        if target["kind"] != "artifact" or type(target["identity"]) is not str:
+            return "mismatched", "invalid_target"
+        if type(target["revision"]) is not str or re.fullmatch(r"[0-9a-f]{64}", target["revision"]) is None:
+            return "mismatched", "invalid_target"
+        identity = json.loads(target["identity"])
+        if (
+            type(identity) is not dict
+            or set(identity) != {"identifier", "path"}
+            or any(type(value) is not str for value in identity.values())
+            or _canonical_json(identity) != target["identity"]
+        ):
+            return "mismatched", "invalid_target"
+        path = Path(identity["path"])
+        if not path.is_absolute() or not path.is_file() or path.resolve() != path:
+            return "mismatched", "locator_mismatch"
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != target["revision"]:
+            return "mismatched", "revision_mismatch"
+        return "verified", "verified"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return "mismatched", "invalid_target"
+
+
+def _main():
+    try:
+        request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+        if type(request) is not dict or set(request) != {"schema_version", "operation_id", "target_verification"}:
+            return 2
+        if request["schema_version"] != 1 or type(request["operation_id"]) is not str:
+            return 2
+        target = request["target_verification"]
+        outcome, reason = _verify(target)
+        unsigned = {
+            "schema_version": 1,
+            "operation_id": request["operation_id"],
+            "target_verification": target,
+            "outcome": outcome,
+            "reason": reason,
+        }
+        print(_canonical_json({
+            **unsigned,
+            "verification_signature": hashlib.sha256(
+                _canonical_json(unsigned).encode("utf-8")
+            ).hexdigest(),
+        }))
+        return 0
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main() if sys.argv[1:] == ["verify-strict-target"] else 2)
+''',
+        encoding="utf-8",
+    )
+    return package_root
 
 
 @pytest.fixture
@@ -37,7 +111,7 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("PYTHONPATH", str(_STAGED_REVIEW_DELEGATOR_SCRIPTS))
+    monkeypatch.setenv("PYTHONPATH", str(_write_fixture_target_verifier(tmp_path)))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
