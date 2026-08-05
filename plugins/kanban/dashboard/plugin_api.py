@@ -665,7 +665,6 @@ def acknowledge_escalation_endpoint(
                 and item.task_id == task_id
                 and item.signature == payload.signature
                 and item.task_event_signature == payload.expected_event_signature
-                and not item.acknowledged
             )
         ),
         None,
@@ -678,6 +677,15 @@ def acknowledge_escalation_endpoint(
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=409, detail="escalation task is stale or unknown")
+        if escalation.acknowledged and not any(
+            event.kind == "escalation_acknowledged"
+            and event.payload.get("operation_id") == payload.operation_id
+            and event.payload.get("signature") == payload.signature
+            and event.payload.get("source_event_signature") == payload.expected_event_signature
+            and event.payload.get("actor") == "dashboard"
+            for event in kanban_db.list_events(conn, task_id)
+        ):
+            raise HTTPException(status_code=409, detail="acknowledged escalation cannot be proven")
         result = kanban_db.acknowledge_escalation(
             conn,
             kanban_db.EscalationAcknowledgement(

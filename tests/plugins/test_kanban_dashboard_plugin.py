@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -94,7 +95,14 @@ def _write_recovery_health(*, board: str, escalations: tuple[dict[str, object], 
     write_recovery_health(snapshot)
 
 
-def _escalation(*, board: str, task_id: str, signature: str, event_signature: str) -> dict[str, object]:
+def _escalation(
+    *,
+    board: str,
+    task_id: str,
+    signature: str,
+    event_signature: str,
+    acknowledged: bool = False,
+) -> dict[str, object]:
     return {
         "board": board,
         "task_id": task_id,
@@ -103,9 +111,169 @@ def _escalation(*, board: str, task_id: str, signature: str, event_signature: st
         "task_event_signature": event_signature,
         "outcome_class": "human_action_required",
         "tier": "initial",
-        "acknowledged": False,
+        "acknowledged": acknowledged,
         "reason_code": "ownerless_blocked",
     }
+
+
+def _run_dashboard_bundle_behavior(scenario: str) -> dict[str, object]:
+    """Exercise selected dashboard components through the shipped bundle."""
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    harness = r'''
+const fs = require("fs");
+const vm = require("vm");
+const scenario = process.argv[1];
+let fetchBehavior;
+const sameDeps = (left, right) => left && right && left.length === right.length && left.every((item, index) => item === right[index]);
+function runner(Component) {
+  const states = [];
+  const effects = [];
+  let cursor = 0;
+  return {
+    render(props) {
+      cursor = 0;
+      global.__activeRunner = this;
+      const output = Component(props);
+      global.__activeRunner = null;
+      const pending = effects.filter((effect) => effect.pending);
+      pending.forEach((effect) => { effect.pending = false; effect.callback(); });
+      return output;
+    },
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial;
+      return [states[index], (next) => { states[index] = typeof next === "function" ? next(states[index]) : next; }];
+    },
+    useEffect(callback, deps) {
+      const index = cursor++;
+      if (!effects[index]) effects[index] = { deps: null, callback: null, pending: false };
+      if (!sameDeps(effects[index].deps, deps)) {
+        effects[index].deps = deps;
+        effects[index].callback = callback;
+        effects[index].pending = true;
+      }
+    },
+    useCallback(callback) { cursor++; return callback; },
+    useMemo(factory) { cursor++; return factory(); },
+    useRef(value) { cursor++; return { current: value }; },
+  };
+}
+const hooks = {
+  useState: (...args) => global.__activeRunner.useState(...args),
+  useEffect: (...args) => global.__activeRunner.useEffect(...args),
+  useCallback: (...args) => global.__activeRunner.useCallback(...args),
+  useMemo: (...args) => global.__activeRunner.useMemo(...args),
+  useRef: (...args) => global.__activeRunner.useRef(...args),
+};
+global.window = {
+  __HERMES_PLUGIN_SDK__: {
+    React: {
+      Component: class {},
+      createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+    },
+    components: {},
+    hooks,
+    utils: { cn: (...items) => items.filter(Boolean).join(" "), timeAgo: () => "" },
+    fetchJSON: (...args) => fetchBehavior(...args),
+  },
+};
+const source = fs.readFileSync(process.env.DASHBOARD_BUNDLE, "utf8");
+const marker = "})();";
+const end = source.lastIndexOf(marker);
+if (end < 0) throw new Error("bundle wrapper missing");
+vm.runInThisContext(source.slice(0, end) + "window.__testComponents = { DiagnosticsSection, DiagnosticCard };" + source.slice(end));
+const { DiagnosticsSection, DiagnosticCard } = window.__testComponents;
+const task = { id: "task-1", assignee: "" };
+function find(node, predicate) {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const match = find(child, predicate);
+      if (match) return match;
+    }
+    return null;
+  }
+  if (!node || typeof node !== "object") return null;
+  if (predicate(node)) return node;
+  for (const child of node.children || []) {
+    const match = find(child, predicate);
+    if (match) return match;
+  }
+  return null;
+}
+function text(node) {
+  if (node == null) return "";
+  if (Array.isArray(node)) return node.map(text).join(" ");
+  if (typeof node === "string") return node;
+  return (node.children || []).map(text).join(" ");
+}
+async function tick() {
+  await new Promise(setImmediate);
+}
+(async () => {
+  if (scenario === "health-unavailable") {
+    fetchBehavior = () => Promise.reject(new Error("unavailable"));
+    const unavailable = runner(DiagnosticsSection);
+    unavailable.render({ boardSlug: "default", task, diagnostics: [] });
+    await tick();
+    unavailable.render({ boardSlug: "default", task, diagnostics: [] });
+    const unavailableTree = unavailable.render({ boardSlug: "default", task, diagnostics: [] });
+    const diagnostic = find(unavailableTree, (node) => node.type === DiagnosticCard);
+    const cardTree = diagnostic
+      ? runner(DiagnosticCard).render({ ...diagnostic.props, task, boardSlug: "default", assignees: [] })
+      : null;
+    fetchBehavior = () => Promise.resolve({ escalations: [] });
+    const empty = runner(DiagnosticsSection);
+    empty.render({ boardSlug: "default", task, diagnostics: [] });
+    await tick();
+    const emptyTree = empty.render({ boardSlug: "default", task, diagnostics: [] });
+    console.log(JSON.stringify({ unavailableText: text(cardTree), unavailableActions: diagnostic ? diagnostic.props.diag.actions.length : null, emptyIsHidden: emptyTree === null }));
+    return;
+  }
+  if (scenario === "new-escalation") {
+    const action = (signature, eventSignature, acknowledged) => ({
+      kind: "acknowledge_escalation", label: "Acknowledge escalation",
+      payload: { signature, expected_event_signature: eventSignature, acknowledged },
+    });
+    const card = runner(DiagnosticCard);
+    card.render({ diag: { actions: [action("old", "event-old", true)] }, task, boardSlug: "default", assignees: [] });
+    card.render({ diag: { actions: [action("new", "event-new", false)] }, task, boardSlug: "default", assignees: [] });
+    const tree = card.render({ diag: { actions: [action("new", "event-new", false)] }, task, boardSlug: "default", assignees: [] });
+    const actionNode = find(tree, (node) => typeof node.type === "function" && node.props.action && node.props.action.kind === "acknowledge_escalation");
+    const actionTree = actionNode ? actionNode.type(actionNode.props) : null;
+    console.log(JSON.stringify({ text: text(actionTree), hasAcknowledgeButton: !!find(actionTree, (node) => node.type === "button" && text(node) === "Acknowledge escalation") }));
+    return;
+  }
+  throw new Error("unknown scenario: " + scenario);
+})().catch((error) => { console.error(error.stack); process.exit(1); });
+'''
+    result = subprocess.run(
+        ["node", "-e", harness, scenario],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={**os.environ, "DASHBOARD_BUNDLE": str(bundle)},
+    )
+    return json.loads(result.stdout)
+
+
+def test_dashboard_recovery_health_unavailable_stays_visible_and_non_actionable():
+    """A failed health fetch must not render as a clean task with no diagnostics."""
+    rendered = _run_dashboard_bundle_behavior("health-unavailable")
+
+    assert "Recovery health unavailable" in rendered["unavailableText"]
+    assert "Acknowledgement is disabled" in rendered["unavailableText"]
+    assert rendered["unavailableActions"] == 0
+    assert rendered["emptyIsHidden"] is True
+
+
+def test_dashboard_new_escalation_resets_local_acknowledgement_badge():
+    """A distinct unacknowledged escalation must offer acknowledgement again."""
+    rendered = _run_dashboard_bundle_behavior("new-escalation")
+
+    assert rendered["hasAcknowledgeButton"] is True
+    assert "Acknowledged — task remains open" not in rendered["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -2149,6 +2317,108 @@ def test_dashboard_acknowledgement_is_lifecycle_neutral_and_replay_safe(client):
         ]
         assert len(acknowledgements) == 1
         assert acknowledgements[0].payload["actor"] == "dashboard"
+    finally:
+        conn.close()
+
+
+def test_dashboard_acknowledgement_replays_after_health_snapshot_marks_it_acknowledged(client):
+    """A refreshed acknowledged snapshot may replay its exact existing operation."""
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(conn, title="replay after health refresh", tenant="team-a")
+        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
+        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
+    finally:
+        conn.close()
+    payload = {
+        "signature": "a" * 64,
+        "expected_event_signature": event_signature,
+        "operation_id": "dashboard-ack-after-health-refresh",
+    }
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id=task_id,
+                signature=payload["signature"],
+                event_signature=event_signature,
+            ),
+        ),
+    )
+    committed = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json=payload,
+    )
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id=task_id,
+                signature=payload["signature"],
+                event_signature=event_signature,
+                acknowledged=True,
+            ),
+        ),
+    )
+
+    replay = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json=payload,
+    )
+
+    assert committed.status_code == 200, committed.text
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["event_id"] == committed.json()["event_id"]
+    conn = kb.connect(board="default")
+    try:
+        assert len([
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "escalation_acknowledged"
+        ]) == 1
+    finally:
+        conn.close()
+
+
+def test_dashboard_rejects_unproven_acknowledged_health_snapshot(client):
+    """An acknowledged snapshot alone must not authorize a new mutation."""
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(conn, title="unproven health acknowledgement", tenant="team-a")
+        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
+        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
+    finally:
+        conn.close()
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id=task_id,
+                signature="a" * 64,
+                event_signature=event_signature,
+                acknowledged=True,
+            ),
+        ),
+    )
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json={
+            "signature": "a" * 64,
+            "expected_event_signature": event_signature,
+            "operation_id": "dashboard-ack-unproven-health",
+        },
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect(board="default")
+    try:
+        assert not any(
+            event.kind == "escalation_acknowledged"
+            for event in kb.list_events(conn, task_id)
+        )
     finally:
         conn.close()
 

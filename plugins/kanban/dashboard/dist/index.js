@@ -1320,14 +1320,24 @@
     const acknowledgeAction = (diag.actions || []).find(function (a) {
       return a.kind === "acknowledge_escalation";
     });
-    const [acknowledged, setAcknowledged] = useState(!!(
+    const acknowledgementKey = acknowledgeAction && acknowledgeAction.payload
+      ? `${acknowledgeAction.payload.signature}:${acknowledgeAction.payload.expected_event_signature}`
+      : "";
+    const serverAcknowledged = !!(
       acknowledgeAction && acknowledgeAction.payload && acknowledgeAction.payload.acknowledged
-    ));
+    );
+    const [acknowledgementState, setAcknowledgementState] = useState({
+      key: acknowledgementKey,
+      acknowledged: serverAcknowledged,
+    });
     useEffect(function () {
-      if (acknowledgeAction && acknowledgeAction.payload && acknowledgeAction.payload.acknowledged) {
-        setAcknowledged(true);
-      }
-    }, [acknowledgeAction && acknowledgeAction.payload && acknowledgeAction.payload.acknowledged]);
+      setAcknowledgementState(function (current) {
+        if (current.key !== acknowledgementKey) {
+          return { key: acknowledgementKey, acknowledged: serverAcknowledged };
+        }
+        return serverAcknowledged ? { ...current, acknowledged: true } : current;
+      });
+    }, [acknowledgementKey, serverAcknowledged]);
 
     const execAction = function (action) {
       if (busy) return;
@@ -1435,7 +1445,7 @@
             operation_id: evidence.operation_id,
           }),
         }).then(function () {
-          setAcknowledged(true);
+          setAcknowledgementState({ key: acknowledgementKey, acknowledged: true });
           setMsg({ ok: true, text: "Escalation acknowledged — task remains open." });
           if (props.onRefreshHealth) props.onRefreshHealth();
           if (onRefresh) onRefresh();
@@ -1515,7 +1525,7 @@
             extra: {
               copied: copiedKey === a.label,
               disabled: (a.kind === "reassign" && !reassignProfile),
-              acknowledged: acknowledged,
+              acknowledged: acknowledgementState.acknowledged,
             },
           });
         }),
@@ -1533,40 +1543,48 @@
 
   function DiagnosticsSection(props) {
     const { t } = useI18n();
-    const [recoveryEscalation, setRecoveryEscalation] = useState(null);
+    const [recoveryHealth, setRecoveryHealth] = useState({
+      status: "loading",
+      escalation: null,
+    });
     const loadRecoveryHealth = useCallback(function () {
       return SDK.fetchJSON(withBoard(`${API}/recovery-health`, props.boardSlug))
         .then(function (health) {
           const current = (health.escalations || []).find(function (item) {
             return item.task_id === props.task.id;
           }) || null;
-          setRecoveryEscalation(current);
+          setRecoveryHealth({ status: "available", escalation: current });
         })
         .catch(function () {
-          // Missing, stale, or corrupt public health is explicitly unavailable;
-          // never turn it into an actionable empty result.
-          setRecoveryEscalation(null);
+          setRecoveryHealth({ status: "unavailable", escalation: null });
         });
     }, [props.boardSlug, props.task.id]);
     useEffect(function () { loadRecoveryHealth(); }, [loadRecoveryHealth]);
-    const recoveryDiagnostic = recoveryEscalation ? {
+    const recoveryDiagnostic = recoveryHealth.status === "unavailable" ? {
+      kind: "recovery_health_unavailable",
+      severity: "error",
+      title: "Recovery health unavailable",
+      detail: "Recovery-health evidence is unavailable. Acknowledgement is disabled until it becomes available.",
+      actions: [],
+      data: {},
+    } : recoveryHealth.escalation ? {
       kind: "recovery_escalation",
       severity: "error",
       title: "Recovery escalation",
-      detail: `Escalation tier ${recoveryEscalation.tier} remains open.`,
+      detail: `Escalation tier ${recoveryHealth.escalation.tier} remains open.`,
       actions: [{
         kind: "acknowledge_escalation",
         label: "Acknowledge escalation",
         payload: {
-          signature: recoveryEscalation.signature,
-          expected_event_signature: recoveryEscalation.task_event_signature,
-          operation_id: "dashboard-ack:" + recoveryEscalation.signature,
-          acknowledged: !!recoveryEscalation.acknowledged,
+          signature: recoveryHealth.escalation.signature,
+          expected_event_signature: recoveryHealth.escalation.task_event_signature,
+          operation_id: "dashboard-ack:" + recoveryHealth.escalation.signature,
+          acknowledged: !!recoveryHealth.escalation.acknowledged,
         },
       }],
       data: {
-        reason: recoveryEscalation.reason_code,
-        outcome: recoveryEscalation.outcome_class,
+        reason: recoveryHealth.escalation.reason_code,
+        outcome: recoveryHealth.escalation.outcome_class,
       },
     } : null;
     const diags = recoveryDiagnostic
