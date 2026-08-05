@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_recovery_health as krh
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,25 @@ def _conn(board: Optional[str] = None):
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
+
+
+def _required_board(board: Optional[str]) -> str:
+    """Resolve an explicit board without falling through to process state."""
+    resolved = _resolve_board(board)
+    if resolved is None:
+        raise HTTPException(status_code=400, detail="board is required")
+    return resolved
+
+
+def _read_recovery_health() -> krh.RecoveryHealthSnapshot:
+    """Read the sole authenticated recovery-health boundary for this plugin."""
+    try:
+        return krh.read_recovery_health()
+    except krh.RecoveryHealthError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="recovery health snapshot is unavailable",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +612,88 @@ def get_task(
 # ---------------------------------------------------------------------------
 # POST /tasks
 # ---------------------------------------------------------------------------
+
+
+@router.get("/recovery-health")
+def get_recovery_health(board: Optional[str] = Query(None, description="Kanban board slug")):
+    """Return only the authenticated public recovery health for one board."""
+    board = _required_board(board)
+    snapshot = _read_recovery_health()
+    health = next((item for item in snapshot.boards if item.board == board), None)
+    if health is None:
+        raise HTTPException(status_code=404, detail=f"recovery health for board {board!r} is unavailable")
+    return {
+        "board": board,
+        "health": {
+            "board": health.board,
+            "review_mode": health.review_mode,
+            "transient_mode": health.transient_mode,
+            "census_healthy": health.census_healthy,
+            "ownerless_blocked_count": health.ownerless_blocked_count,
+            "multiply_owned_blocked_count": health.multiply_owned_blocked_count,
+            "validated_config_digest": health.validated_config_digest,
+            "counters": dict(health.counters),
+        },
+        "escalations": [
+            asdict(escalation)
+            for escalation in snapshot.escalations
+            if escalation.board == board
+        ],
+    }
+
+
+class EscalationAcknowledgementBody(BaseModel):
+    signature: str
+    expected_event_signature: str
+    operation_id: str = Field(min_length=1)
+
+
+@router.post("/tasks/{task_id}/acknowledge-escalation")
+def acknowledge_escalation_endpoint(
+    task_id: str,
+    payload: EscalationAcknowledgementBody,
+    board: Optional[str] = Query(None, description="Kanban board slug"),
+):
+    """Acknowledge one exact public escalation without changing task lifecycle."""
+    board = _required_board(board)
+    snapshot = _read_recovery_health()
+    escalation = next(
+        (
+            item for item in snapshot.escalations
+            if (
+                item.board == board
+                and item.task_id == task_id
+                and item.signature == payload.signature
+                and item.task_event_signature == payload.expected_event_signature
+                and not item.acknowledged
+            )
+        ),
+        None,
+    )
+    if escalation is None:
+        raise HTTPException(status_code=409, detail="escalation evidence is stale or unknown")
+
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=409, detail="escalation task is stale or unknown")
+        result = kanban_db.acknowledge_escalation(
+            conn,
+            kanban_db.EscalationAcknowledgement(
+                task_id=task_id,
+                escalation_signature=payload.signature,
+                expected_event_signature=payload.expected_event_signature,
+                expected_tenant=str(task.tenant or "").strip(),
+                actor="dashboard",
+                operation_id=payload.operation_id,
+            ),
+        )
+        if result.outcome != "committed":
+            raise HTTPException(status_code=409, detail=result.reason or "escalation acknowledgement conflicted")
+        return asdict(result)
+    finally:
+        conn.close()
 
 class CreateTaskBody(BaseModel):
     title: str

@@ -1254,6 +1254,7 @@
   //   comment   → scroll to the comment input at the bottom of the drawer
   //   cli_hint  → copy payload.command to clipboard
   //   open_docs → open payload.url in a new tab
+  //   acknowledge_escalation → POST exact signed recovery-health evidence
   // Unknown kinds are rendered as a disabled informational row so the
   // server can add new action kinds without breaking the UI.
   // -------------------------------------------------------------------------
@@ -1266,8 +1267,13 @@
       "hermes-kanban-diag-action-btn",
       action.suggested ? "hermes-kanban-diag-action-btn--suggested" : "",
     );
+    if (action.kind === "acknowledge_escalation" && extra && extra.acknowledged) {
+      return h("span", {
+        className: cls + " hermes-kanban-diag-action-btn--acknowledged",
+      }, "Acknowledged — task remains open");
+    }
     if (action.kind === "reclaim" || action.kind === "reassign" ||
-        action.kind === "unblock") {
+        action.kind === "unblock" || action.kind === "acknowledge_escalation") {
       return h("button", {
         className: cls,
         disabled: busy || (extra && extra.disabled),
@@ -1311,6 +1317,17 @@
     const [msg, setMsg] = useState(null);
     const [copiedKey, setCopiedKey] = useState(null);
     const [reassignProfile, setReassignProfile] = useState(task.assignee || "");
+    const acknowledgeAction = (diag.actions || []).find(function (a) {
+      return a.kind === "acknowledge_escalation";
+    });
+    const [acknowledged, setAcknowledged] = useState(!!(
+      acknowledgeAction && acknowledgeAction.payload && acknowledgeAction.payload.acknowledged
+    ));
+    useEffect(function () {
+      if (acknowledgeAction && acknowledgeAction.payload && acknowledgeAction.payload.acknowledged) {
+        setAcknowledged(true);
+      }
+    }, [acknowledgeAction && acknowledgeAction.payload && acknowledgeAction.payload.acknowledged]);
 
     const execAction = function (action) {
       if (busy) return;
@@ -1402,6 +1419,32 @@
         }).then(function () { setBusy(false); });
         return;
       }
+      if (action.kind === "acknowledge_escalation") {
+        const evidence = action.payload || {};
+        setBusy(true); setMsg(null);
+        const url = withBoard(
+          `${API}/tasks/${encodeURIComponent(task.id)}/acknowledge-escalation`,
+          boardSlug,
+        );
+        SDK.fetchJSON(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signature: evidence.signature,
+            expected_event_signature: evidence.expected_event_signature,
+            operation_id: evidence.operation_id,
+          }),
+        }).then(function () {
+          setAcknowledged(true);
+          setMsg({ ok: true, text: "Escalation acknowledged — task remains open." });
+          if (props.onRefreshHealth) props.onRefreshHealth();
+          if (onRefresh) onRefresh();
+        }).catch(function (err) {
+          setMsg({ ok: false, text: "Acknowledgement failed: " + (err.message || err) });
+          if (props.onRefreshHealth) props.onRefreshHealth();
+        }).then(function () { setBusy(false); });
+        return;
+      }
     };
 
     // Pull out the reassign action so we can render its picker inline.
@@ -1472,6 +1515,7 @@
             extra: {
               copied: copiedKey === a.label,
               disabled: (a.kind === "reassign" && !reassignProfile),
+              acknowledged: acknowledged,
             },
           });
         }),
@@ -1489,7 +1533,45 @@
 
   function DiagnosticsSection(props) {
     const { t } = useI18n();
-    const diags = props.diagnostics || [];
+    const [recoveryEscalation, setRecoveryEscalation] = useState(null);
+    const loadRecoveryHealth = useCallback(function () {
+      return SDK.fetchJSON(withBoard(`${API}/recovery-health`, props.boardSlug))
+        .then(function (health) {
+          const current = (health.escalations || []).find(function (item) {
+            return item.task_id === props.task.id;
+          }) || null;
+          setRecoveryEscalation(current);
+        })
+        .catch(function () {
+          // Missing, stale, or corrupt public health is explicitly unavailable;
+          // never turn it into an actionable empty result.
+          setRecoveryEscalation(null);
+        });
+    }, [props.boardSlug, props.task.id]);
+    useEffect(function () { loadRecoveryHealth(); }, [loadRecoveryHealth]);
+    const recoveryDiagnostic = recoveryEscalation ? {
+      kind: "recovery_escalation",
+      severity: "error",
+      title: "Recovery escalation",
+      detail: `Escalation tier ${recoveryEscalation.tier} remains open.`,
+      actions: [{
+        kind: "acknowledge_escalation",
+        label: "Acknowledge escalation",
+        payload: {
+          signature: recoveryEscalation.signature,
+          expected_event_signature: recoveryEscalation.task_event_signature,
+          operation_id: "dashboard-ack:" + recoveryEscalation.signature,
+          acknowledged: !!recoveryEscalation.acknowledged,
+        },
+      }],
+      data: {
+        reason: recoveryEscalation.reason_code,
+        outcome: recoveryEscalation.outcome_class,
+      },
+    } : null;
+    const diags = recoveryDiagnostic
+      ? (props.diagnostics || []).concat([recoveryDiagnostic])
+      : (props.diagnostics || []);
     const hasOpenDiags = diags.length > 0;
     const [open, setOpen] = useState(hasOpenDiags);
     useEffect(function () {
@@ -1524,6 +1606,7 @@
                 boardSlug: props.boardSlug,
                 assignees: props.assignees,
                 onRefresh: props.onRefresh,
+                onRefreshHealth: loadRecoveryHealth,
               });
             }),
           )

@@ -1263,6 +1263,7 @@ class EscalationAcknowledgement:
     task_id: str
     escalation_signature: str
     expected_event_signature: str
+    expected_tenant: str
     actor: str
     operation_id: str
 
@@ -8308,27 +8309,24 @@ def acknowledge_escalation(
     actor = request.actor.strip() if isinstance(request.actor, str) else ""
     if not actor:
         raise ValueError("actor must be a nonempty string")
+    if (
+        not isinstance(request.expected_tenant, str)
+        or request.expected_tenant != request.expected_tenant.strip()
+    ):
+        raise ValueError("expected_tenant must be normalized text")
     operation_signature = _canonical_operation_signature(
         "escalation_acknowledged",
         request.task_id,
         {
             "escalation_signature": request.escalation_signature,
             "expected_event_signature": request.expected_event_signature,
+            "expected_tenant": request.expected_tenant,
             "actor": actor,
         },
     )
     with write_txn(conn):
-        replay = _guarded_operation_replay(
-            conn,
-            task_id=request.task_id,
-            operation_id=request.operation_id,
-            event_kind="escalation_acknowledged",
-            operation_signature=operation_signature,
-        )
-        if replay is not None:
-            return replay
         task = conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?",
+            "SELECT tenant FROM tasks WHERE id = ?",
             (request.task_id,),
         ).fetchone()
         if task is None:
@@ -8338,6 +8336,22 @@ def acknowledge_escalation(
                 operation_id=request.operation_id,
                 reason="task not found",
             )
+        if str(task["tenant"] or "").strip() != request.expected_tenant:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=request.task_id,
+                operation_id=request.operation_id,
+                reason="task tenant changed",
+            )
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=request.task_id,
+            operation_id=request.operation_id,
+            event_kind="escalation_acknowledged",
+            operation_signature=operation_signature,
+        )
+        if replay is not None:
+            return replay
         source = _latest_task_event(conn, request.task_id)
         if (
             source is None

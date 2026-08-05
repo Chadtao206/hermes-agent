@@ -672,22 +672,23 @@ def test_acknowledge_escalation_cli_derives_local_guard_and_operation(
 ):
     monkeypatch.setenv("HERMES_PROFILE_NAME", "local-operator")
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(conn, title="human escalation")
+        task_id = kb.create_task(conn, title="human escalation", tenant="team-a")
         assert kb.block_task(conn, task_id, reason="decision", kind="needs_input")
         status_before = kb.get_task(conn, task_id).status
 
-    payload = json.loads(
-        kc.run_slash(f"acknowledge-escalation {task_id} --signature {'b' * 64} --json")
-    )
+    command = f"acknowledge-escalation {task_id} --signature {'b' * 64} --json"
+    payload = json.loads(kc.run_slash(command))
+    replay = json.loads(kc.run_slash(command))
 
     assert payload["outcome"] == "committed"
     assert payload["operation_id"]
+    assert replay["event_id"] == payload["event_id"]
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-        event = kb.list_events(conn, task_id)[-1]
+        events = [event for event in kb.list_events(conn, task_id) if event.kind == "escalation_acknowledged"]
     assert task.status == status_before
-    assert event.kind == "escalation_acknowledged"
-    assert event.payload["actor"] == "local-operator"
+    assert len(events) == 1
+    assert events[0].payload["actor"] == "local-operator"
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):

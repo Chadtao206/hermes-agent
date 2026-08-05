@@ -3306,6 +3306,8 @@ def _cmd_acknowledge_escalation(args: argparse.Namespace) -> int:
         actor,
     )
     with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        expected_tenant = str(task.tenant or "").strip() if task is not None else ""
         expected_signature = args.expected_event_signature
         if expected_signature is None:
             events = kb.list_events(conn, args.task_id)
@@ -3316,6 +3318,7 @@ def _cmd_acknowledge_escalation(args: argparse.Namespace) -> int:
             task_id=args.task_id,
             escalation_signature=args.signature,
             expected_event_signature=expected_signature,
+            expected_tenant=expected_tenant,
             actor=actor,
             operation_id=operation_id,
         )

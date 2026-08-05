@@ -60,6 +60,54 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def _write_recovery_health(*, board: str, escalations: tuple[dict[str, object], ...]):
+    """Write a real authenticated public snapshot for dashboard boundary tests."""
+    from hermes_cli.kanban_recovery_health import (
+        BoardRecoveryHealth,
+        PublicEscalation,
+        RecoveryHealthSnapshot,
+        REQUIRED_COUNTERS,
+        write_recovery_health,
+    )
+
+    boards = {board, *(str(item["board"]) for item in escalations)}
+    snapshot = RecoveryHealthSnapshot(
+        schema_version=1,
+        revision=0,
+        recorded_at=int(time.time()),
+        boards=tuple(
+            BoardRecoveryHealth(
+                board=slug,
+                review_mode="shadow",
+                transient_mode="shadow",
+                census_healthy=True,
+                ownerless_blocked_count=0,
+                multiply_owned_blocked_count=0,
+                validated_config_digest="d" * 64,
+                counters={name: 0 for name in REQUIRED_COUNTERS},
+            )
+            for slug in sorted(boards)
+        ),
+        escalations=tuple(PublicEscalation(**item) for item in escalations),
+        checksum="",
+    )
+    write_recovery_health(snapshot)
+
+
+def _escalation(*, board: str, task_id: str, signature: str, event_signature: str) -> dict[str, object]:
+    return {
+        "board": board,
+        "task_id": task_id,
+        "signature": signature,
+        "bound_input_signature": "b" * 64,
+        "task_event_signature": event_signature,
+        "outcome_class": "human_action_required",
+        "tier": "initial",
+        "acknowledged": False,
+        "reason_code": "ownerless_blocked",
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
@@ -1978,6 +2026,224 @@ def test_board_warnings_cleared_after_clean_completion(client):
     parent_dict = next(t for t in tasks if t["title"] == "parent")
     # The clean completion wiped the warning.
     assert parent_dict.get("warnings") is None
+
+
+def test_recovery_health_lists_only_current_board_escalations(client):
+    """The dashboard may only display authenticated escalation evidence for its board."""
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id="t_default1234",
+                signature="a" * 64,
+                event_signature="c" * 64,
+            ),
+            _escalation(
+                board="other",
+                task_id="t_other1234",
+                signature="e" * 64,
+                event_signature="f" * 64,
+            ),
+        ),
+    )
+
+    response = client.get("/api/plugins/kanban/recovery-health?board=default")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["board"] == "default"
+    assert body["escalations"] == [
+        {
+            "board": "default",
+            "task_id": "t_default1234",
+            "signature": "a" * 64,
+            "bound_input_signature": "b" * 64,
+            "task_event_signature": "c" * 64,
+            "outcome_class": "human_action_required",
+            "tier": "initial",
+            "acknowledged": False,
+            "reason_code": "ownerless_blocked",
+        }
+    ]
+
+
+def test_recovery_health_unavailable_is_not_an_authoritative_empty_view(client):
+    """A missing signed snapshot is unavailable, never a trustworthy empty list."""
+    response = client.get("/api/plugins/kanban/recovery-health?board=default")
+
+    assert response.status_code == 503
+    assert "escalations" not in response.json()
+
+
+def test_dashboard_acknowledgement_is_lifecycle_neutral_and_replay_safe(client):
+    """Exact public evidence may add one acknowledgement without changing task state."""
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="needs an operator decision",
+            assignee="owner",
+            tenant="team-a",
+        )
+        assert kb.block_task(conn, task_id, reason="operator decision", kind="needs_input")
+        before = kb.get_task(conn, task_id)
+        assert before is not None
+        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
+    finally:
+        conn.close()
+
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id=task_id,
+                signature="a" * 64,
+                event_signature=event_signature,
+            ),
+        ),
+    )
+    payload = {
+        "signature": "a" * 64,
+        "expected_event_signature": event_signature,
+        "operation_id": "dashboard-ack-1",
+    }
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json=payload,
+    )
+    replay = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["event_id"] == response.json()["event_id"]
+    conn = kb.connect(board="default")
+    try:
+        after = kb.get_task(conn, task_id)
+        assert after is not None
+        assert (
+            after.status,
+            after.assignee,
+            after.current_step_key,
+            after.max_retries,
+            after.block_kind,
+            after.block_recurrences,
+            after.consecutive_failures,
+        ) == (
+            before.status,
+            before.assignee,
+            before.current_step_key,
+            before.max_retries,
+            before.block_kind,
+            before.block_recurrences,
+            before.consecutive_failures,
+        )
+        acknowledgements = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "escalation_acknowledged"
+        ]
+        assert len(acknowledgements) == 1
+        assert acknowledgements[0].payload["actor"] == "dashboard"
+    finally:
+        conn.close()
+
+
+def test_dashboard_acknowledgement_rejects_a_tenant_changed_after_context_read(client, monkeypatch):
+    """The route passes its exact task tenant to the core's atomic precondition."""
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(conn, title="tenant race", tenant="team-a")
+        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
+        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
+    finally:
+        conn.close()
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id=task_id,
+                signature="a" * 64,
+                event_signature=event_signature,
+            ),
+        ),
+    )
+    original_get_task = kb.get_task
+
+    def change_tenant_after_dashboard_read(connection, requested_task_id):
+        task = original_get_task(connection, requested_task_id)
+        if requested_task_id == task_id:
+            with kb.write_txn(connection):
+                connection.execute("UPDATE tasks SET tenant = 'team-b' WHERE id = ?", (task_id,))
+        return task
+
+    monkeypatch.setattr(kb, "get_task", change_tenant_after_dashboard_read)
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json={
+            "signature": "a" * 64,
+            "expected_event_signature": event_signature,
+            "operation_id": "dashboard-ack-tenant-race",
+        },
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect(board="default")
+    try:
+        assert original_get_task(conn, task_id).tenant == "team-b"
+        assert not any(
+            event.kind == "escalation_acknowledged"
+            for event in kb.list_events(conn, task_id)
+        )
+    finally:
+        conn.close()
+
+
+def test_stale_or_unknown_dashboard_signature_is_rejected(client):
+    """Evidence absent from the current signed health snapshot cannot mutate a task."""
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(conn, title="blocked", tenant="team-a")
+        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
+        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
+    finally:
+        conn.close()
+    _write_recovery_health(
+        board="default",
+        escalations=(
+            _escalation(
+                board="default",
+                task_id=task_id,
+                signature="a" * 64,
+                event_signature=event_signature,
+            ),
+        ),
+    )
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
+        json={
+            "signature": "0" * 64,
+            "expected_event_signature": "1" * 64,
+            "operation_id": "dashboard-ack-stale",
+        },
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect(board="default")
+    try:
+        assert not any(
+            event.kind == "escalation_acknowledged"
+            for event in kb.list_events(conn, task_id)
+        )
+    finally:
+        conn.close()
 
 
 def test_reclaim_endpoint_releases_running_claim(client):

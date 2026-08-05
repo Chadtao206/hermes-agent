@@ -1457,6 +1457,7 @@ def test_escalation_acknowledgement_is_exact_and_lifecycle_neutral(conn):
         task_id=task_id,
         escalation_signature="a" * 64,
         expected_event_signature=_latest_event_signature(conn, task_id),
+        expected_tenant="",
         actor="operator",
         operation_id="ack-1",
     )
@@ -1491,6 +1492,41 @@ def test_escalation_acknowledgement_is_exact_and_lifecycle_neutral(conn):
     assert event.kind == "escalation_acknowledged"
     assert event.payload["signature"] == "a" * 64
     assert event.payload["actor"] == "operator"
+
+
+def test_escalation_acknowledgement_rejects_a_changed_tenant_and_replays_exact_tenant(conn):
+    """An acknowledgement is bound to the task's exact tenant as well as its event."""
+    task_id = kb.create_task(conn, title="tenant-bound escalation", tenant="team-a")
+    assert kb.block_task(conn, task_id, reason="recovery fixture", kind="needs_input")
+    event_signature = _latest_event_signature(conn, task_id)
+    request = kb.EscalationAcknowledgement(
+        task_id=task_id,
+        escalation_signature="a" * 64,
+        expected_event_signature=event_signature,
+        expected_tenant="team-a",
+        actor="operator",
+        operation_id="tenant-bound-ack",
+    )
+
+    committed = kb.acknowledge_escalation(conn, request)
+    replay = kb.acknowledge_escalation(conn, request)
+    mismatched = kb.acknowledge_escalation(
+        conn,
+        kb.EscalationAcknowledgement(
+            task_id=task_id,
+            escalation_signature="b" * 64,
+            expected_event_signature=event_signature,
+            expected_tenant="team-b",
+            actor="operator",
+            operation_id="tenant-mismatch-ack",
+        ),
+    )
+
+    assert committed.outcome == "committed"
+    assert replay == committed
+    assert mismatched.outcome == "precondition_changed"
+    assert len(_operation_events(conn, task_id, "tenant-bound-ack")) == 1
+    assert not _operation_events(conn, task_id, "tenant-mismatch-ack")
 
 
 def test_operation_keyed_link_and_unlink_replay_original_events(conn):
