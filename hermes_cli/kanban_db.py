@@ -1306,6 +1306,7 @@ class LeaseResult:
 class ControllerClaim:
     controller_id: str
     board: str
+    expected_tenant: str
     task_id: str
     generation_signature: str
     authority: str
@@ -1319,6 +1320,7 @@ class ControllerClaim:
 class ControllerClaimRecord:
     controller_id: str
     board: str
+    tenant: str
     task_id: str
     generation_signature: str
     authority: str
@@ -1679,6 +1681,7 @@ CREATE TABLE IF NOT EXISTS kanban_controller_leases (
 CREATE TABLE IF NOT EXISTS kanban_controller_claims (
     controller_id        TEXT NOT NULL,
     board                TEXT NOT NULL,
+    tenant               TEXT NOT NULL DEFAULT '',
     task_id              TEXT NOT NULL,
     generation_signature TEXT NOT NULL DEFAULT '',
     authority            TEXT NOT NULL,
@@ -3243,6 +3246,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
 
     _migrate_review_generation_registry(conn)
+    _add_column_if_missing(
+        conn, "kanban_controller_claims", "tenant", "tenant TEXT NOT NULL DEFAULT ''"
+    )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -8621,6 +8627,7 @@ def publish_controller_claim(
         raise ValueError("authority must be mutate, monitor, or escalate_only")
     controller_id = claim.controller_id.strip()
     board = _normalize_board_slug(claim.board)
+    tenant = str(claim.expected_tenant or "").strip()
     generation_signature = claim.generation_signature.strip()
     if not controller_id or board is None:
         raise ValueError("controller_id and board are required")
@@ -8639,6 +8646,7 @@ def publish_controller_claim(
         {
             "controller_id": controller_id,
             "board": board,
+            "tenant": tenant,
             "generation_signature": generation_signature,
             "authority": claim.authority,
             "input_signature": claim.input_signature,
@@ -8648,6 +8656,11 @@ def publish_controller_claim(
     )
     now = _controller_epoch_now()
     with write_txn(conn):
+        task = conn.execute("SELECT tenant FROM tasks WHERE id = ?", (claim.task_id,)).fetchone()
+        if task is None:
+            return _guarded_result("not_applied", task_id=claim.task_id, operation_id=claim.operation_id, reason="task not found")
+        if str(task["tenant"] or "").strip() != tenant:
+            return _guarded_result("precondition_changed", task_id=claim.task_id, operation_id=claim.operation_id, reason="task tenant changed")
         replay = _guarded_operation_replay(
             conn,
             task_id=claim.task_id,
@@ -8656,18 +8669,7 @@ def publish_controller_claim(
             operation_signature=operation_signature,
         )
         if replay is not None:
-            return replay
-        task = conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?",
-            (claim.task_id,),
-        ).fetchone()
-        if task is None:
-            return _guarded_result(
-                "not_applied",
-                task_id=claim.task_id,
-                operation_id=claim.operation_id,
-                reason="task not found",
-            )
+            return replace(replay, outcome="deduplicated") if replay.outcome == "committed" else replay
         lease = conn.execute(
             "SELECT holder_epoch, expires_at FROM kanban_controller_leases "
             "WHERE controller_id = ? AND board = ?",
@@ -8689,12 +8691,13 @@ def publish_controller_claim(
         conn.execute(
             """
             INSERT INTO kanban_controller_claims (
-                controller_id, board, task_id, generation_signature,
+                controller_id, board, tenant, task_id, generation_signature,
                 authority, input_signature, lease_epoch, expires_at, operation_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(controller_id, board, task_id, generation_signature)
             DO UPDATE SET
                 authority = excluded.authority,
+                tenant = excluded.tenant,
                 input_signature = excluded.input_signature,
                 lease_epoch = excluded.lease_epoch,
                 expires_at = excluded.expires_at,
@@ -8703,6 +8706,7 @@ def publish_controller_claim(
             (
                 controller_id,
                 board,
+                tenant,
                 claim.task_id,
                 generation_signature,
                 claim.authority,
@@ -8721,6 +8725,7 @@ def publish_controller_claim(
                 "operation_signature": operation_signature,
                 "controller_id": controller_id,
                 "board": board,
+                "tenant": tenant,
                 "generation_signature": generation_signature,
                 "authority": claim.authority,
                 "input_signature": claim.input_signature,
@@ -8976,6 +8981,7 @@ def read_recovery_snapshot(
                 ControllerClaimRecord(
                     controller_id=row["controller_id"],
                     board=row["board"],
+                    tenant=row["tenant"],
                     task_id=row["task_id"],
                     generation_signature=row["generation_signature"],
                     authority=row["authority"],

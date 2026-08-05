@@ -164,6 +164,45 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
 
+def test_controller_claim_tenant_migration_quarantines_legacy_rows(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP TABLE kanban_controller_claims")
+    conn.execute(
+        """
+        CREATE TABLE kanban_controller_claims (
+            controller_id TEXT NOT NULL,
+            board TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            generation_signature TEXT NOT NULL DEFAULT '',
+            authority TEXT NOT NULL,
+            input_signature TEXT NOT NULL,
+            lease_epoch INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            operation_id TEXT NOT NULL,
+            PRIMARY KEY (controller_id, board, task_id, generation_signature)
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO kanban_controller_claims VALUES (?, ?, ?, '', 'mutate', ?, 1, 300, 'legacy')",
+        ("legacy", "legacy", "task-1", "a" * 64),
+    )
+    conn.commit()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kb.connect(db_path) as migrated:
+        columns = {row["name"]: row for row in migrated.execute(
+            "PRAGMA table_info(kanban_controller_claims)"
+        )}
+        assert columns["tenant"]["notnull"] == 1
+        assert migrated.execute(
+            "SELECT tenant FROM kanban_controller_claims"
+        ).fetchone()["tenant"] == ""
+
+
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
     """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
     gone after migration; the notifier query returns an integer cursor."""

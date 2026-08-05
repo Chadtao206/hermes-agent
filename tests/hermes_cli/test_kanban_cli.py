@@ -249,6 +249,56 @@ def test_controller_lease_cli_stale_renewal_is_structured_nonacquisition(kanban_
     assert stale["reason"]
 
 
+def test_controller_claim_publish_cli_is_tenant_scoped_and_replay_safe(kanban_home):
+    with kb.connect_closing(board="default") as connection:
+        task_id = kb.create_task(connection, title="claim cli", tenant="alpha")
+    lease = _lease_cli("default", "acquire", token="claim-cli-token")
+    command = (
+        f"--board default controller-claim publish {task_id} "
+        "--expected-tenant alpha --controller-id blocked-recovery "
+        f"--generation-signature {'e' * 64} --authority mutate "
+        f"--input-signature {'f' * 64} --lease-epoch {lease['holder_epoch']} "
+        f"--expires-at {lease['expires_at']} --operation-id claim-cli --json"
+    )
+
+    committed = json.loads(kc.run_slash(command))
+    replay = json.loads(kc.run_slash(command))
+
+    assert committed["outcome"] == "committed"
+    assert replay["outcome"] == "deduplicated"
+    with kb.connect_closing(board="default") as connection:
+        connection.execute("UPDATE tasks SET tenant = 'beta' WHERE id = ?", (task_id,))
+    stale = json.loads(kc.run_slash(command))
+    assert stale["outcome"] == "precondition_changed"
+
+
+@pytest.mark.parametrize(
+    "prefix, expected_tenant",
+    [
+        ("", "alpha"),
+        ("--board default ", ""),
+    ],
+)
+def test_controller_claim_publish_cli_requires_board_and_tenant(
+    kanban_home, prefix, expected_tenant,
+):
+    with kb.connect_closing(board="default") as connection:
+        task_id = kb.create_task(connection, title="claim cli invalid", tenant="alpha")
+    output = kc.run_slash(
+        f"{prefix}controller-claim publish {task_id} "
+        f"--expected-tenant {expected_tenant} --controller-id blocked-recovery "
+        f"--generation-signature {'e' * 64} --authority mutate "
+        f"--input-signature {'f' * 64} --lease-epoch 1 --expires-at 9999999999 "
+        "--operation-id invalid-claim --json"
+    )
+
+    assert "outcome" not in output
+    with kb.connect_closing(board="default") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM kanban_controller_claims"
+        ).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize(
     ("board", "arguments"),
     [

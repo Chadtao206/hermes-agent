@@ -1795,6 +1795,7 @@ def test_stale_controller_epoch_cannot_publish_claim(conn, monkeypatch):
     claim = kb.ControllerClaim(
         controller_id="blocked-recovery",
         board="default",
+        expected_tenant="",
         task_id=task_id,
         generation_signature="e" * 64,
         authority="mutate",
@@ -1819,6 +1820,78 @@ def test_stale_controller_epoch_cannot_publish_claim(conn, monkeypatch):
     assert new.holder_epoch > old.holder_epoch
     assert stale.outcome == "precondition_changed"
     assert not _operation_events(conn, task_id, "claim-stale-after-takeover")
+
+
+def _controller_claim(
+    task_id: str,
+    lease: kb.LeaseResult,
+    *,
+    expected_tenant: str,
+    operation_id: str = "tenant-claim",
+) -> kb.ControllerClaim:
+    return kb.ControllerClaim(
+        controller_id="blocked-recovery",
+        board="default",
+        expected_tenant=expected_tenant,
+        task_id=task_id,
+        generation_signature="e" * 64,
+        authority="mutate",
+        input_signature="f" * 64,
+        lease_epoch=lease.holder_epoch,
+        expires_at=lease.expires_at,
+        operation_id=operation_id,
+    )
+
+
+def test_controller_claim_rejects_atomic_tenant_change(conn, monkeypatch):
+    _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="tenant claim", tenant="alpha")
+    lease = kb.acquire_controller_lease(
+        conn, _lease_request("router-a", operation_id="tenant-lease"),
+    )
+    claim = _controller_claim(task_id, lease, expected_tenant="alpha")
+
+    conn.execute("UPDATE tasks SET tenant = ? WHERE id = ?", ("beta", task_id))
+    result = kb.publish_controller_claim(conn, claim)
+
+    assert result.outcome == "precondition_changed"
+    assert conn.execute(
+        "SELECT 1 FROM kanban_controller_claims WHERE task_id = ?", (task_id,)
+    ).fetchone() is None
+
+
+def test_controller_claim_replay_requires_current_tenant(conn, monkeypatch):
+    _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="tenant replay", tenant="alpha")
+    lease = kb.acquire_controller_lease(
+        conn, _lease_request("router-a", operation_id="tenant-replay-lease"),
+    )
+    claim = _controller_claim(
+        task_id, lease, expected_tenant="alpha", operation_id="tenant-replay",
+    )
+
+    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    conn.execute("UPDATE tasks SET tenant = ? WHERE id = ?", ("beta", task_id))
+
+    assert kb.publish_controller_claim(conn, claim).outcome == "precondition_changed"
+
+
+def test_recovery_snapshot_signs_claim_tenant(conn, monkeypatch):
+    _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="tenant snapshot", tenant="alpha")
+    lease = kb.acquire_controller_lease(
+        conn, _lease_request("router-a", operation_id="tenant-snapshot-lease"),
+    )
+    claim = _controller_claim(
+        task_id, lease, expected_tenant="alpha", operation_id="tenant-snapshot",
+    )
+
+    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    snapshot = kb.read_recovery_snapshot(conn, now=100)
+    recorded = next(item for item in snapshot.claims if item.task_id == task_id)
+
+    assert recorded.tenant == "alpha"
+    assert snapshot.revision_signature == kb.snapshot_signature(snapshot)
 
 
 def test_recovery_snapshot_reads_board_state_with_reproducible_signature(

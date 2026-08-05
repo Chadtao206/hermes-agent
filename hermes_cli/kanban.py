@@ -25,7 +25,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -424,6 +424,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         parser.add_argument("--census-signature", required=True)
         parser.add_argument("--operation-id", required=True)
         parser.add_argument("--json", action="store_true", required=True)
+
+    p_controller_claim = sub.add_parser("controller-claim")
+    claim_sub = p_controller_claim.add_subparsers(dest="controller_claim_action", required=True)
+    claim_publish = claim_sub.add_parser("publish")
+    claim_publish.add_argument("task_id")
+    claim_publish.add_argument("--expected-tenant", required=True)
+    claim_publish.add_argument("--controller-id", required=True)
+    claim_publish.add_argument("--generation-signature", required=True)
+    claim_publish.add_argument("--authority", required=True)
+    claim_publish.add_argument("--input-signature", required=True)
+    claim_publish.add_argument("--lease-epoch", required=True, type=int)
+    claim_publish.add_argument("--expires-at", required=True, type=int)
+    claim_publish.add_argument("--operation-id", required=True)
+    claim_publish.add_argument("--json", action="store_true", required=True)
 
     p_review_generation = sub.add_parser(
         "create-review-generation",
@@ -1264,6 +1278,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "init":     _cmd_init,
             "create":   _cmd_create,
             "controller-lease": _cmd_controller_lease,
+            "controller-claim": _cmd_controller_claim,
             "create-review-generation": _cmd_create_review_generation,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1898,6 +1913,30 @@ def _lease_result_payload(result: kb.LeaseResult) -> dict[str, object]:
         "operation_id": result.operation_id,
         "reason": result.reason,
     }
+
+
+def _cmd_controller_claim(args: argparse.Namespace) -> int:
+    board = getattr(args, "board", None)
+    if not board:
+        raise ValueError("controller-claim requires explicit global --board")
+    normalized_board = kb._normalize_board_slug(board)
+    if normalized_board is None or normalized_board != kb.get_current_board():
+        raise ValueError("controller-claim board does not match the active request scope")
+    if args.controller_claim_action != "publish":
+        raise ValueError("unsupported controller claim action")
+    if not args.expected_tenant.strip():
+        raise ValueError("controller-claim requires --expected-tenant")
+    claim = kb.ControllerClaim(
+        controller_id=args.controller_id, board=normalized_board,
+        expected_tenant=args.expected_tenant, task_id=args.task_id,
+        generation_signature=args.generation_signature, authority=args.authority,
+        input_signature=args.input_signature, lease_epoch=args.lease_epoch,
+        expires_at=args.expires_at, operation_id=args.operation_id,
+    )
+    with kb.connect_closing(board=normalized_board) as connection:
+        result = kb.publish_controller_claim(connection, claim)
+    print(json.dumps(asdict(result), ensure_ascii=False))
+    return 0
 
 
 def _cmd_controller_lease(args: argparse.Namespace) -> int:
