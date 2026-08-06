@@ -1,5 +1,13 @@
 # Kanban Blocked Recovery Router Implementation Plan
 
+> **Task 13/14 authority amendment (2026-08-06).**
+> `../specs/2026-08-06-kanban-boris-on-demand-recovery-boundary-design.md`
+> supersedes Task 13/14 requirements that make the specialized just-do-it
+> requeue watchdog, `GenerationCandidate`, or its tests a router dependency.
+> The remaining router plan stays authoritative. Do not execute Task 13 or its
+> Task 14 gate verbatim; a replacement plan must preserve completed evidence
+> and follow the newer controller boundary.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace prose-driven blocked-review cleanup with a durable two-phase router that owns exactly the cards it can safely mutate and automatically completes only exact approved generations through the strict judge.

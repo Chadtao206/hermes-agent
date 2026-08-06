@@ -1,5 +1,13 @@
 # Task 13 Cross-Controller Transport Implementation Plan
 
+> **Do not execute as written — superseded in part on 2026-08-06.**
+> `../specs/2026-08-06-kanban-boris-on-demand-recovery-boundary-design.md`
+> removes the candidate/watchdog work in this plan, retains the adjudicator
+> safety work, and adds structured-target production, Boris lifecycle
+> exclusion, and a current-authority final-write fence. Preserve the partial
+> implementation and evidence; use the replacement plan written after the new
+> boundary receives written-spec approval.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Complete Task 13 by transporting exact-head watchdog candidates through the checksummed router cursor and publishing tenant-guarded adjudicator claims under fenced core leases.

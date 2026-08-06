@@ -1,5 +1,12 @@
 # Task 13 Cross-Controller Transport Design
 
+> **Superseded in part on 2026-08-06.**
+> `2026-08-06-kanban-boris-on-demand-recovery-boundary-design.md` removes this
+> document's `GenerationCandidate`, candidate inbox/publication, and
+> specialized-watchdog lane-creation design. Its tenant-scoped adjudicator
+> claim, fenced lease, reconciliation, and final-write safety goals remain.
+> Do not implement this document independently of the newer boundary.
+
 **Status:** Approved on 2026-08-05
 
 ## Context
