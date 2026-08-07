@@ -438,6 +438,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     claim_publish.add_argument("--expires-at", required=True, type=int)
     claim_publish.add_argument("--operation-id", required=True)
     claim_publish.add_argument("--json", action="store_true", required=True)
+    claim_mutate = claim_sub.add_parser("mutate")
+    claim_mutate.add_argument("task_id")
+    claim_mutate.add_argument("--expected-tenant", required=True)
+    claim_mutate.add_argument("--controller-id", required=True)
+    claim_mutate.add_argument("--generation-signature", required=True)
+    claim_mutate.add_argument("--input-signature", required=True)
+    claim_mutate.add_argument("--authority-signature", required=True)
+    claim_mutate.add_argument("--claim-operation-id", required=True)
+    claim_mutate.add_argument("--claim-expires-at", required=True, type=int)
+    claim_mutate.add_argument("--lease-holder-token", required=True)
+    claim_mutate.add_argument("--lease-epoch", required=True, type=int)
+    claim_mutate.add_argument("--lease-issued-at", required=True, type=int)
+    claim_mutate.add_argument("--lease-expires-at", required=True, type=int)
+    claim_mutate.add_argument("--lease-census-signature", required=True)
+    claim_mutate.add_argument("--lease-operation-id", required=True)
+    claim_mutate.add_argument("--verb", required=True, choices=("unblock", "archive"))
+    claim_mutate.add_argument("--operation-id", required=True)
+    claim_mutate.add_argument("--json", action="store_true", required=True)
 
     p_review_generation = sub.add_parser(
         "create-review-generation",
@@ -1922,19 +1940,52 @@ def _cmd_controller_claim(args: argparse.Namespace) -> int:
     normalized_board = kb._normalize_board_slug(board)
     if normalized_board is None or normalized_board != kb.get_current_board():
         raise ValueError("controller-claim board does not match the active request scope")
-    if args.controller_claim_action != "publish":
-        raise ValueError("unsupported controller claim action")
     if not args.expected_tenant.strip():
         raise ValueError("controller-claim requires --expected-tenant")
-    claim = kb.ControllerClaim(
-        controller_id=args.controller_id, board=normalized_board,
-        expected_tenant=args.expected_tenant, task_id=args.task_id,
-        generation_signature=args.generation_signature, authority=args.authority,
-        input_signature=args.input_signature, lease_epoch=args.lease_epoch,
-        expires_at=args.expires_at, operation_id=args.operation_id,
-    )
     with kb.connect_closing(board=normalized_board) as connection:
-        result = kb.publish_controller_claim(connection, claim)
+        if args.controller_claim_action == "publish":
+            result = kb.publish_controller_claim(
+                connection,
+                kb.ControllerClaim(
+                    controller_id=args.controller_id,
+                    board=normalized_board,
+                    expected_tenant=args.expected_tenant,
+                    task_id=args.task_id,
+                    generation_signature=args.generation_signature,
+                    authority=args.authority,
+                    input_signature=args.input_signature,
+                    lease_epoch=args.lease_epoch,
+                    expires_at=args.expires_at,
+                    operation_id=args.operation_id,
+                ),
+            )
+        elif args.controller_claim_action == "mutate":
+            result = kb.apply_controller_lifecycle_mutation(
+                connection,
+                kb.ControllerLifecycleMutation(
+                    preconditions=kb.ControllerAuthorityPreconditions(
+                        controller_id=args.controller_id,
+                        board=normalized_board,
+                        expected_tenant=args.expected_tenant,
+                        task_id=args.task_id,
+                        generation_signature=args.generation_signature,
+                        input_signature=args.input_signature,
+                        authority_signature=args.authority_signature,
+                        claim_operation_id=args.claim_operation_id,
+                        claim_expires_at=args.claim_expires_at,
+                        lease_holder_token=args.lease_holder_token,
+                        lease_epoch=args.lease_epoch,
+                        lease_issued_at=args.lease_issued_at,
+                        lease_expires_at=args.lease_expires_at,
+                        lease_census_signature=args.lease_census_signature,
+                        lease_operation_id=args.lease_operation_id,
+                    ),
+                    verb=args.verb,
+                    operation_id=args.operation_id,
+                ),
+            )
+        else:  # argparse enforces this; keep the write boundary fail closed.
+            raise ValueError("unsupported controller claim action")
     print(json.dumps(asdict(result), ensure_ascii=False))
     return 0
 

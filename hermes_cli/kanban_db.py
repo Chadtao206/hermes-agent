@@ -1317,6 +1317,32 @@ class ControllerClaim:
 
 
 @dataclass(frozen=True)
+class ControllerAuthorityPreconditions:
+    controller_id: str
+    board: str
+    expected_tenant: str
+    task_id: str
+    generation_signature: str
+    input_signature: str
+    authority_signature: str
+    claim_operation_id: str
+    claim_expires_at: int
+    lease_holder_token: str
+    lease_epoch: int
+    lease_issued_at: int
+    lease_expires_at: int
+    lease_census_signature: str
+    lease_operation_id: str
+
+
+@dataclass(frozen=True)
+class ControllerLifecycleMutation:
+    preconditions: ControllerAuthorityPreconditions
+    verb: str
+    operation_id: str
+
+
+@dataclass(frozen=True)
 class ControllerClaimRecord:
     controller_id: str
     board: str
@@ -8661,6 +8687,19 @@ def publish_controller_claim(
             return _guarded_result("not_applied", task_id=claim.task_id, operation_id=claim.operation_id, reason="task not found")
         if str(task["tenant"] or "").strip() != tenant:
             return _guarded_result("precondition_changed", task_id=claim.task_id, operation_id=claim.operation_id, reason="task tenant changed")
+        snapshot = read_recovery_snapshot(conn, now=now)
+        if (
+            recovery_task_input_signature(snapshot, claim.task_id)
+            != claim.input_signature
+            or recovery_task_generation_signature(snapshot, claim.task_id)
+            != generation_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=claim.task_id,
+                operation_id=claim.operation_id,
+                reason="task recovery input or generation changed",
+            )
         replay = _guarded_operation_replay(
             conn,
             task_id=claim.task_id,
@@ -8741,6 +8780,283 @@ def publish_controller_claim(
         )
 
 
+def apply_controller_lifecycle_mutation(
+    conn: sqlite3.Connection,
+    request: ControllerLifecycleMutation,
+) -> GuardedMutationResult:
+    """Apply one lifecycle mutation under an exact current claim and lease."""
+    if type(request) is not ControllerLifecycleMutation:
+        raise ValueError("controller lifecycle mutation is required")
+    guard = request.preconditions
+    if type(guard) is not ControllerAuthorityPreconditions:
+        raise ValueError("controller authority preconditions are required")
+    controller_id = (
+        guard.controller_id.strip()
+        if isinstance(guard.controller_id, str)
+        else ""
+    )
+    board = _normalize_board_slug(guard.board)
+    tenant = (
+        guard.expected_tenant.strip()
+        if isinstance(guard.expected_tenant, str)
+        else ""
+    )
+    task_id = guard.task_id if isinstance(guard.task_id, str) else ""
+    operation_id = (
+        request.operation_id.strip()
+        if isinstance(request.operation_id, str)
+        else ""
+    )
+    if not controller_id or board is None or not tenant:
+        raise ValueError("controller_id, board, and expected_tenant are required")
+    if not task_id or task_id != task_id.strip() or "\x00" in task_id:
+        raise ValueError("task_id must be an exact nonempty string")
+    if not operation_id or operation_id != request.operation_id:
+        raise ValueError("operation_id must be an exact nonempty string")
+    if request.verb not in {"unblock", "archive"}:
+        raise ValueError("controller lifecycle verb must be unblock or archive")
+    if guard.generation_signature and not re.fullmatch(
+        r"[0-9a-f]{64}", guard.generation_signature
+    ):
+        raise ValueError("generation_signature must be empty or a SHA-256 digest")
+    for value, label in (
+        (guard.input_signature, "input_signature"),
+        (guard.authority_signature, "authority_signature"),
+        (guard.lease_census_signature, "lease_census_signature"),
+    ):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    for value, label in (
+        (guard.claim_operation_id, "claim_operation_id"),
+        (guard.lease_holder_token, "lease_holder_token"),
+        (guard.lease_operation_id, "lease_operation_id"),
+    ):
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{label} must be an exact nonempty string")
+    for value, label in (
+        (guard.claim_expires_at, "claim_expires_at"),
+        (guard.lease_epoch, "lease_epoch"),
+        (guard.lease_issued_at, "lease_issued_at"),
+        (guard.lease_expires_at, "lease_expires_at"),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{label} must be a positive integer")
+
+    _require_connection_board(conn, board)
+    if _connection_board(conn) != board:
+        raise ValueError("controller lifecycle board does not match the connection")
+    operation_signature = _canonical_operation_signature(
+        "controller_lifecycle_mutated",
+        task_id,
+        {
+            "verb": request.verb,
+            "preconditions": asdict(guard),
+        },
+    )
+    archived = False
+    with write_txn(conn):
+        now = _controller_epoch_now()
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=task_id,
+            operation_id=operation_id,
+            event_kind="controller_lifecycle_mutated",
+            operation_signature=operation_signature,
+        )
+        if replay is not None:
+            return replay
+
+        task = conn.execute(
+            "SELECT tenant, status, current_run_id, created_by FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            return _guarded_result(
+                "not_applied",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task not found",
+            )
+        if task["created_by"] == "boris-slack-intake":
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task is excluded from controller automation",
+            )
+        if str(task["tenant"] or "").strip() != tenant:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task tenant changed",
+            )
+        if task["status"] != "blocked":
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task is no longer blocked",
+            )
+
+        snapshot = read_recovery_snapshot(conn, now=now)
+        if recovery_task_authority_signature(snapshot, task_id) != guard.authority_signature:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task authority changed",
+            )
+        current_mutate_claims = tuple(
+            claim for claim in snapshot.claims
+            if claim.board == board
+            and claim.tenant == tenant
+            and claim.task_id == task_id
+            and claim.authority == "mutate"
+            and claim.expires_at > now
+        )
+        if len(current_mutate_claims) != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task does not have exactly one current mutate claim",
+            )
+        if (
+            recovery_task_input_signature(snapshot, task_id)
+            != guard.input_signature
+            or recovery_task_generation_signature(snapshot, task_id)
+            != guard.generation_signature
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task recovery input or generation changed",
+            )
+
+        claim = current_mutate_claims[0]
+        if any(
+            (
+                claim.controller_id != controller_id,
+                claim.generation_signature != guard.generation_signature,
+                claim.input_signature != guard.input_signature,
+                claim.lease_epoch != guard.lease_epoch,
+                claim.expires_at != guard.claim_expires_at,
+                claim.operation_id != guard.claim_operation_id,
+            )
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="controller claim changed or expired",
+            )
+
+        lease = conn.execute(
+            "SELECT * FROM kanban_controller_leases "
+            "WHERE controller_id = ? AND board = ?",
+            (controller_id, board),
+        ).fetchone()
+        if lease is None or any(
+            (
+                lease["holder_token"] != guard.lease_holder_token,
+                int(lease["holder_epoch"]) != guard.lease_epoch,
+                int(lease["issued_at"]) != guard.lease_issued_at,
+                int(lease["expires_at"]) != guard.lease_expires_at,
+                lease["census_signature"] != guard.lease_census_signature,
+                lease["operation_id"] != guard.lease_operation_id,
+                guard.lease_issued_at > now,
+                guard.lease_expires_at <= now,
+                guard.lease_expires_at <= guard.lease_issued_at,
+                guard.claim_expires_at > guard.lease_expires_at,
+            )
+        ):
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="controller lease changed or expired",
+            )
+
+        run_id: Optional[int] = None
+        event_payload: dict[str, object] = {
+            "operation_id": operation_id,
+            "operation_signature": operation_signature,
+            "controller_id": controller_id,
+            "board": board,
+            "tenant": tenant,
+            "verb": request.verb,
+            "claim_operation_id": guard.claim_operation_id,
+            "lease_operation_id": guard.lease_operation_id,
+        }
+        if request.verb == "unblock":
+            if task["current_run_id"] is not None:
+                conn.execute(
+                    "UPDATE task_runs SET status = 'reclaimed', "
+                    "outcome = 'reclaimed', "
+                    "summary = COALESCE(summary, "
+                    "'invariant recovery on controller unblock'), "
+                    "ended_at = ?, claim_lock = NULL, claim_expires = NULL, "
+                    "worker_pid = NULL WHERE id = ? AND ended_at IS NULL",
+                    (now, int(task["current_run_id"])),
+                )
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links link "
+                "JOIN tasks parent ON parent.id = link.parent_id "
+                "WHERE link.child_id = ? AND parent.status != 'done' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            new_status = "todo" if undone_parent else "ready"
+            changed = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'blocked'",
+                (new_status, task_id),
+            )
+            event_payload["status"] = new_status
+        else:
+            changed = conn.execute(
+                "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'blocked'",
+                (task_id,),
+            )
+            if changed.rowcount == 1:
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="reclaimed",
+                    status="reclaimed",
+                    summary="task archived by recovery controller",
+                )
+                archived = True
+            event_payload["status"] = "archived"
+        if changed.rowcount != 1:
+            return _guarded_result(
+                "precondition_changed",
+                task_id=task_id,
+                operation_id=operation_id,
+                reason="task lifecycle changed during guarded mutation",
+            )
+        event_id = _append_event(
+            conn,
+            task_id,
+            "controller_lifecycle_mutated",
+            event_payload,
+            run_id=run_id,
+        )
+        result = GuardedMutationResult(
+            outcome="committed",
+            task_id=task_id,
+            operation_id=operation_id,
+            event_id=event_id,
+        )
+    if archived:
+        recompute_ready(conn)
+    return result
+
+
 def snapshot_signature(snapshot: RecoverySnapshot) -> str:
     payload = asdict(snapshot)
     payload.pop("revision_signature", None)
@@ -8761,7 +9077,9 @@ def read_recovery_snapshot(
     if type(now) is not int or now < 0:
         raise ValueError("now must be a nonnegative epoch integer")
     board = _connection_board(conn)
-    conn.execute("BEGIN")
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
     try:
         task_rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
         event_rows = conn.execute(
@@ -9008,14 +9326,196 @@ def read_recovery_snapshot(
             invariant_violations=tuple(invariant_violations),
             revision_signature="",
         )
-        conn.execute("COMMIT")
+        if owns_transaction:
+            conn.execute("COMMIT")
     except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass
+        if owns_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
         raise
     return replace(snapshot, revision_signature=snapshot_signature(snapshot))
+
+
+def _recovery_snapshot_task(
+    snapshot: RecoverySnapshot,
+    task_id: str,
+) -> Mapping[str, object]:
+    matches = tuple(task for task in snapshot.tasks if task.get("id") == task_id)
+    if len(matches) != 1:
+        raise ValueError(
+            f"snapshot must contain exactly one task row for {task_id!r}"
+        )
+    return matches[0]
+
+
+def recovery_task_generation_signature(
+    snapshot: RecoverySnapshot,
+    task_id: str,
+) -> str:
+    """Return the exact current review generation bound to one task, if any."""
+    task = _recovery_snapshot_task(snapshot, task_id)
+    board = str(snapshot.board).strip()
+    tenant = str(task.get("tenant") or "").strip()
+    generations = tuple(
+        item
+        for item in snapshot.review_generations
+        if item.current
+        and item.board == board
+        and str(item.tenant or "").strip() == tenant
+        and item.parent_task_id == task_id
+    )
+    if len(generations) > 1:
+        raise ValueError(
+            f"snapshot contains multiple current review generations for {task_id!r}"
+        )
+    return generations[0].generation if generations else ""
+
+
+def recovery_task_input_signature(
+    snapshot: RecoverySnapshot,
+    task_id: str,
+) -> str:
+    """Sign the immutable board inputs that authorize recovery of one task."""
+    task = _recovery_snapshot_task(snapshot, task_id)
+    board = str(snapshot.board).strip()
+    tenant = str(task.get("tenant") or "").strip()
+    latest_block = next(
+        (event for event in snapshot.latest_block_events if event.task_id == task_id),
+        None,
+    )
+    latest_terminal = next(
+        (
+            event
+            for event in snapshot.latest_terminal_events
+            if event.task_id == task_id
+        ),
+        None,
+    )
+    transient_retry_events = tuple(
+        sorted(
+            (
+                event
+                for event in snapshot.transient_retry_events
+                if event.task_id == task_id
+            ),
+            key=lambda event: event.id,
+        )
+    )
+    durable_side_effect_events = tuple(
+        sorted(
+            (
+                event
+                for event in snapshot.durable_side_effect_events
+                if event.task_id == task_id
+            ),
+            key=lambda event: event.id,
+        )
+    )
+    related_links = tuple(sorted(link for link in snapshot.links if task_id in link))
+    current_run = next(
+        (run for run in snapshot.current_runs if run.task_id == task_id),
+        None,
+    )
+    latest_terminal_run = next(
+        (run for run in snapshot.latest_terminal_runs if run.task_id == task_id),
+        None,
+    )
+    relevant_generations = tuple(
+        sorted(
+            (
+                item
+                for item in snapshot.review_generations
+                if item.current
+                and item.board == board
+                and str(item.tenant or "").strip() == tenant
+                and (item.parent_task_id == task_id or item.task_id == task_id)
+            ),
+            key=lambda item: (
+                item.parent_task_id,
+                item.task_id,
+                item.generation,
+                item.key,
+            ),
+        )
+    )
+    reviewer_task_ids = {item.task_id for item in relevant_generations}
+    generation_reviewer_tasks = tuple(
+        item for item in snapshot.tasks if item.get("id") in reviewer_task_ids
+    )
+    return canonical_payload_signature(
+        {
+            "board": board,
+            "tenant": tenant,
+            "task": dict(task),
+            "latest_block_event": (
+                None if latest_block is None else asdict(latest_block)
+            ),
+            "latest_terminal_event": (
+                None if latest_terminal is None else asdict(latest_terminal)
+            ),
+            "transient_retry_events": [
+                asdict(event) for event in transient_retry_events
+            ],
+            "durable_side_effect_events": [
+                asdict(event) for event in durable_side_effect_events
+            ],
+            "related_links": related_links,
+            "current_run": None if current_run is None else asdict(current_run),
+            "latest_terminal_run": (
+                None
+                if latest_terminal_run is None
+                else asdict(latest_terminal_run)
+            ),
+            "current_review_generations": [
+                asdict(item) for item in relevant_generations
+            ],
+            "generation_reviewer_tasks": generation_reviewer_tasks,
+        }
+    )
+
+
+def recovery_task_authority_signature(
+    snapshot: RecoverySnapshot,
+    task_id: str,
+) -> str:
+    task = _recovery_snapshot_task(snapshot, task_id)
+    tenant = str(task.get("tenant") or "").strip()
+    now = snapshot.observed_at
+    claims = tuple(sorted(
+        (
+            claim for claim in snapshot.claims
+            if claim.board == snapshot.board
+            and claim.tenant == tenant
+            and claim.task_id == task_id
+            and claim.expires_at > now
+        ),
+        key=lambda claim: (
+            claim.controller_id, claim.generation_signature,
+            claim.authority, claim.operation_id,
+        ),
+    ))
+    controller_ids = {claim.controller_id for claim in claims}
+    leases = tuple(sorted(
+        (
+            lease for lease in snapshot.leases
+            if lease.board == snapshot.board
+            and lease.controller_id in controller_ids
+        ),
+        key=lambda lease: (lease.controller_id, lease.holder_epoch),
+    ))
+    return canonical_payload_signature({
+        "schema_version": 1,
+        "board": snapshot.board,
+        "tenant": tenant,
+        "task_id": task_id,
+        "created_by": task.get("created_by"),
+        "input_signature": recovery_task_input_signature(snapshot, task_id),
+        "generation_signature": recovery_task_generation_signature(snapshot, task_id),
+        "claims": [asdict(claim) for claim in claims],
+        "leases": [asdict(lease) for lease in leases],
+    })
 
 
 def canonical_payload_signature(payload: Mapping[str, object]) -> str:

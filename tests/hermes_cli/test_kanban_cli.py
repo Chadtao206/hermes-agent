@@ -253,23 +253,113 @@ def test_controller_claim_publish_cli_is_tenant_scoped_and_replay_safe(kanban_ho
     with kb.connect_closing(board="default") as connection:
         task_id = kb.create_task(connection, title="claim cli", tenant="alpha")
     lease = _lease_cli("default", "acquire", token="claim-cli-token")
+    with kb.connect_closing(board="default") as connection:
+        snapshot = kb.read_recovery_snapshot(connection, now=lease["issued_at"])
+        generation_signature = kb.recovery_task_generation_signature(
+            snapshot, task_id,
+        )
+        input_signature = kb.recovery_task_input_signature(snapshot, task_id)
     command = (
         f"--board default controller-claim publish {task_id} "
         "--expected-tenant alpha --controller-id blocked-recovery "
-        f"--generation-signature {'e' * 64} --authority mutate "
-        f"--input-signature {'f' * 64} --lease-epoch {lease['holder_epoch']} "
+        f"--generation-signature '{generation_signature}' --authority mutate "
+        f"--input-signature {input_signature} --lease-epoch {lease['holder_epoch']} "
         f"--expires-at {lease['expires_at']} --operation-id claim-cli --json"
     )
 
     committed = json.loads(kc.run_slash(command))
     replay = json.loads(kc.run_slash(command))
 
-    assert committed["outcome"] == "committed"
+    assert committed["outcome"] == "committed", committed
     assert replay["outcome"] == "deduplicated"
     with kb.connect_closing(board="default") as connection:
         connection.execute("UPDATE tasks SET tenant = 'beta' WHERE id = ?", (task_id,))
     stale = json.loads(kc.run_slash(command))
     assert stale["outcome"] == "precondition_changed"
+
+
+def test_controller_claim_mutate_cli_rechecks_exact_authority_at_write(kanban_home):
+    with kb.connect_closing(board="default") as connection:
+        task_id = kb.create_task(
+            connection, title="guarded lifecycle cli", tenant="alpha",
+        )
+        assert kb.block_task(connection, task_id, reason="awaiting adjudication")
+        snapshot = kb.read_recovery_snapshot(connection, now=1)
+        input_signature = kb.recovery_task_input_signature(snapshot, task_id)
+        generation_signature = kb.recovery_task_generation_signature(
+            snapshot, task_id,
+        )
+    lease = _lease_cli("default", "acquire", token="claim-cli-token")
+    claim_operation_id = "claim-cli-mutate"
+    claim_command = (
+        f"--board default controller-claim publish {task_id} "
+        "--expected-tenant alpha --controller-id blocked-recovery "
+        f"--generation-signature '{generation_signature}' --authority mutate "
+        f"--input-signature {input_signature} "
+        f"--lease-epoch {lease['holder_epoch']} "
+        f"--expires-at {lease['expires_at']} "
+        f"--operation-id {claim_operation_id} --json"
+    )
+    assert json.loads(kc.run_slash(claim_command))["outcome"] == "committed"
+    with kb.connect_closing(board="default") as connection:
+        authority_signature = kb.recovery_task_authority_signature(
+            kb.read_recovery_snapshot(connection, now=lease["issued_at"]), task_id,
+        )
+    mutate_command = (
+        f"--board default controller-claim mutate {task_id} "
+        "--expected-tenant alpha --controller-id blocked-recovery "
+        f"--generation-signature '{generation_signature}' "
+        f"--input-signature {input_signature} "
+        f"--authority-signature {authority_signature} "
+        f"--claim-operation-id {claim_operation_id} "
+        f"--claim-expires-at {lease['expires_at']} "
+        "--lease-holder-token claim-cli-token "
+        f"--lease-epoch {lease['holder_epoch']} "
+        f"--lease-issued-at {lease['issued_at']} "
+        f"--lease-expires-at {lease['expires_at']} "
+        f"--lease-census-signature {'c' * 64} "
+        f"--lease-operation-id {lease['operation_id']} "
+        "--verb unblock --operation-id guarded-cli-unblock --json"
+    )
+
+    committed = json.loads(kc.run_slash(mutate_command))
+    replayed = json.loads(kc.run_slash(mutate_command))
+
+    assert committed["outcome"] == "committed"
+    assert replayed["outcome"] == "committed"
+    assert replayed["event_id"] == committed["event_id"]
+    with kb.connect_closing(board="default") as connection:
+        assert kb.get_task(connection, task_id).status == "ready"
+
+
+@pytest.mark.parametrize(
+    "authority_signature, expected_error",
+    [
+        (None, "the following arguments are required: --authority-signature"),
+        ("malformed", "authority_signature must be a lowercase SHA-256 digest"),
+    ],
+)
+def test_controller_claim_mutate_cli_requires_valid_authority_signature(
+    kanban_home, authority_signature, expected_error,
+):
+    authority = (
+        "" if authority_signature is None
+        else f" --authority-signature {authority_signature}"
+    )
+
+    output = kc.run_slash(
+        "--board default controller-claim mutate missing-task "
+        "--expected-tenant alpha --controller-id adjudicator "
+        f"--generation-signature {'a' * 64} --input-signature {'b' * 64}"
+        f"{authority} --claim-operation-id missing-claim --claim-expires-at 400 "
+        "--lease-holder-token missing-holder --lease-epoch 1 "
+        "--lease-issued-at 100 --lease-expires-at 400 "
+        f"--lease-census-signature {'c' * 64} "
+        "--lease-operation-id missing-lease --verb unblock "
+        "--operation-id missing-mutation --json"
+    )
+
+    assert expected_error in output
 
 
 @pytest.mark.parametrize(

@@ -1804,7 +1804,14 @@ def test_stale_controller_epoch_cannot_publish_claim(conn, monkeypatch):
         expires_at=350,
         operation_id="claim-old",
     )
-    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    snapshot = kb.read_recovery_snapshot(conn, now=now[0])
+    claim = replace(
+        claim,
+        generation_signature=kb.recovery_task_generation_signature(snapshot, task_id),
+        input_signature=kb.recovery_task_input_signature(snapshot, task_id),
+    )
+    initial = kb.publish_controller_claim(conn, claim)
+    assert initial.outcome == "committed", initial.reason
     now[0] = 401
     new = kb.acquire_controller_lease(
         conn,
@@ -1869,8 +1876,15 @@ def test_controller_claim_replay_requires_current_tenant(conn, monkeypatch):
     claim = _controller_claim(
         task_id, lease, expected_tenant="alpha", operation_id="tenant-replay",
     )
+    snapshot = kb.read_recovery_snapshot(conn, now=100)
+    claim = replace(
+        claim,
+        generation_signature=kb.recovery_task_generation_signature(snapshot, task_id),
+        input_signature=kb.recovery_task_input_signature(snapshot, task_id),
+    )
 
-    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    initial = kb.publish_controller_claim(conn, claim)
+    assert initial.outcome == "committed", initial.reason
     conn.execute("UPDATE tasks SET tenant = ? WHERE id = ?", ("beta", task_id))
 
     assert kb.publish_controller_claim(conn, claim).outcome == "precondition_changed"
@@ -1885,13 +1899,346 @@ def test_recovery_snapshot_signs_claim_tenant(conn, monkeypatch):
     claim = _controller_claim(
         task_id, lease, expected_tenant="alpha", operation_id="tenant-snapshot",
     )
+    snapshot = kb.read_recovery_snapshot(conn, now=100)
+    claim = replace(
+        claim,
+        generation_signature=kb.recovery_task_generation_signature(snapshot, task_id),
+        input_signature=kb.recovery_task_input_signature(snapshot, task_id),
+    )
 
-    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    initial = kb.publish_controller_claim(conn, claim)
+    assert initial.outcome == "committed", initial.reason
     snapshot = kb.read_recovery_snapshot(conn, now=100)
     recorded = next(item for item in snapshot.claims if item.task_id == task_id)
 
     assert recorded.tenant == "alpha"
     assert snapshot.revision_signature == kb.snapshot_signature(snapshot)
+
+
+def test_controller_claim_rejects_stale_current_task_input(conn, monkeypatch):
+    _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="claim input fence", tenant="alpha")
+    assert kb.block_task(conn, task_id, reason="awaiting watchdog", kind="review")
+    before = kb.read_recovery_snapshot(conn, now=100)
+    lease = kb.acquire_controller_lease(
+        conn,
+        kb.LeaseRequest(
+            controller_id="pr-watchdog",
+            board="default",
+            holder_token="watchdog-a",
+            ttl_seconds=300,
+            census_signature="c" * 64,
+            operation_id="watchdog-input-lease",
+        ),
+    )
+    claim = kb.ControllerClaim(
+        controller_id="pr-watchdog",
+        board="default",
+        expected_tenant="alpha",
+        task_id=task_id,
+        generation_signature=kb.recovery_task_generation_signature(before, task_id),
+        authority="mutate",
+        input_signature=kb.recovery_task_input_signature(before, task_id),
+        lease_epoch=lease.holder_epoch,
+        expires_at=lease.expires_at,
+        operation_id="watchdog-stale-input-claim",
+    )
+    kb.add_comment(conn, task_id, "operator", "new evidence after S1")
+
+    result = kb.publish_controller_claim(conn, claim)
+
+    assert result.outcome == "precondition_changed"
+    assert not _operation_events(conn, task_id, claim.operation_id)
+
+
+def test_controller_claim_rejects_wrong_current_generation(conn, monkeypatch):
+    _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="claim generation fence", tenant="alpha")
+    assert kb.block_task(conn, task_id, reason="review handoff", kind="review")
+    generation = "a" * 64
+    created = kb.create_review_generation_task(
+        conn,
+        kb.ReviewGenerationCreate(
+            board="default",
+            tenant="alpha",
+            key=f"review-lane:default:alpha:{task_id}:{generation}",
+            title="current review generation",
+            assignee="reviewer",
+            parent_preconditions=_review_parent_preconditions(conn, task_id),
+            operation_id="create-current-generation",
+        ),
+    )
+    assert created.outcome == "committed"
+    snapshot = kb.read_recovery_snapshot(conn, now=100)
+    assert kb.recovery_task_generation_signature(snapshot, task_id) == generation
+    lease = kb.acquire_controller_lease(
+        conn,
+        kb.LeaseRequest(
+            controller_id="pr-watchdog",
+            board="default",
+            holder_token="watchdog-a",
+            ttl_seconds=300,
+            census_signature="c" * 64,
+            operation_id="watchdog-generation-lease",
+        ),
+    )
+    claim = kb.ControllerClaim(
+        controller_id="pr-watchdog",
+        board="default",
+        expected_tenant="alpha",
+        task_id=task_id,
+        generation_signature="b" * 64,
+        authority="mutate",
+        input_signature=kb.recovery_task_input_signature(snapshot, task_id),
+        lease_epoch=lease.holder_epoch,
+        expires_at=lease.expires_at,
+        operation_id="watchdog-wrong-generation-claim",
+    )
+
+    result = kb.publish_controller_claim(conn, claim)
+
+    assert result.outcome == "precondition_changed"
+    assert not _operation_events(conn, task_id, claim.operation_id)
+
+
+def _adjudicator_lifecycle_fixture(conn, monkeypatch):
+    clock = _clock(monkeypatch, 100)
+    task_id = kb.create_task(
+        conn, title="guarded adjudicated lifecycle", tenant="alpha",
+    )
+    assert kb.block_task(conn, task_id, reason="awaiting adjudication")
+    snapshot = kb.read_recovery_snapshot(conn, now=100)
+    input_signature = kb.recovery_task_input_signature(snapshot, task_id)
+    generation_signature = kb.recovery_task_generation_signature(snapshot, task_id)
+    lease_request = kb.LeaseRequest(
+        controller_id="adjudicator",
+        board="default",
+        holder_token="adjudicator-holder-a",
+        ttl_seconds=300,
+        census_signature="c" * 64,
+        operation_id="adjudicator-lease-a",
+    )
+    lease = kb.acquire_controller_lease(conn, lease_request)
+    claim = kb.ControllerClaim(
+        controller_id="adjudicator",
+        board="default",
+        expected_tenant="alpha",
+        task_id=task_id,
+        generation_signature=generation_signature,
+        authority="mutate",
+        input_signature=input_signature,
+        lease_epoch=lease.holder_epoch,
+        expires_at=lease.expires_at,
+        operation_id="adjudicator-claim-a",
+    )
+    assert kb.publish_controller_claim(conn, claim).outcome == "committed"
+    authority = kb.ControllerAuthorityPreconditions(
+        controller_id="adjudicator",
+        board="default",
+        expected_tenant="alpha",
+        task_id=task_id,
+        generation_signature=generation_signature,
+        input_signature=input_signature,
+        authority_signature="",
+        claim_operation_id=claim.operation_id,
+        claim_expires_at=claim.expires_at,
+        lease_holder_token=lease.holder_token,
+        lease_epoch=lease.holder_epoch,
+        lease_issued_at=lease.issued_at,
+        lease_expires_at=lease.expires_at,
+        lease_census_signature=lease_request.census_signature,
+        lease_operation_id=lease.operation_id,
+    )
+    request = kb.ControllerLifecycleMutation(
+        preconditions=authority,
+        verb="unblock",
+        operation_id="adjudicated-lifecycle-a",
+    )
+    return clock, task_id, lease, request
+
+
+def _with_current_authority(conn, request, task_id, now=100):
+    snapshot = kb.read_recovery_snapshot(conn, now=now)
+    guard = replace(
+        request.preconditions,
+        authority_signature=kb.recovery_task_authority_signature(snapshot, task_id),
+    )
+    return replace(request, preconditions=guard)
+
+
+def test_guarded_adjudicated_lifecycle_rejects_lease_takeover(conn, monkeypatch):
+    clock, task_id, lease, request = _adjudicator_lifecycle_fixture(
+        conn, monkeypatch,
+    )
+    request = _with_current_authority(conn, request, task_id)
+    clock[0] = lease.expires_at + 1
+    takeover = kb.acquire_controller_lease(
+        conn,
+        kb.LeaseRequest(
+            controller_id="adjudicator",
+            board="default",
+            holder_token="adjudicator-holder-b",
+            ttl_seconds=300,
+            census_signature="d" * 64,
+            operation_id="adjudicator-lease-b",
+        ),
+    )
+    clock[0] += 1
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert takeover.holder_epoch > lease.holder_epoch
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_adjudicated_lifecycle_rejects_expired_authority(conn, monkeypatch):
+    clock, task_id, lease, request = _adjudicator_lifecycle_fixture(
+        conn, monkeypatch,
+    )
+    request = _with_current_authority(conn, request, task_id)
+    clock[0] = lease.expires_at
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_adjudicated_lifecycle_rejects_changed_task_input(conn, monkeypatch):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+    kb.add_comment(conn, task_id, "operator", "new manual evidence")
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_adjudicated_lifecycle_preserves_manual_unblock(conn, monkeypatch):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+    assert kb.unblock_task(conn, task_id)
+    close_request = replace(
+        request, verb="archive", operation_id="adjudicated-close-after-manual",
+    )
+
+    result = kb.apply_controller_lifecycle_mutation(conn, close_request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert not _operation_events(conn, task_id, close_request.operation_id)
+
+
+def test_guarded_adjudicated_lifecycle_commits_and_replays_once(conn, monkeypatch):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+
+    committed = kb.apply_controller_lifecycle_mutation(conn, request)
+    replayed = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert committed.outcome == "committed"
+    assert replayed.outcome == "committed"
+    assert replayed.event_id == committed.event_id
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert len(_operation_events(conn, task_id, request.operation_id)) == 1
+
+
+def test_guarded_lifecycle_rejects_competing_claim_after_planning(conn, monkeypatch):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+    lease = kb.acquire_controller_lease(
+        conn,
+        kb.LeaseRequest(
+            controller_id="competing-controller",
+            board="default",
+            holder_token="competing-holder-a",
+            ttl_seconds=300,
+            census_signature="d" * 64,
+            operation_id="competing-claim-lease",
+        ),
+    )
+    assert kb.publish_controller_claim(
+        conn,
+        kb.ControllerClaim(
+            controller_id="competing-controller",
+            board="default",
+            expected_tenant="alpha",
+            task_id=task_id,
+            generation_signature=request.preconditions.generation_signature,
+            authority="mutate",
+            input_signature=request.preconditions.input_signature,
+            lease_epoch=lease.holder_epoch,
+            expires_at=lease.expires_at,
+            operation_id="competing-claim-after-plan",
+        ),
+    ).outcome == "committed"
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_guarded_lifecycle_rejects_boris_creator_even_with_exact_claim(
+    conn, monkeypatch,
+):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    conn.execute(
+        "UPDATE tasks SET created_by = ? WHERE id = ?",
+        ("boris-slack-intake", task_id),
+    )
+    request = _with_current_authority(conn, request, task_id)
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert result.reason == "task is excluded from controller automation"
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_task_authority_signature_tracks_only_relevant_authority(conn, monkeypatch):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    before = kb.read_recovery_snapshot(conn, now=100)
+    first = kb.recovery_task_authority_signature(before, task_id)
+    competing_lease = kb.acquire_controller_lease(
+        conn,
+        kb.LeaseRequest(
+            controller_id="competing-controller",
+            board="default",
+            holder_token="competing-holder-a",
+            ttl_seconds=300,
+            census_signature="d" * 64,
+            operation_id="competing-signature-lease",
+        ),
+    )
+    assert kb.publish_controller_claim(
+        conn,
+        kb.ControllerClaim(
+            controller_id="competing-controller",
+            board="default",
+            expected_tenant="alpha",
+            task_id=task_id,
+            generation_signature=request.preconditions.generation_signature,
+            authority="mutate",
+            input_signature=request.preconditions.input_signature,
+            lease_epoch=competing_lease.holder_epoch,
+            expires_at=competing_lease.expires_at,
+            operation_id="competing-signature-claim",
+        ),
+    ).outcome == "committed"
+    second = kb.read_recovery_snapshot(conn, now=100)
+    assert kb.recovery_task_authority_signature(second, task_id) != first
+    other = kb.create_task(conn, title="unrelated", tenant="alpha")
+    kb.add_comment(conn, other, "operator", "unrelated evidence")
+    unchanged = kb.read_recovery_snapshot(conn, now=100)
+    assert kb.recovery_task_authority_signature(unchanged, task_id) == (
+        kb.recovery_task_authority_signature(second, task_id)
+    )
 
 
 def test_recovery_snapshot_reads_board_state_with_reproducible_signature(
