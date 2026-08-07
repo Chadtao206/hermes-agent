@@ -736,6 +736,35 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_with_review_target_uses_managed_transition(worker_env):
+    from tools import kanban_tools as kt
+    result = json.loads(kt._handle_block({
+        "kind": "review",
+        "reason": "ready for PR review",
+        "review_target": {
+            "kind": "pull_request",
+            "url": "https://github.com/Ylopo/forge/pull/123",
+        },
+    }))
+    assert result["success"] is True
+    assert result["status"] == "blocked"
+    assert result["block_kind"] == "review"
+    assert result["managed_review"] is True
+
+
+def test_block_rejects_review_target_for_non_review_kind(worker_env):
+    from tools import kanban_tools as kt
+    result = json.loads(kt._handle_block({
+        "kind": "transient",
+        "reason": "network error",
+        "review_target": {
+            "kind": "pull_request",
+            "url": "https://github.com/Ylopo/forge/pull/123",
+        },
+    }))
+    assert result["success"] is False
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:

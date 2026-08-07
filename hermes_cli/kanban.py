@@ -753,6 +753,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_managed_review = sub.add_parser(
+        "block-managed-review", help="Atomically block one task with a typed review target",
+    )
+    p_managed_review.add_argument("task_id")
+    p_managed_review.add_argument("--expected-tenant", required=True)
+    p_managed_review.add_argument("--expected-status", choices=("running", "ready"), required=True)
+    p_managed_review.add_argument("--expected-run-id", type=int, default=None)
+    p_managed_review.add_argument("--review-target", required=True)
+    p_managed_review.add_argument("--operation-id", required=True)
+    p_managed_review.add_argument("--reason", default=None)
+    p_managed_review.add_argument("--json", action="store_true", required=True)
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1318,6 +1330,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
+            "block-managed-review": _cmd_block_managed_review,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -1390,6 +1403,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "complete",
     "edit",
     "block",
+    "block-managed-review",
     "schedule",
     "unblock",
     "promote",
@@ -3166,6 +3180,30 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 else:
                     print(f"Blocked {tid}{suffix}")
     return 0 if not failed else 1
+
+
+def _cmd_block_managed_review(args: argparse.Namespace) -> int:
+    try:
+        review_target = json.loads(args.review_target)
+        if type(review_target) is not dict:
+            raise ValueError("--review-target must be a JSON object")
+        with kb.connect_closing() as conn:
+            result = kb.block_managed_review(
+                conn,
+                args.task_id,
+                board=kb.get_current_board(),
+                expected_tenant=args.expected_tenant,
+                expected_status=args.expected_status,
+                expected_run_id=args.expected_run_id,
+                review_target=review_target,
+                operation_id=args.operation_id,
+                reason=args.reason,
+            )
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"kanban: block-managed-review error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(asdict(result), ensure_ascii=False))
+    return 0 if result.outcome == "committed" else 1
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:

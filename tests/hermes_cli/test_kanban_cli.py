@@ -546,6 +546,41 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_block_managed_review_cli_persists_exact_target(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="implementation", tenant="alpha")
+        assert kb.claim_task(conn, task_id) is not None
+        run = kb.latest_run(conn, task_id)
+    target = json.dumps({
+        "kind": "pull_request",
+        "url": "https://github.com/Ylopo/forge/pull/123",
+    })
+    result = json.loads(kc.run_slash(
+        f"--board default block-managed-review {task_id} --expected-tenant alpha "
+        f"--expected-status running --expected-run-id {run.id} "
+        f"--review-target '{target}' --operation-id cli-managed-review --json"
+    ))
+    assert result["outcome"] == "committed"
+    with kb.connect_closing() as conn:
+        event = kb.list_events(conn, task_id)[-1]
+    assert event.payload["review_target"] == json.loads(target)
+
+
+@pytest.mark.parametrize("command", [
+    "--review-target '{not-json}' --operation-id op --json",
+    "--review-target '[]' --operation-id op --json",
+    "--review-target '{\"kind\": \"pull_request\", \"url\": \"https://github.com/Ylopo/forge/pull/123\"}' --json",
+    "--review-target '{\"kind\": \"pull_request\", \"url\": \"https://github.com/Ylopo/forge/pull/123\"}' --operation-id op --ids other --json",
+])
+def test_block_managed_review_cli_rejects_invalid_or_bulk_input(kanban_home, command):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="implementation", tenant="alpha")
+    out = kc.run_slash(
+        f"block-managed-review {task_id} --expected-tenant alpha --expected-status ready {command}"
+    )
+    assert "error" in out.lower() or "usage" in out.lower()
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

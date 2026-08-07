@@ -743,6 +743,12 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    review_target = args.get("review_target")
+    if review_target is not None and kind != "review":
+        return json.dumps({
+            "success": False,
+            "error": "review_target requires kind='review'",
+        })
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -762,6 +768,9 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        if task is None:
+            conn.close()
+            return tool_error(f"could not block {tid} (unknown id)")
         if (
             task
             and task.goal_mode
@@ -776,12 +785,37 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
-            ok = kb.block_task(
-                conn, tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id(tid),
-            )
+            if review_target is None:
+                ok = kb.block_task(
+                    conn, tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id(tid),
+                )
+            else:
+                run_id = _worker_run_id(tid)
+                current_board = board or kb.get_current_board()
+                operation_id = "managed-review-block:" + kb.canonical_payload_signature({
+                    "schema_version": 1,
+                    "board": current_board,
+                    "tenant": task.tenant,
+                    "task_id": tid,
+                    "expected_status": task.status,
+                    "expected_run_id": run_id,
+                    "review_target": review_target,
+                    "reason": reason,
+                })
+                result = kb.block_managed_review(
+                    conn, tid,
+                    board=current_board,
+                    expected_tenant=task.tenant or "",
+                    expected_status=task.status,
+                    expected_run_id=run_id,
+                    review_target=review_target,
+                    operation_id=operation_id,
+                    reason=reason,
+                )
+                ok = result.outcome == "committed"
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
@@ -791,6 +825,15 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
+            if review_target is not None:
+                return json.dumps({
+                    "success": True,
+                    "task_id": tid,
+                    "run_id": run.id if run else None,
+                    "status": landed.status if landed else "blocked",
+                    "block_kind": kind,
+                    "managed_review": True,
+                })
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
@@ -1671,12 +1714,26 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": ["dependency", "needs_input", "capability", "transient", "review"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "review_target": {
+                "description": "Closed durable descriptor for a managed review handoff; only valid with kind='review'.",
+                "oneOf": [
+                    {"type": "object", "additionalProperties": False,
+                     "properties": {"kind": {"const": "pull_request"}, "url": {"type": "string"}},
+                     "required": ["kind", "url"]},
+                    {"type": "object", "additionalProperties": False,
+                     "properties": {"kind": {"const": "git"}, "repository": {"type": "string"}},
+                     "required": ["kind", "repository"]},
+                    {"type": "object", "additionalProperties": False,
+                     "properties": {"kind": {"const": "artifact"}, "identifier": {"type": "string"}, "path": {"type": "string"}, "sha256": {"type": "string"}},
+                     "required": ["kind", "identifier", "path", "sha256"]},
+                ],
             },
             "board": _board_schema_prop(),
         },

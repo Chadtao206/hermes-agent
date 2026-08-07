@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+from urllib.parse import urlsplit
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -132,6 +133,73 @@ VALID_BLOCK_KINDS = {
     "transient",
     "review",
 }
+
+
+def _review_target_text(value: object, name: str) -> str:
+    if type(value) is not str or not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"review_target {name} must be a nonempty text value without control characters")
+    return value
+
+
+def _canonical_github_pull_url(value: object) -> str:
+    url = _review_target_text(value, "url")
+    parts = urlsplit(url)
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "github.com"
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or re.fullmatch(r"/[^/]+/[^/]+/pull/[1-9][0-9]*", parts.path) is None
+    ):
+        raise ValueError("review_target pull_request url must be a canonical GitHub HTTPS pull URL")
+    return url
+
+
+def _canonical_absolute_path(value: object) -> str:
+    path = _review_target_text(value, "path")
+    if not os.path.isabs(path) or os.path.normpath(path) != path or os.path.realpath(path) != path:
+        raise ValueError("review_target path must be a canonical absolute path")
+    return path
+
+
+def _bounded_review_identifier(value: object) -> str:
+    identifier = _review_target_text(value, "identifier")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", identifier) is None:
+        raise ValueError("review_target artifact identifier is invalid")
+    return identifier
+
+
+def _lower_sha256(value: object) -> str:
+    digest = _review_target_text(value, "sha256")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("review_target sha256 must be a lowercase SHA-256 digest")
+    return digest
+
+
+def normalize_review_target(value: Mapping[str, object]) -> dict[str, object]:
+    """Validate a closed, durable managed-review descriptor without I/O."""
+    if type(value) is not dict or type(value.get("kind")) is not str:
+        raise ValueError("review_target must be an exact object with a kind")
+    kind = value["kind"]
+    expected = {
+        "pull_request": {"kind", "url"},
+        "git": {"kind", "repository"},
+        "artifact": {"kind", "identifier", "path", "sha256"},
+    }.get(kind)
+    if expected is None or set(value) != expected:
+        raise ValueError("review_target has an unsupported or open schema")
+    if kind == "pull_request":
+        return {"kind": kind, "url": _canonical_github_pull_url(value["url"])}
+    if kind == "git":
+        return {"kind": kind, "repository": _canonical_absolute_path(value["repository"])}
+    return {
+        "kind": kind,
+        "identifier": _bounded_review_identifier(value["identifier"]),
+        "path": _canonical_absolute_path(value["path"]),
+        "sha256": _lower_sha256(value["sha256"]),
+    }
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -7591,6 +7659,112 @@ def block_task(
         reason=reason,
     )
     return True
+
+
+def block_managed_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: str,
+    expected_tenant: str,
+    expected_status: str,
+    expected_run_id: Optional[int],
+    review_target: Mapping[str, object],
+    operation_id: str,
+    reason: Optional[str] = None,
+) -> GuardedMutationResult:
+    """Atomically block one owned task with a closed review target."""
+    normalized_board = _normalize_board_slug(board)
+    if normalized_board is None:
+        raise ValueError("board is required")
+    if (
+        type(task_id) is not str or not task_id or task_id != task_id.strip()
+        or type(expected_tenant) is not str
+        or expected_tenant != expected_tenant.strip()
+        or expected_status not in {"running", "ready"}
+        or (expected_run_id is not None and (type(expected_run_id) is not int or expected_run_id < 1))
+        or type(operation_id) is not str or not operation_id.strip()
+        or (reason is not None and type(reason) is not str)
+    ):
+        raise ValueError("managed review block has invalid preconditions")
+    normalized_target = normalize_review_target(review_target)
+    _require_connection_board(conn, normalized_board)
+    operation_signature = _canonical_operation_signature(
+        "blocked",
+        task_id,
+        {
+            "board": normalized_board,
+            "tenant": expected_tenant,
+            "expected_status": expected_status,
+            "expected_run_id": expected_run_id,
+            "reason": reason,
+            "review_target": normalized_target,
+        },
+    )
+    with write_txn(conn):
+        replay = _guarded_operation_replay(
+            conn,
+            task_id=task_id,
+            operation_id=operation_id,
+            event_kind="blocked",
+            operation_signature=operation_signature,
+        )
+        if replay is not None:
+            return replay
+        row = conn.execute(
+            "SELECT tenant, status, current_run_id, created_by, block_kind, block_recurrences "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return _guarded_result("not_applied", task_id=task_id, operation_id=operation_id, reason="task not found")
+        if row["created_by"] == "boris-slack-intake":
+            return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task is excluded from controller automation")
+        if str(row["tenant"] or "").strip() != expected_tenant:
+            return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task tenant changed")
+        if row["status"] != expected_status:
+            return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task status changed")
+        current_run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
+        if expected_run_id is not None and current_run_id != expected_run_id:
+            return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task run changed")
+        previous_kind = row["block_kind"]
+        previous_recurrences = int(row["block_recurrences"] or 0)
+        recurrences = previous_recurrences + 1 if previous_kind == "review" else 1
+        sql = (
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, block_kind = 'review', block_recurrences = ? "
+            "WHERE id = ? AND status = ?"
+        )
+        params: tuple[object, ...] = (recurrences, task_id, expected_status)
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params += (expected_run_id,)
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
+            return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task changed during managed review block")
+        run_id = _end_run(conn, task_id, outcome="blocked", status="blocked", summary=reason)
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(conn, task_id, outcome="blocked", summary=reason)
+        event_id = _append_event(
+            conn, task_id, "blocked",
+            {
+                "schema_version": 1,
+                "reason": reason,
+                "kind": "review",
+                "recurrences": recurrences,
+                "review_target": normalized_target,
+                "operation_id": operation_id,
+                "operation_signature": operation_signature,
+            },
+            run_id=run_id,
+        )
+        blocked_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked", task_id, board=normalized_board,
+        assignee=blocked_task.assignee if blocked_task else None, run_id=run_id,
+        reason=reason,
+    )
+    return GuardedMutationResult("committed", task_id, operation_id, event_id=event_id)
 
 
 

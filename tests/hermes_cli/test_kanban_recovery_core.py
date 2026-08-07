@@ -42,6 +42,145 @@ def _running_task(conn, title: str = "review") -> str:
     return task_id
 
 
+def _running_task_state(conn, *, tenant: str = "alpha") -> tuple[str, int, tuple[object, ...]]:
+    task_id = kb.create_task(conn, title="managed review", tenant=tenant)
+    assert kb.claim_task(conn, task_id, claimer="reviewer") is not None
+    run = kb.latest_run(conn, task_id)
+    assert run is not None
+    return task_id, run.id, _task_run_event_state(conn, task_id)
+
+
+def _task_run_event_state(conn, task_id: str) -> tuple[object, ...]:
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, "
+        "block_kind, block_recurrences FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return (
+        tuple(row),
+        conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)).fetchone()[0],
+        conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0],
+    )
+
+
+def test_managed_review_block_commits_one_typed_target(conn):
+    task_id = kb.create_task(conn, title="implementation", tenant="alpha")
+    assert kb.claim_task(conn, task_id) is not None
+    run = kb.latest_run(conn, task_id)
+    assert run is not None
+    target = {
+        "kind": "pull_request",
+        "url": "https://github.com/Ylopo/forge/pull/123",
+    }
+
+    result = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha",
+        expected_status="running", expected_run_id=run.id,
+        review_target=target, operation_id="managed-review-block-1",
+        reason="implementation complete; review required",
+    )
+
+    assert result.outcome == "committed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    event = _latest_event(conn, task_id)
+    assert event.kind == "blocked"
+    assert event.payload == {
+        "schema_version": 1,
+        "reason": "implementation complete; review required",
+        "kind": "review",
+        "recurrences": 1,
+        "review_target": target,
+        "operation_id": "managed-review-block-1",
+        "operation_signature": event.payload["operation_signature"],
+    }
+
+
+@pytest.mark.parametrize("target", [
+    {"kind": "pull_request", "url": "http://github.com/Ylopo/forge/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123", "head": "a" * 40},
+    {"kind": "git", "repository": "relative/repo"},
+    {"kind": "artifact", "identifier": "build", "path": "/tmp/x", "sha256": "BAD"},
+    {"kind": "unknown", "url": "https://github.com/Ylopo/forge/pull/123"},
+])
+def test_managed_review_block_rejects_malformed_target_without_partial_write(conn, target):
+    task_id, run_id, before = _running_task_state(conn, tenant="alpha")
+    with pytest.raises(ValueError):
+        kb.block_managed_review(
+            conn, task_id, board="default", expected_tenant="alpha",
+            expected_status="running", expected_run_id=run_id,
+            review_target=target, operation_id="invalid-managed-review",
+        )
+    assert _task_run_event_state(conn, task_id) == before
+
+
+@pytest.mark.parametrize("change", ["tenant", "status", "run", "boris"])
+def test_managed_review_block_rejects_stale_or_excluded_task_without_partial_write(conn, change):
+    task_id, run_id, before = _running_task_state(conn, tenant="alpha")
+    if change == "tenant":
+        conn.execute("UPDATE tasks SET tenant = 'beta' WHERE id = ?", (task_id,))
+    elif change == "status":
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    elif change == "run":
+        run_id += 1
+    else:
+        conn.execute("UPDATE tasks SET created_by = 'boris-slack-intake' WHERE id = ?", (task_id,))
+    before = _task_run_event_state(conn, task_id)
+    result = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha",
+        expected_status="running", expected_run_id=run_id,
+        review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+        operation_id=f"managed-review-{change}",
+    )
+    assert result.outcome == "precondition_changed"
+    assert _task_run_event_state(conn, task_id) == before
+
+
+def test_managed_review_block_rejects_wrong_connection_board_without_partial_write(conn):
+    task_id, run_id, before = _running_task_state(conn, tenant="alpha")
+    kb.create_board("other-board")
+    with pytest.raises(ValueError, match="does not match connected database"):
+        kb.block_managed_review(
+            conn, task_id, board="other-board", expected_tenant="alpha",
+            expected_status="running", expected_run_id=run_id,
+            review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+            operation_id="managed-review-wrong-board",
+        )
+    assert _task_run_event_state(conn, task_id) == before
+
+
+def test_managed_review_block_replays_exact_operation_and_conflicts_on_other_target(conn):
+    task_id, run_id, _before = _running_task_state(conn, tenant="alpha")
+    first = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha", expected_status="running",
+        expected_run_id=run_id,
+        review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+        operation_id="managed-review-replay",
+    )
+    replay = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha", expected_status="running",
+        expected_run_id=run_id,
+        review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+        operation_id="managed-review-replay",
+    )
+    conflict = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha", expected_status="running",
+        expected_run_id=run_id,
+        review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/124"},
+        operation_id="managed-review-replay",
+    )
+    assert replay == first
+    assert conflict.outcome == "conflict"
+    assert len(_operation_events(conn, task_id, "managed-review-replay")) == 1
+
+
+def test_generic_review_block_remains_targetless(conn):
+    task_id = kb.create_task(conn, title="legacy handoff", tenant="alpha")
+    assert kb.block_task(conn, task_id, kind="review", reason="PR is in the body")
+    event = _latest_event(conn, task_id)
+    assert event.payload["kind"] == "review"
+    assert "review_target" not in event.payload
+
+
 def _review_metadata(
     *,
     verdict: str = "APPROVED",
