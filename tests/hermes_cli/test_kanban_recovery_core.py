@@ -104,6 +104,7 @@ def test_managed_review_block_commits_one_typed_target(conn):
     {"kind": "pull_request", "url": "https://github.com/Ylopo%5Cforge/repo/pull/123"},
     {"kind": "pull_request", "url": "https://github.com/Ylopo\u0085/forge/pull/123"},
     {"kind": "pull_request", "url": f"https://github.com/{'a' * 40}/forge/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/bad--owner/forge/pull/123"},
     {"kind": "pull_request", "url": f"https://github.com/Ylopo/{'a' * 101}/pull/123"},
     {"kind": "pull_request", "url": "https://user@github.com/Ylopo/forge/pull/123"},
     {"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123?diff=1"},
@@ -122,6 +123,28 @@ def test_managed_review_block_rejects_malformed_target_without_partial_write(con
             expected_status="running", expected_run_id=run_id,
             review_target=target, operation_id="invalid-managed-review",
         )
+    assert _task_run_event_state(conn, task_id) == before
+
+
+@pytest.mark.parametrize("reason", ["x" * 4097, "needs\ninput", "needs\x00input"])
+def test_managed_review_block_rejects_oversized_or_control_bearing_reason_without_partial_write(
+    conn, reason,
+):
+    """Break caught: managed review persists unbounded/control-bearing event data."""
+    task_id, run_id, before = _running_task_state(conn, tenant="alpha")
+
+    with pytest.raises(ValueError, match="reason"):
+        kb.block_managed_review(
+            conn, task_id, board="default", expected_tenant="alpha",
+            expected_status="running", expected_run_id=run_id,
+            review_target={
+                "kind": "pull_request",
+                "url": "https://github.com/Ylopo/forge/pull/123",
+            },
+            operation_id="invalid-managed-review-reason",
+            reason=reason,
+        )
+
     assert _task_run_event_state(conn, task_id) == before
 
 

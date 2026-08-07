@@ -135,6 +135,8 @@ VALID_BLOCK_KINDS = {
     "review",
 }
 
+_MANAGED_REVIEW_REASON_MAX_CHARS = 4096
+
 
 def _review_target_text(value: object, name: str) -> str:
     if (
@@ -163,10 +165,25 @@ def _canonical_github_pull_url(value: object) -> str:
         or parts.query
         or parts.fragment
         or match is None
+        or "--" in match.group("owner")
         or match.group("repository") in {".", ".."}
     ):
         raise ValueError("review_target pull_request url must be a canonical GitHub HTTPS pull URL")
     return url
+
+
+def _bounded_managed_review_reason(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    if (
+        type(value) is not str
+        or len(value) > _MANAGED_REVIEW_REASON_MAX_CHARS
+        or any(unicodedata.category(char) == "Cc" for char in value)
+    ):
+        raise ValueError(
+            "managed review reason must be bounded text without control characters"
+        )
+    return value
 
 
 def _canonical_absolute_path(value: object) -> str:
@@ -7696,11 +7713,11 @@ def block_managed_review(
         or expected_status not in {"running", "ready"}
         or (expected_run_id is not None and (type(expected_run_id) is not int or expected_run_id < 1))
         or type(operation_id) is not str or not operation_id.strip()
-        or (reason is not None and type(reason) is not str)
     ):
         raise ValueError("managed review block has invalid preconditions")
     if expected_status == "running" and expected_run_id is None:
         raise ValueError("managed review block requires expected_run_id for a running task")
+    reason = _bounded_managed_review_reason(reason)
     normalized_target = normalize_review_target(review_target)
     _require_connection_board(conn, normalized_board)
     operation_signature = _canonical_operation_signature(
