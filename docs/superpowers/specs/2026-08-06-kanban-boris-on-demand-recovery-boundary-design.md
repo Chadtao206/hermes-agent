@@ -1,7 +1,7 @@
 # Kanban / Boris On-Demand Recovery Boundary Design
 
 **Date:** 2026-08-06
-**Status:** Approved design, pending written-spec review
+**Status:** Approved
 **Scope:** Controller ownership, Task 13 revision, and CRON deprecation boundary
 **Rollout:** Documentation and staged implementation only; no live CRON, Kanban,
 gateway, config, or source mutation is authorized by this design
