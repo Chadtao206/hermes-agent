@@ -1829,6 +1829,44 @@ def test_stale_controller_epoch_cannot_publish_claim(conn, monkeypatch):
     assert not _operation_events(conn, task_id, "claim-stale-after-takeover")
 
 
+def test_claim_publication_rechecks_expiry_after_waiting_for_writer_lock(
+    conn, monkeypatch,
+):
+    now = _clock(monkeypatch, 100)
+    task_id = kb.create_task(conn, title="claim lock wait", tenant="alpha")
+    lease = kb.acquire_controller_lease(
+        conn, _lease_request("router-a", operation_id="claim-lock-lease"),
+    )
+    snapshot = kb.read_recovery_snapshot(conn, now=now[0])
+    claim = kb.ControllerClaim(
+        controller_id="blocked-recovery",
+        board="default",
+        expected_tenant="alpha",
+        task_id=task_id,
+        generation_signature=kb.recovery_task_generation_signature(snapshot, task_id),
+        authority="mutate",
+        input_signature=kb.recovery_task_input_signature(snapshot, task_id),
+        lease_epoch=lease.holder_epoch,
+        expires_at=lease.expires_at,
+        operation_id="claim-after-lock-wait",
+    )
+    original_write_txn = kb.write_txn
+
+    @contextlib.contextmanager
+    def writer_lock_wait(connection):
+        with original_write_txn(connection):
+            now[0] = lease.expires_at
+            yield connection
+
+    monkeypatch.setattr(kb, "write_txn", writer_lock_wait)
+
+    result = kb.publish_controller_claim(conn, claim)
+
+    assert result.outcome == "precondition_changed"
+    assert result.reason == "controller lease no longer authorizes this claim"
+    assert not _operation_events(conn, task_id, claim.operation_id)
+
+
 def _controller_claim(
     task_id: str,
     lease: kb.LeaseResult,
@@ -2181,7 +2219,9 @@ def test_guarded_lifecycle_rejects_competing_claim_after_planning(conn, monkeypa
     result = kb.apply_controller_lifecycle_mutation(conn, request)
 
     assert result.outcome == "precondition_changed"
+    assert result.reason == "task authority changed"
     assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
 
 
 def test_guarded_lifecycle_rejects_boris_creator_even_with_exact_claim(
@@ -2199,6 +2239,86 @@ def test_guarded_lifecycle_rejects_boris_creator_even_with_exact_claim(
     assert result.outcome == "precondition_changed"
     assert result.reason == "task is excluded from controller automation"
     assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_lifecycle_rejects_changed_lease_census_without_mutation(
+    conn, monkeypatch,
+):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+    request = replace(
+        request,
+        preconditions=replace(
+            request.preconditions,
+            lease_census_signature="d" * 64,
+        ),
+    )
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert result.reason == "controller lease changed or expired"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_lifecycle_rejects_changed_generation_without_mutation(
+    conn, monkeypatch,
+):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+    request = replace(
+        request,
+        preconditions=replace(
+            request.preconditions,
+            generation_signature="a" * 64,
+        ),
+    )
+
+    result = kb.apply_controller_lifecycle_mutation(conn, request)
+
+    assert result.outcome == "precondition_changed"
+    assert result.reason == "task recovery input or generation changed"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_lifecycle_rejects_unsupported_verb_without_mutation(
+    conn, monkeypatch,
+):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+
+    with pytest.raises(ValueError, match="controller lifecycle verb must be unblock or archive"):
+        kb.apply_controller_lifecycle_mutation(
+            conn,
+            replace(request, verb="unsupported"),
+        )
+
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert not _operation_events(conn, task_id, request.operation_id)
+
+
+def test_guarded_lifecycle_rejects_operation_id_for_different_mutation(
+    conn, monkeypatch,
+):
+    _, task_id, _, request = _adjudicator_lifecycle_fixture(conn, monkeypatch)
+    request = _with_current_authority(conn, request, task_id)
+    committed = kb.apply_controller_lifecycle_mutation(conn, request)
+    assert committed.outcome == "committed"
+    assert kb.block_task(conn, task_id, reason="operator reblocked task")
+    status_before = kb.get_task(conn, task_id).status
+
+    conflict = kb.apply_controller_lifecycle_mutation(
+        conn,
+        replace(request, verb="archive"),
+    )
+
+    assert conflict.outcome == "conflict"
+    assert conflict.reason == "operation_id is already bound to another mutation"
+    assert kb.get_task(conn, task_id).status == status_before
+    assert len(_operation_events(conn, task_id, request.operation_id)) == 1
 
 
 def test_task_authority_signature_tracks_only_relevant_authority(conn, monkeypatch):

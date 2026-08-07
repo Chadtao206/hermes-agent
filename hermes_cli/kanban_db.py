@@ -8493,8 +8493,8 @@ def acquire_controller_lease(
         request.operation_id,
     )
     _require_connection_board(conn, board)
-    now = _controller_epoch_now()
     with write_txn(conn):
+        now = _controller_epoch_now()
         row = conn.execute(
             "SELECT * FROM kanban_controller_leases "
             "WHERE controller_id = ? AND board = ?",
@@ -8680,8 +8680,8 @@ def publish_controller_claim(
             "expires_at": claim.expires_at,
         },
     )
-    now = _controller_epoch_now()
     with write_txn(conn):
+        now = _controller_epoch_now()
         task = conn.execute("SELECT tenant FROM tasks WHERE id = ?", (claim.task_id,)).fetchone()
         if task is None:
             return _guarded_result("not_applied", task_id=claim.task_id, operation_id=claim.operation_id, reason="task not found")

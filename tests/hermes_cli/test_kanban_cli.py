@@ -278,7 +278,7 @@ def test_controller_claim_publish_cli_is_tenant_scoped_and_replay_safe(kanban_ho
     assert stale["outcome"] == "precondition_changed"
 
 
-def test_controller_claim_mutate_cli_rechecks_exact_authority_at_write(kanban_home):
+def _planned_controller_mutation_cli(kanban_home):
     with kb.connect_closing(board="default") as connection:
         task_id = kb.create_task(
             connection, title="guarded lifecycle cli", tenant="alpha",
@@ -322,14 +322,100 @@ def test_controller_claim_mutate_cli_rechecks_exact_authority_at_write(kanban_ho
         "--verb unblock --operation-id guarded-cli-unblock --json"
     )
 
+    return task_id, lease, generation_signature, input_signature, mutate_command
+
+
+def test_controller_claim_mutate_cli_replays_the_complete_json_contract(kanban_home):
+    task_id, _lease, _generation, _input, mutate_command = (
+        _planned_controller_mutation_cli(kanban_home)
+    )
+
     committed = json.loads(kc.run_slash(mutate_command))
     replayed = json.loads(kc.run_slash(mutate_command))
 
-    assert committed["outcome"] == "committed"
-    assert replayed["outcome"] == "committed"
-    assert replayed["event_id"] == committed["event_id"]
+    assert committed == {
+        "outcome": "committed",
+        "task_id": task_id,
+        "operation_id": "guarded-cli-unblock",
+        "event_id": committed["event_id"],
+        "reason": "",
+    }
+    assert replayed == committed
     with kb.connect_closing(board="default") as connection:
         assert kb.get_task(connection, task_id).status == "ready"
+
+
+def test_controller_claim_mutate_cli_rejects_competing_authority_after_planning(
+    kanban_home,
+):
+    task_id, lease, generation_signature, input_signature, mutate_command = (
+        _planned_controller_mutation_cli(kanban_home)
+    )
+    with kb.connect_closing(board="default") as connection:
+        competing_lease = kb.acquire_controller_lease(
+            connection,
+            kb.LeaseRequest(
+                controller_id="competing-controller",
+                board="default",
+                holder_token="competing-holder",
+                ttl_seconds=300,
+                census_signature="d" * 64,
+                operation_id="competing-cli-lease",
+            ),
+        )
+        competing = kb.publish_controller_claim(
+            connection,
+            kb.ControllerClaim(
+                controller_id="competing-controller",
+                board="default",
+                expected_tenant="alpha",
+                task_id=task_id,
+                generation_signature=generation_signature,
+                authority="mutate",
+                input_signature=input_signature,
+                lease_epoch=competing_lease.holder_epoch,
+                expires_at=competing_lease.expires_at,
+                operation_id="competing-cli-claim",
+            ),
+        )
+        assert competing.outcome == "committed"
+
+    payload = json.loads(kc.run_slash(mutate_command))
+
+    assert payload == {
+        "outcome": "precondition_changed",
+        "task_id": task_id,
+        "operation_id": "guarded-cli-unblock",
+        "event_id": None,
+        "reason": "task authority changed",
+    }
+    with kb.connect_closing(board="default") as connection:
+        assert kb.get_task(connection, task_id).status == "blocked"
+
+
+def test_controller_claim_mutate_cli_rejects_boris_creator_changed_after_planning(
+    kanban_home,
+):
+    task_id, _lease, _generation, _input, mutate_command = (
+        _planned_controller_mutation_cli(kanban_home)
+    )
+    with kb.connect_closing(board="default") as connection:
+        connection.execute(
+            "UPDATE tasks SET created_by = ? WHERE id = ?",
+            ("boris-slack-intake", task_id),
+        )
+
+    payload = json.loads(kc.run_slash(mutate_command))
+
+    assert payload == {
+        "outcome": "precondition_changed",
+        "task_id": task_id,
+        "operation_id": "guarded-cli-unblock",
+        "event_id": None,
+        "reason": "task is excluded from controller automation",
+    }
+    with kb.connect_closing(board="default") as connection:
+        assert kb.get_task(connection, task_id).status == "blocked"
 
 
 @pytest.mark.parametrize(
