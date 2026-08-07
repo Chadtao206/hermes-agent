@@ -736,8 +736,17 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
-def test_block_with_review_target_uses_managed_transition(worker_env):
+def _set_worker_run_id(monkeypatch, task_id):
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    return run.id
+
+
+def test_block_with_review_target_uses_managed_transition(monkeypatch, worker_env):
     from tools import kanban_tools as kt
+    _set_worker_run_id(monkeypatch, worker_env)
     result = json.loads(kt._handle_block({
         "kind": "review",
         "reason": "ready for PR review",
@@ -750,6 +759,56 @@ def test_block_with_review_target_uses_managed_transition(worker_env):
     assert result["status"] == "blocked"
     assert result["block_kind"] == "review"
     assert result["managed_review"] is True
+
+
+def test_block_with_review_target_replays_after_lost_acknowledgement(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    run_id = _set_worker_run_id(monkeypatch, worker_env)
+    args = {
+        "kind": "review",
+        "reason": "ready for PR review",
+        "review_target": {
+            "kind": "pull_request",
+            "url": "https://github.com/Ylopo/forge/pull/123",
+        },
+    }
+    first = json.loads(kt._handle_block(args))
+    second = json.loads(kt._handle_block(args))
+    assert first["success"] is True
+    assert second["success"] is True
+    with kb.connect_closing() as conn:
+        blocked = [event for event in kb.list_events(conn, worker_env) if event.kind == "blocked"]
+        runs = kb.list_runs(conn, worker_env)
+    assert len(blocked) == 1
+    assert blocked[0].run_id == run_id
+    assert len(runs) == 1
+    assert runs[0].outcome == "blocked"
+
+
+def test_block_with_review_target_fails_closed_without_worker_run_identity(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    with kb.connect_closing() as conn:
+        before = kb.get_task(conn, worker_env)
+        before_runs = len(kb.list_runs(conn, worker_env))
+        before_events = len(kb.list_events(conn, worker_env))
+    result = json.loads(kt._handle_block({
+        "kind": "review",
+        "reason": "ready for PR review",
+        "review_target": {
+            "kind": "pull_request",
+            "url": "https://github.com/Ylopo/forge/pull/123",
+        },
+    }))
+    assert result["success"] is False
+    with kb.connect_closing() as conn:
+        after = kb.get_task(conn, worker_env)
+        after_runs = len(kb.list_runs(conn, worker_env))
+        after_events = len(kb.list_events(conn, worker_env))
+    assert (after.status, after.current_run_id) == (before.status, before.current_run_id)
+    assert after_runs == before_runs
+    assert after_events == before_events
 
 
 def test_block_rejects_review_target_for_non_review_kind(worker_env):

@@ -794,13 +794,19 @@ def _handle_block(args: dict, **kw) -> str:
                 )
             else:
                 run_id = _worker_run_id(tid)
+                if run_id is None:
+                    return json.dumps({
+                        "success": False,
+                        "error": "managed review block requires the worker run identity",
+                    })
                 current_board = board or kb.get_current_board()
+                expected_status = "running"
                 operation_id = "managed-review-block:" + kb.canonical_payload_signature({
                     "schema_version": 1,
                     "board": current_board,
                     "tenant": task.tenant,
                     "task_id": tid,
-                    "expected_status": task.status,
+                    "expected_status": expected_status,
                     "expected_run_id": run_id,
                     "review_target": review_target,
                     "reason": reason,
@@ -809,7 +815,7 @@ def _handle_block(args: dict, **kw) -> str:
                     conn, tid,
                     board=current_board,
                     expected_tenant=task.tenant or "",
-                    expected_status=task.status,
+                    expected_status=expected_status,
                     expected_run_id=run_id,
                     review_target=review_target,
                     operation_id=operation_id,

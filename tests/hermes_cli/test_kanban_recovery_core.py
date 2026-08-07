@@ -97,6 +97,18 @@ def test_managed_review_block_commits_one_typed_target(conn):
 
 @pytest.mark.parametrize("target", [
     {"kind": "pull_request", "url": "http://github.com/Ylopo/forge/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo /forge/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/./forge/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo/../pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo%2Fforge/repo/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo%5Cforge/repo/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo\u0085/forge/pull/123"},
+    {"kind": "pull_request", "url": f"https://github.com/{'a' * 40}/forge/pull/123"},
+    {"kind": "pull_request", "url": f"https://github.com/Ylopo/{'a' * 101}/pull/123"},
+    {"kind": "pull_request", "url": "https://user@github.com/Ylopo/forge/pull/123"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123?diff=1"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123#files"},
+    {"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123/files"},
     {"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123", "head": "a" * 40},
     {"kind": "git", "repository": "relative/repo"},
     {"kind": "artifact", "identifier": "build", "path": "/tmp/x", "sha256": "BAD"},
@@ -130,6 +142,47 @@ def test_managed_review_block_rejects_stale_or_excluded_task_without_partial_wri
         expected_status="running", expected_run_id=run_id,
         review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
         operation_id=f"managed-review-{change}",
+    )
+    assert result.outcome == "precondition_changed"
+    assert _task_run_event_state(conn, task_id) == before
+
+
+def test_managed_review_block_requires_run_identity_for_running_task(conn):
+    task_id, _run_id, before = _running_task_state(conn, tenant="alpha")
+    with pytest.raises(ValueError, match="run"):
+        kb.block_managed_review(
+            conn, task_id, board="default", expected_tenant="alpha",
+            expected_status="running", expected_run_id=None,
+            review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+            operation_id="managed-review-missing-run",
+        )
+    assert _task_run_event_state(conn, task_id) == before
+
+
+def test_managed_review_block_requires_ready_task_to_have_no_current_run(conn):
+    task_id, run_id, _before = _running_task_state(conn, tenant="alpha")
+    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    before = _task_run_event_state(conn, task_id)
+    result = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha",
+        expected_status="ready", expected_run_id=None,
+        review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+        operation_id="managed-review-ready-stale-run",
+    )
+    assert result.outcome == "precondition_changed"
+    assert kb.latest_run(conn, task_id).id == run_id
+    assert _task_run_event_state(conn, task_id) == before
+
+
+def test_managed_review_block_compares_persisted_tenant_literally(conn):
+    task_id, run_id, _before = _running_task_state(conn, tenant="alpha")
+    conn.execute("UPDATE tasks SET tenant = ' alpha ' WHERE id = ?", (task_id,))
+    before = _task_run_event_state(conn, task_id)
+    result = kb.block_managed_review(
+        conn, task_id, board="default", expected_tenant="alpha",
+        expected_status="running", expected_run_id=run_id,
+        review_target={"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"},
+        operation_id="managed-review-literal-tenant",
     )
     assert result.outcome == "precondition_changed"
     assert _task_run_event_state(conn, task_id) == before

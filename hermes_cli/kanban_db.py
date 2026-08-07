@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from urllib.parse import urlsplit
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field, replace
@@ -136,7 +137,11 @@ VALID_BLOCK_KINDS = {
 
 
 def _review_target_text(value: object, name: str) -> str:
-    if type(value) is not str or not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+    if (
+        type(value) is not str
+        or not value
+        or any(unicodedata.category(char) == "Cc" for char in value)
+    ):
         raise ValueError(f"review_target {name} must be a nonempty text value without control characters")
     return value
 
@@ -144,6 +149,12 @@ def _review_target_text(value: object, name: str) -> str:
 def _canonical_github_pull_url(value: object) -> str:
     url = _review_target_text(value, "url")
     parts = urlsplit(url)
+    owner = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+    repository = r"[A-Za-z0-9_.-]{1,100}"
+    match = re.fullmatch(
+        rf"/(?P<owner>{owner})/(?P<repository>{repository})/pull/(?P<number>[1-9][0-9]{{0,19}})",
+        parts.path,
+    )
     if (
         parts.scheme != "https"
         or parts.netloc != "github.com"
@@ -151,7 +162,8 @@ def _canonical_github_pull_url(value: object) -> str:
         or parts.password is not None
         or parts.query
         or parts.fragment
-        or re.fullmatch(r"/[^/]+/[^/]+/pull/[1-9][0-9]*", parts.path) is None
+        or match is None
+        or match.group("repository") in {".", ".."}
     ):
         raise ValueError("review_target pull_request url must be a canonical GitHub HTTPS pull URL")
     return url
@@ -7687,6 +7699,8 @@ def block_managed_review(
         or (reason is not None and type(reason) is not str)
     ):
         raise ValueError("managed review block has invalid preconditions")
+    if expected_status == "running" and expected_run_id is None:
+        raise ValueError("managed review block requires expected_run_id for a running task")
     normalized_target = normalize_review_target(review_target)
     _require_connection_board(conn, normalized_board)
     operation_signature = _canonical_operation_signature(
@@ -7720,26 +7734,22 @@ def block_managed_review(
             return _guarded_result("not_applied", task_id=task_id, operation_id=operation_id, reason="task not found")
         if row["created_by"] == "boris-slack-intake":
             return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task is excluded from controller automation")
-        if str(row["tenant"] or "").strip() != expected_tenant:
+        if str(row["tenant"] or "") != expected_tenant:
             return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task tenant changed")
         if row["status"] != expected_status:
             return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task status changed")
         current_run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
-        if expected_run_id is not None and current_run_id != expected_run_id:
+        if current_run_id != expected_run_id:
             return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task run changed")
         previous_kind = row["block_kind"]
         previous_recurrences = int(row["block_recurrences"] or 0)
         recurrences = previous_recurrences + 1 if previous_kind == "review" else 1
-        sql = (
+        cur = conn.execute(
             "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, block_kind = 'review', block_recurrences = ? "
-            "WHERE id = ? AND status = ?"
+            "WHERE id = ? AND status = ? AND current_run_id IS ?",
+            (recurrences, task_id, expected_status, expected_run_id),
         )
-        params: tuple[object, ...] = (recurrences, task_id, expected_status)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params += (expected_run_id,)
-        cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return _guarded_result("precondition_changed", task_id=task_id, operation_id=operation_id, reason="task changed during managed review block")
         run_id = _end_run(conn, task_id, outcome="blocked", status="blocked", summary=reason)

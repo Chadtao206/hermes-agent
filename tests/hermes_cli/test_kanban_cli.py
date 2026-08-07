@@ -566,6 +566,47 @@ def test_block_managed_review_cli_persists_exact_target(kanban_home):
     assert event.payload["review_target"] == json.loads(target)
 
 
+def _managed_review_cli_state(task_id):
+    with kb.connect_closing() as conn:
+        task = conn.execute(
+            "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, "
+            "block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        return (
+            tuple(task),
+            conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)).fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0],
+        )
+
+
+def test_block_managed_review_cli_rejects_unsupported_target_kind_without_mutation(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="implementation", tenant="alpha")
+    before = _managed_review_cli_state(task_id)
+    target = json.dumps({"kind": "unknown", "url": "https://github.com/Ylopo/forge/pull/123"})
+    out = kc.run_slash(
+        f"block-managed-review {task_id} --expected-tenant alpha --expected-status ready "
+        f"--review-target '{target}' --operation-id unsupported-kind --json"
+    )
+    assert "unsupported" in out.lower()
+    assert _managed_review_cli_state(task_id) == before
+
+
+def test_block_managed_review_cli_reports_stale_tenant_without_mutation(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="implementation", tenant="beta")
+    before = _managed_review_cli_state(task_id)
+    target = json.dumps({"kind": "pull_request", "url": "https://github.com/Ylopo/forge/pull/123"})
+    result = json.loads(kc.run_slash(
+        f"block-managed-review {task_id} --expected-tenant alpha --expected-status ready "
+        f"--review-target '{target}' --operation-id stale-tenant --json"
+    ))
+    assert result["outcome"] == "precondition_changed"
+    assert result["reason"] == "task tenant changed"
+    assert _managed_review_cli_state(task_id) == before
+
+
 @pytest.mark.parametrize("command", [
     "--review-target '{not-json}' --operation-id op --json",
     "--review-target '[]' --operation-id op --json",
