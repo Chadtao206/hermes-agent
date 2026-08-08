@@ -66,7 +66,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 HOME = Path(os.environ.get("HERMES_HOME") or "/Users/ctao/.hermes")
 STATE_PATH = HOME / "state" / "just_do_it_review_reactions.json"
@@ -118,6 +118,72 @@ PERMALINK_RE = re.compile(
 )
 # Source channels whose posts this watchdog may react to. #meeting-room and
 # other chatter channels must never be reacted to.
+BORIS_CHANNEL = "C0BPCKPEFCG"
+
+STATE_BLOCKED = "blocked"
+STATE_NOTES = "notes"
+STATE_ACTIVE = "active"
+STATE_APPROVED = "approved"
+
+STATE_PRECEDENCE = {
+    STATE_BLOCKED: 4,
+    STATE_NOTES: 3,
+    STATE_ACTIVE: 2,
+    STATE_APPROVED: 1,
+}
+
+LEGACY_REACTIONS = {
+    STATE_BLOCKED: "review-no",
+    STATE_NOTES: "doge_notes",
+    STATE_ACTIVE: "thinkies",
+    STATE_APPROVED: "white_check_mark",
+}
+BORIS_REACTIONS = {
+    STATE_BLOCKED: "face_vomiting",
+    STATE_NOTES: "doge_notes",
+    STATE_ACTIVE: "rubbing",
+    STATE_APPROVED: "blinkapproved",
+}
+REACTION_TO_STATE = {
+    reaction: state
+    for table in (LEGACY_REACTIONS, BORIS_REACTIONS)
+    for state, reaction in table.items()
+}
+
+
+def normalize_review_state(value: object) -> str | None:
+    text = str(value or "")
+    if text in STATE_PRECEDENCE:
+        return text
+    return REACTION_TO_STATE.get(text)
+
+
+def source_channel(permalink: str) -> str | None:
+    match = PERMALINK_RE.search(str(permalink or ""))
+    return match.group("channel").upper() if match else None
+
+
+def render_reaction(
+    permalink: str,
+    state: str,
+    boris_style: str = "modern",
+) -> str:
+    if state not in STATE_PRECEDENCE:
+        raise ValueError(f"unknown review state: {state}")
+    if source_channel(permalink) == BORIS_CHANNEL and boris_style == "modern":
+        return BORIS_REACTIONS[state]
+    return LEGACY_REACTIONS[state]
+
+
+def owned_reactions(permalink: str) -> tuple[str, ...]:
+    tables = (
+        (LEGACY_REACTIONS, BORIS_REACTIONS)
+        if source_channel(permalink) == BORIS_CHANNEL
+        else (LEGACY_REACTIONS,)
+    )
+    return tuple(dict.fromkeys(reaction for table in tables for reaction in table.values()))
+
+
 DEFAULT_ALLOWED_CHANNELS = {
     "C08K8FQKX9S",  # #just-do-it / ticket-hub
     "C07BU8AAPB3",
@@ -127,7 +193,7 @@ DEFAULT_ALLOWED_CHANNELS = {
     # this watchdog owns their reaction state too. Without this entry
     # extract_permalinks() drops the link and those posts would keep the
     # initial :thinkies: forever, never reaching doge_notes/review-no/✅.
-    "C0BPCKPEFCG",  # #boris-reviews
+    BORIS_CHANNEL,  # #boris-reviews
 }
 
 EMOJI_BLOCK = "review-no"
@@ -1009,6 +1075,14 @@ def aggregate_emoji(emojis: list[str] | set[str] | tuple[str, ...]) -> str | Non
     if not known:
         return None
     return max(known, key=lambda emoji: PRECEDENCE[emoji])
+
+
+def aggregate_state(states: Iterable[str]) -> str | None:
+    known = [normalize_review_state(state) for state in states]
+    known = [state for state in known if state in STATE_PRECEDENCE]
+    if not known:
+        return None
+    return max(known, key=lambda state: STATE_PRECEDENCE[state])
 
 
 # --- reaction plumbing ----------------------------------------------------

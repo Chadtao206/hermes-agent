@@ -25,6 +25,10 @@ OTHER_WATCHED = "C07BU8AAPB3"
 UNWATCHED = "C0B5CT0TRFS"  # #meeting-room: chatter, never reacted to
 PERMALINK = f"https://ylopo.slack.com/archives/{CHANNEL}/p1785000000000001"
 PERMALINK_B = f"https://ylopo.slack.com/archives/{OTHER_WATCHED}/p1785000000000002"
+BORIS_CHANNEL = "C0BPCKPEFCG"
+BORIS_PERMALINK = (
+    f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000003"
+)
 NOW = 1785300000
 
 
@@ -37,6 +41,77 @@ def load_mod():
 
 
 m = load_mod()
+
+
+class ReactionSchemeTest(unittest.TestCase):
+    def test_boris_channel_uses_modern_reactions(self):
+        expected = {
+            m.STATE_ACTIVE: "rubbing",
+            m.STATE_NOTES: "doge_notes",
+            m.STATE_BLOCKED: "face_vomiting",
+            m.STATE_APPROVED: "blinkapproved",
+        }
+        self.assertEqual(
+            {state: m.render_reaction(BORIS_PERMALINK, state) for state in expected},
+            expected,
+        )
+
+    def test_legacy_channel_keeps_legacy_reactions(self):
+        expected = {
+            m.STATE_ACTIVE: "thinkies",
+            m.STATE_NOTES: "doge_notes",
+            m.STATE_BLOCKED: "review-no",
+            m.STATE_APPROVED: "white_check_mark",
+        }
+        self.assertEqual(
+            {state: m.render_reaction(PERMALINK, state) for state in expected},
+            expected,
+        )
+
+    def test_reverse_style_renders_legacy_only_for_boris(self):
+        self.assertEqual(
+            m.render_reaction(BORIS_PERMALINK, m.STATE_BLOCKED, "legacy"),
+            "review-no",
+        )
+        self.assertEqual(
+            m.render_reaction(PERMALINK, m.STATE_BLOCKED, "legacy"),
+            "review-no",
+        )
+
+    def test_boris_owns_old_and_new_names_but_legacy_does_not(self):
+        self.assertEqual(
+            set(m.owned_reactions(BORIS_PERMALINK)),
+            {
+                "thinkies", "doge_notes", "review-no", "white_check_mark",
+                "rubbing", "face_vomiting", "blinkapproved",
+            },
+        )
+        self.assertEqual(
+            set(m.owned_reactions(PERMALINK)),
+            {"thinkies", "doge_notes", "review-no", "white_check_mark"},
+        )
+
+    def test_normalizes_legacy_modern_and_semantic_values(self):
+        expected = {
+            "review-no": m.STATE_BLOCKED,
+            "face_vomiting": m.STATE_BLOCKED,
+            "doge_notes": m.STATE_NOTES,
+            "thinkies": m.STATE_ACTIVE,
+            "rubbing": m.STATE_ACTIVE,
+            "white_check_mark": m.STATE_APPROVED,
+            "blinkapproved": m.STATE_APPROVED,
+        }
+        for rendered, state in expected.items():
+            self.assertEqual(m.normalize_review_state(rendered), state)
+            self.assertEqual(m.normalize_review_state(state), state)
+
+    def test_aggregate_state_preserves_precedence(self):
+        self.assertEqual(
+            m.aggregate_state(
+                [m.STATE_APPROVED, "rubbing", "doge_notes", "face_vomiting"]
+            ),
+            m.STATE_BLOCKED,
+        )
 
 
 def args(**overrides):
