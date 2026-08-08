@@ -71,6 +71,43 @@ def _resolved(value: Path | str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _matches_script_identity(
+    value: Any, live_scripts: Path, expected_basename: str
+) -> bool:
+    """Match a stored script to one exact file in the selected scripts root."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        scripts_root = _resolved(live_scripts)
+        expected_relative = Path(expected_basename)
+        if (
+            expected_relative.is_absolute()
+            or expected_relative != Path(expected_relative.name)
+        ):
+            return False
+        expected = _resolved(scripts_root / expected_relative)
+        if expected.parent != scripts_root:
+            return False
+
+        candidate = Path(value).expanduser()
+        if candidate.is_absolute():
+            return _resolved(candidate) == expected
+        if candidate != expected_relative:
+            return False
+        return _resolved(scripts_root / candidate) == expected
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _matches_schedule_identity(value: Any, expected: Mapping[str, Any]) -> bool:
+    """Compare exact scheduler behavior while allowing derived display text."""
+    if not isinstance(value, Mapping):
+        return False
+    operational = dict(value)
+    operational.pop("display", None)
+    return operational == dict(expected)
+
+
 def _is_live_home(path: Path | str) -> bool:
     """Return whether a home is the current/default home or a real profile."""
     home = _resolved(path)
@@ -516,12 +553,14 @@ def _job_map_locked(paths: Paths) -> dict[str, dict[str, Any]]:
 def _validate_job_fingerprints(paths: Paths, selected: Mapping[str, dict[str, Any]]) -> None:
     for job_id, expected in RETIRE.items():
         job = selected[job_id]
-        wanted_script = paths.live_scripts / expected["script"]
         conditions = {
             "name": job.get("name") == expected["name"],
-            "schedule": job.get("schedule") == expected["schedule"],
-            "script": bool(job.get("script"))
-            and _resolved(str(job["script"])) == wanted_script,
+            "schedule": _matches_schedule_identity(
+                job.get("schedule"), expected["schedule"]
+            ),
+            "script": _matches_script_identity(
+                job.get("script"), paths.live_scripts, expected["script"]
+            ),
             "enabled": job.get("enabled") is True,
             "state": job.get("state") == "scheduled",
         }
@@ -532,9 +571,12 @@ def _validate_job_fingerprints(paths: Paths, selected: Mapping[str, dict[str, An
             )
     retained = selected[RETAIN_ID]
     retained_conditions = {
-        "script": bool(retained.get("script"))
-        and _resolved(str(retained["script"])) == paths.live_scripts / RETAIN_SCRIPT,
-        "schedule": retained.get("schedule") == {"kind": "cron", "expr": "* * * * *"},
+        "script": _matches_script_identity(
+            retained.get("script"), paths.live_scripts, RETAIN_SCRIPT
+        ),
+        "schedule": _matches_schedule_identity(
+            retained.get("schedule"), {"kind": "cron", "expr": "* * * * *"}
+        ),
         "no_agent": retained.get("no_agent") is True,
         "enabled": retained.get("enabled") is True,
         "state": retained.get("state") == "scheduled",
@@ -1242,9 +1284,12 @@ def _validate_paused_retiring_record(
     expected = RETIRE[job_id]
     conditions = {
         "name": job.get("name") == expected["name"],
-        "schedule": job.get("schedule") == expected["schedule"],
-        "script": bool(job.get("script"))
-        and _resolved(str(job["script"])) == paths.live_scripts / expected["script"],
+        "schedule": _matches_schedule_identity(
+            job.get("schedule"), expected["schedule"]
+        ),
+        "script": _matches_script_identity(
+            job.get("script"), paths.live_scripts, expected["script"]
+        ),
         "enabled": job.get("enabled") is False,
         "state": job.get("state") == "paused",
     }
@@ -1404,9 +1449,12 @@ def _validate_retained_job(job: Optional[dict[str, Any]], paths: Paths) -> list[
         return ["retained job is missing"]
     checks = {
         "id": job.get("id") == RETAIN_ID,
-        "script": bool(job.get("script"))
-        and _resolved(str(job["script"])) == paths.live_scripts / RETAIN_SCRIPT,
-        "schedule": job.get("schedule") == {"kind": "cron", "expr": "* * * * *"},
+        "script": _matches_script_identity(
+            job.get("script"), paths.live_scripts, RETAIN_SCRIPT
+        ),
+        "schedule": _matches_schedule_identity(
+            job.get("schedule"), {"kind": "cron", "expr": "* * * * *"}
+        ),
         "no_agent": job.get("no_agent") is True,
         "enabled": job.get("enabled") is True,
         "state": job.get("state") == "scheduled",

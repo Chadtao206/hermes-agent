@@ -65,6 +65,21 @@ def _job(job_id: str, name: str, script: Path, schedule: dict) -> dict:
     }
 
 
+def _use_canonical_stored_job_identities(fixture: RetirementFixture) -> None:
+    schedule_displays = {
+        "ee4582d0598f": "every 2m",
+        "ff865c33c5ea": "*/2 * * * *",
+        RETAIN_ID: "* * * * *",
+    }
+    for job in fixture.jobs:
+        job["script"] = Path(job["script"]).name
+        job["schedule"]["display"] = schedule_displays[job["id"]]
+    next(job for job in fixture.jobs if job["id"] == RETAIN_ID)["name"] = (
+        "boris-review-reaction-state-watchdog"
+    )
+    fixture.write_jobs()
+
+
 @dataclass
 class RetirementFixture:
     root: Path
@@ -517,6 +532,91 @@ def test_preflight_refuses_name_schedule_or_script_drift(retirement_fixture):
     fixture.jobs[0]["script"] = "unexpected.py"
     fixture.write_jobs()
     with pytest.raises(RetirementError, match="fingerprint mismatch"):
+        preflight(fixture.paths, fixture.now)
+
+
+def test_canonical_stored_job_identities_complete_retirement(retirement_fixture):
+    fixture = retirement_fixture
+    _use_canonical_stored_job_identities(fixture)
+
+    manifest = fixture.preflight_and_pause()
+    finalize(fixture.paths, manifest, manifest.cutoff_epoch + 181)
+    fixture.insert_execution(
+        RETAIN_ID,
+        status="completed",
+        claimed_at=fixture.utc_iso(manifest.cutoff_epoch + 200),
+    )
+
+    assert verify_retired(fixture.paths, manifest, manifest.cutoff_epoch + 240) == []
+
+
+@pytest.mark.parametrize(
+    "script_shape",
+    [
+        pytest.param("wrong-basename", id="wrong-basename"),
+        pytest.param("traversal", id="traversal"),
+        pytest.param("nested", id="nested"),
+        pytest.param("outside-absolute", id="outside-absolute"),
+    ],
+)
+def test_preflight_rejects_noncanonical_script_identity(
+    retirement_fixture, script_shape
+):
+    fixture = retirement_fixture
+    _use_canonical_stored_job_identities(fixture)
+    job = next(job for job in fixture.jobs if job["id"] == "ee4582d0598f")
+    bad_scripts = {
+        "wrong-basename": "unexpected.py",
+        "traversal": "../slack_channel_watch.py",
+        "nested": "nested/slack_channel_watch.py",
+        "outside-absolute": str(fixture.root / "outside" / "slack_channel_watch.py"),
+    }
+    job["script"] = bad_scripts[script_shape]
+    fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="fingerprint mismatch: script"):
+        preflight(fixture.paths, fixture.now)
+
+
+@pytest.mark.parametrize(
+    ("job_id", "schedule"),
+    [
+        pytest.param(
+            "ee4582d0598f",
+            {"kind": "cron", "expr": "*/2 * * * *", "display": "*/2 * * * *"},
+            id="wrong-kind",
+        ),
+        pytest.param(
+            "ee4582d0598f",
+            {"kind": "interval", "minutes": 3, "display": "every 3m"},
+            id="wrong-minutes",
+        ),
+        pytest.param(
+            "ff865c33c5ea",
+            {"kind": "cron", "expr": "* * * * *", "display": "* * * * *"},
+            id="wrong-expr",
+        ),
+        pytest.param(
+            "ee4582d0598f",
+            {
+                "kind": "interval",
+                "minutes": 2,
+                "display": "every 2m",
+                "timezone": "UTC",
+            },
+            id="unexpected-operational-key",
+        ),
+    ],
+)
+def test_preflight_rejects_operational_schedule_drift(
+    retirement_fixture, job_id, schedule
+):
+    fixture = retirement_fixture
+    _use_canonical_stored_job_identities(fixture)
+    next(job for job in fixture.jobs if job["id"] == job_id)["schedule"] = schedule
+    fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="fingerprint mismatch: schedule"):
         preflight(fixture.paths, fixture.now)
 
 
