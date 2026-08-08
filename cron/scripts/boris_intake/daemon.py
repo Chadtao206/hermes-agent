@@ -98,7 +98,7 @@ class Pipeline:
                     lane_id = self._create_lane(cmd)
                     self.store.record_lane(cmd.idempotency_key, lane_id)
                     self.store.record_request(event.user_id, self.deps.now())
-                    self.slack.add_thinkies(cmd.channel_id, cmd.message_ts)
+                    self.slack.add_reviewing_reaction(cmd.channel_id, cmd.message_ts)
                     self.slack.reply_ack(cmd)
                 except Exception as exc:
                     audit.write(self.audit_path, {

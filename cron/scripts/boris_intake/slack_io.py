@@ -1,6 +1,6 @@
 """Slack writes. Best-effort by design — a failed reaction must never block a review.
 
-Reaction ownership: this module adds the initial :thinkies: and nothing else.
+Reaction ownership: this module adds the initial :rubbing: and nothing else.
 just_do_it_review_reaction_watchdog.py is the single authoritative writer for
 every later state (doge_notes / review-no / white_check_mark).
 """
@@ -39,8 +39,8 @@ class SlackIO:
         except Exception:
             pass  # best effort; the watchdogs reconcile reaction state
 
-    def add_thinkies(self, channel: str, ts: str) -> None:
-        self._post("reactions.add", channel=channel, timestamp=ts, name="thinkies")
+    def add_reviewing_reaction(self, channel: str, ts: str) -> None:
+        self._post("reactions.add", channel=channel, timestamp=ts, name="rubbing")
 
     def reply_ack(self, cmd: ReviewCommand) -> None:
         """Confirm which PR and which commit was picked up — nothing more.
@@ -49,7 +49,7 @@ class SlackIO:
         the requester (it stays in the audit log for debugging). The read-only /
         non-blocking policy is already stated in the channel description, the
         pinned instructions, and the footer of every GitHub comment; repeating it
-        on every review is noise. The :thinkies: reaction already signals state,
+        on every review is noise. The :rubbing: reaction already signals state,
         so this line exists only to disambiguate WHICH PR at WHICH commit — which
         matters when several links are posted at once or the head has moved.
         """

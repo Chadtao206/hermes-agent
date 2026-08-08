@@ -19,11 +19,11 @@ def recorder():
     return calls, call
 
 
-def test_adds_only_thinkies():
+def test_adds_only_rubbing():
     calls, call = recorder()
-    SlackIO(call, "t", dry_run=False).add_thinkies("C1", "1.0")
+    SlackIO(call, "t", dry_run=False).add_reviewing_reaction("C1", "1.0")
     assert calls == [("reactions.add", {"channel": "C1", "timestamp": "1.0",
-                                        "name": "thinkies"})]
+                                        "name": "rubbing"})]
 
 
 def test_ack_is_threaded_and_names_the_pr_and_sha():
@@ -84,7 +84,7 @@ def test_rejection_reply_includes_reason():
 def test_dry_run_performs_no_network_calls():
     calls, call = recorder()
     io = SlackIO(call, "t", dry_run=True)
-    io.add_thinkies("C1", "1.0")
+    io.add_reviewing_reaction("C1", "1.0")
     io.reply_ack(CMD)
     io.reply_rejection("C1", "1.0", Rejection(ReasonCode.RATE_LIMITED, "slow down"))
     assert calls == []
@@ -94,4 +94,4 @@ def test_dry_run_performs_no_network_calls():
 def test_slack_failure_is_swallowed():
     def call(token, method, **kw):
         return {"ok": False, "error": "ratelimited"}
-    SlackIO(call, "t", dry_run=False).add_thinkies("C1", "1.0")  # must not raise
+    SlackIO(call, "t", dry_run=False).add_reviewing_reaction("C1", "1.0")  # must not raise

@@ -72,6 +72,8 @@ def test_live_creates_lane_reacts_and_acks(tmp_path):
     p.handle(normalize(msg()))
     methods = [m for m, _ in calls]
     assert "reactions.add" in methods and "chat.postMessage" in methods
+    reaction = next(kw for method, kw in calls if method == "reactions.add")
+    assert reaction["name"] == "rubbing"
     assert store.lane_for(KEY) == "t_new"
 
 
