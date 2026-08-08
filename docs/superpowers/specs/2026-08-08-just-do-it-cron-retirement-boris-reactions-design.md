@@ -216,6 +216,16 @@ No migration touches:
 
 Under the CRON registry lock or supported CLI mutation surface:
 
+- require the explicit immutable recovery commit
+  `7f5bc40da3f97e181bfc00ba1688cd0f065ff10a` as an exact full commit ID and
+  ancestor of current `HEAD`, never a symbolic/short ref or history-search
+  fallback;
+- require every durable recovery path at that pin, persist its exact blob/tree
+  object ID, and permit only the two Task 6-deleted requeue paths to be absent
+  from current `HEAD`;
+- require retained reaction and Boris durable objects at current `HEAD` to be
+  identical to the pin, and reject uncommitted changes anywhere in the durable
+  path set;
 - resolve all three exact IDs and verify their expected names, schedules,
   script paths, enabled state, and fingerprints;
 - record current executions and prove whether any invocation is claimed or

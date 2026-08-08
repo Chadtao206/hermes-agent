@@ -61,6 +61,21 @@ ENTRYPOINTS = {
     "retired-requeue-script": "just_do_it_blocked_review_requeue_watchdog.py",
     "retired-requeue-test": "test_just_do_it_blocked_review_requeue_watchdog.py",
 }
+DURABLE_RECOVERY_OBJECTS = {
+    "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py": "blob",
+    "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py": "blob",
+    "cron/scripts/just_do_it_review_reaction_watchdog.py": "blob",
+    "tests/cron/test_just_do_it_review_reaction_watchdog.py": "blob",
+    "cron/scripts/boris_intake": "tree",
+    "tests/cron/boris_intake": "tree",
+}
+RETAINED_DURABLE_PATHS = (
+    "cron/scripts/just_do_it_review_reaction_watchdog.py",
+    "tests/cron/test_just_do_it_review_reaction_watchdog.py",
+    "cron/scripts/boris_intake",
+    "tests/cron/boris_intake",
+)
+_FULL_COMMIT_ID = re.compile(r"[0-9a-fA-F]{40}")
 
 
 class RetirementError(RuntimeError):
@@ -723,34 +738,98 @@ def _json_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _repository_identity(source_root: Path) -> tuple[str, dict[str, str]]:
-    durable = (
-        "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
-        "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py",
-        "cron/scripts/just_do_it_review_reaction_watchdog.py",
-        "tests/cron/test_just_do_it_review_reaction_watchdog.py",
-        "cron/scripts/boris_intake",
-        "tests/cron/boris_intake",
-    )
+def _repository_identity(
+    source_root: Path, recovery_ref: str
+) -> tuple[str, dict[str, str]]:
+    if not isinstance(recovery_ref, str) or not _FULL_COMMIT_ID.fullmatch(
+        recovery_ref
+    ):
+        raise RetirementError(
+            "--recovery-ref must be an exact full 40-hex commit ID"
+        )
 
-    def git(*args: str) -> str:
-        result = subprocess.run(
+    def run_git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             ["git", "-C", str(source_root), *args],
             text=True,
             capture_output=True,
             check=False,
         )
+
+    def git(*args: str) -> str:
+        result = run_git(*args)
         if result.returncode != 0:
             raise RetirementError(
                 f"unable to resolve committed recovery object for source root: {result.stderr.strip()}"
             )
         return result.stdout.strip()
 
-    commit = git("rev-parse", "HEAD")
-    if git("status", "--porcelain", "--", *durable):
+    try:
+        recovery_commit = git(
+            "rev-parse", "--verify", f"{recovery_ref}^{{commit}}"
+        ).lower()
+    except RetirementError as exc:
+        raise RetirementError(
+            "--recovery-ref does not identify an exact commit object"
+        ) from exc
+    if recovery_commit != recovery_ref.lower():
+        raise RetirementError(
+            "--recovery-ref must identify the exact commit object, not a tag object"
+        )
+
+    head_commit = git("rev-parse", "--verify", "HEAD^{commit}").lower()
+    ancestor = run_git(
+        "merge-base", "--is-ancestor", recovery_commit, head_commit
+    )
+    if ancestor.returncode == 1:
+        raise RetirementError(
+            "--recovery-ref is not an ancestor of current HEAD"
+        )
+    if ancestor.returncode != 0:
+        raise RetirementError(
+            "unable to verify recovery commit ancestry: "
+            + ancestor.stderr.strip()
+        )
+
+    durable_paths = tuple(DURABLE_RECOVERY_OBJECTS)
+    if git(
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        *durable_paths,
+    ):
         raise RetirementError("durable recovery source has uncommitted changes")
-    hashes = {relative: git("rev-parse", f"HEAD:{relative}") for relative in durable}
-    return commit, hashes
+
+    hashes: dict[str, str] = {}
+    for relative, expected_kind in DURABLE_RECOVERY_OBJECTS.items():
+        result = run_git(
+            "rev-parse", "--verify", f"{recovery_commit}:{relative}"
+        )
+        if result.returncode != 0:
+            raise RetirementError(
+                f"recovery commit is missing durable recovery path: {relative}"
+            )
+        object_id = result.stdout.strip().lower()
+        if git("cat-file", "-t", object_id) != expected_kind:
+            raise RetirementError(
+                f"durable recovery path has unexpected Git object type: {relative}"
+            )
+        hashes[relative] = object_id
+
+    for relative in RETAINED_DURABLE_PATHS:
+        result = run_git(
+            "rev-parse", "--verify", f"{head_commit}:{relative}"
+        )
+        if result.returncode != 0:
+            raise RetirementError(
+                f"retained durable source is missing from current HEAD: {relative}"
+            )
+        if result.stdout.strip().lower() != hashes[relative]:
+            raise RetirementError(
+                f"retained durable source diverged from recovery commit: {relative}"
+            )
+    return recovery_commit, hashes
 
 
 def _unique_archive_dir(paths: Paths, epoch: int) -> Path:
@@ -792,7 +871,7 @@ def _preflight_asset_sources(paths: Paths) -> dict[str, Path]:
     return assets
 
 
-def preflight(paths: Paths, now: Any) -> Manifest:
+def preflight(paths: Paths, now: Any, recovery_ref: str) -> Manifest:
     """Validate exact identities and create a complete, recoverable snapshot."""
     created_epoch = _epoch(now)
     _assert_store_paths(paths)
@@ -820,7 +899,9 @@ def preflight(paths: Paths, now: Any) -> Manifest:
         # database, board, and Git hashing begins.
         latest = _latest_executions(paths.executions_path)
         task_census = _task_census(paths.board_path)
-        repository_commit, repository_trees = _repository_identity(paths.source_root)
+        repository_commit, repository_trees = _repository_identity(
+            paths.source_root, recovery_ref
+        )
         for key, source in _preflight_asset_sources(paths).items():
             destination = archive_dir / "preflight" / "assets" / key
             files[key] = _snapshot(source, destination)
@@ -2196,6 +2277,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     preflight_parser = subparsers.add_parser("preflight")
     _add_path_options(preflight_parser, archive=True)
+    preflight_parser.add_argument("--recovery-ref", required=True)
     preflight_parser.add_argument("--now-epoch", type=int)
     for name, requires_apply in (
         ("pause", True),
@@ -2232,7 +2314,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "preflight":
             paths = _paths_from_args(args)
             now = _now_from_args(args, paths)
-            manifest = preflight(paths, now)
+            manifest = preflight(paths, now, args.recovery_ref)
             _print({"ok": True, "manifest_path": str(manifest.manifest_path)})
             return 0
         paths, manifest = _load_cli_manifest(args)

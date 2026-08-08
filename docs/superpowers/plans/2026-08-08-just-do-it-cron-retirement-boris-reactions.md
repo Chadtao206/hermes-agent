@@ -755,9 +755,10 @@ git commit -m "feat(boris): use rubbing for active reviews"
 - Create: `tests/cron/test_retire_just_do_it_crons.py`
 
 **Interfaces:**
-- Consumes: a Hermes home, source root, archive root, execution DB, board DB, and exact job IDs.
+- Consumes: a Hermes home, source root, archive root, execution DB, board DB,
+  exact job IDs, and an explicit immutable recovery commit.
 - Produces:
-  - `preflight(paths, now) -> Manifest`
+  - `preflight(paths, now, recovery_ref) -> Manifest`
   - `pause_producers(paths, manifest, now) -> Manifest`
   - `verify_quiescent(paths, manifest, now, grace_seconds=180) -> list[str]`
   - `checkpoint_component(paths, manifest, component, now) -> Manifest`
@@ -781,7 +782,7 @@ def test_preflight_refuses_name_schedule_or_script_drift(retirement_fixture):
     fixture.jobs[0]["script"] = "unexpected.py"
     fixture.write_jobs()
     with pytest.raises(RetirementError, match="fingerprint mismatch"):
-        preflight(fixture.paths, fixture.now)
+        preflight(fixture.paths, fixture.now, fixture.recovery_ref)
 
 
 def test_quiescence_rejects_running_or_post_pause_execution(retirement_fixture):
@@ -932,16 +933,23 @@ The manifest records:
 Snapshot `boris_intake.db` through `sqlite3.Connection.backup`, not by copying
 its live database/WAL/SHM files independently. Copy secret-bearing config as
 an opaque mode-preserving file, hash it, and never print or embed its contents
-in the manifest or command output. Record the current repository commit and
-tree hashes for the durable source paths; the committed Git objects are their
-recoverable backup.
+in the manifest or command output. Require an explicit full 40-hex recovery
+commit ID, verify that it is the exact commit object and an ancestor of current
+`HEAD`, and record that resolved commit plus blob/tree hashes for every durable
+recovery path. Never search history or fall back to `HEAD`. The two deprecated
+requeue paths must exist at the pinned commit but may be absent at `HEAD` after
+Task 6. Retained reaction and Boris durable paths must have identical committed
+objects at the pin and `HEAD`, and every durable path must be clean in the
+worktree. The pinned Git objects are the recoverable backup while retained
+`HEAD` identity proves the deployable retained code has not diverged.
 
 - [ ] **Step 4: Implement guarded operations through `cron.jobs`**
 
 Use `cron.jobs.use_cron_store(paths.hermes_home)` for locked job mutations.
-`preflight` enters that store and the registry lock while loading the three
-records, validating exact fingerprints, and copying the raw `jobs.json` bytes;
-it releases the lock before hashing unrelated files.
+`preflight` requires the explicit immutable recovery commit, then enters that
+store and the registry lock while loading the three records, validating exact
+fingerprints, and copying the raw `jobs.json` bytes; it releases the lock before
+hashing unrelated files.
 `pause_producers` calls `pause_job(id, reason="guarded just-do-it retirement")`
 by exact ID and asserts `enabled is False` and `state == "paused"` afterward.
 
@@ -1034,6 +1042,9 @@ rehearse-reactions
 
 Require `--manifest` with the absolute path printed by `preflight` for every
 state-changing command after `preflight`.
+Require preflight alone to receive `--recovery-ref` as an exact full 40-hex
+commit ID. Subsequent manifest commands consume the persisted recovery identity
+and must not require the option again.
 Require `--apply` for `pause`, `checkpoint`, `finalize`, and `rollback`; without it, print the
 validated action plan and exit without writes. Support `--hermes-home` and
 `--source-root`, plus explicit `--board-path` and `--boris-launchd-plist`
@@ -1206,10 +1217,18 @@ Expected: all copies exist; no live path is modified.
 
 - [ ] **Step 2: Run preflight and pause against the isolated home**
 
+Pin recovery to `7f5bc40da3f97e181bfc00ba1688cd0f065ff10a`, the reviewed
+Task 5 commit immediately before Task 6 deleted the two deprecated versioned
+paths. Preflight recovers those deleted artifacts from that exact ancestor,
+while requiring the retained reaction/Boris Git objects to remain identical at
+the pin and current deployable `HEAD`. It never searches history or falls back
+to another commit.
+
 ```bash
 rehearsal_preflight=$(python scripts/ops/retire_just_do_it_crons.py preflight \
   --hermes-home "$rehearsal_home" \
   --source-root "$PWD" \
+  --recovery-ref 7f5bc40da3f97e181bfc00ba1688cd0f065ff10a \
   --board-path "$rehearsal_home/kanban.db" \
   --boris-launchd-plist "$rehearsal_home/ai.hermes.boris-intake.plist" \
   --archive-root "$rehearsal_home/forensics")
@@ -1321,10 +1340,16 @@ Expected: PASS.
 
 - [ ] **Step 2: Take the live preflight backup**
 
+Use the same reviewed immutable recovery commit rehearsed in Task 7. The pin
+supplies only the deleted deprecated recovery objects; exact retained
+reaction/Boris object equality against current `HEAD` proves it cannot bless
+stale deployable code.
+
 ```bash
 retirement_preflight=$(python scripts/ops/retire_just_do_it_crons.py preflight \
   --hermes-home /Users/ctao/.hermes \
   --source-root "$PWD" \
+  --recovery-ref 7f5bc40da3f97e181bfc00ba1688cd0f065ff10a \
   --archive-root /Users/ctao/.hermes/forensics)
 retirement_manifest=$(printf '%s' "$retirement_preflight" | jq -r '.manifest_path')
 test -f "$retirement_manifest"

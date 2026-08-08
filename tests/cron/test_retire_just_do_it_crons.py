@@ -33,6 +33,14 @@ from scripts.ops.retire_just_do_it_crons import (
 
 RETIRE_IDS = {"ee4582d0598f", "ff865c33c5ea"}
 RETAIN_ID = "6daa151da351"
+DURABLE_RECOVERY_PATHS = (
+    "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
+    "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py",
+    "cron/scripts/just_do_it_review_reaction_watchdog.py",
+    "tests/cron/test_just_do_it_review_reaction_watchdog.py",
+    "cron/scripts/boris_intake",
+    "tests/cron/boris_intake",
+)
 
 
 def _hash_file(path: Path) -> str:
@@ -90,6 +98,9 @@ class RetirementFixture:
     watchdog_source_path: Path
     process_listing_path: Path
     service_status_path: Path
+    incomplete_recovery_ref: str = ""
+    recovery_ref: str = ""
+    head_commit: str = ""
 
     def utc_iso(self, epoch: int) -> str:
         return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
@@ -133,7 +144,7 @@ class RetirementFixture:
         return execution_id
 
     def preflight_only(self):
-        return preflight(self.paths, self.now)
+        return preflight(self.paths, self.now, self.recovery_ref)
 
     def preflight_and_pause(self):
         manifest = self.preflight_only()
@@ -332,23 +343,33 @@ def _initialize_boris_db(path: Path) -> None:
         )
 
 
-def _git_commit(source_root: Path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
-    subprocess.run(["git", "add", "."], cwd=source_root, check=True)
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.test",
-            "commit",
-            "-qm",
-            "fixture",
-        ],
+def _git(source_root: Path, *args: str, input_text: str | None = None) -> str:
+    result = subprocess.run(
+        ["git", *args],
         cwd=source_root,
         check=True,
+        text=True,
+        input=input_text,
+        capture_output=True,
     )
+    return result.stdout.strip()
+
+
+def _git_initialize(source_root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=source_root, check=True)
+    _git(source_root, "config", "user.name", "Fixture")
+    _git(source_root, "config", "user.email", "fixture@example.test")
+
+
+def _git_commit(
+    source_root: Path, message: str, *, allow_empty: bool = False
+) -> str:
+    _git(source_root, "add", ".")
+    arguments = ["commit", "-qm", message]
+    if allow_empty:
+        arguments.append("--allow-empty")
+    _git(source_root, *arguments)
+    return _git(source_root, "rev-parse", "HEAD")
 
 
 @pytest.fixture
@@ -413,6 +434,10 @@ def retirement_fixture(tmp_path) -> RetirementFixture:
         service_status_path=service_status_path,
     )
     fixture.write_jobs()
+    _git_initialize(source_root)
+    fixture.incomplete_recovery_ref = _git_commit(
+        source_root, "incomplete durable source", allow_empty=True
+    )
 
     live_contents = {
         "slack_channel_watch.py": "channel live\n",
@@ -449,7 +474,13 @@ def retirement_fixture(tmp_path) -> RetirementFixture:
     from cron.scripts import just_do_it_review_reaction_watchdog as versioned_watchdog
 
     shutil.copy2(versioned_watchdog.__file__, fixture.watchdog_source_path)
-    _git_commit(source_root)
+    fixture.recovery_ref = _git_commit(source_root, "complete durable baseline")
+    for relative in (
+        "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
+        "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py",
+    ):
+        (source_root / relative).unlink()
+    fixture.head_commit = _git_commit(source_root, "delete deprecated durable source")
 
     for job_id in RETIRE_IDS | {RETAIN_ID}:
         output = cron_output / job_id
@@ -532,7 +563,147 @@ def test_preflight_refuses_name_schedule_or_script_drift(retirement_fixture):
     fixture.jobs[0]["script"] = "unexpected.py"
     fixture.write_jobs()
     with pytest.raises(RetirementError, match="fingerprint mismatch"):
-        preflight(fixture.paths, fixture.now)
+        preflight(fixture.paths, fixture.now, fixture.recovery_ref)
+
+
+def test_preflight_persists_exact_recovery_commit_after_durable_deletion(
+    retirement_fixture,
+):
+    fixture = retirement_fixture
+    assert _git(fixture.paths.source_root, "status", "--porcelain") == ""
+    assert _git(fixture.paths.source_root, "rev-parse", "HEAD") == fixture.head_commit
+    for relative in DURABLE_RECOVERY_PATHS[:2]:
+        assert not (fixture.paths.source_root / relative).exists()
+
+    manifest = fixture.preflight_only()
+    expected_hashes = {
+        relative: _git(
+            fixture.paths.source_root,
+            "rev-parse",
+            f"{fixture.recovery_ref}:{relative}",
+        )
+        for relative in DURABLE_RECOVERY_PATHS
+    }
+
+    assert manifest.repository_commit == fixture.recovery_ref
+    assert manifest.repository_tree_hashes == expected_hashes
+    restored = Manifest.load(manifest.manifest_path)
+    assert restored.repository_commit == fixture.recovery_ref
+    assert restored.repository_tree_hashes == expected_hashes
+
+
+@pytest.mark.parametrize("ref_kind", ("symbolic", "branch", "tag", "short"))
+def test_preflight_rejects_non_full_commit_recovery_refs(
+    retirement_fixture, ref_kind
+):
+    fixture = retirement_fixture
+    branch = _git(fixture.paths.source_root, "branch", "--show-current")
+    _git(fixture.paths.source_root, "tag", "baseline-recovery", fixture.recovery_ref)
+    refs = {
+        "symbolic": "HEAD",
+        "branch": branch,
+        "tag": "baseline-recovery",
+        "short": fixture.recovery_ref[:12],
+    }
+
+    with pytest.raises(RetirementError, match="full 40-hex commit ID"):
+        preflight(fixture.paths, fixture.now, refs[ref_kind])
+
+
+def test_preflight_rejects_full_tag_object_id(retirement_fixture):
+    fixture = retirement_fixture
+    _git(
+        fixture.paths.source_root,
+        "tag",
+        "-a",
+        "annotated-recovery",
+        "-m",
+        "annotated recovery",
+        fixture.recovery_ref,
+    )
+    tag_object = _git(
+        fixture.paths.source_root, "rev-parse", "annotated-recovery"
+    )
+    assert len(tag_object) == 40
+
+    with pytest.raises(RetirementError, match="exact commit object"):
+        preflight(fixture.paths, fixture.now, tag_object)
+
+
+def test_preflight_rejects_unknown_full_commit_id(retirement_fixture):
+    fixture = retirement_fixture
+
+    with pytest.raises(RetirementError, match="exact commit object"):
+        preflight(fixture.paths, fixture.now, "0" * 40)
+
+
+def test_preflight_rejects_recovery_commit_missing_durable_objects(
+    retirement_fixture,
+):
+    fixture = retirement_fixture
+
+    with pytest.raises(RetirementError, match="missing durable recovery path"):
+        preflight(
+            fixture.paths,
+            fixture.now,
+            fixture.incomplete_recovery_ref,
+        )
+
+
+def test_preflight_rejects_non_ancestor_recovery_commit(retirement_fixture):
+    fixture = retirement_fixture
+    tree = _git(
+        fixture.paths.source_root,
+        "rev-parse",
+        f"{fixture.recovery_ref}^{{tree}}",
+    )
+    non_ancestor = _git(
+        fixture.paths.source_root,
+        "commit-tree",
+        tree,
+        input_text="parallel durable baseline\n",
+    )
+
+    with pytest.raises(RetirementError, match="not an ancestor of current HEAD"):
+        preflight(fixture.paths, fixture.now, non_ancestor)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cron/scripts/just_do_it_review_reaction_watchdog.py",
+        "cron/scripts/boris_intake/daemon.py",
+    ),
+)
+def test_preflight_rejects_retained_durable_source_divergence(
+    retirement_fixture, relative
+):
+    fixture = retirement_fixture
+    path = fixture.paths.source_root / relative
+    path.write_text(path.read_text() + "retained divergence\n")
+    _git_commit(fixture.paths.source_root, "diverge retained durable source")
+
+    with pytest.raises(RetirementError, match="retained durable source diverged"):
+        preflight(fixture.paths, fixture.now, fixture.recovery_ref)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cron/scripts/just_do_it_review_reaction_watchdog.py",
+        "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
+    ),
+)
+def test_preflight_rejects_uncommitted_durable_changes(
+    retirement_fixture, relative
+):
+    fixture = retirement_fixture
+    path = fixture.paths.source_root / relative
+    existing = path.read_text() if path.exists() else ""
+    path.write_text(existing + "uncommitted durable change\n")
+
+    with pytest.raises(RetirementError, match="uncommitted changes"):
+        preflight(fixture.paths, fixture.now, fixture.recovery_ref)
 
 
 def test_canonical_stored_job_identities_complete_retirement(retirement_fixture):
@@ -575,7 +746,7 @@ def test_preflight_rejects_noncanonical_script_identity(
     fixture.write_jobs()
 
     with pytest.raises(RetirementError, match="fingerprint mismatch: script"):
-        preflight(fixture.paths, fixture.now)
+        preflight(fixture.paths, fixture.now, fixture.recovery_ref)
 
 
 @pytest.mark.parametrize(
@@ -617,7 +788,7 @@ def test_preflight_rejects_operational_schedule_drift(
     fixture.write_jobs()
 
     with pytest.raises(RetirementError, match="fingerprint mismatch: schedule"):
-        preflight(fixture.paths, fixture.now)
+        preflight(fixture.paths, fixture.now, fixture.recovery_ref)
 
 
 def test_quiescence_rejects_running_or_post_pause_execution(retirement_fixture):
@@ -1037,7 +1208,9 @@ def test_quiescence_uses_canonical_process_start_identity(
     retirement_fixture, monkeypatch
 ):
     paths = replace(retirement_fixture.paths, process_listing_path=None)
-    manifest = preflight(paths, retirement_fixture.now)
+    manifest = preflight(
+        paths, retirement_fixture.now, retirement_fixture.recovery_ref
+    )
     manifest = pause_producers(paths, manifest, retirement_fixture.now + 1)
     retirement_fixture.insert_execution(
         "ee4582d0598f",
@@ -1547,6 +1720,29 @@ def test_isolated_home_defaults_to_an_isolated_launchd_plist(
     )
 
 
+def test_cli_requires_recovery_ref_only_for_preflight(
+    retirement_fixture, capsys
+):
+    with pytest.raises(SystemExit) as exc_info:
+        controller_main(
+            [
+                "preflight",
+                "--hermes-home",
+                str(retirement_fixture.paths.hermes_home),
+                "--source-root",
+                str(retirement_fixture.paths.source_root),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "--recovery-ref" in capsys.readouterr().err
+
+    manifest = retirement_fixture.preflight_only()
+    assert controller_main(
+        ["pause", "--manifest", str(manifest.manifest_path)]
+    ) == 0
+
+
 def test_cli_rejects_now_override_for_the_designated_live_home(
     tmp_path, monkeypatch, capsys
 ):
@@ -1571,6 +1767,8 @@ def test_cli_rejects_now_override_for_the_designated_live_home(
             str(designated_live),
             "--source-root",
             str(tmp_path / "source"),
+            "--recovery-ref",
+            "0" * 40,
             "--now-epoch",
             "1",
         ]
@@ -1620,6 +1818,8 @@ def test_cli_rejects_test_injection_for_every_live_home(
             str(homes[home_kind]),
             "--source-root",
             str(tmp_path / "source"),
+            "--recovery-ref",
+            "0" * 40,
             option,
             "1" if option == "--now-epoch" else str(injected),
         ]
@@ -1664,6 +1864,8 @@ def test_cli_accepts_test_injection_for_an_isolated_home(
             str(retirement_fixture.paths.hermes_home),
             "--source-root",
             str(retirement_fixture.paths.source_root),
+            "--recovery-ref",
+            retirement_fixture.recovery_ref,
             "--archive-root",
             str(retirement_fixture.paths.archive_root),
             "--board-path",
