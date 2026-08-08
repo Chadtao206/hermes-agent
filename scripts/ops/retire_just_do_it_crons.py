@@ -376,6 +376,13 @@ def _epoch(value: Any) -> int:
     return int(value)
 
 
+def _utc_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        current = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return current.astimezone(timezone.utc)
+    return datetime.fromtimestamp(int(value), tz=timezone.utc)
+
+
 def _iso(epoch: int) -> str:
     return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
 
@@ -950,7 +957,7 @@ def pause_producers(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
     """Pause only the two exact producers and record cutoff after verification."""
     _assert_manifest_paths(paths, manifest)
     if manifest.phase == "paused":
-        _validate_paused_registry(paths, manifest)
+        _validate_paused_registry(paths, manifest, now)
         return manifest
     if manifest.phase != "preflight":
         raise RetirementError(f"cannot pause from manifest phase {manifest.phase}")
@@ -1315,6 +1322,8 @@ def _restore_paused_registry(
     paths: Paths,
     manifest: Manifest,
     paused_records: Mapping[str, dict[str, Any]],
+    *,
+    finalize_now: Any,
 ) -> None:
     """Atomically restore paused retirees while preserving fresh retained state."""
     exact_paused_records: dict[str, dict[str, Any]] = {}
@@ -1331,6 +1340,10 @@ def _restore_paused_registry(
     with cron_jobs.use_cron_store(paths.hermes_home):
         with cron_jobs._jobs_lock():
             current = copy.deepcopy(cron_jobs.load_jobs())
+            compensation_now = max(
+                _utc_datetime(finalize_now),
+                _utc_datetime(cron_jobs._hermes_now()),
+            )
             retained_records = [
                 copy.deepcopy(job)
                 for job in current
@@ -1347,6 +1360,7 @@ def _restore_paused_registry(
                         manifest.jobs[RETAIN_ID],
                         retained_records[0],
                         preflight_epoch=manifest.created_epoch,
+                        finalize_now=compensation_now,
                     )
                 except BaseException as exc:
                     retained_error = exc
@@ -1449,7 +1463,8 @@ def _validate_retained_record_progress(
     preflight_record: Mapping[str, Any],
     current_record: Any,
     *,
-    preflight_epoch: Optional[int] = None,
+    preflight_epoch: int,
+    finalize_now: Any,
 ) -> dict[str, Any]:
     """Validate a reachable recurring-scheduler transition.
 
@@ -1473,6 +1488,11 @@ def _validate_retained_record_progress(
 
     def fail(detail: str) -> None:
         raise RetirementError(f"retained job {detail} before finalize")
+
+    preflight_time = _utc_datetime(preflight_epoch)
+    finalize_time = _utc_datetime(finalize_now)
+    if finalize_time < preflight_time:
+        fail("finalize observation time predates preflight")
 
     def timestamp(
         value: Any, field_name: str, record_name: str
@@ -1519,6 +1539,7 @@ def _validate_retained_record_progress(
     def validate_completion_shape(
         runtime: Mapping[str, Any],
         last_run: Optional[datetime],
+        completion_count: int,
         record_name: str,
     ) -> None:
         status = runtime["last_status"]
@@ -1536,10 +1557,19 @@ def _validate_retained_record_progress(
             ):
                 fail(f"{record_name} {field_name} has an invalid runtime type")
         if last_run is None:
-            if status not in (missing, None):
-                fail(f"{record_name} last_status is not coupled to a completion")
-            if runtime["last_error"] not in (missing, None):
-                fail(f"{record_name} last_error is not coupled to a completion")
+            for field_name in (
+                "last_status",
+                "last_error",
+                "last_delivery_error",
+            ):
+                if runtime[field_name] not in (missing, None):
+                    fail(
+                        f"{record_name} {field_name} is not coupled to a completion"
+                    )
+            if completion_count != 0:
+                fail(
+                    f"{record_name} repeat.completed is not coupled to a completion"
+                )
         elif status not in ("ok", "error"):
             fail(f"{record_name} completed run requires a terminal status")
         if status == "ok" and runtime["last_error"] not in (missing, None):
@@ -1643,6 +1673,11 @@ def _validate_retained_record_progress(
         != preflight_runtime["last_run_at"]
     ):
         fail("last_run_at changed without a newer completion")
+    if last_run_advanced:
+        if current_last_run < preflight_time:
+            fail("new completion predates preflight observation window")
+        if current_last_run > finalize_time:
+            fail("new completion exceeds finalize observation window")
 
     preflight_next_run = timestamp(
         preflight_runtime["next_run_at"], "next_run_at", "preflight"
@@ -1661,11 +1696,6 @@ def _validate_retained_record_progress(
     if current_last_run is not None and current_next_run <= current_last_run:
         fail("current next_run_at must follow the latest completed run")
 
-    validate_completion_shape(
-        preflight_runtime, preflight_last_run, "preflight"
-    )
-    validate_completion_shape(current_runtime, current_last_run, "current")
-
     preflight_completed = completed(
         preflight_runtime["repeat.completed"], "preflight"
     )
@@ -1674,6 +1704,19 @@ def _validate_retained_record_progress(
     )
     if current_completed < preflight_completed:
         fail("repeat.completed runtime progress regressed")
+
+    validate_completion_shape(
+        preflight_runtime,
+        preflight_last_run,
+        preflight_completed,
+        "preflight",
+    )
+    validate_completion_shape(
+        current_runtime,
+        current_last_run,
+        current_completed,
+        "current",
+    )
 
     completion_fields = (
         "last_status",
@@ -1714,6 +1757,12 @@ def _validate_retained_record_progress(
         current_runtime["fire_claim"], "fire_claim", "current"
     )
 
+    if (
+        last_run_advanced
+        and current_runtime["fire_claim"] not in (missing, None)
+    ):
+        fail("new completion did not clear fire_claim")
+
     if preflight_fire_at is not None:
         if (
             preflight_last_run is not None
@@ -1726,6 +1775,10 @@ def _validate_retained_record_progress(
             fail("preflight fire_claim is not coupled to next_run_at")
 
     if current_fire_at is not None:
+        if current_fire_at < preflight_time:
+            fail("current fire_claim predates preflight observation window")
+        if current_fire_at > finalize_time:
+            fail("current fire_claim exceeds finalize observation window")
         if current_last_run is not None and current_fire_at <= current_last_run:
             fail("current fire_claim is not after the latest completion")
         if scheduled_next(
@@ -1739,23 +1792,17 @@ def _validate_retained_record_progress(
         if claim_changed:
             if preflight_fire_at is not None and current_fire_at <= preflight_fire_at:
                 fail("current fire_claim timestamp did not advance")
-            if preflight_epoch is not None:
-                preflight_time = datetime.fromtimestamp(
-                    preflight_epoch, tz=timezone.utc
-                )
-                if current_fire_at < preflight_time:
-                    fail("current fire_claim predates preflight")
-    elif last_run_advanced:
-        if current_runtime["fire_claim"] is not None:
-            fail("completion did not clear fire_claim")
-    elif current_runtime["fire_claim"] != preflight_runtime["fire_claim"]:
+    elif (
+        not last_run_advanced
+        and current_runtime["fire_claim"] != preflight_runtime["fire_claim"]
+    ):
         fail("fire_claim changed without a claim or completion")
 
     return copy.deepcopy(dict(current_record))
 
 
 def _validate_paused_registry(
-    paths: Paths, manifest: Manifest
+    paths: Paths, manifest: Manifest, observation_now: Any
 ) -> dict[str, dict[str, Any]]:
     jobs = _load_jobs(paths)
     for job_id in RETIRE:
@@ -1770,6 +1817,7 @@ def _validate_paused_registry(
         manifest.jobs[RETAIN_ID],
         jobs.get(RETAIN_ID),
         preflight_epoch=manifest.created_epoch,
+        finalize_now=observation_now,
     )
     paused_records = {
         job_id: copy.deepcopy(jobs[job_id])
@@ -1796,7 +1844,7 @@ def _validate_finalize_plan(
                 + "; ".join(retired_errors)
             )
         return None
-    paused_records = _validate_paused_registry(paths, manifest)
+    paused_records = _validate_paused_registry(paths, manifest, now)
     for key in ENTRYPOINTS:
         _require_match(manifest.files[key])
     for source in _quiescent_sources(paths).values():
@@ -1862,7 +1910,12 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
     except BaseException as finalize_error:
         compensation_errors: list[BaseException] = []
         try:
-            _restore_paused_registry(paths, manifest, paused_records)
+            _restore_paused_registry(
+                paths,
+                manifest,
+                paused_records,
+                finalize_now=now,
+            )
         except BaseException as exc:
             compensation_errors.append(exc)
         for active, archived, key, original_fingerprint in reversed(moved):
@@ -2551,10 +2604,10 @@ def _verify_restored(paths: Paths, manifest: Manifest) -> list[str]:
     return errors
 
 
-def _validate_pause_plan(paths: Paths, manifest: Manifest) -> None:
+def _validate_pause_plan(paths: Paths, manifest: Manifest, now: Any) -> None:
     _assert_manifest_paths(paths, manifest)
     if manifest.phase == "paused":
-        _validate_paused_registry(paths, manifest)
+        _validate_paused_registry(paths, manifest, now)
         return
     if manifest.phase != "preflight":
         raise RetirementError(f"cannot pause from manifest phase {manifest.phase}")
@@ -2699,7 +2752,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         now = _now_from_args(args, paths)
         if args.command == "pause":
             if not args.apply:
-                _validate_pause_plan(paths, manifest)
+                _validate_pause_plan(paths, manifest, now)
                 _print({"apply": False, "action": "pause", "job_ids": sorted(RETIRE)})
                 return 0
             pause_producers(paths, manifest, now)

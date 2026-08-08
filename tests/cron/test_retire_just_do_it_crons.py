@@ -1144,6 +1144,324 @@ def test_finalize_dry_run_accepts_an_exact_external_fire_claim_transition(
     ) == 0
 
 
+def test_finalize_observation_window_rejects_completion_before_preflight(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    retained.update(
+        last_run_at=retirement_fixture.utc_iso(manifest.created_epoch - 1),
+        next_run_at=retirement_fixture.utc_iso(manifest.created_epoch),
+        last_status="ok",
+        last_error=None,
+        last_delivery_error=None,
+        fire_claim=None,
+    )
+    retained["repeat"]["completed"] += 1
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="new completion predates preflight"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+
+def test_finalize_observation_window_rejects_completion_after_finalize_now(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    finalize_epoch = manifest.cutoff_epoch + 181
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    retained.update(
+        last_run_at=retirement_fixture.utc_iso(finalize_epoch + 1),
+        next_run_at=retirement_fixture.utc_iso(manifest.created_epoch + 240),
+        last_status="ok",
+        last_error=None,
+        last_delivery_error=None,
+        fire_claim=None,
+    )
+    retained["repeat"]["completed"] += 1
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(
+        RetirementError, match="new completion exceeds finalize observation"
+    ):
+        finalize(retirement_fixture.paths, manifest, finalize_epoch)
+
+
+def test_finalize_observation_window_rejects_unchanged_claim_before_preflight(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    retained = next(
+        job for job in retirement_fixture.jobs if job["id"] == RETAIN_ID
+    )
+    retained["fire_claim"] = {
+        "at": retirement_fixture.utc_iso(retirement_fixture.now - 60),
+        "by": "fixture-scheduler:123",
+    }
+    retained["next_run_at"] = retirement_fixture.utc_iso(retirement_fixture.now)
+    retirement_fixture.write_jobs()
+    manifest = retirement_fixture.preflight_and_pause()
+
+    with pytest.raises(
+        RetirementError, match="current fire_claim predates preflight"
+    ):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+
+def test_finalize_dry_run_observation_window_rejects_claim_after_finalize_now(
+    retirement_fixture, capsys
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    finalize_epoch = manifest.cutoff_epoch + 181
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    retained["fire_claim"] = {
+        "at": retirement_fixture.utc_iso(finalize_epoch + 1),
+        "by": "fixture-scheduler:123",
+    }
+    retained["next_run_at"] = retirement_fixture.utc_iso(
+        manifest.created_epoch + 240
+    )
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    result = controller_main(
+        [
+            "finalize",
+            "--manifest",
+            str(manifest.manifest_path),
+            "--now-epoch",
+            str(finalize_epoch),
+        ]
+    )
+
+    assert result == 2
+    assert "current fire_claim exceeds finalize observation" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("delivery_error", "completed", "expected_error"),
+    [
+        pytest.param(
+            "orphaned delivery failure",
+            0,
+            "last_delivery_error is not coupled to a completion",
+            id="delivery-error-without-completion",
+        ),
+        pytest.param(
+            None,
+            1,
+            "repeat.completed is not coupled to a completion",
+            id="completed-count-without-completion",
+        ),
+    ],
+)
+def test_finalize_observation_window_rejects_no_completion_scheduler_state(
+    retirement_fixture, delivery_error, completed, expected_error
+):
+    _configure_retained_progress_job(retirement_fixture)
+    retained = next(
+        job for job in retirement_fixture.jobs if job["id"] == RETAIN_ID
+    )
+    retained.update(
+        last_run_at=None,
+        last_status=None,
+        last_error=None,
+        last_delivery_error=delivery_error,
+    )
+    retained["repeat"]["completed"] = completed
+    retirement_fixture.write_jobs()
+    manifest = retirement_fixture.preflight_and_pause()
+
+    with pytest.raises(RetirementError, match=expected_error):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+
+def test_finalize_observation_window_rejects_completion_with_unchanged_claim(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    retained = next(
+        job for job in retirement_fixture.jobs if job["id"] == RETAIN_ID
+    )
+    retained["fire_claim"] = {
+        "at": retirement_fixture.utc_iso(retirement_fixture.now + 120),
+        "by": "fixture-scheduler:123",
+    }
+    retained["next_run_at"] = retirement_fixture.utc_iso(
+        retirement_fixture.now + 180
+    )
+    retirement_fixture.write_jobs()
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    retained.update(
+        last_run_at=retirement_fixture.utc_iso(manifest.created_epoch + 60),
+        last_status="ok",
+        last_error=None,
+        last_delivery_error=None,
+    )
+    retained["repeat"]["completed"] += 1
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="new completion did not clear fire_claim"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+
+def test_finalize_observation_window_rejects_finalize_now_before_preflight(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    manifest.cutoff_epoch = manifest.created_epoch - 1000
+    manifest.cutoff_iso = retirement_fixture.utc_iso(manifest.cutoff_epoch)
+
+    with pytest.raises(
+        RetirementError, match="finalize observation time predates preflight"
+    ):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.created_epoch - 1
+        )
+
+
+@pytest.mark.parametrize(
+    ("transition", "offset"),
+    [
+        pytest.param("completion", 0, id="completion-at-lower-bound"),
+        pytest.param("completion", 182, id="completion-at-upper-bound"),
+        pytest.param("claim", 0, id="claim-at-lower-bound"),
+        pytest.param("claim", 182, id="claim-at-upper-bound"),
+    ],
+)
+def test_finalize_observation_window_accepts_inclusive_scheduler_boundaries(
+    retirement_fixture, monkeypatch, transition, offset
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    finalize_epoch = manifest.created_epoch + 182
+    transition_time = datetime.fromtimestamp(
+        manifest.created_epoch + offset, tz=timezone.utc
+    )
+    monkeypatch.setattr(cron_jobs, "_hermes_now", lambda: transition_time)
+    monkeypatch.setenv("HERMES_MACHINE_ID", "fixture-scheduler:123")
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        if transition == "completion":
+            assert cron_jobs.advance_next_run(RETAIN_ID) is True
+            cron_jobs.mark_job_run(RETAIN_ID, success=True)
+        else:
+            assert cron_jobs.claim_job_for_fire(RETAIN_ID) is True
+    latest_retained = next(
+        job for job in retirement_fixture.read_jobs() if job["id"] == RETAIN_ID
+    )
+
+    finalized = finalize(retirement_fixture.paths, manifest, finalize_epoch)
+
+    assert finalized.phase == "finalized"
+    assert retirement_fixture.read_jobs() == [latest_retained]
+
+
+def test_finalize_observation_window_accepts_successful_delivery_failure_completion(
+    retirement_fixture, monkeypatch
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    run_time = datetime.fromtimestamp(
+        manifest.created_epoch + 60, tz=timezone.utc
+    )
+    monkeypatch.setattr(cron_jobs, "_hermes_now", lambda: run_time)
+    monkeypatch.setenv("HERMES_MACHINE_ID", "fixture-scheduler:123")
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        assert cron_jobs.claim_job_for_fire(RETAIN_ID) is True
+        cron_jobs.mark_job_run(
+            RETAIN_ID,
+            success=True,
+            delivery_error="fixture delivery failed",
+        )
+    latest_retained = next(
+        job for job in retirement_fixture.read_jobs() if job["id"] == RETAIN_ID
+    )
+    assert latest_retained["last_status"] == "ok"
+    assert latest_retained["last_error"] is None
+    assert latest_retained["last_delivery_error"] == "fixture delivery failed"
+    assert latest_retained["fire_claim"] is None
+
+    finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+
+    assert retirement_fixture.read_jobs() == [latest_retained]
+
+
+def test_finalize_observation_window_accepts_absent_zero_completion_counter(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    retained = next(
+        job for job in retirement_fixture.jobs if job["id"] == RETAIN_ID
+    )
+    retained.update(
+        last_run_at=None,
+        last_status=None,
+        last_error=None,
+        last_delivery_error=None,
+    )
+    retained["repeat"].pop("completed")
+    retirement_fixture.write_jobs()
+    manifest = retirement_fixture.preflight_and_pause()
+    latest_retained = next(
+        job for job in retirement_fixture.read_jobs() if job["id"] == RETAIN_ID
+    )
+
+    finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+
+    assert retirement_fixture.read_jobs() == [latest_retained]
+
+
+def test_finalize_observation_window_accepts_absent_claim_after_completion(
+    retirement_fixture,
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    assert "fire_claim" not in retained
+    retained.update(
+        last_run_at=retirement_fixture.utc_iso(manifest.created_epoch + 60),
+        next_run_at=retirement_fixture.utc_iso(manifest.created_epoch + 120),
+        last_status="ok",
+        last_error=None,
+        last_delivery_error=None,
+    )
+    retained["repeat"]["completed"] += 1
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+    latest_retained = copy.deepcopy(retained)
+
+    finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+
+    assert retirement_fixture.read_jobs() == [latest_retained]
+
+
 def test_finalize_rejects_a_non_null_run_claim_on_the_retained_cron(
     retirement_fixture,
 ):
