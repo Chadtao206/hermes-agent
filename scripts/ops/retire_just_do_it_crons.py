@@ -25,7 +25,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -1316,17 +1316,74 @@ def _restore_paused_registry(
     manifest: Manifest,
     paused_records: Mapping[str, dict[str, Any]],
 ) -> None:
-    """Compensate a partial finalize without ever re-enabling producers."""
+    """Atomically restore paused retirees while preserving fresh retained state."""
+    exact_paused_records: dict[str, dict[str, Any]] = {}
     for job_id in RETIRE:
-        _validate_paused_retiring_record(paths, job_id, paused_records[job_id])
-    retained = _validate_retained_record_progress(
-        paths, manifest.jobs[RETAIN_ID], paused_records.get(RETAIN_ID)
-    )
-    exact_paused_records = {
-        job_id: copy.deepcopy(paused_records[job_id]) for job_id in RETIRE
-    }
-    exact_paused_records[RETAIN_ID] = retained
-    _restore_registry_with_records(paths, manifest, exact_paused_records)
+        record = paused_records.get(job_id)
+        if record is None:
+            raise RetirementError(
+                f"paused compensation record is missing: {job_id}"
+            )
+        _validate_paused_retiring_record(paths, job_id, record)
+        exact_paused_records[job_id] = copy.deepcopy(record)
+
+    retained_error: Optional[BaseException] = None
+    with cron_jobs.use_cron_store(paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            current = copy.deepcopy(cron_jobs.load_jobs())
+            retained_records = [
+                copy.deepcopy(job)
+                for job in current
+                if job.get("id") == RETAIN_ID
+            ]
+            if len(retained_records) != 1:
+                retained_error = RetirementError(
+                    "retained job is missing or duplicated during finalize compensation"
+                )
+            else:
+                try:
+                    _validate_retained_record_progress(
+                        paths,
+                        manifest.jobs[RETAIN_ID],
+                        retained_records[0],
+                        preflight_epoch=manifest.created_epoch,
+                    )
+                except BaseException as exc:
+                    retained_error = exc
+
+            rebuilt: list[dict[str, Any]] = []
+            restored_retirees: set[str] = set()
+            for job in current:
+                job_id = str(job.get("id"))
+                if job_id in RETIRE:
+                    if job_id not in restored_retirees:
+                        rebuilt.append(copy.deepcopy(exact_paused_records[job_id]))
+                        restored_retirees.add(job_id)
+                    continue
+                rebuilt.append(copy.deepcopy(job))
+            for job_id in sorted(set(RETIRE) - restored_retirees):
+                rebuilt.append(copy.deepcopy(exact_paused_records[job_id]))
+
+            cron_jobs.save_jobs(rebuilt)
+            restored = cron_jobs.load_jobs()
+            for job_id, expected in exact_paused_records.items():
+                matches = [job for job in restored if job.get("id") == job_id]
+                if matches != [expected]:
+                    raise RetirementError(
+                        f"paused job record not restored exactly: {job_id}"
+                    )
+            restored_retained = [
+                job for job in restored if job.get("id") == RETAIN_ID
+            ]
+            if restored_retained != retained_records:
+                raise RetirementError(
+                    "latest retained job record changed during compensation"
+                )
+
+            if retained_error is not None:
+                raise RetirementError(
+                    "retained job failed validation during finalize compensation"
+                ) from retained_error
 
 
 def _protect_remove_output(paths: Paths, manifest: Manifest, job_id: str) -> None:
@@ -1391,9 +1448,19 @@ def _validate_retained_record_progress(
     paths: Paths,
     preflight_record: Mapping[str, Any],
     current_record: Any,
+    *,
+    preflight_epoch: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Validate scheduler-owned progress without weakening retained identity."""
+    """Validate a reachable recurring-scheduler transition.
+
+    Recurring scheduler storage has three observable phases: an idle/completed
+    record, a preemptively advanced ``next_run_at``, or an external
+    ``fire_claim`` whose timestamp determines that next run.  Only
+    ``mark_job_run`` changes completion fields.  One-shot ``run_claim`` state
+    is unreachable for this cron job.
+    """
     missing = object()
+    schedule_identity = {"kind": "cron", "expr": "* * * * *"}
     runtime_fields = (
         "last_run_at",
         "next_run_at",
@@ -1423,15 +1490,77 @@ def _validate_retained_record_progress(
             fail(f"{record_name} {field_name} must be timezone-aware")
         return parsed.astimezone(timezone.utc)
 
-    def claim(value: Any, field_name: str, record_name: str) -> None:
+    def claim(
+        value: Any, field_name: str, record_name: str
+    ) -> Optional[datetime]:
         if value is missing or value is None:
-            return
+            return None
         if not isinstance(value, Mapping) or set(value) != {"at", "by"}:
             fail(f"{record_name} {field_name} has an invalid runtime shape")
-        timestamp(value["at"], f"{field_name}.at", record_name)
+        claimed_at = timestamp(value["at"], f"{field_name}.at", record_name)
+        if claimed_at is None:
+            fail(f"{record_name} {field_name}.at is required")
         owner = value["by"]
         if not isinstance(owner, str) or not owner.strip():
             fail(f"{record_name} {field_name}.by has an invalid runtime type")
+        return claimed_at
+
+    def completed(value: Any, record_name: str) -> int:
+        if value is missing:
+            return 0
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            fail(f"{record_name} repeat.completed has an invalid runtime type")
+        return value
+
+    def validate_completion_shape(
+        runtime: Mapping[str, Any],
+        last_run: Optional[datetime],
+        record_name: str,
+    ) -> None:
+        status = runtime["last_status"]
+        if status is not missing and status is not None and status not in (
+            "ok",
+            "error",
+        ):
+            fail(f"{record_name} last_status has an invalid runtime value")
+        for field_name in ("last_error", "last_delivery_error"):
+            value = runtime[field_name]
+            if (
+                value is not missing
+                and value is not None
+                and not isinstance(value, str)
+            ):
+                fail(f"{record_name} {field_name} has an invalid runtime type")
+        if last_run is None:
+            if status not in (missing, None):
+                fail(f"{record_name} last_status is not coupled to a completion")
+            if runtime["last_error"] not in (missing, None):
+                fail(f"{record_name} last_error is not coupled to a completion")
+        elif status not in ("ok", "error"):
+            fail(f"{record_name} completed run requires a terminal status")
+        if status == "ok" and runtime["last_error"] not in (missing, None):
+            fail(f"{record_name} successful run cannot retain last_error")
+
+    def scheduled_next(base: datetime, detail: str) -> datetime:
+        try:
+            computed = cron_jobs.compute_next_run(
+                schedule_identity, base.isoformat()
+            )
+        except Exception as exc:
+            fail(f"could not compute {detail}: {exc}")
+        parsed = timestamp(computed, detail, "scheduler")
+        if parsed is None:
+            fail(f"could not compute {detail}")
+        return parsed
+
+    def require_schedule_occurrence(value: datetime, detail: str) -> None:
+        preceding = value - timedelta(microseconds=1)
+        if scheduled_next(preceding, detail) != value:
+            fail(f"{detail} is not a retained cron occurrence")
 
     def project(
         raw: Any, record_name: str
@@ -1446,7 +1575,7 @@ def _validate_retained_record_progress(
         ):
             fail(f"{record_name} script identity is invalid")
         if not _matches_schedule_identity(
-            record.get("schedule"), {"kind": "cron", "expr": "* * * * *"}
+            record.get("schedule"), schedule_identity
         ):
             fail(f"{record_name} schedule identity is invalid")
         if record.get("no_agent") is not True:
@@ -1475,9 +1604,6 @@ def _validate_retained_record_progress(
             ):
                 fail(f"{record_name} repeat limit has an invalid type")
             record["repeat"] = repeat_projection
-
-        record["script"] = RETAIN_SCRIPT
-        record["schedule"] = {"kind": "cron", "expr": "* * * * *"}
         return record, runtime
 
     preflight_projection, preflight_runtime = project(
@@ -1504,6 +1630,19 @@ def _validate_retained_record_progress(
         current_last_run is None or current_last_run < preflight_last_run
     ):
         fail("last_run_at runtime progress regressed")
+    last_run_advanced = (
+        current_last_run is not None
+        and (
+            preflight_last_run is None
+            or current_last_run > preflight_last_run
+        )
+    )
+    if (
+        not last_run_advanced
+        and current_runtime["last_run_at"]
+        != preflight_runtime["last_run_at"]
+    ):
+        fail("last_run_at changed without a newer completion")
 
     preflight_next_run = timestamp(
         preflight_runtime["next_run_at"], "next_run_at", "preflight"
@@ -1515,44 +1654,17 @@ def _validate_retained_record_progress(
         fail("next_run_at is required for the scheduled recurring job")
     if current_next_run < preflight_next_run:
         fail("next_run_at runtime progress regressed")
+    require_schedule_occurrence(preflight_next_run, "preflight next_run_at")
+    require_schedule_occurrence(current_next_run, "current next_run_at")
+    if preflight_last_run is not None and preflight_next_run <= preflight_last_run:
+        fail("preflight next_run_at must follow the latest completed run")
+    if current_last_run is not None and current_next_run <= current_last_run:
+        fail("current next_run_at must follow the latest completed run")
 
-    for record_name, runtime in (
-        ("preflight", preflight_runtime),
-        ("current", current_runtime),
-    ):
-        status = runtime["last_status"]
-        if (
-            status is not missing
-            and status is not None
-            and status not in ("ok", "error")
-        ):
-            fail(f"{record_name} last_status has an invalid runtime value")
-        for field_name in ("last_error", "last_delivery_error"):
-            value = runtime[field_name]
-            if (
-                value is not missing
-                and value is not None
-                and not isinstance(value, str)
-            ):
-                fail(f"{record_name} {field_name} has an invalid runtime type")
-        for field_name in ("fire_claim", "run_claim"):
-            claim(runtime[field_name], field_name, record_name)
-    if (
-        preflight_runtime["last_status"] not in (missing, None)
-        and current_runtime["last_status"] is None
-    ):
-        fail("last_status runtime progress regressed")
-
-    def completed(value: Any, record_name: str) -> int:
-        if value is missing:
-            return 0
-        if (
-            not isinstance(value, int)
-            or isinstance(value, bool)
-            or value < 0
-        ):
-            fail(f"{record_name} repeat.completed has an invalid runtime type")
-        return value
+    validate_completion_shape(
+        preflight_runtime, preflight_last_run, "preflight"
+    )
+    validate_completion_shape(current_runtime, current_last_run, "current")
 
     preflight_completed = completed(
         preflight_runtime["repeat.completed"], "preflight"
@@ -1562,6 +1674,83 @@ def _validate_retained_record_progress(
     )
     if current_completed < preflight_completed:
         fail("repeat.completed runtime progress regressed")
+
+    completion_fields = (
+        "last_status",
+        "last_error",
+        "last_delivery_error",
+        "repeat.completed",
+    )
+    if last_run_advanced:
+        for field_name in completion_fields:
+            if current_runtime[field_name] is missing:
+                fail(f"new completion did not persist {field_name}")
+        if current_completed <= preflight_completed:
+            fail("new completion did not increase repeat.completed")
+        completion_next = scheduled_next(
+            current_last_run, "next_run_at after completion"
+        )
+        if current_next_run < completion_next:
+            fail("next_run_at regressed behind the latest completion")
+    else:
+        for field_name in completion_fields:
+            if current_runtime[field_name] != preflight_runtime[field_name]:
+                fail(f"{field_name} changed without a newer completion")
+
+    for record_name, runtime in (
+        ("preflight", preflight_runtime),
+        ("current", current_runtime),
+    ):
+        run_claim = runtime["run_claim"]
+        if run_claim not in (missing, None):
+            fail(f"{record_name} run_claim is impossible for a cron job")
+    if current_runtime["run_claim"] != preflight_runtime["run_claim"]:
+        fail("run_claim storage changed for a cron job")
+
+    preflight_fire_at = claim(
+        preflight_runtime["fire_claim"], "fire_claim", "preflight"
+    )
+    current_fire_at = claim(
+        current_runtime["fire_claim"], "fire_claim", "current"
+    )
+
+    if preflight_fire_at is not None:
+        if (
+            preflight_last_run is not None
+            and preflight_fire_at <= preflight_last_run
+        ):
+            fail("preflight fire_claim is not after the latest completion")
+        if scheduled_next(
+            preflight_fire_at, "preflight claimed next_run_at"
+        ) != preflight_next_run:
+            fail("preflight fire_claim is not coupled to next_run_at")
+
+    if current_fire_at is not None:
+        if current_last_run is not None and current_fire_at <= current_last_run:
+            fail("current fire_claim is not after the latest completion")
+        if scheduled_next(
+            current_fire_at, "current claimed next_run_at"
+        ) != current_next_run:
+            fail("current fire_claim is not coupled to next_run_at")
+        claim_changed = (
+            current_runtime["fire_claim"]
+            != preflight_runtime["fire_claim"]
+        )
+        if claim_changed:
+            if preflight_fire_at is not None and current_fire_at <= preflight_fire_at:
+                fail("current fire_claim timestamp did not advance")
+            if preflight_epoch is not None:
+                preflight_time = datetime.fromtimestamp(
+                    preflight_epoch, tz=timezone.utc
+                )
+                if current_fire_at < preflight_time:
+                    fail("current fire_claim predates preflight")
+    elif last_run_advanced:
+        if current_runtime["fire_claim"] is not None:
+            fail("completion did not clear fire_claim")
+    elif current_runtime["fire_claim"] != preflight_runtime["fire_claim"]:
+        fail("fire_claim changed without a claim or completion")
+
     return copy.deepcopy(dict(current_record))
 
 
@@ -1577,7 +1766,10 @@ def _validate_paused_registry(
             )
         _validate_paused_retiring_record(paths, job_id, job)
     retained = _validate_retained_record_progress(
-        paths, manifest.jobs[RETAIN_ID], jobs.get(RETAIN_ID)
+        paths,
+        manifest.jobs[RETAIN_ID],
+        jobs.get(RETAIN_ID),
+        preflight_epoch=manifest.created_epoch,
     )
     paused_records = {
         job_id: copy.deepcopy(jobs[job_id])
