@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -86,6 +87,63 @@ def _use_canonical_stored_job_identities(fixture: RetirementFixture) -> None:
         "boris-review-reaction-state-watchdog"
     )
     fixture.write_jobs()
+
+
+def _configure_retained_progress_job(fixture: RetirementFixture) -> None:
+    """Give the retained fixture the complete mutable scheduler record shape."""
+    workdir = fixture.root / "retained-workdir"
+    workdir.mkdir()
+    retained = next(job for job in fixture.jobs if job["id"] == RETAIN_ID)
+    retained.update(
+        {
+            "skills": ["review-reactions"],
+            "skill": "review-reactions",
+            "model": "retained-model",
+            "provider": "retained-provider",
+            "provider_snapshot": "retained-provider-snapshot",
+            "model_snapshot": "retained-model-snapshot",
+            "base_url": "https://provider.example/v1",
+            "context_from": ["upstream-job"],
+            "schedule_display": "* * * * *",
+            "repeat": {"times": None, "completed": 7},
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": fixture.utc_iso(fixture.now - 3600),
+            "last_error": None,
+            "last_delivery_error": None,
+            "deliver": "origin",
+            "origin": {"platform": "slack", "channel_id": "C0BPCKPEFCG"},
+            "enabled_toolsets": ["slack"],
+            "workdir": str(workdir),
+            "attach_to_session": False,
+        }
+    )
+    fixture.write_jobs()
+
+
+def _run_retained_job_three_times(
+    fixture: RetirementFixture, monkeypatch: pytest.MonkeyPatch
+) -> dict:
+    """Exercise the real recurring claim/advance/completion storage paths."""
+    with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+        for index in range(1, 4):
+            run_time = datetime.fromtimestamp(
+                fixture.now + (index * 60), tz=timezone.utc
+            )
+            monkeypatch.setattr(
+                cron_jobs, "_hermes_now", lambda current=run_time: current
+            )
+            assert cron_jobs.advance_next_run(RETAIN_ID) is True
+            assert cron_jobs.claim_job_for_fire(RETAIN_ID) is True
+            cron_jobs.mark_job_run(
+                RETAIN_ID,
+                success=index != 3,
+                error="transient retained failure" if index == 3 else None,
+                delivery_error="transient delivery failure" if index == 3 else None,
+            )
+    return copy.deepcopy(
+        next(job for job in fixture.read_jobs() if job["id"] == RETAIN_ID)
+    )
 
 
 @dataclass
@@ -992,6 +1050,267 @@ def test_finalize_revalidates_the_paused_job_fingerprint(retirement_fixture):
         finalize(
             retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
         )
+    assert all(path.exists() for path in retirement_fixture.retired_live_paths())
+    assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
+
+
+def test_finalize_dry_run_accepts_multiple_retained_scheduler_runs(
+    retirement_fixture, monkeypatch, capsys
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    latest_retained = _run_retained_job_three_times(retirement_fixture, monkeypatch)
+    preflight_retained = manifest.jobs[RETAIN_ID]
+    assert latest_retained["repeat"]["completed"] == 10
+    for field in (
+        "last_run_at",
+        "next_run_at",
+        "last_status",
+        "last_error",
+        "last_delivery_error",
+    ):
+        assert latest_retained[field] != preflight_retained.get(field)
+    assert latest_retained["fire_claim"] is None
+    assert latest_retained["enabled"] is True
+    assert latest_retained["state"] == "scheduled"
+    jobs_before = retirement_fixture.paths.jobs_path.read_bytes()
+    manifest_before = manifest.manifest_path.read_bytes()
+
+    result = controller_main(
+        [
+            "finalize",
+            "--manifest",
+            str(manifest.manifest_path),
+            "--now-epoch",
+            str(manifest.cutoff_epoch + 181),
+        ]
+    )
+
+    assert result == 0
+    assert '"apply": false' in capsys.readouterr().out
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
+    assert next(
+        job for job in retirement_fixture.read_jobs() if job["id"] == RETAIN_ID
+    ) == latest_retained
+
+
+def test_finalize_apply_accepts_multiple_retained_scheduler_runs(
+    retirement_fixture, monkeypatch
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    latest_retained = _run_retained_job_three_times(retirement_fixture, monkeypatch)
+
+    result = controller_main(
+        [
+            "finalize",
+            "--manifest",
+            str(manifest.manifest_path),
+            "--now-epoch",
+            str(manifest.cutoff_epoch + 181),
+            "--apply",
+        ]
+    )
+
+    assert result == 0
+    assert Manifest.load(manifest.manifest_path).phase == "finalized"
+    assert retirement_fixture.read_jobs() == [latest_retained]
+
+
+@pytest.mark.parametrize("claim_field", ("fire_claim", "run_claim"))
+def test_finalize_dry_run_accepts_well_shaped_retained_claim_progress(
+    retirement_fixture, claim_field
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    retained[claim_field] = {
+        "at": retirement_fixture.utc_iso(manifest.cutoff_epoch + 120),
+        "by": "fixture-scheduler:123",
+    }
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    assert controller_main(
+        [
+            "finalize",
+            "--manifest",
+            str(manifest.manifest_path),
+            "--now-epoch",
+            str(manifest.cutoff_epoch + 181),
+        ]
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [
+        pytest.param("id", "different-id", id="id"),
+        pytest.param("name", "drifted retained name", id="name"),
+        pytest.param("prompt", "drifted retained prompt", id="prompt"),
+        pytest.param("script", "unexpected.py", id="script"),
+        pytest.param(
+            "schedule",
+            {"kind": "cron", "expr": "*/5 * * * *"},
+            id="schedule-operational",
+        ),
+        pytest.param("no_agent", False, id="no-agent"),
+        pytest.param("deliver", "local", id="delivery"),
+        pytest.param(
+            "origin", {"platform": "telegram", "chat_id": "other"}, id="origin"
+        ),
+        pytest.param("provider", "other-provider", id="provider"),
+        pytest.param("provider_snapshot", "other-snapshot", id="provider-snapshot"),
+        pytest.param("model", "other-model", id="model"),
+        pytest.param("model_snapshot", "other-snapshot", id="model-snapshot"),
+        pytest.param("base_url", "https://other.example/v1", id="base-url"),
+        pytest.param("workdir", "/different/workdir", id="workdir"),
+        pytest.param("enabled_toolsets", ["terminal"], id="toolsets"),
+        pytest.param("skills", ["other-skill"], id="skills"),
+        pytest.param("skill", "other-skill", id="legacy-skill"),
+        pytest.param("context_from", ["other-upstream"], id="context-from"),
+        pytest.param("attach_to_session", True, id="delivery-attachment"),
+        pytest.param("repeat.times", 5, id="repeat-limit"),
+        pytest.param("opaque_future_config", {"changed": True}, id="unknown-config"),
+    ],
+)
+def test_finalize_rejects_retained_immutable_or_config_drift(
+    retirement_fixture, field, drifted_value
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    if field == "repeat.times":
+        retained["repeat"]["times"] = drifted_value
+    else:
+        retained[field] = drifted_value
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="retained job"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    assert all(path.exists() for path in retirement_fixture.retired_live_paths())
+    assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("last_run_at", 123, id="last-run-type"),
+        pytest.param(
+            "last_run_at", "2026-08-08T19:58:00+00:00", id="last-run-regression"
+        ),
+        pytest.param(
+            "last_run_at", "2026-08-08T20:01:00", id="last-run-naive"
+        ),
+        pytest.param("next_run_at", None, id="next-run-type"),
+        pytest.param(
+            "next_run_at", "2026-08-08T19:59:30+00:00", id="next-run-regression"
+        ),
+        pytest.param("next_run_at", "not-a-timestamp", id="next-run-shape"),
+        pytest.param("last_status", "completed", id="last-status-value"),
+        pytest.param("last_status", None, id="last-status-regression"),
+        pytest.param("last_error", ["not", "text"], id="last-error-type"),
+        pytest.param("last_delivery_error", 7, id="delivery-error-type"),
+        pytest.param(
+            "fire_claim",
+            {"at": "2026-08-08T20:01:00+00:00"},
+            id="fire-claim-missing-owner",
+        ),
+        pytest.param(
+            "fire_claim",
+            {
+                "at": "2026-08-08T20:01:00+00:00",
+                "by": "owner",
+                "unexpected": True,
+            },
+            id="fire-claim-extra-field",
+        ),
+        pytest.param(
+            "run_claim", {"at": "not-a-timestamp", "by": "owner"}, id="run-claim-time"
+        ),
+        pytest.param("repeat.completed", 6, id="repeat-completed-regression"),
+        pytest.param("repeat.completed", True, id="repeat-completed-bool"),
+        pytest.param("repeat.completed", -1, id="repeat-completed-negative"),
+    ],
+)
+def test_finalize_rejects_invalid_retained_runtime_progress(
+    retirement_fixture, field, invalid_value
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+    if field == "repeat.completed":
+        retained["repeat"]["completed"] = invalid_value
+    else:
+        retained[field] = invalid_value
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="retained job"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("enabled", False, id="disabled"),
+        pytest.param("state", "paused", id="paused"),
+        pytest.param("state", "error", id="error-state"),
+    ],
+)
+def test_finalize_rejects_disabled_or_non_scheduled_retained_job(
+    retirement_fixture, field, invalid_value
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    next(job for job in jobs if job["id"] == RETAIN_ID)[field] = invalid_value
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="retained job"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+
+def test_finalize_compensation_preserves_latest_retained_scheduler_progress(
+    retirement_fixture, monkeypatch
+):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = retirement_fixture.preflight_and_pause()
+    latest_retained = _run_retained_job_three_times(retirement_fixture, monkeypatch)
+    paused_retiring = {
+        job["id"]: copy.deepcopy(job)
+        for job in retirement_fixture.read_jobs()
+        if job["id"] in RETIRE_IDS
+    }
+    real_remove = cron_jobs.remove_job
+
+    def fail_second_removal(job_id):
+        if job_id == "ff865c33c5ea":
+            return False
+        return real_remove(job_id)
+
+    monkeypatch.setattr(cron_jobs, "remove_job", fail_second_removal)
+    with pytest.raises(RetirementError, match="could not be removed"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    restored = {job["id"]: job for job in retirement_fixture.read_jobs()}
+    assert restored[RETAIN_ID] == latest_retained
+    assert {job_id: restored[job_id] for job_id in RETIRE_IDS} == paused_retiring
     assert all(path.exists() for path in retirement_fixture.retired_live_paths())
     assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
 

@@ -1319,9 +1319,14 @@ def _restore_paused_registry(
     """Compensate a partial finalize without ever re-enabling producers."""
     for job_id in RETIRE:
         _validate_paused_retiring_record(paths, job_id, paused_records[job_id])
-    if paused_records.get(RETAIN_ID) != manifest.jobs[RETAIN_ID]:
-        raise RetirementError("retained job changed before finalize compensation")
-    _restore_registry_with_records(paths, manifest, paused_records)
+    retained = _validate_retained_record_progress(
+        paths, manifest.jobs[RETAIN_ID], paused_records.get(RETAIN_ID)
+    )
+    exact_paused_records = {
+        job_id: copy.deepcopy(paused_records[job_id]) for job_id in RETIRE
+    }
+    exact_paused_records[RETAIN_ID] = retained
+    _restore_registry_with_records(paths, manifest, exact_paused_records)
 
 
 def _protect_remove_output(paths: Paths, manifest: Manifest, job_id: str) -> None:
@@ -1382,6 +1387,184 @@ def _validate_paused_retiring_record(
         )
 
 
+def _validate_retained_record_progress(
+    paths: Paths,
+    preflight_record: Mapping[str, Any],
+    current_record: Any,
+) -> dict[str, Any]:
+    """Validate scheduler-owned progress without weakening retained identity."""
+    missing = object()
+    runtime_fields = (
+        "last_run_at",
+        "next_run_at",
+        "last_status",
+        "last_error",
+        "last_delivery_error",
+        "fire_claim",
+        "run_claim",
+    )
+
+    def fail(detail: str) -> None:
+        raise RetirementError(f"retained job {detail} before finalize")
+
+    def timestamp(
+        value: Any, field_name: str, record_name: str
+    ) -> Optional[datetime]:
+        if value is missing or value is None:
+            return None
+        if not isinstance(value, str) or not value or value != value.strip():
+            fail(f"{record_name} {field_name} has an invalid runtime type")
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            fail(f"{record_name} {field_name} has an invalid runtime shape")
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            fail(f"{record_name} {field_name} must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
+    def claim(value: Any, field_name: str, record_name: str) -> None:
+        if value is missing or value is None:
+            return
+        if not isinstance(value, Mapping) or set(value) != {"at", "by"}:
+            fail(f"{record_name} {field_name} has an invalid runtime shape")
+        timestamp(value["at"], f"{field_name}.at", record_name)
+        owner = value["by"]
+        if not isinstance(owner, str) or not owner.strip():
+            fail(f"{record_name} {field_name}.by has an invalid runtime type")
+
+    def project(
+        raw: Any, record_name: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(raw, Mapping):
+            fail(f"{record_name} record has an invalid shape")
+        record = copy.deepcopy(dict(raw))
+        if record.get("id") != RETAIN_ID:
+            fail(f"{record_name} id is invalid")
+        if not _matches_script_identity(
+            record.get("script"), paths.live_scripts, RETAIN_SCRIPT
+        ):
+            fail(f"{record_name} script identity is invalid")
+        if not _matches_schedule_identity(
+            record.get("schedule"), {"kind": "cron", "expr": "* * * * *"}
+        ):
+            fail(f"{record_name} schedule identity is invalid")
+        if record.get("no_agent") is not True:
+            fail(f"{record_name} no_agent identity is invalid")
+        if record.get("enabled") is not True or record.get("state") != "scheduled":
+            fail(f"{record_name} must remain enabled and scheduled")
+
+        runtime = {
+            field_name: record.pop(field_name, missing)
+            for field_name in runtime_fields
+        }
+        repeat = record.get("repeat", missing)
+        runtime["repeat.completed"] = missing
+        if repeat is not missing and repeat is not None:
+            if not isinstance(repeat, Mapping):
+                fail(f"{record_name} repeat has an invalid shape")
+            repeat_projection = copy.deepcopy(dict(repeat))
+            runtime["repeat.completed"] = repeat_projection.pop(
+                "completed", missing
+            )
+            repeat_limit = repeat_projection.get("times")
+            if repeat_limit is not None and (
+                not isinstance(repeat_limit, int)
+                or isinstance(repeat_limit, bool)
+                or repeat_limit <= 0
+            ):
+                fail(f"{record_name} repeat limit has an invalid type")
+            record["repeat"] = repeat_projection
+
+        record["script"] = RETAIN_SCRIPT
+        record["schedule"] = {"kind": "cron", "expr": "* * * * *"}
+        return record, runtime
+
+    preflight_projection, preflight_runtime = project(
+        preflight_record, "preflight"
+    )
+    current_projection, current_runtime = project(current_record, "current")
+    if current_projection != preflight_projection:
+        fail("immutable/config fingerprint mismatch")
+
+    for field_name in (*runtime_fields, "repeat.completed"):
+        if (
+            preflight_runtime[field_name] is not missing
+            and current_runtime[field_name] is missing
+        ):
+            fail(f"current {field_name} was removed")
+
+    preflight_last_run = timestamp(
+        preflight_runtime["last_run_at"], "last_run_at", "preflight"
+    )
+    current_last_run = timestamp(
+        current_runtime["last_run_at"], "last_run_at", "current"
+    )
+    if preflight_last_run is not None and (
+        current_last_run is None or current_last_run < preflight_last_run
+    ):
+        fail("last_run_at runtime progress regressed")
+
+    preflight_next_run = timestamp(
+        preflight_runtime["next_run_at"], "next_run_at", "preflight"
+    )
+    current_next_run = timestamp(
+        current_runtime["next_run_at"], "next_run_at", "current"
+    )
+    if preflight_next_run is None or current_next_run is None:
+        fail("next_run_at is required for the scheduled recurring job")
+    if current_next_run < preflight_next_run:
+        fail("next_run_at runtime progress regressed")
+
+    for record_name, runtime in (
+        ("preflight", preflight_runtime),
+        ("current", current_runtime),
+    ):
+        status = runtime["last_status"]
+        if (
+            status is not missing
+            and status is not None
+            and status not in ("ok", "error")
+        ):
+            fail(f"{record_name} last_status has an invalid runtime value")
+        for field_name in ("last_error", "last_delivery_error"):
+            value = runtime[field_name]
+            if (
+                value is not missing
+                and value is not None
+                and not isinstance(value, str)
+            ):
+                fail(f"{record_name} {field_name} has an invalid runtime type")
+        for field_name in ("fire_claim", "run_claim"):
+            claim(runtime[field_name], field_name, record_name)
+    if (
+        preflight_runtime["last_status"] not in (missing, None)
+        and current_runtime["last_status"] is None
+    ):
+        fail("last_status runtime progress regressed")
+
+    def completed(value: Any, record_name: str) -> int:
+        if value is missing:
+            return 0
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            fail(f"{record_name} repeat.completed has an invalid runtime type")
+        return value
+
+    preflight_completed = completed(
+        preflight_runtime["repeat.completed"], "preflight"
+    )
+    current_completed = completed(
+        current_runtime["repeat.completed"], "current"
+    )
+    if current_completed < preflight_completed:
+        fail("repeat.completed runtime progress regressed")
+    return copy.deepcopy(dict(current_record))
+
+
 def _validate_paused_registry(
     paths: Paths, manifest: Manifest
 ) -> dict[str, dict[str, Any]]:
@@ -1393,12 +1576,15 @@ def _validate_paused_registry(
                 f"job {job_id} fingerprint mismatch before exact removal"
             )
         _validate_paused_retiring_record(paths, job_id, job)
-    if jobs.get(RETAIN_ID) != manifest.jobs[RETAIN_ID]:
-        raise RetirementError("retained job fingerprint mismatch before finalize")
-    return {
+    retained = _validate_retained_record_progress(
+        paths, manifest.jobs[RETAIN_ID], jobs.get(RETAIN_ID)
+    )
+    paused_records = {
         job_id: copy.deepcopy(jobs[job_id])
-        for job_id in (*sorted(RETIRE), RETAIN_ID)
+        for job_id in sorted(RETIRE)
     }
+    paused_records[RETAIN_ID] = retained
+    return paused_records
 
 
 def _validate_finalize_plan(
