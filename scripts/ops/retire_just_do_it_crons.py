@@ -1909,22 +1909,26 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
         manifest.save()
     except BaseException as finalize_error:
         compensation_errors: list[BaseException] = []
-        try:
-            _restore_paused_registry(
-                paths,
-                manifest,
-                paused_records,
-                finalize_now=now,
-            )
-        except BaseException as exc:
-            compensation_errors.append(exc)
+        source_compensation_errors: list[BaseException] = []
         for active, archived, key, original_fingerprint in reversed(moved):
             try:
                 if archived.exists() and not active.exists():
                     os.replace(archived, active)
+                _require_match(original_fingerprint)
+            except BaseException as exc:
+                source_compensation_errors.append(exc)
+            manifest.files[key] = original_fingerprint
+        compensation_errors.extend(source_compensation_errors)
+        if not source_compensation_errors:
+            try:
+                _restore_paused_registry(
+                    paths,
+                    manifest,
+                    paused_records,
+                    finalize_now=now,
+                )
             except BaseException as exc:
                 compensation_errors.append(exc)
-            manifest.files[key] = original_fingerprint
         manifest.phase = paused_phase
         manifest.finalized_epoch = paused_finalized_epoch
         manifest.finalized_iso = paused_finalized_iso

@@ -1868,6 +1868,98 @@ def test_finalize_compensation_preserves_latest_retained_scheduler_progress(
     assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
 
 
+def test_finalize_compensation_restores_verified_sources_before_retired_records(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    entrypoints = tuple(
+        copy.deepcopy(manifest.files[key])
+        for key in retirement_controller.ENTRYPOINTS
+    )
+    real_remove = cron_jobs.remove_job
+    real_save = cron_jobs.save_jobs
+    source_state_at_registry_restore: list[bool] = []
+
+    def observe_save(jobs):
+        if RETIRE_IDS <= {job.get("id") for job in jobs}:
+            source_state_at_registry_restore.append(
+                all(
+                    fingerprint.active_path.is_file()
+                    and _hash_file(fingerprint.active_path) == fingerprint.sha256
+                    for fingerprint in entrypoints
+                )
+            )
+        return real_save(jobs)
+
+    def fail_second_removal(job_id):
+        if job_id == "ff865c33c5ea":
+            return False
+        return real_remove(job_id)
+
+    monkeypatch.setattr(cron_jobs, "save_jobs", observe_save)
+    monkeypatch.setattr(cron_jobs, "remove_job", fail_second_removal)
+
+    with pytest.raises(RetirementError, match="could not be removed"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    assert source_state_at_registry_restore == [True]
+
+
+def test_finalize_compensation_source_verification_failure_gates_registry_restore(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    target = manifest.files["retired-channel-script"].active_path
+    real_remove = cron_jobs.remove_job
+    real_require = retirement_controller._require_match
+    real_save = cron_jobs.save_jobs
+    removal_failed = False
+    verification_failed = False
+    registry_restores = 0
+
+    def fail_second_removal(job_id):
+        nonlocal removal_failed
+        if job_id == "ff865c33c5ea":
+            removal_failed = True
+            return False
+        return real_remove(job_id)
+
+    def fail_source_verification(fingerprint, path=None):
+        nonlocal verification_failed
+        checked_path = path or fingerprint.active_path
+        if removal_failed and not verification_failed and checked_path == target:
+            verification_failed = True
+            raise RetirementError("injected source compensation verification failure")
+        return real_require(fingerprint, path)
+
+    def observe_save(jobs):
+        nonlocal registry_restores
+        if RETIRE_IDS <= {job.get("id") for job in jobs}:
+            registry_restores += 1
+        return real_save(jobs)
+
+    monkeypatch.setattr(cron_jobs, "remove_job", fail_second_removal)
+    monkeypatch.setattr(
+        retirement_controller, "_require_match", fail_source_verification
+    )
+    monkeypatch.setattr(cron_jobs, "save_jobs", observe_save)
+
+    with pytest.raises(
+        RetirementError, match="exact paused-state compensation failed"
+    ):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    restored_ids = {job["id"] for job in retirement_fixture.read_jobs()}
+    assert verification_failed is True
+    assert registry_restores == 0
+    assert RETIRE_IDS - restored_ids
+    assert Manifest.load(manifest.manifest_path).phase == "paused"
+
+
 @pytest.mark.parametrize("retained_drift", ("invalid", "missing"))
 def test_finalize_compensation_restores_paused_retirees_before_reporting_bad_retained(
     retirement_fixture, monkeypatch, retained_drift
