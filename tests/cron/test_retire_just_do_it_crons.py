@@ -1960,6 +1960,102 @@ def test_finalize_compensation_source_verification_failure_gates_registry_restor
     assert Manifest.load(manifest.manifest_path).phase == "paused"
 
 
+def test_finalize_compensation_tracks_entrypoint_before_move_reports_failure(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    original = copy.deepcopy(manifest.files["retired-channel-script"])
+    archived = (
+        manifest.archive_dir
+        / "retired-entrypoints"
+        / original.active_path.name
+    )
+    real_replace = os.replace
+    move_reported_failure = False
+
+    def fail_after_entrypoint_move(source, destination):
+        nonlocal move_reported_failure
+        result = real_replace(source, destination)
+        if (
+            not move_reported_failure
+            and source == original.active_path
+            and destination == archived
+        ):
+            move_reported_failure = True
+            raise OSError("injected failure after entrypoint move")
+        return result
+
+    monkeypatch.setattr(
+        retirement_controller.os, "replace", fail_after_entrypoint_move
+    )
+
+    with pytest.raises(OSError, match="failure after entrypoint move"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    restored_ids = {job["id"] for job in retirement_fixture.read_jobs()}
+    assert move_reported_failure is True
+    assert original.active_path.is_file()
+    assert _hash_file(original.active_path) == original.sha256
+    assert not archived.exists()
+    assert RETIRE_IDS <= restored_ids
+
+
+def test_finalize_compensation_active_archive_collision_gates_registry_restore(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    originals = {
+        key: copy.deepcopy(manifest.files[key])
+        for key in retirement_controller.ENTRYPOINTS
+    }
+    collision = originals["retired-requeue-test"]
+    collision_archive = (
+        manifest.archive_dir
+        / "retired-entrypoints"
+        / collision.active_path.name
+    )
+    real_remove = cron_jobs.remove_job
+    real_save = cron_jobs.save_jobs
+    collision_created = False
+    registry_restores = 0
+
+    def fail_second_removal(job_id):
+        nonlocal collision_created
+        if job_id == "ff865c33c5ea":
+            shutil.copy2(collision_archive, collision.active_path)
+            collision_created = True
+            return False
+        return real_remove(job_id)
+
+    def observe_save(jobs):
+        nonlocal registry_restores
+        if RETIRE_IDS <= {job.get("id") for job in jobs}:
+            registry_restores += 1
+        return real_save(jobs)
+
+    monkeypatch.setattr(cron_jobs, "remove_job", fail_second_removal)
+    monkeypatch.setattr(cron_jobs, "save_jobs", observe_save)
+
+    with pytest.raises(
+        RetirementError, match="exact paused-state compensation failed"
+    ):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    assert collision_created is True
+    assert registry_restores == 0
+    assert collision.active_path.is_file()
+    assert collision_archive.is_file()
+    for key, fingerprint in originals.items():
+        if key != "retired-requeue-test":
+            assert fingerprint.active_path.is_file()
+            assert _hash_file(fingerprint.active_path) == fingerprint.sha256
+    assert Manifest.load(manifest.manifest_path).phase == "paused"
+
+
 @pytest.mark.parametrize("retained_drift", ("invalid", "missing"))
 def test_finalize_compensation_restores_paused_retirees_before_reporting_bad_retained(
     retirement_fixture, monkeypatch, retained_drift

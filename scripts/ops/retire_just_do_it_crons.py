@@ -1894,8 +1894,8 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
                 raise RetirementError(f"retired archive path already exists: {destination}")
-            os.replace(fingerprint.active_path, destination)
             moved.append((fingerprint.active_path, destination, key, fingerprint))
+            os.replace(fingerprint.active_path, destination)
             moved_fingerprint = replace(fingerprint, archive_path=destination)
             _require_match(moved_fingerprint, destination)
             manifest.files[key] = moved_fingerprint
@@ -1912,7 +1912,12 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
         source_compensation_errors: list[BaseException] = []
         for active, archived, key, original_fingerprint in reversed(moved):
             try:
-                if archived.exists() and not active.exists():
+                if archived.exists() and active.exists():
+                    raise RetirementError(
+                        "entrypoint source and archive both exist during "
+                        f"finalize compensation: {active}"
+                    )
+                if archived.exists():
                     os.replace(archived, active)
                 _require_match(original_fingerprint)
             except BaseException as exc:
