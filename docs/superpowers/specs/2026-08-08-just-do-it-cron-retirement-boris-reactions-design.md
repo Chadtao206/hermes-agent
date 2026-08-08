@@ -1,7 +1,8 @@
 # Just-Do-It CRON Retirement and Boris Reaction Migration Design
 
 **Date:** 2026-08-08
-**Status:** Approved design, pending written-spec review
+**Status:** Approved; implementation plan committed
+**Implementation plan:** `docs/superpowers/plans/2026-08-08-just-do-it-cron-retirement-boris-reactions.md`
 **Scope:** Fully retire the two legacy just-do-it lane-producing CRONs and
 adopt a Boris-channel-specific reaction vocabulary without changing review
 authorization, review execution, or Kanban lifecycle ownership.
