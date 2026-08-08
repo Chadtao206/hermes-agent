@@ -595,10 +595,10 @@ class PrecedenceTest(unittest.TestCase):
             m.STATE_BLOCKED,
         )
 
-    def test_aggregate_ignores_unknown_and_empty(self):
+    def test_aggregate_fails_closed_on_unknown_and_empty(self):
         self.assertIsNone(m.aggregate_state([]))
         self.assertIsNone(m.aggregate_state(["eyes"]))
-        self.assertEqual(m.aggregate_state(["eyes", m.STATE_ACTIVE]), m.STATE_ACTIVE)
+        self.assertIsNone(m.aggregate_state(["eyes", m.STATE_ACTIVE]))
 
     def test_multi_pr_same_post_aggregates_to_block(self):
         rows = [lane("t_ok", "done"), lane("t_bad", "done")]
@@ -1082,6 +1082,148 @@ class BorisMigrationTest(unittest.TestCase):
         process.assert_not_called()
         react.assert_not_called()
         save.assert_not_called()
+
+    def test_main_roundtrips_boris_style_without_changing_legacy_records(self):
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["posts"] = {
+            BORIS_PERMALINK: {
+                "emoji": "review-no",
+                "applied_at": NOW - 60,
+                "pending_removals": [],
+                "lanes": {"t_boris": "review-no"},
+                "source": "boris-transaction-fixture",
+            },
+            PERMALINK: {
+                "emoji": "doge_notes",
+                "applied_at": NOW - 60,
+                "pending_removals": [],
+                "lanes": {"t_legacy": "doge_notes"},
+                "source": "legacy-transaction-fixture",
+                "opaque": {"keep": ["deeply", "equal"]},
+            },
+        }
+        legacy_before = json.loads(json.dumps(initial["posts"][PERMALINK]))
+        row = lane("t_boris", "done", permalink=BORIS_PERMALINK)
+        shown = show("t_boris", {"verdict": "NEEDS_FIX"})
+        invocation = ["--backfill-existing", "--only-task", "t_boris"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "watchdog.json"
+            state_path.write_text(json.dumps(initial))
+
+            modern = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(m.time, "time", return_value=NOW),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[row]),
+                mock.patch.object(m, "kanban_show", return_value=shown),
+                mock.patch.object(m, "slack_reaction", modern),
+            ):
+                self.assertEqual(m.main(invocation), 0)
+            after_modern = json.loads(state_path.read_text())
+            self.assertEqual(modern.calls, [
+                (BORIS_PERMALINK, "face_vomiting", False),
+                (BORIS_PERMALINK, "review-no", True),
+            ])
+            self.assertEqual(after_modern["posts"][BORIS_PERMALINK]["state"], m.STATE_BLOCKED)
+            self.assertEqual(after_modern["posts"][BORIS_PERMALINK]["emoji"], "face_vomiting")
+            self.assertEqual(after_modern["posts"][PERMALINK], legacy_before)
+
+            legacy = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(m.time, "time", return_value=NOW + 1),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[row]),
+                mock.patch.object(m, "kanban_show", return_value=shown),
+                mock.patch.object(m, "slack_reaction", legacy),
+            ):
+                self.assertEqual(m.main([*invocation, "--boris-reaction-style", "legacy"]), 0)
+            after_legacy = json.loads(state_path.read_text())
+            self.assertEqual(legacy.calls, [
+                (BORIS_PERMALINK, "review-no", False),
+                (BORIS_PERMALINK, "face_vomiting", True),
+            ])
+            self.assertEqual(after_legacy["posts"][BORIS_PERMALINK]["state"], m.STATE_BLOCKED)
+            self.assertEqual(after_legacy["posts"][BORIS_PERMALINK]["emoji"], "review-no")
+            self.assertEqual(after_legacy["posts"][PERMALINK], legacy_before)
+
+            converged = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(m.time, "time", return_value=NOW + 2),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[row]),
+                mock.patch.object(m, "kanban_show", return_value=shown),
+                mock.patch.object(m, "slack_reaction", converged),
+            ):
+                self.assertEqual(m.main([*invocation, "--boris-reaction-style", "legacy"]), 0)
+            self.assertEqual(converged.calls, [])
+            self.assertEqual(json.loads(state_path.read_text())["posts"][PERMALINK], legacy_before)
+
+
+class UnknownPersistedLaneTest(unittest.TestCase):
+    def migrated_state(self):
+        state = m.migrate_state(None, NOW, backfill=True)[0]
+        state["posts"][PERMALINK] = {
+            "emoji": m.EMOJI_BLOCK,
+            "applied_at": NOW - 60,
+            "pending_removals": [],
+            "lanes": {
+                "t_unknown": "future-review-state",
+                "t_approved": m.EMOJI_APPROVED,
+            },
+        }
+        return m.migrate_state(json_roundtrip(state), NOW + 1)[0]
+
+    def test_unknown_persisted_lane_is_retained_and_holds_approved_sibling(self):
+        state = self.migrated_state()
+        record = state["posts"][PERMALINK]
+        self.assertEqual(record["lanes"]["t_unknown"], "future-review-state")
+        self.assertEqual(
+            m.hold_kind(record["unresolved_lanes"]["t_unknown"]),
+            m.HOLD_KIND_UNKNOWN,
+        )
+
+        held = tick([], {}, state=state, now=NOW + 2)
+        record = state["posts"][PERMALINK]
+        self.assertEqual(held["slack"].calls, [])
+        self.assertEqual(record["emoji"], m.EMOJI_BLOCK)
+        self.assertEqual(record["want"], m.EMOJI_APPROVED)
+        self.assertEqual(record["lanes"]["t_unknown"], "future-review-state")
+
+    def test_safe_reclassification_releases_unknown_persisted_lane(self):
+        state = self.migrated_state()
+        self.assertIn("t_unknown", state["posts"][PERMALINK]["unresolved_lanes"])
+        rows = [lane("t_unknown", "done", completed_at=NOW + 100)]
+        shows = {"t_unknown": show(
+            "t_unknown",
+            {"github_review_submitted": True, "github_review_state": "APPROVED", "findings": []},
+            ended_at=NOW + 100,
+        )}
+        healed = tick(rows, shows, state=state, now=NOW + 200)
+        self.assertEqual(healed["slack"].adds, [(PERMALINK, m.EMOJI_APPROVED)])
+        self.assertEqual(healed["slack"].removes, [(PERMALINK, m.EMOJI_BLOCK)])
+        record = state["posts"][PERMALINK]
+        self.assertNotIn("unresolved_lanes", record)
+        self.assertEqual(record["lanes"]["t_unknown"], m.EMOJI_APPROVED)
+
+    def test_explicit_clear_releases_unknown_hold_and_survives_restart(self):
+        state = self.migrated_state()
+        released = tick(
+            [],
+            {},
+            state=state,
+            now=NOW + 2,
+            clear_unresolved=[PERMALINK],
+        )
+        self.assertEqual(released["slack"].adds, [(PERMALINK, m.EMOJI_APPROVED)])
+        self.assertEqual(released["slack"].removes, [(PERMALINK, m.EMOJI_BLOCK)])
+        record = state["posts"][PERMALINK]
+        self.assertNotIn("unresolved_lanes", record)
+        self.assertEqual(record["lanes"]["t_unknown"], "future-review-state")
+        self.assertIn("t_unknown", record["cleared_lanes"])
+
+        restarted, _ = m.migrate_state(json_roundtrip(state), NOW + 3)
+        self.assertNotIn("unresolved_lanes", restarted["posts"][PERMALINK])
 
 
 # --- state migration / restart -------------------------------------------

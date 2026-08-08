@@ -1084,11 +1084,10 @@ def source_text(show: dict[str, Any]) -> str:
 
 
 def aggregate_state(states: Iterable[str]) -> str | None:
-    known = [normalize_review_state(state) for state in states]
-    known = [state for state in known if state in STATE_PRECEDENCE]
-    if not known:
+    normalized = [normalize_review_state(state) for state in states]
+    if not normalized or any(state is None for state in normalized):
         return None
-    return max(known, key=lambda state: STATE_PRECEDENCE[state])
+    return max(normalized, key=lambda state: STATE_PRECEDENCE[state])
 
 
 # --- reaction plumbing ----------------------------------------------------
@@ -1324,6 +1323,15 @@ def lane_states(record: object) -> dict[str, str]:
     }
 
 
+def unknown_lane_values(record: object) -> dict[str, object]:
+    lanes = record.get("lanes") if isinstance(record, dict) else None
+    return {
+        str(task_id): raw
+        for task_id, raw in (lanes.items() if isinstance(lanes, dict) else [])
+        if normalize_review_state(raw) is None
+    }
+
+
 def _new_state(now: int, *, backfill: bool = False) -> dict[str, Any]:
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1408,24 +1416,32 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
         if not isinstance(record, dict):
             state["posts"].pop(permalink, None)
             continue
-        if record_state(record) is None:
-            record["emoji"] = None
-            if not (normalize_review_state(record.get("want")) is not None or record.get("last_error")
-                    or record.get("pending_removals") or record.get("deferred_at")
-                    or record.get("unresolved_lanes") or record.get("cleared_lanes")):
-                state["posts"].pop(permalink, None)
-                continue
         lanes = record.get("lanes")
         record["lanes"] = {
             str(task): raw_state
             for task, raw_state in (lanes.items() if isinstance(lanes, dict) else [])
-            if normalize_review_state(raw_state) is not None
         }
+        unknown_lanes = unknown_lane_values(record)
+        if record_state(record) is None:
+            record["emoji"] = None
+            if not (normalize_review_state(record.get("want")) is not None or record.get("last_error")
+                    or record.get("pending_removals") or record.get("deferred_at")
+                    or record.get("unresolved_lanes") or record.get("cleared_lanes")
+                    or unknown_lanes):
+                state["posts"].pop(permalink, None)
+                continue
         record["pending_removals"] = [
             reaction
             for reaction in (record.get("pending_removals") or [])
             if reaction in owned_reactions(permalink)
         ]
+        record["cleared_lanes"] = {
+            str(task): _epoch(at)
+            for task, at in ((record.get("cleared_lanes") or {}).items()
+                             if isinstance(record.get("cleared_lanes"), dict) else [])
+        }
+        if not record["cleared_lanes"]:
+            record.pop("cleared_lanes", None)
         # A hold must survive a restart, so its provenance is normalized rather
         # than dropped; an unreadable value still counts as "held, reason lost".
         unresolved = record.get("unresolved_lanes")
@@ -1447,13 +1463,16 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
             record["unresolved_lanes"] = {
                 "unknown": "hold persisted without lane provenance (pre-provenance state)"
             }
-        record["cleared_lanes"] = {
-            str(task): _epoch(at)
-            for task, at in ((record.get("cleared_lanes") or {}).items()
-                             if isinstance(record.get("cleared_lanes"), dict) else [])
-        }
-        if not record["cleared_lanes"]:
-            record.pop("cleared_lanes", None)
+        for task_id, raw_state in unknown_lanes.items():
+            if task_id in record.get("cleared_lanes", {}):
+                continue
+            record.setdefault("unresolved_lanes", {}).setdefault(
+                task_id,
+                hold_provenance(
+                    HOLD_KIND_UNKNOWN,
+                    f"unknown persisted lane state: {raw_state!r}",
+                ),
+            )
     return state, notes
 
 
@@ -1601,6 +1620,7 @@ def process_tick(
     attempts: dict[str, Any] = cursor["attempts"]
     posts: dict[str, Any] = state["posts"]
     max_shows = int(getattr(args, "max_shows", MAX_SHOWS_PER_TICK) or MAX_SHOWS_PER_TICK)
+    cleared_posts: set[str] = set()
 
     # Operator escape hatch: explicitly release a hold an operator has classified by
     # hand. This is the only way a hold ends without the lane reclassifying, and it
@@ -1621,6 +1641,7 @@ def process_tick(
             record.pop("unresolved_lanes", None)
             record.pop("alerted_at", None)
             record.pop("deferred_at", None)
+            cleared_posts.add(permalink)
             outputs.append(
                 f"JUST_DO_IT_REVIEW_REACTIONS hold_cleared source={permalink} "
                 f"lanes={','.join(released) or 'unknown'} (operator override)"
@@ -1759,7 +1780,7 @@ def process_tick(
 
     # Evaluate posts with new information, plus any post still owing repair work or
     # a due post-convergence reconciliation sweep.
-    candidates = set(fresh) | set(quarantined) | set(unshowable)
+    candidates = set(fresh) | set(quarantined) | set(unshowable) | cleared_posts
     for permalink, record in posts.items():
         if not isinstance(record, dict):
             continue
@@ -1771,17 +1792,10 @@ def process_tick(
     for permalink in sorted(candidates):
         record = posts.get(permalink) if isinstance(posts.get(permalink), dict) else None
         semantic_lanes = lane_states(record)
+        unknown_lanes = unknown_lane_values(record)
         for task_id, contribution in (fresh.get(permalink) or {}).items():
             semantic_lanes[task_id] = contribution["state"]
         is_boris = source_channel(permalink) == BORIS_CHANNEL
-        persisted_lanes = (
-            semantic_lanes
-            if is_boris
-            else {
-                task_id: render_reaction(permalink, lane_state, "legacy")
-                for task_id, lane_state in semantic_lanes.items()
-            }
-        )
         # Persisted hold provenance, refreshed with anything found this tick. The
         # persisted set is authoritative: a held lane that is no longer rediscovered
         # (aged past --lookback-seconds, archived, or simply absent from this tick's
@@ -1803,8 +1817,18 @@ def process_tick(
         # Only a lane that was actually read and safely classified releases its hold.
         for task_id in resolved.get(permalink) or ():
             unresolved.pop(task_id, None)
+            unknown_lanes.pop(task_id, None)
         for task_id in set(quarantined.get(permalink) or {}) | set(resolved.get(permalink) or ()):
             cleared_lanes.pop(task_id, None)
+        persisted_lanes = (
+            dict(semantic_lanes)
+            if is_boris
+            else {
+                task_id: render_reaction(permalink, lane_state, "legacy")
+                for task_id, lane_state in semantic_lanes.items()
+            }
+        )
+        persisted_lanes.update(unknown_lanes)
         desired_state = aggregate_state(list(semantic_lanes.values()))
         desired_reaction = (
             render_reaction(permalink, desired_state, args.boris_reaction_style)
