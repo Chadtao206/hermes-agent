@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from cron import jobs as cron_jobs
+from scripts.ops import retire_just_do_it_crons as retirement_controller
 from scripts.ops.retire_just_do_it_crons import (
     Manifest,
     Paths,
@@ -23,6 +24,7 @@ from scripts.ops.retire_just_do_it_crons import (
     preflight,
     rehearse_reaction_roundtrip,
     rollback,
+    main as controller_main,
     verify_quiescent,
     verify_retired,
 )
@@ -242,6 +244,9 @@ class RetirementFixture:
         (self.paths.state_dir / "boris_intake_audit.jsonl").write_text(
             '{"event":"changed"}\n'
         )
+        (
+            self.paths.source_root / "tests" / "cron" / "boris_intake" / "test_daemon.py"
+        ).write_text("changed durable Boris test\n")
         return manifest
 
     def reaction_matches_latest_checkpoint(self) -> bool:
@@ -250,9 +255,13 @@ class RetirementFixture:
         ).read_text() == "reaction live\n"
 
     def boris_matches_latest_checkpoint(self) -> bool:
-        return (
+        live_matches = (
             self.paths.live_scripts / "boris_intake" / "slack_io.py"
         ).read_text() == "boris live slack\n"
+        test_matches = (
+            self.paths.source_root / "tests" / "cron" / "boris_intake" / "test_daemon.py"
+        ).read_text() == "durable boris test\n"
+        return live_matches and test_matches
 
     def legacy_reaction_records(self) -> dict:
         state = json.loads(self.reaction_state_path.read_text())
@@ -671,3 +680,239 @@ def test_failed_second_removal_restores_everything_and_can_retry(
         retirement_fixture.paths, recovered, recovered.cutoff_epoch + 182
     )
     assert {job["id"] for job in retirement_fixture.read_jobs()} == {RETAIN_ID}
+
+
+def test_quiescence_rejects_an_unparseable_claim_timestamp(retirement_fixture):
+    manifest = retirement_fixture.preflight_and_pause()
+    retirement_fixture.insert_execution(
+        "ee4582d0598f",
+        status="completed",
+        claimed_at="not-an-iso-timestamp",
+    )
+    errors = verify_quiescent(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+    assert any("invalid claimed_at" in error for error in errors)
+
+
+def test_finalize_revalidates_the_paused_job_fingerprint(retirement_fixture):
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    next(job for job in jobs if job["id"] == "ee4582d0598f")["name"] = "drifted"
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="fingerprint mismatch"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+    assert all(path.exists() for path in retirement_fixture.retired_live_paths())
+    assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
+
+
+def test_boris_verification_rejects_source_or_watermark_regression(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    manifest = checkpoint_component(
+        retirement_fixture.paths,
+        manifest,
+        "boris-intake",
+        manifest.cutoff_epoch + 210,
+    )
+    audit = retirement_fixture.paths.state_dir / "boris_intake_audit.jsonl"
+    audit.write_text(audit.read_text() + '{"event":"ordinary-new-intake"}\n')
+    heartbeat = retirement_fixture.paths.state_dir / "boris_intake_heartbeat"
+    heartbeat.write_text("200\n")
+    checkpoint_mtime = manifest.component_checkpoints["boris-intake"][-1][
+        "heartbeat_mtime"
+    ]
+    os.utime(heartbeat, (checkpoint_mtime + 5, checkpoint_mtime + 5))
+    (
+        retirement_fixture.paths.state_dir
+        / "boris_intake_watermark_C0BPCKPEFCG.txt"
+    ).write_text("0.5\n")
+    (
+        retirement_fixture.paths.live_scripts / "boris_intake" / "daemon.py"
+    ).write_text("not the versioned Boris daemon\n")
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+    assert any("Boris source" in error for error in errors)
+    assert any("Boris watermark regressed" in error for error in errors)
+
+
+def test_failed_second_pause_restores_preflight_records_and_can_retry(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_only()
+    original = retirement_fixture.read_jobs()
+    real_pause = cron_jobs.pause_job
+
+    def fail_second(job_id, reason=None):
+        if job_id == "ff865c33c5ea":
+            raise OSError("injected second pause failure")
+        return real_pause(job_id, reason=reason)
+
+    monkeypatch.setattr(cron_jobs, "pause_job", fail_second)
+    with pytest.raises(OSError, match="injected second pause failure"):
+        pause_producers(retirement_fixture.paths, manifest, retirement_fixture.now + 1)
+    assert retirement_fixture.read_jobs() == original
+    assert manifest.phase == "preflight"
+    assert manifest.cutoff_epoch is None
+
+    monkeypatch.setattr(cron_jobs, "pause_job", real_pause)
+    paused = pause_producers(
+        retirement_fixture.paths, manifest, retirement_fixture.now + 2
+    )
+    assert paused.phase == "paused"
+
+
+def test_rollback_does_not_restore_an_unchanged_boris_component(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    manifest = checkpoint_component(
+        retirement_fixture.paths,
+        manifest,
+        "boris-intake",
+        manifest.cutoff_epoch + 210,
+    )
+    config = retirement_fixture.paths.hermes_home / "config.yaml"
+    config.write_text(
+        "boris_intake:\n  mode: live\n  unrelated_operator_setting: preserve-me\n"
+    )
+
+    rollback(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+    assert "unrelated_operator_setting: preserve-me" in config.read_text()
+    assert "boris-intake" not in manifest.changed_components
+
+
+def test_verify_retired_reports_a_non_finite_boris_watermark(retirement_fixture):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    manifest = checkpoint_component(
+        retirement_fixture.paths,
+        manifest,
+        "boris-intake",
+        manifest.cutoff_epoch + 210,
+    )
+    heartbeat = retirement_fixture.paths.state_dir / "boris_intake_heartbeat"
+    checkpoint_mtime = manifest.component_checkpoints["boris-intake"][-1][
+        "heartbeat_mtime"
+    ]
+    os.utime(heartbeat, (checkpoint_mtime + 5, checkpoint_mtime + 5))
+    (
+        retirement_fixture.paths.state_dir
+        / "boris_intake_watermark_C0BPCKPEFCG.txt"
+    ).write_text("NaN\n")
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+    assert any("invalid Boris watermark" in error for error in errors)
+
+
+def test_cli_mutating_commands_are_dry_run_without_apply(
+    retirement_fixture, capsys
+):
+    manifest = retirement_fixture.preflight_only()
+    manifest_path = str(manifest.manifest_path)
+
+    jobs_before = retirement_fixture.paths.jobs_path.read_bytes()
+    manifest_before = manifest.manifest_path.read_bytes()
+    assert controller_main(["pause", "--manifest", manifest_path]) == 0
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
+
+    manifest = pause_producers(
+        retirement_fixture.paths, manifest, retirement_fixture.now + 1
+    )
+    jobs_before = retirement_fixture.paths.jobs_path.read_bytes()
+    manifest_before = manifest.manifest_path.read_bytes()
+    assert controller_main(
+        [
+            "finalize",
+            "--manifest",
+            manifest_path,
+            "--now-epoch",
+            str(manifest.cutoff_epoch + 181),
+        ]
+    ) == 0
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
+
+    manifest = finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        cron_jobs.pause_job(RETAIN_ID, reason="installation lock")
+    jobs_before = retirement_fixture.paths.jobs_path.read_bytes()
+    manifest_before = manifest.manifest_path.read_bytes()
+    archive_before = _hash_tree(manifest.archive_dir)
+    assert controller_main(
+        [
+            "checkpoint",
+            "--manifest",
+            manifest_path,
+            "--component",
+            "retained-reaction",
+        ]
+    ) == 0
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
+    assert _hash_tree(manifest.archive_dir) == archive_before
+
+    assert controller_main(["rollback", "--manifest", manifest_path]) == 0
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
+    assert _hash_tree(manifest.archive_dir) == archive_before
+    assert '"apply": false' in capsys.readouterr().out
+
+
+def test_cli_rejects_now_override_for_the_designated_live_home(
+    tmp_path, monkeypatch, capsys
+):
+    designated_live = tmp_path / "designated-live"
+    monkeypatch.setattr(retirement_controller, "LIVE_HOME", designated_live.resolve())
+
+    assert controller_main(
+        [
+            "preflight",
+            "--hermes-home",
+            str(designated_live),
+            "--source-root",
+            str(tmp_path / "source"),
+            "--now-epoch",
+            "1",
+        ]
+    ) == 2
+    assert "--now-epoch is forbidden" in capsys.readouterr().out
+    assert not designated_live.exists()
+
+
+def test_completed_rollback_is_idempotent_without_replaying_component_restore(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    manifest = retirement_fixture.checkpoint_and_change_boris(manifest)
+    manifest = rollback(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+    assert set(manifest.changed_components) == {
+        "retained-reaction",
+        "boris-intake",
+    }
+    config = retirement_fixture.paths.hermes_home / "config.yaml"
+    config.write_text("unrelated_after_completed_rollback: preserve-me\n")
+
+    rollback(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 300
+    )
+    assert config.read_text() == "unrelated_after_completed_rollback: preserve-me\n"
