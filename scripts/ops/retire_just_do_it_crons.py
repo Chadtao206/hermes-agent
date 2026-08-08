@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from cron import jobs as cron_jobs
+from gateway.status import get_process_start_time
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 
 RETIRE = {
@@ -51,8 +53,8 @@ DEPRECATED_CREATOR = "just-do-it-blocked-review-requeue-watchdog"
 DEPRECATED_IDEMPOTENCY_PREFIX = "just-do-it-rereview:"
 
 BORIS_CHANNEL = "C0BPCKPEFCG"
+BORIS_LAUNCHD_LABEL = "ai.hermes.boris-intake"
 LEGACY_CHANNELS = ("C08K8FQKX9S", "C07BU8AAPB3", "C09339EGZ9U")
-LIVE_HOME = Path("/Users/ctao/.hermes")
 ENTRYPOINTS = {
     "retired-channel-script": "slack_channel_watch.py",
     "retired-channel-test": "test_slack_channel_watch.py",
@@ -67,6 +69,20 @@ class RetirementError(RuntimeError):
 
 def _resolved(value: Path | str) -> Path:
     return Path(value).expanduser().resolve()
+
+
+def _is_live_home(path: Path | str) -> bool:
+    """Return whether a home is the current/default home or a real profile."""
+    home = _resolved(path)
+    current = _resolved(get_hermes_home())
+    default = _resolved(get_default_hermes_root())
+    if home in {current, default}:
+        return True
+    try:
+        relative = home.relative_to(default / "profiles")
+    except ValueError:
+        return False
+    return bool(relative.parts)
 
 
 @dataclass(frozen=True)
@@ -84,11 +100,22 @@ class Paths:
     # Hermetic tests and isolated rehearsals provide a JSON process census.
     # Production may omit it and use the OS process table.
     process_listing_path: Optional[Path] = None
+    boris_service_status_path: Optional[Path] = None
 
     def __post_init__(self) -> None:
         home = _resolved(self.hermes_home)
         source = _resolved(self.source_root)
         archive = _resolved(self.archive_root)
+        if self.boris_launchd_plist is None:
+            plist_root = Path.home() if _is_live_home(home) else home
+            plist_default = (
+                plist_root
+                / "Library"
+                / "LaunchAgents"
+                / f"{BORIS_LAUNCHD_LABEL}.plist"
+            )
+        else:
+            plist_default = self.boris_launchd_plist
         defaults = {
             "hermes_home": home,
             "source_root": source,
@@ -99,10 +126,7 @@ class Paths:
             "live_scripts": home / "scripts",
             "state_dir": home / "state",
             "cron_output": home / "cron" / "output",
-            "boris_launchd_plist": Path.home()
-            / "Library"
-            / "LaunchAgents"
-            / "ai.hermes.boris-intake.plist",
+            "boris_launchd_plist": plist_default,
         }
         for name, default in defaults.items():
             raw = getattr(self, name)
@@ -110,6 +134,12 @@ class Paths:
         if self.process_listing_path is not None:
             object.__setattr__(
                 self, "process_listing_path", _resolved(self.process_listing_path)
+            )
+        if self.boris_service_status_path is not None:
+            object.__setattr__(
+                self,
+                "boris_service_status_path",
+                _resolved(self.boris_service_status_path),
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -355,6 +385,26 @@ def _copy_preserving(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)
 
 
+def _atomic_write_bytes(path: Path, payload: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _snapshot(source: Path, destination: Path) -> FileFingerprint:
     before = _fingerprint(source, destination)
     _copy_preserving(source, destination)
@@ -496,6 +546,17 @@ def _validate_job_fingerprints(paths: Paths, selected: Mapping[str, dict[str, An
         )
 
 
+def _validate_preflight_job_selection(
+    paths: Paths,
+    manifest: Manifest,
+    selected: Mapping[str, dict[str, Any]],
+) -> None:
+    for job_id, expected in manifest.jobs.items():
+        if selected.get(job_id) != expected:
+            raise RetirementError(f"job {job_id} drifted after preflight")
+    _validate_job_fingerprints(paths, selected)
+
+
 def _connect_readonly(path: Path) -> sqlite3.Connection:
     if not path.is_file():
         raise RetirementError(f"required SQLite database is missing: {path}")
@@ -607,11 +668,11 @@ def _legacy_projection(raw: Any) -> dict[str, Any]:
     legacy_posts = {
         key: value for key, value in posts.items() if f"/{BORIS_CHANNEL}/" not in key
     }
-    legacy_reacted = {
-        key: value
-        for key, value in reacted.items()
-        if f"/{BORIS_CHANNEL}/" not in json.dumps(value, sort_keys=True)
-    }
+    legacy_reacted: dict[str, Any] = {}
+    for key, value in reacted.items():
+        permalink = key.split(":", 1)[1] if isinstance(key, str) and ":" in key else ""
+        if f"/{BORIS_CHANNEL}/" not in permalink:
+            legacy_reacted[key] = value
     return {"posts": legacy_posts, "reacted": legacy_reacted}
 
 
@@ -765,15 +826,31 @@ def _assert_manifest_paths(paths: Paths, manifest: Manifest) -> None:
 def pause_producers(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
     """Pause only the two exact producers and record cutoff after verification."""
     _assert_manifest_paths(paths, manifest)
-    if manifest.phase not in {"preflight", "paused"}:
+    if manifest.phase == "paused":
+        _validate_paused_registry(paths, manifest)
+        return manifest
+    if manifest.phase != "preflight":
         raise RetirementError(f"cannot pause from manifest phase {manifest.phase}")
+    manifest_bytes = manifest.manifest_path.read_bytes()
+    manifest_mode = stat.S_IMODE(manifest.manifest_path.stat().st_mode)
+    manifest_state = (
+        manifest.phase,
+        manifest.cutoff_epoch,
+        manifest.cutoff_iso,
+    )
     with cron_jobs.use_cron_store(paths.hermes_home):
         with cron_jobs._jobs_lock():
             original_jobs = copy.deepcopy(cron_jobs.load_jobs())
-            jobs_before = {job["id"]: job for job in original_jobs}
-            for job_id in RETIRE:
-                if jobs_before.get(job_id) != manifest.jobs[job_id] and manifest.phase == "preflight":
-                    raise RetirementError(f"job {job_id} drifted after preflight")
+            selected: dict[str, dict[str, Any]] = {}
+            for wanted in (*sorted(RETIRE), RETAIN_ID):
+                matches = [job for job in original_jobs if job.get("id") == wanted]
+                if len(matches) != 1:
+                    raise RetirementError(
+                        "job fingerprint mismatch: expected exactly one record "
+                        f"for {wanted}"
+                    )
+                selected[wanted] = copy.deepcopy(matches[0])
+            _validate_preflight_job_selection(paths, manifest, selected)
             try:
                 for job_id in sorted(RETIRE):
                     updated = cron_jobs.pause_job(
@@ -781,37 +858,57 @@ def pause_producers(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
                     )
                     if updated is None:
                         raise RetirementError(f"exact retiring job disappeared: {job_id}")
+                current = {job["id"]: job for job in cron_jobs.load_jobs()}
+                for job_id in RETIRE:
+                    job = current.get(job_id)
+                    if (
+                        not job
+                        or job.get("enabled") is not False
+                        or job.get("state") != "paused"
+                    ):
+                        raise RetirementError(
+                            f"failed to verify exact paused state for {job_id}"
+                        )
+                if current.get(RETAIN_ID) != manifest.jobs[RETAIN_ID]:
+                    raise RetirementError("retained job changed while pausing producers")
+                cutoff = _epoch(now)
+                manifest.cutoff_epoch = cutoff
+                manifest.cutoff_iso = _iso(cutoff)
+                manifest.phase = "paused"
+                manifest.save()
             except BaseException as pause_error:
+                manifest.phase, manifest.cutoff_epoch, manifest.cutoff_iso = manifest_state
+                restore_errors: list[BaseException] = []
                 try:
                     cron_jobs.save_jobs(original_jobs)
-                except BaseException as restore_error:
+                except BaseException as exc:
+                    restore_errors.append(exc)
+                try:
+                    _atomic_write_bytes(
+                        manifest.manifest_path, manifest_bytes, manifest_mode
+                    )
+                except BaseException as exc:
+                    restore_errors.append(exc)
+                if restore_errors:
                     raise RetirementError(
-                        "producer pause failed and exact preflight records could not be restored"
-                    ) from restore_error
+                        "producer pause failed and exact preflight state could not be restored"
+                    ) from restore_errors[0]
                 raise pause_error
-            current = {job["id"]: job for job in cron_jobs.load_jobs()}
-            for job_id in RETIRE:
-                job = current.get(job_id)
-                if not job or job.get("enabled") is not False or job.get("state") != "paused":
-                    raise RetirementError(f"failed to verify exact paused state for {job_id}")
-            if current.get(RETAIN_ID) != manifest.jobs[RETAIN_ID]:
-                raise RetirementError("retained job changed while pausing producers")
-    cutoff = _epoch(now)
-    manifest.cutoff_epoch = cutoff
-    manifest.cutoff_iso = _iso(cutoff)
-    manifest.phase = "paused"
-    manifest.save()
     return manifest
 
 
 def _load_process_listing(paths: Paths) -> list[dict[str, Any]]:
     if paths.process_listing_path is not None:
+        if _is_live_home(paths.hermes_home):
+            raise RetirementError(
+                "--process-listing-path is forbidden for a live Hermes home"
+            )
         raw = json.loads(paths.process_listing_path.read_text(encoding="utf-8"))
         if not isinstance(raw, list) or not all(isinstance(row, dict) for row in raw):
             raise RetirementError("injected process listing must be a JSON list of objects")
         return [{**row, "_injected": True} for row in raw]
     result = subprocess.run(
-        ["ps", "-axo", "pid=,lstart=,command="],
+        ["ps", "-axo", "pid=,command="],
         text=True,
         capture_output=True,
         check=False,
@@ -819,24 +916,72 @@ def _load_process_listing(paths: Paths) -> list[dict[str, Any]]:
     if result.returncode != 0:
         raise RetirementError("unable to obtain process listing")
     rows: list[dict[str, Any]] = []
-    pattern = re.compile(
-        r"^\s*(\d+)\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+(.*)$"
-    )
+    pattern = re.compile(r"^\s*(\d+)\s+(.*)$")
     for line in result.stdout.splitlines():
         match = pattern.match(line)
         if not match:
             continue
-        try:
-            started = int(
-                datetime.strptime(match.group(2), "%a %b %d %H:%M:%S %Y")
-                .timestamp()
-            )
-        except ValueError:
-            continue
+        pid = int(match.group(1))
         rows.append(
-            {"pid": int(match.group(1)), "started_at": started, "command": match.group(3)}
+            {
+                "pid": pid,
+                "started_at": get_process_start_time(pid),
+                "command": match.group(2),
+            }
         )
     return rows
+
+
+def _launchd_pid(output: str) -> Optional[int]:
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('"PID"') or stripped.startswith("PID"):
+            raw = stripped.split("=", 1)[-1].strip().rstrip(";").strip('"')
+            try:
+                pid = int(raw)
+            except ValueError:
+                return None
+            return pid if pid > 0 else None
+        parts = stripped.split()
+        if len(parts) >= 3 and parts[-1] == BORIS_LAUNCHD_LABEL:
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                return None
+            return pid if pid > 0 else None
+    return None
+
+
+def _load_boris_service_status(paths: Paths) -> dict[str, Any]:
+    if paths.boris_service_status_path is not None:
+        if _is_live_home(paths.hermes_home):
+            raise RetirementError(
+                "--boris-service-status-path is forbidden for a live Hermes home"
+            )
+        raw = json.loads(
+            paths.boris_service_status_path.read_text(encoding="utf-8")
+        )
+        if not isinstance(raw, dict):
+            raise RetirementError(
+                "injected Boris service status must be a JSON object"
+            )
+        return raw
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", BORIS_LAUNCHD_LABEL],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise RetirementError(f"unable to query Boris launchd service: {exc}") from exc
+    pid = _launchd_pid(result.stdout) if result.returncode == 0 else None
+    return {
+        "label": BORIS_LAUNCHD_LABEL,
+        "state": "running" if pid is not None else "stopped",
+        "pid": pid,
+    }
 
 
 def _command_basenames(command: str) -> set[str]:
@@ -985,24 +1130,43 @@ def _quiescent_sources(paths: Paths) -> dict[str, Path]:
     return sources
 
 
-def _restore_registry_records(paths: Paths, manifest: Manifest) -> None:
+def _load_registry_snapshot(manifest: Manifest) -> list[dict[str, Any]]:
+    fingerprint = manifest.files["jobs-registry"]
+    _require_match(fingerprint, fingerprint.archive_path)
+    raw_snapshot = json.loads(fingerprint.archive_path.read_text(encoding="utf-8"))
+    original = raw_snapshot.get("jobs", raw_snapshot)
+    if not isinstance(original, list) or not all(
+        isinstance(job, dict) for job in original
+    ):
+        raise RetirementError("backed-up jobs registry is invalid")
+    original_by_id = {str(job.get("id")): job for job in original}
+    for job_id, expected in manifest.jobs.items():
+        if original_by_id.get(job_id) != expected:
+            raise RetirementError(
+                f"backed-up jobs registry record differs for {job_id}"
+            )
+    return copy.deepcopy(original)
+
+
+def _restore_registry_with_records(
+    paths: Paths,
+    manifest: Manifest,
+    protected_records: Mapping[str, dict[str, Any]],
+) -> None:
+    original = _load_registry_snapshot(manifest)
+    protected = set(RETIRE) | {RETAIN_ID}
+    if set(protected_records) != protected:
+        raise RetirementError("protected registry restore set is incomplete")
     with cron_jobs.use_cron_store(paths.hermes_home):
         with cron_jobs._jobs_lock():
             current = cron_jobs.load_jobs()
             current_by_id = {str(job.get("id")): job for job in current}
-            raw_snapshot = json.loads(
-                manifest.files["jobs-registry"].archive_path.read_text(encoding="utf-8")
-            )
-            original = raw_snapshot.get("jobs", raw_snapshot)
-            if not isinstance(original, list):
-                raise RetirementError("backed-up jobs registry is invalid")
             rebuilt: list[dict[str, Any]] = []
             seen: set[str] = set()
-            protected = set(RETIRE) | {RETAIN_ID}
             for old in original:
                 old_id = str(old.get("id"))
                 if old_id in protected:
-                    rebuilt.append(copy.deepcopy(manifest.jobs[old_id]))
+                    rebuilt.append(copy.deepcopy(protected_records[old_id]))
                     seen.add(old_id)
                 elif old_id in current_by_id:
                     rebuilt.append(copy.deepcopy(current_by_id[old_id]))
@@ -1012,24 +1176,29 @@ def _restore_registry_records(paths: Paths, manifest: Manifest) -> None:
                 if current_id not in seen:
                     rebuilt.append(copy.deepcopy(current_job))
             cron_jobs.save_jobs(rebuilt)
-
-
-def _restore_paused_registry(paths: Paths, manifest: Manifest) -> None:
-    """Compensate a partial finalize without ever re-enabling producers."""
-    _restore_registry_records(paths, manifest)
-    with cron_jobs.use_cron_store(paths.hermes_home):
-        with cron_jobs._jobs_lock():
-            for job_id in sorted(RETIRE):
-                updated = cron_jobs.pause_job(
-                    job_id, reason="guarded just-do-it retirement"
-                )
-                if updated is None:
+            restored = {str(job.get("id")): job for job in cron_jobs.load_jobs()}
+            for job_id, expected in protected_records.items():
+                if restored.get(job_id) != expected:
                     raise RetirementError(
-                        f"failed to restore paused producer after finalize abort: {job_id}"
+                        f"job record not restored exactly: {job_id}"
                     )
-            current = {job["id"]: job for job in cron_jobs.load_jobs()}
-            for job_id in RETIRE:
-                _validate_paused_retiring_record(paths, job_id, current[job_id])
+
+
+def _restore_registry_records(paths: Paths, manifest: Manifest) -> None:
+    _restore_registry_with_records(paths, manifest, manifest.jobs)
+
+
+def _restore_paused_registry(
+    paths: Paths,
+    manifest: Manifest,
+    paused_records: Mapping[str, dict[str, Any]],
+) -> None:
+    """Compensate a partial finalize without ever re-enabling producers."""
+    for job_id in RETIRE:
+        _validate_paused_retiring_record(paths, job_id, paused_records[job_id])
+    if paused_records.get(RETAIN_ID) != manifest.jobs[RETAIN_ID]:
+        raise RetirementError("retained job changed before finalize compensation")
+    _restore_registry_with_records(paths, manifest, paused_records)
 
 
 def _protect_remove_output(paths: Paths, manifest: Manifest, job_id: str) -> None:
@@ -1087,7 +1256,9 @@ def _validate_paused_retiring_record(
         )
 
 
-def _validate_paused_registry(paths: Paths, manifest: Manifest) -> None:
+def _validate_paused_registry(
+    paths: Paths, manifest: Manifest
+) -> dict[str, dict[str, Any]]:
     jobs = _load_jobs(paths)
     for job_id in RETIRE:
         job = jobs.get(job_id)
@@ -1098,10 +1269,15 @@ def _validate_paused_registry(paths: Paths, manifest: Manifest) -> None:
         _validate_paused_retiring_record(paths, job_id, job)
     if jobs.get(RETAIN_ID) != manifest.jobs[RETAIN_ID]:
         raise RetirementError("retained job fingerprint mismatch before finalize")
+    return {
+        job_id: copy.deepcopy(jobs[job_id])
+        for job_id in (*sorted(RETIRE), RETAIN_ID)
+    }
 
 
-def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
-    """Archive exact entrypoints and remove exact jobs after quiescence proof."""
+def _validate_finalize_plan(
+    paths: Paths, manifest: Manifest, now: Any
+) -> Optional[dict[str, dict[str, Any]]]:
     _assert_manifest_paths(paths, manifest)
     errors = verify_quiescent(paths, manifest, now)
     if errors:
@@ -1111,9 +1287,30 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
     if manifest.phase == "finalized":
         retired_errors = verify_retired(paths, manifest, now)
         if retired_errors:
-            raise RetirementError("finalized manifest no longer verifies: " + "; ".join(retired_errors))
+            raise RetirementError(
+                "finalized manifest no longer verifies: "
+                + "; ".join(retired_errors)
+            )
+        return None
+    paused_records = _validate_paused_registry(paths, manifest)
+    for key in ENTRYPOINTS:
+        _require_match(manifest.files[key])
+    for source in _quiescent_sources(paths).values():
+        _measure(source)
+    for job_id in RETIRE:
+        protected = manifest.archive_dir / "protected-output" / job_id
+        if protected.exists():
+            raise RetirementError(
+                f"protected output staging path already exists: {protected}"
+            )
+    return paused_records
+
+
+def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
+    """Archive exact entrypoints and remove exact jobs after quiescence proof."""
+    paused_records = _validate_finalize_plan(paths, manifest, now)
+    if paused_records is None:
         return manifest
-    _validate_paused_registry(paths, manifest)
 
     quiescent_base = manifest.archive_dir / f"quiescent-{_epoch(now)}"
     quiescent_dir = quiescent_base
@@ -1130,9 +1327,13 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
         for job_id in RETIRE
     }
     manifest.save()
+    paused_manifest_bytes = manifest.manifest_path.read_bytes()
+    paused_manifest_mode = stat.S_IMODE(manifest.manifest_path.stat().st_mode)
+    paused_phase = manifest.phase
+    paused_finalized_epoch = manifest.finalized_epoch
+    paused_finalized_iso = manifest.finalized_iso
 
     moved: list[tuple[Path, Path, str, FileFingerprint]] = []
-    removed: list[str] = []
     try:
         for key in ENTRYPOINTS:
             fingerprint = manifest.files[key]
@@ -1149,22 +1350,40 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
 
         for job_id in sorted(RETIRE):
             _protect_remove_output(paths, manifest, job_id)
-            removed.append(job_id)
-    except BaseException:
-        if removed:
-            _restore_paused_registry(paths, manifest)
-        for active, archived, key, original_fingerprint in reversed(moved):
-            if archived.exists() and not active.exists():
-                os.replace(archived, active)
-            manifest.files[key] = original_fingerprint
+        completed = _epoch(now)
+        manifest.finalized_epoch = completed
+        manifest.finalized_iso = _iso(completed)
+        manifest.phase = "finalized"
         manifest.save()
-        raise
-
-    completed = _epoch(now)
-    manifest.finalized_epoch = completed
-    manifest.finalized_iso = _iso(completed)
-    manifest.phase = "finalized"
-    manifest.save()
+    except BaseException as finalize_error:
+        compensation_errors: list[BaseException] = []
+        try:
+            _restore_paused_registry(paths, manifest, paused_records)
+        except BaseException as exc:
+            compensation_errors.append(exc)
+        for active, archived, key, original_fingerprint in reversed(moved):
+            try:
+                if archived.exists() and not active.exists():
+                    os.replace(archived, active)
+            except BaseException as exc:
+                compensation_errors.append(exc)
+            manifest.files[key] = original_fingerprint
+        manifest.phase = paused_phase
+        manifest.finalized_epoch = paused_finalized_epoch
+        manifest.finalized_iso = paused_finalized_iso
+        try:
+            _atomic_write_bytes(
+                manifest.manifest_path,
+                paused_manifest_bytes,
+                paused_manifest_mode,
+            )
+        except BaseException as exc:
+            compensation_errors.append(exc)
+        if compensation_errors:
+            raise RetirementError(
+                "finalize failed and exact paused-state compensation failed"
+            ) from compensation_errors[0]
+        raise finalize_error
     return manifest
 
 
@@ -1313,8 +1532,18 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
                        WHERE job_id IN (?, ?) AND unixepoch(claimed_at) > ?""",
                     (*sorted(RETIRE), manifest.cutoff_epoch),
                 ).fetchone()[0]
+                invalid_timestamps = connection.execute(
+                    """SELECT job_id, claimed_at FROM executions
+                       WHERE job_id IN (?, ?) AND unixepoch(claimed_at) IS NULL""",
+                    tuple(sorted(RETIRE)),
+                ).fetchall()
             if count:
                 errors.append(f"retired jobs have {count} post-cutoff executions")
+            for row in invalid_timestamps:
+                errors.append(
+                    f"execution {row['job_id']} has an invalid claimed_at timestamp: "
+                    f"{row['claimed_at']}"
+                )
         except (sqlite3.Error, RetirementError) as exc:
             errors.append(f"execution verification failed: {exc}")
     try:
@@ -1392,11 +1621,18 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
         except (OSError, ValueError, KeyError) as exc:
             errors.append(f"Boris heartbeat verification failed: {exc}")
         try:
-            processes = _load_process_listing(paths)
-            if not any("boris_intake" in str(row.get("command") or "") for row in processes):
-                errors.append("Boris launchd process is not running")
+            service = _load_boris_service_status(paths)
+            pid = service.get("pid")
+            if (
+                service.get("label") != BORIS_LAUNCHD_LABEL
+                or service.get("state") != "running"
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+            ):
+                errors.append("exact Boris launchd service is not running")
         except (OSError, ValueError, json.JSONDecodeError, RetirementError) as exc:
-            errors.append(f"Boris process verification failed: {exc}")
+            errors.append(f"Boris service verification failed: {exc}")
     return errors
 
 
@@ -1466,9 +1702,21 @@ def checkpoint_component(
             "job": copy.deepcopy(retained),
             "files": {key: value.to_dict() for key, value in fingerprints.items()},
         }
+        reaction_raw = json.loads(
+            (paths.state_dir / "just_do_it_review_reactions.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        refreshed_legacy_hash = _json_hash(_legacy_projection(reaction_raw))
+        record["legacy_reaction_projection_sha256"] = refreshed_legacy_hash
+        manifest.legacy_reaction_projection_sha256 = refreshed_legacy_hash
     else:
         sources = {
             "boris-live-source": paths.live_scripts / "boris_intake",
+            "boris-versioned-source": paths.source_root
+            / "cron"
+            / "scripts"
+            / "boris_intake",
             "boris-versioned-tests": paths.source_root / "tests" / "cron" / "boris_intake",
             "boris-audit": paths.state_dir / "boris_intake_audit.jsonl",
             "boris-watermark": paths.state_dir
@@ -1568,14 +1816,50 @@ def _component_primary_changed(
             )
         )
     if component == "boris-intake":
-        source = fingerprints["boris-live-source"]
-        try:
-            return _source_tree_hashes(source.archive_path) != _source_tree_hashes(
-                source.active_path
-            )
-        except OSError:
-            return True
+        install_surfaces = (
+            "boris-live-source",
+            "boris-versioned-source",
+            "boris-versioned-tests",
+            "config",
+            "boris-launchd-plist",
+        )
+        return any(not _matches(fingerprints[key]) for key in install_surfaces)
     raise RetirementError(f"unknown checkpoint component: {component}")
+
+
+def _validate_rollback_plan(
+    paths: Paths, manifest: Manifest
+) -> set[str]:
+    _assert_manifest_paths(paths, manifest)
+    _load_registry_snapshot(manifest)
+    for key in ENTRYPOINTS:
+        fingerprint = manifest.files[key]
+        if not _matches(fingerprint, fingerprint.archive_path):
+            raise RetirementError(
+                "refusing job restore because source archive hash differs: "
+                f"{fingerprint.archive_path}"
+            )
+
+    planned = set(manifest.changed_components)
+    for component in ("retained-reaction", "boris-intake"):
+        checkpoints = manifest.component_checkpoints.get(component, [])
+        if checkpoints and _component_primary_changed(component, checkpoints[-1]):
+            planned.add(component)
+    for component in planned:
+        checkpoints = manifest.component_checkpoints.get(component, [])
+        if not checkpoints:
+            raise RetirementError(
+                f"changed component has no completed checkpoint: {component}"
+            )
+        fingerprints = _checkpoint_files(checkpoints[-1])
+        for fingerprint in fingerprints.values():
+            _require_match(fingerprint, fingerprint.archive_path)
+        if component == "boris-intake" and not _file_prefix_matches(
+            fingerprints["boris-audit"].archive_path,
+            fingerprints["boris-audit"].active_path,
+        ):
+            raise RetirementError("Boris audit continuity failed before rollback")
+    return planned
 
 
 def rollback(
@@ -1593,6 +1877,7 @@ def rollback(
                 "completed rollback no longer verifies: " + "; ".join(errors)
             )
         return manifest
+    planned_components = _validate_rollback_plan(paths, manifest)
     emit = event or (lambda _name: None)
 
     for key in ENTRYPOINTS:
@@ -1609,13 +1894,8 @@ def rollback(
     emit("sources_restored")
 
     marker_changed = False
-    for component in ("retained-reaction", "boris-intake"):
-        checkpoints = manifest.component_checkpoints.get(component, [])
-        if not checkpoints:
-            continue
-        if component not in manifest.changed_components and _component_primary_changed(
-            component, checkpoints[-1]
-        ):
+    for component in sorted(planned_components):
+        if component not in manifest.changed_components:
             manifest.changed_components.append(component)
             marker_changed = True
     if marker_changed:
@@ -1627,8 +1907,15 @@ def rollback(
         if not checkpoints or component not in manifest.changed_components:
             continue
         fingerprints = _checkpoint_files(checkpoints[-1])
-        for key in fingerprints:
-            _restore_fingerprint(fingerprints[key])
+        if component == "boris-intake" and not _file_prefix_matches(
+            fingerprints["boris-audit"].archive_path,
+            fingerprints["boris-audit"].active_path,
+        ):
+            raise RetirementError("Boris audit continuity failed before rollback")
+        for key, fingerprint in fingerprints.items():
+            if component == "boris-intake" and key == "boris-audit":
+                continue
+            _restore_fingerprint(fingerprint)
 
     # Exact source verification is the final gate before either retired record
     # can re-enter the registry.
@@ -1730,6 +2017,14 @@ def rehearse_reaction_roundtrip(
         "legacy_first_pass_calls": run_pass("legacy"),
         "legacy_second_pass_calls": run_pass("legacy"),
     }
+    if (
+        report["modern_first_pass_calls"] <= 0
+        or report["legacy_first_pass_calls"] <= 0
+    ):
+        raise RetirementError(
+            "reaction rehearsal must exercise a non-vacuous modern and legacy pass: "
+            f"{report}"
+        )
     report["legacy_records_unchanged"] = _legacy_projection(working) == legacy_before
     report["supplied_ledger_unchanged"] = (
         json.loads(state_path.read_text(encoding="utf-8")) == supplied
@@ -1749,11 +2044,22 @@ def _verify_restored(paths: Paths, manifest: Manifest) -> list[str]:
     return errors
 
 
+def _validate_pause_plan(paths: Paths, manifest: Manifest) -> None:
+    _assert_manifest_paths(paths, manifest)
+    if manifest.phase == "paused":
+        _validate_paused_registry(paths, manifest)
+        return
+    if manifest.phase != "preflight":
+        raise RetirementError(f"cannot pause from manifest phase {manifest.phase}")
+    selected = _job_map_locked(paths)
+    _validate_preflight_job_selection(paths, manifest, selected)
+
+
 def _paths_from_args(args: argparse.Namespace) -> Paths:
-    home = _resolved(args.hermes_home or LIVE_HOME)
+    home = _resolved(args.hermes_home or get_hermes_home())
     source = _resolved(args.source_root or Path.cwd())
     archive = _resolved(args.archive_root or home / "forensics")
-    return Paths(
+    paths = Paths(
         hermes_home=home,
         source_root=source,
         archive_root=archive,
@@ -1764,7 +2070,14 @@ def _paths_from_args(args: argparse.Namespace) -> Paths:
         process_listing_path=(
             Path(args.process_listing_path) if args.process_listing_path else None
         ),
+        boris_service_status_path=(
+            Path(args.boris_service_status_path)
+            if args.boris_service_status_path
+            else None
+        ),
     )
+    _reject_live_test_injection(paths, args.now_epoch)
+    return paths
 
 
 def _load_cli_manifest(args: argparse.Namespace) -> tuple[Paths, Manifest]:
@@ -1779,17 +2092,34 @@ def _load_cli_manifest(args: argparse.Namespace) -> tuple[Paths, Manifest]:
         "board_path": args.board_path,
         "boris_launchd_plist": args.boris_launchd_plist,
         "process_listing_path": args.process_listing_path,
+        "boris_service_status_path": args.boris_service_status_path,
     }
     for name, raw in overrides.items():
         if raw is not None and _resolved(raw) != getattr(paths, name):
             raise RetirementError(f"--{name.replace('_', '-')} differs from manifest")
+    _reject_live_test_injection(paths, args.now_epoch)
     return paths, manifest
+
+
+def _reject_live_test_injection(paths: Paths, now_epoch: Optional[int]) -> None:
+    if not _is_live_home(paths.hermes_home):
+        return
+    flags = []
+    if now_epoch is not None:
+        flags.append("--now-epoch")
+    if paths.process_listing_path is not None:
+        flags.append("--process-listing-path")
+    if paths.boris_service_status_path is not None:
+        flags.append("--boris-service-status-path")
+    if flags:
+        raise RetirementError(
+            f"{', '.join(flags)} is forbidden for a live Hermes home"
+        )
 
 
 def _now_from_args(args: argparse.Namespace, paths: Paths) -> int:
     if args.now_epoch is not None:
-        if paths.hermes_home == LIVE_HOME:
-            raise RetirementError("--now-epoch is forbidden for the live Hermes home")
+        _reject_live_test_injection(paths, args.now_epoch)
         return int(args.now_epoch)
     return int(time.time())
 
@@ -1802,6 +2132,7 @@ def _add_path_options(parser: argparse.ArgumentParser, *, archive: bool = False)
     parser.add_argument("--board-path")
     parser.add_argument("--boris-launchd-plist")
     parser.add_argument("--process-listing-path", help=argparse.SUPPRESS)
+    parser.add_argument("--boris-service-status-path", help=argparse.SUPPRESS)
 
 
 def _add_manifest_options(parser: argparse.ArgumentParser, *, apply: bool = False) -> None:
@@ -1860,8 +2191,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         now = _now_from_args(args, paths)
         if args.command == "pause":
             if not args.apply:
-                selected = _job_map_locked(paths)
-                _validate_job_fingerprints(paths, selected)
+                _validate_pause_plan(paths, manifest)
                 _print({"apply": False, "action": "pause", "job_ids": sorted(RETIRE)})
                 return 0
             pause_producers(paths, manifest, now)
@@ -1877,11 +2207,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             checkpoint_component(paths, manifest, args.component, now)
         elif args.command == "finalize":
             if not args.apply:
-                errors = verify_quiescent(paths, manifest, now)
-                if errors:
-                    raise RetirementError("; ".join(errors))
-                for key in ENTRYPOINTS:
-                    _require_match(manifest.files[key])
+                _validate_finalize_plan(paths, manifest, now)
                 _print(
                     {
                         "apply": False,
@@ -1902,8 +2228,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise RetirementError("; ".join(errors))
         elif args.command == "rollback":
             if not args.apply:
-                for key in ENTRYPOINTS:
-                    _require_match(manifest.files[key], manifest.files[key].archive_path)
+                _validate_rollback_plan(paths, manifest)
                 _print(
                     {
                         "apply": False,
