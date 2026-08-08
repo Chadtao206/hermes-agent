@@ -1,13 +1,15 @@
 import subprocess
+from pathlib import Path
 
-GHX_RO = "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"
+GHX_RO = Path(__file__).with_name("fixtures") / "ghx_ro.sh"
+TOKEN_FIXTURE = GHX_RO.with_name("gh_token")
 
 
 def run(args, scope="Ylopo/repo#1"):
     return subprocess.run(
-        [GHX_RO, *args], capture_output=True, text=True,
+        [str(GHX_RO), *args], capture_output=True, text=True,
         env={"PATH": "/usr/bin:/bin", "BORIS_PR_SCOPE": scope,
-             "BORIS_GH_TOKEN_PATH": "/dev/null", "GHX_RO_DRY_RUN": "1"},
+             "BORIS_GH_TOKEN_PATH": str(TOKEN_FIXTURE), "GHX_RO_DRY_RUN": "1"},
     )
 
 
