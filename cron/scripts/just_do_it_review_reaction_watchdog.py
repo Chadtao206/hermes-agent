@@ -60,6 +60,8 @@ failure needs operator visibility.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -200,10 +202,6 @@ EMOJI_BLOCK = "review-no"
 EMOJI_COMMENT = "doge_notes"
 EMOJI_ACTIVE = "thinkies"
 EMOJI_APPROVED = "white_check_mark"
-# Reactions this watchdog owns and is allowed to remove. Ordered highest -> lowest
-# precedence; removal walks this order for stable, test-visible call sequences.
-OWNED_EMOJI = (EMOJI_BLOCK, EMOJI_COMMENT, EMOJI_ACTIVE, EMOJI_APPROVED)
-PRECEDENCE = {EMOJI_BLOCK: 4, EMOJI_COMMENT: 3, EMOJI_ACTIVE: 2, EMOJI_APPROVED: 1}
 
 ACTIVE_STATUSES = {"todo", "triage", "ready", "scheduled", "running", "review"}
 DONE_STATUSES = {"done"}
@@ -376,6 +374,22 @@ def save_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
     tmp.replace(path)
+
+
+@contextlib.contextmanager
+def exclusive_run_lock(path: Path | None = None):
+    path = path or STATE_PATH.with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def kanban_json(args: list[str], *, timeout: int = 90) -> Any:
@@ -915,9 +929,9 @@ def run_indicates_comments(run_row: dict[str, Any]) -> tuple[bool, str]:
 
 
 def classify_run_status(run_row: dict[str, Any]) -> tuple[str, str | None, str]:
-    """(status, emoji, why) for one reviewer run. Status is the fail-closed axis.
+    """(status, state, why) for one reviewer run. Status is the fail-closed axis.
 
-    ``signal``      the run states a verdict; ``emoji`` is it.
+    ``signal``      the run states a verdict; ``state`` is it.
     ``quarantine``  the run is ambiguous (unreadable surface, or an approval claim
                     contradicted by a veto). The lane holds its post and alerts.
     ``none``        the run states nothing at all.
@@ -933,23 +947,23 @@ def classify_run_status(run_row: dict[str, Any]) -> tuple[str, str | None, str]:
         return "quarantine", None, f"metadata is not a dict ({type(md).__name__})"
     blocked, why = run_indicates_block(run_row)
     if blocked:
-        return "signal", EMOJI_BLOCK, why
+        return "signal", STATE_BLOCKED, why
     defects = metadata_defects(md)
     if defects:
         return "quarantine", None, "malformed: " + "; ".join(defects[:3])
     commented, why = run_indicates_comments(run_row)
     if commented:
-        return "signal", EMOJI_COMMENT, why
+        return "signal", STATE_NOTES, why
     if approval_claimed(md) and _no_blockers(md):
         vetoes = approval_vetoes(md)
         if vetoes:
             return "quarantine", None, "approval contradicted by " + ",".join(vetoes[:3])
-        return "signal", EMOJI_APPROVED, "approval submitted/existing for head"
+        return "signal", STATE_APPROVED, "approval submitted/existing for head"
     return "none", None, "no reviewer signal"
 
 
 def classify_run(run_row: dict[str, Any]) -> tuple[str | None, str]:
-    """Map one completed reviewer run onto its desired reaction.
+    """Map one completed reviewer run onto its semantic review state.
 
     Within a lane the order is block > comments > approval, matching Chad's
     aggregation precedence: a lane that approved AND delivered substantive
@@ -1003,7 +1017,7 @@ def task_approval(show: dict[str, Any]) -> tuple[bool, str]:
     unreadable run must win here too, not just on the reaction path.
     """
     emoji, why = classify_task(show)
-    return emoji == EMOJI_APPROVED, why
+    return emoji == STATE_APPROVED, why
 
 
 def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
@@ -1016,7 +1030,7 @@ def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
     An older ``review-no`` is still adopted: it is the top of the precedence order,
     so nothing it could be hiding outranks it.
 
-    Returns ``QUARANTINE`` as the emoji when the lane is unsafe to classify.
+    Returns ``QUARANTINE`` as the state when the lane is unsafe to classify.
     """
     runs = show.get("runs") if isinstance(show, dict) else None
     if not isinstance(runs, list):
@@ -1036,7 +1050,7 @@ def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
         if status == "none":
             unclassified.append(str(run_row.get("id")))
             continue
-        if unclassified and emoji != EMOJI_BLOCK:
+        if unclassified and emoji != STATE_BLOCKED:
             return QUARANTINE, (
                 f"run={run_row.get('id')} {emoji} is behind unclassified newer "
                 f"run(s) {','.join(unclassified[:3])}"
@@ -1067,14 +1081,6 @@ def source_text(show: dict[str, Any]) -> str:
                 if md.get(key):
                     parts.append(str(md[key]))
     return "\n".join(parts)
-
-
-def aggregate_emoji(emojis: list[str] | set[str] | tuple[str, ...]) -> str | None:
-    """Highest-precedence reaction across a post's lanes."""
-    known = [emoji for emoji in emojis if emoji in PRECEDENCE]
-    if not known:
-        return None
-    return max(known, key=lambda emoji: PRECEDENCE[emoji])
 
 
 def aggregate_state(states: Iterable[str]) -> str | None:
@@ -1132,6 +1138,7 @@ def apply_transition(
     desired: str,
     record: dict[str, Any] | None,
     reactor: Callable[[str, str, bool], dict[str, Any]],
+    owned: tuple[str, ...],
 ) -> dict[str, Any]:
     """Add the desired reaction, then drop stale owned ones. Never bare-first.
 
@@ -1140,11 +1147,11 @@ def apply_transition(
     exactly one reaction. A failed add leaves the prior reaction untouched.
     """
     prior = record.get("emoji") if isinstance(record, dict) else None
-    pending = (
-        [emoji for emoji in (record.get("pending_removals") or []) if emoji in OWNED_EMOJI]
-        if isinstance(record, dict)
-        else []
-    )
+    pending = [
+        reaction
+        for reaction in ((record or {}).get("pending_removals") or [])
+        if reaction in owned
+    ]
     calls = 0
     add = reactor(permalink, desired, False)
     calls += 1
@@ -1159,15 +1166,15 @@ def apply_transition(
         }
 
     stale = set(pending)
-    if prior in PRECEDENCE:
+    if prior in owned:
         stale.add(prior)
     else:
-        stale.update(OWNED_EMOJI)  # unknown prior: converge to exactly one
+        stale.update(owned)  # unknown prior: converge to exactly one
     stale.discard(desired)
 
     removed: list[str] = []
     still_pending: list[str] = []
-    for emoji in OWNED_EMOJI:
+    for emoji in owned:
         if emoji not in stale:
             continue
         resp = reactor(permalink, emoji, True)
@@ -1209,7 +1216,7 @@ def reconcile_due(record: dict[str, Any] | None, now: int) -> bool:
     ``len(RECONCILE_DELAYS_SECONDS)``, so a settled post goes back to costing zero
     Slack calls. A post with no armed deadline is never swept.
     """
-    if not isinstance(record, dict) or record.get("emoji") not in PRECEDENCE:
+    if record_state(record) is None:
         return False
     sweeps = record.get("reconcile_sweeps")
     sweeps = sweeps if isinstance(sweeps, int) and sweeps > 0 else 0
@@ -1223,6 +1230,7 @@ def reconcile_sweep(
     permalink: str,
     desired: str,
     reactor: Callable[[str, str, bool], dict[str, Any]],
+    owned: tuple[str, ...],
 ) -> dict[str, Any]:
     """Blindly remove every owned emoji except ``desired``.
 
@@ -1235,7 +1243,7 @@ def reconcile_sweep(
     calls = 0
     removed: list[str] = []
     pending: list[str] = []
-    for emoji in OWNED_EMOJI:
+    for emoji in owned:
         if emoji == desired:
             continue
         resp = reactor(permalink, emoji, True)
@@ -1275,7 +1283,7 @@ def _reconcile_converged(
             f"WOULD_RECONCILE source={permalink} desired={desired} sweep={sweeps + 1}"
         )
         return
-    result = reconcile_sweep(permalink, desired, reactor)
+    result = reconcile_sweep(permalink, desired, reactor, owned_reactions(permalink))
     metrics["reaction_calls"] += int(result.get("calls") or 0)
     metrics["reconcile_sweeps"] += 1
     record["reconciled_at"] = now
@@ -1299,6 +1307,21 @@ def _reconcile_converged(
 
 
 # --- state ---------------------------------------------------------------
+
+
+def record_state(record: object) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    return normalize_review_state(record.get("state") or record.get("emoji"))
+
+
+def lane_states(record: object) -> dict[str, str]:
+    lanes = record.get("lanes") if isinstance(record, dict) else None
+    return {
+        str(task_id): state
+        for task_id, raw in (lanes.items() if isinstance(lanes, dict) else [])
+        if (state := normalize_review_state(raw)) is not None
+    }
 
 
 def _new_state(now: int, *, backfill: bool = False) -> dict[str, Any]:
@@ -1355,7 +1378,7 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
             if not PERMALINK_RE.fullmatch(permalink):
                 continue
             record = state["posts"].get(permalink)
-            if isinstance(record, dict) and record.get("emoji") in PRECEDENCE:
+            if record_state(record) is not None:
                 continue
             at = _epoch((entry or {}).get("at")) if isinstance(entry, dict) else 0
             state["posts"][permalink] = {
@@ -1385,21 +1408,23 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
         if not isinstance(record, dict):
             state["posts"].pop(permalink, None)
             continue
-        if record.get("emoji") not in PRECEDENCE:
+        if record_state(record) is None:
             record["emoji"] = None
-            if not (record.get("want") in PRECEDENCE or record.get("last_error")
+            if not (normalize_review_state(record.get("want")) is not None or record.get("last_error")
                     or record.get("pending_removals") or record.get("deferred_at")
                     or record.get("unresolved_lanes") or record.get("cleared_lanes")):
                 state["posts"].pop(permalink, None)
                 continue
         lanes = record.get("lanes")
         record["lanes"] = {
-            str(task): emoji
-            for task, emoji in (lanes.items() if isinstance(lanes, dict) else [])
-            if emoji in PRECEDENCE
+            str(task): raw_state
+            for task, raw_state in (lanes.items() if isinstance(lanes, dict) else [])
+            if normalize_review_state(raw_state) is not None
         }
         record["pending_removals"] = [
-            emoji for emoji in (record.get("pending_removals") or []) if emoji in OWNED_EMOJI
+            reaction
+            for reaction in (record.get("pending_removals") or [])
+            if reaction in owned_reactions(permalink)
         ]
         # A hold must survive a restart, so its provenance is normalized rather
         # than dropped; an unreadable value still counts as "held, reason lost".
@@ -1634,7 +1659,7 @@ def process_tick(
                 continue
             for link in links:
                 fresh.setdefault(link, {})[task_id] = {
-                    "emoji": EMOJI_ACTIVE,
+                    "state": STATE_ACTIVE,
                     "reason": f"active lane status={row.get('status')}",
                 }
             continue
@@ -1706,13 +1731,13 @@ def process_tick(
             continue
         attempts.pop(task_id, None)
         seen[task_id] = row_epoch(row)
-        emoji, why = classify_task(show)
+        lane_state, why = classify_task(show)
         # Metadata/comment provenance also counts for lanes we already fetched
         # (legacy reach), unioned with the body links that queued the lane.
         show_links = links + [
             link for link in extract_permalinks(source_text(show), allowed_channels) if link not in links
         ]
-        if emoji == QUARANTINE:
+        if lane_state == QUARANTINE:
             # The lane was read but is not safe to classify, and an unsafe lane can
             # be hiding a `review-no`. Hold every post it cites and persist the
             # provenance, so the hold survives ticks and restarts even though the
@@ -1721,7 +1746,7 @@ def process_tick(
                 fresh.setdefault(link, {})
             _hold_links(quarantined, show_links, task_id, HOLD_KIND_QUARANTINE, why)
             continue
-        if emoji is None:
+        if lane_state is None:
             # Read successfully, and it says nothing. That is a resolution: the lane
             # is not hiding anything, so it releases any hold it was holding.
             for link in show_links:
@@ -1729,7 +1754,7 @@ def process_tick(
                 resolved.setdefault(link, set()).add(task_id)
             continue
         for link in show_links:
-            fresh.setdefault(link, {})[task_id] = {"emoji": emoji, "reason": why}
+            fresh.setdefault(link, {})[task_id] = {"state": lane_state, "reason": why}
             resolved.setdefault(link, set()).add(task_id)
 
     # Evaluate posts with new information, plus any post still owing repair work or
@@ -1745,9 +1770,18 @@ def process_tick(
 
     for permalink in sorted(candidates):
         record = posts.get(permalink) if isinstance(posts.get(permalink), dict) else None
-        lanes: dict[str, str] = dict((record or {}).get("lanes") or {})
+        semantic_lanes = lane_states(record)
         for task_id, contribution in (fresh.get(permalink) or {}).items():
-            lanes[task_id] = contribution["emoji"]
+            semantic_lanes[task_id] = contribution["state"]
+        is_boris = source_channel(permalink) == BORIS_CHANNEL
+        persisted_lanes = (
+            semantic_lanes
+            if is_boris
+            else {
+                task_id: render_reaction(permalink, lane_state, "legacy")
+                for task_id, lane_state in semantic_lanes.items()
+            }
+        )
         # Persisted hold provenance, refreshed with anything found this tick. The
         # persisted set is authoritative: a held lane that is no longer rediscovered
         # (aged past --lookback-seconds, archived, or simply absent from this tick's
@@ -1771,7 +1805,12 @@ def process_tick(
             unresolved.pop(task_id, None)
         for task_id in set(quarantined.get(permalink) or {}) | set(resolved.get(permalink) or ()):
             cleared_lanes.pop(task_id, None)
-        desired = aggregate_emoji(list(lanes.values()))
+        desired_state = aggregate_state(list(semantic_lanes.values()))
+        desired_reaction = (
+            render_reaction(permalink, desired_state, args.boris_reaction_style)
+            if desired_state is not None
+            else None
+        )
         current = record.get("emoji") if record else None
 
         # A post is HELD when any lane citing it is unresolved: either a completed
@@ -1782,22 +1821,22 @@ def process_tick(
         if unresolved:
             metrics["posts_held"] += 1
             metrics["posts_deferred"] += 1  # legacy metric name, same event
-            new_record = {**(record or {}), "emoji": current, "lanes": lanes,
+            new_record = {**(record or {}), "emoji": current, "lanes": persisted_lanes,
                           "unresolved_lanes": unresolved,
                           "deferred_at": (record or {}).get("deferred_at") or now}
             if cleared_lanes:
                 new_record["cleared_lanes"] = cleared_lanes
             else:
                 new_record.pop("cleared_lanes", None)
-            if desired is not None:
-                new_record["want"] = desired
+            if desired_reaction is not None:
+                new_record["want"] = desired_reaction
             reason, grace = hold_report(unresolved)
             held_since = _epoch(new_record.get("deferred_at")) or now
             if now - held_since >= grace and _alert_due(new_record, now):
                 new_record["alerted_at"] = now
                 outputs.append(
                     f"JUST_DO_IT_REVIEW_REACTIONS held source={permalink} reason={reason} "
-                    f"want={desired or 'unknown'} retained={current or 'none'} "
+                    f"want={desired_reaction or 'unknown'} retained={current or 'none'} "
                     f"unresolved={','.join(sorted(unresolved)) or 'none'} "
                     f"held_for={max(0, now - held_since)}s"
                 )
@@ -1818,13 +1857,14 @@ def process_tick(
             else:
                 record.pop("cleared_lanes", None)
 
-        if desired is None:
+        if desired_reaction is None:
             # Released, and nothing left to say. Recording a hold for every routine
             # cap/backoff deferral would otherwise leave behind empty records that
             # `compact_state` cannot age out (they have no `applied_at`). Same rule
             # `migrate_state` applies on restart, applied eagerly.
             if record is not None and not (
-                record.get("emoji") in PRECEDENCE or record.get("want") in PRECEDENCE
+                record_state(record) is not None
+                or normalize_review_state(record.get("want")) is not None
                 or record.get("last_error") or record.get("pending_removals")
                 or record.get("cleared_lanes")
             ):
@@ -1832,14 +1872,26 @@ def process_tick(
             continue
 
         pending = list((record or {}).get("pending_removals") or [])
-        if current == desired and not pending:
+        if current == desired_reaction and not pending:
             metrics["posts_converged"] += 1
             if record is not None:
-                record["lanes"] = lanes
+                if is_boris:
+                    record["state"] = desired_state
+                record["emoji"] = desired_reaction
+                record["lanes"] = persisted_lanes
                 record.pop("last_error", None)
                 record.pop("last_error_at", None)
                 record.pop("want", None)
-                _reconcile_converged(permalink, desired, record, now, args, reactor, outputs, metrics)
+                _reconcile_converged(
+                    permalink,
+                    desired_reaction,
+                    record,
+                    now,
+                    args,
+                    reactor,
+                    outputs,
+                    metrics,
+                )
             continue
 
         failure_key = f"react|{permalink}"
@@ -1850,12 +1902,18 @@ def process_tick(
         )
         if args.dry_run:
             outputs.append(
-                f"WOULD_TRANSITION source={permalink} {current or 'none'} -> {desired} "
-                f"lanes={len(lanes)} reason={reasons or 'persisted lane state'}"
+                f"WOULD_TRANSITION source={permalink} {current or 'none'} -> {desired_reaction} "
+                f"lanes={len(semantic_lanes)} reason={reasons or 'persisted lane state'}"
             )
             continue
 
-        result = apply_transition(permalink, desired, record, reactor)
+        result = apply_transition(
+            permalink,
+            desired_reaction,
+            record,
+            reactor,
+            owned_reactions(permalink),
+        )
         metrics["reaction_calls"] += int(result.get("calls") or 0)
         if not result.get("ok"):
             _note_attempt(state["failures"], failure_key, now)
@@ -1864,15 +1922,15 @@ def process_tick(
             new_record = dict(record or {})
             new_record.update({
                 "emoji": current,
-                "want": desired,
-                "lanes": lanes,
+                "want": desired_reaction,
+                "lanes": persisted_lanes,
                 "pending_removals": list(result.get("pending_removals") or pending),
                 "last_error": str(result.get("error"))[-300:],
                 "last_error_at": now,
             })
             posts[permalink] = new_record
             outputs.append(
-                f"JUST_DO_IT_REVIEW_REACTIONS react_failed source={permalink} want={desired} "
+                f"JUST_DO_IT_REVIEW_REACTIONS react_failed source={permalink} want={desired_reaction} "
                 f"retained={current or 'none'}: {str(result.get('error'))[-300:]}"
             )
             hard_failed = True
@@ -1880,10 +1938,11 @@ def process_tick(
 
         state["failures"].pop(failure_key, None)
         posts[permalink] = {
-            "emoji": desired,
+            **({"state": desired_state} if is_boris else {}),
+            "emoji": desired_reaction,
             "applied_at": now,
             "pending_removals": result.get("pending_removals") or [],
-            "lanes": lanes,
+            "lanes": persisted_lanes,
             "removed": result.get("removed") or [],
             "reason": reasons or "persisted lane state",
             # A transition does not revoke the operator's standing release: the lane
@@ -1897,7 +1956,7 @@ def process_tick(
         metrics["posts_transitioned"] += 1
         outputs.append(
             f"JUST_DO_IT_REVIEW_REACTIONS transitioned source={permalink} "
-            f"{current or 'none'} -> {desired} removed={','.join(result.get('removed') or []) or 'none'}"
+            f"{current or 'none'} -> {desired_reaction} removed={','.join(result.get('removed') or []) or 'none'}"
             + (f" pending_removals={','.join(result['pending_removals'])}" if result.get("pending_removals") else "")
         )
         if result.get("pending_removals"):
@@ -1907,9 +1966,9 @@ def process_tick(
             )
         # Keep the legacy ledger current so a rollback to the approval-only
         # watchdog stays quiet on posts already marked ✅.
-        if desired == EMOJI_APPROVED:
-            for task_id, emoji in lanes.items():
-                if emoji == EMOJI_APPROVED:
+        if desired_state == STATE_APPROVED:
+            for task_id, lane_state in semantic_lanes.items():
+                if lane_state == STATE_APPROVED:
                     state["reacted"].setdefault(
                         f"{task_id}:{permalink}",
                         {"at": now, "task_id": task_id, "permalink": permalink,
@@ -1936,44 +1995,54 @@ def main(argv: list[str] | None = None) -> int:
                          "The release is standing: a lane that keeps failing to show does not "
                          "re-hold the post, but a lane that is read again and quarantines again "
                          "does.")
+    ap.add_argument(
+        "--boris-reaction-style",
+        choices=("modern", "legacy"),
+        default="modern",
+        help="Render #boris-reviews with modern reactions (default) or legacy reactions for rollback.",
+    )
     ap.add_argument("--verbose", action="store_true", help="Always print the METRICS line.")
     args = ap.parse_args(argv)
 
-    now = int(time.time())
-    raw_text = None
-    try:
-        raw_text = STATE_PATH.read_text()
-    except OSError:
+    with exclusive_run_lock() as acquired:
+        if not acquired:
+            return 0
+
+        now = int(time.time())
         raw_text = None
-    raw = load_json(STATE_PATH, None)
-    state, notes = migrate_state(raw, now, backfill=args.backfill_existing)
-    if notes and raw_text is not None and not args.dry_run:
-        backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
-        if not backup.exists():
-            try:
-                backup.write_text(raw_text)
-            except OSError as exc:  # pragma: no cover - disk failure only
-                notes.append(f"state backup failed: {exc}")
+        try:
+            raw_text = STATE_PATH.read_text()
+        except OSError:
+            raw_text = None
+        raw = load_json(STATE_PATH, None)
+        state, notes = migrate_state(raw, now, backfill=args.backfill_existing)
+        if notes and raw_text is not None and not args.dry_run:
+            backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
+            if not backup.exists():
+                try:
+                    backup.write_text(raw_text)
+                except OSError as exc:  # pragma: no cover - disk failure only
+                    notes.append(f"state backup failed: {exc}")
 
-    code, outputs, metrics = process_tick(
-        args,
-        now,
-        state,
-        lister=kanban_reviewer_lanes,
-        shower=kanban_show,
-        reactor=slack_reaction,
-    )
-    if not args.dry_run:
-        save_json(STATE_PATH, state)
+        code, outputs, metrics = process_tick(
+            args,
+            now,
+            state,
+            lister=kanban_reviewer_lanes,
+            shower=kanban_show,
+            reactor=slack_reaction,
+        )
+        if not args.dry_run:
+            save_json(STATE_PATH, state)
 
-    lines = [f"JUST_DO_IT_REVIEW_REACTIONS {note}" for note in notes] + outputs
-    if lines or args.verbose:
-        lines.append("METRICS " + json.dumps(
-            {**metrics, "posts_tracked": len(state["posts"]), "cursor_size": len(state["cursor"]["seen"])},
-            sort_keys=True,
-        ))
-        print("\n".join(lines))
-    return code
+        lines = [f"JUST_DO_IT_REVIEW_REACTIONS {note}" for note in notes] + outputs
+        if lines or args.verbose:
+            lines.append("METRICS " + json.dumps(
+                {**metrics, "posts_tracked": len(state["posts"]), "cursor_size": len(state["cursor"]["seen"])},
+                sort_keys=True,
+            ))
+            print("\n".join(lines))
+        return code
 
 
 if __name__ == "__main__":

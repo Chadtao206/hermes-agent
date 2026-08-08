@@ -7,10 +7,15 @@ callables, and every Slack interaction is recorded by FakeSlack.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
+import json
 import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = Path(
@@ -123,6 +128,7 @@ def args(**overrides):
         "backfill_existing": False,
         "max_shows": m.MAX_SHOWS_PER_TICK,
         "clear_unresolved": [],
+        "boris_reaction_style": "modern",
         "verbose": False,
     }
     values.update(overrides)
@@ -256,14 +262,14 @@ class ApprovalClassifierTest(unittest.TestCase):
             "github_review_state": "APPROVED",
             "findings": [],
         }})
-        self.assertEqual(emoji, m.EMOJI_APPROVED)
+        self.assertEqual(emoji, m.STATE_APPROVED)
 
     def test_already_approved_exact_head_classifies_white_check_mark(self):
         emoji, _ = m.classify_run({"metadata": {
             "existing_chad_approval_for_head": True,
             "findings": [],
         }})
-        self.assertEqual(emoji, m.EMOJI_APPROVED)
+        self.assertEqual(emoji, m.STATE_APPROVED)
 
 
 class ApprovalEvidenceTest(unittest.TestCase):
@@ -308,7 +314,7 @@ class ApprovalEvidenceTest(unittest.TestCase):
         self.approves({"review": {"submitted": True, "id": 999, "state": "COMMENTED"}}, expected=False)
         self.assertEqual(
             m.classify_run({"metadata": {"review": {"submitted": True, "id": 999, "state": "COMMENTED"}}})[0],
-            m.EMOJI_COMMENT,
+            m.STATE_NOTES,
         )
 
     def test_changes_requested_state_vetoes_review_id_evidence(self):
@@ -419,7 +425,7 @@ class BlockClassifierTest(unittest.TestCase):
             "approved_review": True,
             "findings": [],
         }})
-        self.assertEqual((emoji, "approval"), (m.EMOJI_APPROVED, "approval"), why)
+        self.assertEqual((emoji, "approval"), (m.STATE_APPROVED, "approval"), why)
 
     def test_zero_remaining_blockers_prose_does_not_block(self):
         self.assert_block({"verdict": "ACCEPT with zero remaining major blockers"}, expected=False)
@@ -443,26 +449,26 @@ class CommentClassifierTest(unittest.TestCase):
         return m.classify_run({"metadata": metadata})[0]
 
     def test_commented_review_state_is_doge_notes(self):
-        self.assertEqual(self.classify({"github_review_state": "COMMENTED"}), m.EMOJI_COMMENT)
+        self.assertEqual(self.classify({"github_review_state": "COMMENTED"}), m.STATE_NOTES)
 
     def test_needs_follow_up_non_blocking_is_doge_notes(self):
         self.assertEqual(
             self.classify({"verdict": "needs-follow-up; non-blocking COMMENT review submitted"}),
-            m.EMOJI_COMMENT,
+            m.STATE_NOTES,
         )
 
     def test_major_findings_are_doge_notes(self):
         self.assertEqual(
             self.classify({"verdict": "ACCEPTED_FOR_HUMAN_REVIEW",
                            "findings": [{"severity": "major", "summary": "duplicated logic"}]}),
-            m.EMOJI_COMMENT,
+            m.STATE_NOTES,
         )
 
     def test_minor_findings_are_doge_notes(self):
-        self.assertEqual(self.classify({"findings": [{"severity": "minor", "summary": "typo"}]}), m.EMOJI_COMMENT)
+        self.assertEqual(self.classify({"findings": [{"severity": "minor", "summary": "typo"}]}), m.STATE_NOTES)
 
     def test_posted_comment_count_is_doge_notes(self):
-        self.assertEqual(self.classify({"review_comments_posted": 3}), m.EMOJI_COMMENT)
+        self.assertEqual(self.classify({"review_comments_posted": 3}), m.STATE_NOTES)
 
     def test_approval_with_substantive_findings_prefers_doge_notes(self):
         # Chad's precedence puts doge_notes above white_check_mark, so a lane that
@@ -473,7 +479,7 @@ class CommentClassifierTest(unittest.TestCase):
                 "github_review_state": "APPROVED",
                 "findings": [{"severity": "minor", "summary": "nit"}],
             }),
-            m.EMOJI_COMMENT,
+            m.STATE_NOTES,
         )
 
     def test_block_wins_over_comments(self):
@@ -482,13 +488,13 @@ class CommentClassifierTest(unittest.TestCase):
                 "github_review_state": "COMMENTED",
                 "findings": [{"severity": "blocker", "summary": "unsafe"}],
             }),
-            m.EMOJI_BLOCK,
+            m.STATE_BLOCKED,
         )
 
     def test_empty_findings_are_not_comments(self):
         self.assertEqual(
             self.classify({"github_review_submitted": True, "github_review_state": "APPROVED", "findings": []}),
-            m.EMOJI_APPROVED,
+            m.STATE_APPROVED,
         )
 
 
@@ -503,7 +509,7 @@ class MalformedMetadataTest(unittest.TestCase):
     def test_non_dict_blocking_review_container_still_blocks(self):
         # Boris REJECT t_397531f0: a malformed blocking surface must never be
         # dropped. The shape is wrong but the content is unambiguous.
-        self.assertEqual(m.classify_run({"metadata": {"review": "NEEDS_FIX"}})[0], m.EMOJI_BLOCK)
+        self.assertEqual(m.classify_run({"metadata": {"review": "NEEDS_FIX"}})[0], m.STATE_BLOCKED)
 
     def test_unreadable_review_container_quarantines(self):
         status, emoji, _why = m.classify_run_status({"metadata": {"review": 7}})
@@ -529,7 +535,7 @@ class MalformedMetadataTest(unittest.TestCase):
             ],
         }
         emoji, why = m.classify_task(payload)
-        self.assertEqual(emoji, m.EMOJI_COMMENT)
+        self.assertEqual(emoji, m.STATE_NOTES)
         self.assertIn("run=new", why)
 
     def test_newest_unclassified_run_quarantines_instead_of_falling_back(self):
@@ -557,7 +563,7 @@ class MalformedMetadataTest(unittest.TestCase):
                 {"id": "new", "ended_at": NOW - 60, "metadata": {"worker_session_id": "abc"}},
             ],
         }
-        self.assertEqual(m.classify_task(payload)[0], m.EMOJI_BLOCK)
+        self.assertEqual(m.classify_task(payload)[0], m.STATE_BLOCKED)
 
     def test_older_comment_is_not_adopted_behind_an_unclassified_newer_run(self):
         payload = {
@@ -576,20 +582,23 @@ class MalformedMetadataTest(unittest.TestCase):
 class PrecedenceTest(unittest.TestCase):
     def test_precedence_order(self):
         self.assertEqual(
-            sorted(m.PRECEDENCE, key=lambda emoji: -m.PRECEDENCE[emoji]),
-            [m.EMOJI_BLOCK, m.EMOJI_COMMENT, m.EMOJI_ACTIVE, m.EMOJI_APPROVED],
+            sorted(m.STATE_PRECEDENCE, key=lambda state: -m.STATE_PRECEDENCE[state]),
+            [m.STATE_BLOCKED, m.STATE_NOTES, m.STATE_ACTIVE, m.STATE_APPROVED],
         )
 
     def test_aggregate_picks_highest(self):
-        self.assertEqual(m.aggregate_emoji([m.EMOJI_APPROVED, m.EMOJI_ACTIVE]), m.EMOJI_ACTIVE)
-        self.assertEqual(m.aggregate_emoji([m.EMOJI_ACTIVE, m.EMOJI_COMMENT]), m.EMOJI_COMMENT)
-        self.assertEqual(m.aggregate_emoji([m.EMOJI_COMMENT, m.EMOJI_BLOCK]), m.EMOJI_BLOCK)
-        self.assertEqual(m.aggregate_emoji([m.EMOJI_BLOCK, m.EMOJI_APPROVED, m.EMOJI_ACTIVE]), m.EMOJI_BLOCK)
+        self.assertEqual(m.aggregate_state([m.STATE_APPROVED, m.STATE_ACTIVE]), m.STATE_ACTIVE)
+        self.assertEqual(m.aggregate_state([m.STATE_ACTIVE, m.STATE_NOTES]), m.STATE_NOTES)
+        self.assertEqual(m.aggregate_state([m.STATE_NOTES, m.STATE_BLOCKED]), m.STATE_BLOCKED)
+        self.assertEqual(
+            m.aggregate_state([m.STATE_BLOCKED, m.STATE_APPROVED, m.STATE_ACTIVE]),
+            m.STATE_BLOCKED,
+        )
 
     def test_aggregate_ignores_unknown_and_empty(self):
-        self.assertIsNone(m.aggregate_emoji([]))
-        self.assertIsNone(m.aggregate_emoji(["eyes"]))
-        self.assertEqual(m.aggregate_emoji(["eyes", m.EMOJI_ACTIVE]), m.EMOJI_ACTIVE)
+        self.assertIsNone(m.aggregate_state([]))
+        self.assertIsNone(m.aggregate_state(["eyes"]))
+        self.assertEqual(m.aggregate_state(["eyes", m.STATE_ACTIVE]), m.STATE_ACTIVE)
 
     def test_multi_pr_same_post_aggregates_to_block(self):
         rows = [lane("t_ok", "done"), lane("t_bad", "done")]
@@ -781,7 +790,13 @@ class LaneDiscoveryTest(unittest.TestCase):
 class TransitionTest(unittest.TestCase):
     def test_adds_desired_before_removing_stale(self):
         slack = FakeSlack()
-        result = m.apply_transition(PERMALINK, m.EMOJI_COMMENT, {"emoji": m.EMOJI_ACTIVE}, slack)
+        result = m.apply_transition(
+            PERMALINK,
+            m.EMOJI_COMMENT,
+            {"emoji": m.EMOJI_ACTIVE},
+            slack,
+            m.owned_reactions(PERMALINK),
+        )
         self.assertTrue(result["ok"])
         self.assertEqual(slack.calls, [
             (PERMALINK, m.EMOJI_COMMENT, False),
@@ -792,7 +807,9 @@ class TransitionTest(unittest.TestCase):
 
     def test_unknown_prior_sweeps_every_other_owned_emoji(self):
         slack = FakeSlack()
-        result = m.apply_transition(PERMALINK, m.EMOJI_ACTIVE, None, slack)
+        result = m.apply_transition(
+            PERMALINK, m.EMOJI_ACTIVE, None, slack, m.owned_reactions(PERMALINK)
+        )
         self.assertEqual(slack.adds, [(PERMALINK, m.EMOJI_ACTIVE)])
         self.assertEqual(
             [emoji for _, emoji in slack.removes],
@@ -802,21 +819,39 @@ class TransitionTest(unittest.TestCase):
 
     def test_already_reacted_and_no_reaction_are_success(self):
         slack = FakeSlack(already_reacted=[m.EMOJI_BLOCK])
-        result = m.apply_transition(PERMALINK, m.EMOJI_BLOCK, {"emoji": m.EMOJI_COMMENT}, slack)
+        result = m.apply_transition(
+            PERMALINK,
+            m.EMOJI_BLOCK,
+            {"emoji": m.EMOJI_COMMENT},
+            slack,
+            m.owned_reactions(PERMALINK),
+        )
         self.assertTrue(result["ok"])
         self.assertTrue(result["already_reacted"])
         self.assertEqual(result["pending_removals"], [])
 
     def test_failed_add_retains_prior_and_removes_nothing(self):
         slack = FakeSlack(fail_add=[m.EMOJI_BLOCK])
-        result = m.apply_transition(PERMALINK, m.EMOJI_BLOCK, {"emoji": m.EMOJI_ACTIVE}, slack)
+        result = m.apply_transition(
+            PERMALINK,
+            m.EMOJI_BLOCK,
+            {"emoji": m.EMOJI_ACTIVE},
+            slack,
+            m.owned_reactions(PERMALINK),
+        )
         self.assertFalse(result["ok"])
         self.assertEqual(slack.removes, [])
         self.assertEqual(result["prior"], m.EMOJI_ACTIVE)
 
     def test_failed_removal_is_recorded_for_retry(self):
         slack = FakeSlack(fail_remove=[m.EMOJI_ACTIVE])
-        result = m.apply_transition(PERMALINK, m.EMOJI_COMMENT, {"emoji": m.EMOJI_ACTIVE}, slack)
+        result = m.apply_transition(
+            PERMALINK,
+            m.EMOJI_COMMENT,
+            {"emoji": m.EMOJI_ACTIVE},
+            slack,
+            m.owned_reactions(PERMALINK),
+        )
         self.assertTrue(result["ok"])
         self.assertEqual(result["pending_removals"], [m.EMOJI_ACTIVE])
 
@@ -911,6 +946,142 @@ class TransitionTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("kanban_list_failed", "\n".join(outputs))
         self.assertEqual(slack.calls, [])
+
+
+class BorisMigrationTest(unittest.TestCase):
+    def test_modern_transition_adds_before_removing_legacy(self):
+        slack = FakeSlack()
+        record = {"emoji": "review-no", "state": m.STATE_BLOCKED}
+        result = m.apply_transition(
+            BORIS_PERMALINK,
+            "face_vomiting",
+            record,
+            slack,
+            m.owned_reactions(BORIS_PERMALINK),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(slack.calls[0], (BORIS_PERMALINK, "face_vomiting", False))
+        self.assertIn((BORIS_PERMALINK, "review-no", True), slack.calls[1:])
+
+    def test_failed_modern_add_retains_legacy_reaction(self):
+        slack = FakeSlack(fail_add={"face_vomiting"})
+        result = m.apply_transition(
+            BORIS_PERMALINK,
+            "face_vomiting",
+            {"emoji": "review-no", "state": m.STATE_BLOCKED},
+            slack,
+            m.owned_reactions(BORIS_PERMALINK),
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(slack.removes, [])
+
+    def test_legacy_post_never_removes_modern_manual_emoji(self):
+        slack = FakeSlack()
+        m.reconcile_sweep(
+            PERMALINK,
+            "review-no",
+            slack,
+            m.owned_reactions(PERMALINK),
+        )
+        self.assertNotIn((PERMALINK, "face_vomiting", True), slack.calls)
+        self.assertNotIn((PERMALINK, "rubbing", True), slack.calls)
+        self.assertNotIn((PERMALINK, "blinkapproved", True), slack.calls)
+
+    def test_reverse_style_removes_modern_after_adding_legacy(self):
+        state = m.STATE_BLOCKED
+        desired = m.render_reaction(BORIS_PERMALINK, state, "legacy")
+        slack = FakeSlack()
+        result = m.apply_transition(
+            BORIS_PERMALINK,
+            desired,
+            {"emoji": "face_vomiting", "state": state},
+            slack,
+            m.owned_reactions(BORIS_PERMALINK),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(slack.calls[0], (BORIS_PERMALINK, "review-no", False))
+        self.assertIn((BORIS_PERMALINK, "face_vomiting", True), slack.calls[1:])
+
+    def test_kanban_adapter_exposes_only_list_and_show(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="[]", stderr=""
+        )
+        with mock.patch.object(m, "run", return_value=completed) as run:
+            m.kanban_reviewer_lanes()
+            completed.stdout = json.dumps({"id": "lane-1"})
+            m.kanban_show("lane-1")
+        verbs = [call.args[0][2] for call in run.call_args_list]
+        self.assertEqual(verbs, ["list", "show"])
+
+    def mixed_channel_state(self):
+        state = m.migrate_state(None, NOW)[0]
+        state["machine_baseline_at"] = 0
+        state["posts"] = {
+            BORIS_PERMALINK: {
+                "emoji": "doge_notes",
+                "applied_at": NOW - 60,
+                "pending_removals": [],
+                "lanes": {"t_boris": "doge_notes"},
+                "source": "boris-fixture",
+            },
+            PERMALINK: {
+                "emoji": "doge_notes",
+                "applied_at": NOW - 60,
+                "pending_removals": [],
+                "lanes": {"t_legacy": "doge_notes"},
+                "source": "legacy-fixture",
+            },
+        }
+        return state
+
+    def test_boris_only_backfill_migrates_ledger_without_touching_legacy_record(self):
+        state = self.mixed_channel_state()
+        legacy_before = json.loads(json.dumps(state["posts"][PERMALINK]))
+        result = tick(
+            [lane("t_boris", "done", permalink=BORIS_PERMALINK)],
+            {"t_boris": show("t_boris", {"github_review_state": "COMMENTED"})},
+            state=state,
+            only_task=["t_boris"],
+            backfill_existing=True,
+        )
+        self.assertEqual(result["slack"].calls, [])
+        self.assertEqual(state["posts"][BORIS_PERMALINK]["state"], m.STATE_NOTES)
+        self.assertEqual(
+            state["posts"][BORIS_PERMALINK]["lanes"], {"t_boris": m.STATE_NOTES}
+        )
+        self.assertEqual(state["posts"][PERMALINK], legacy_before)
+
+    def test_boris_style_defaults_modern_and_can_reverse_to_legacy(self):
+        modern = tick([lane("t_modern", "running", permalink=BORIS_PERMALINK)], {})
+        self.assertEqual(modern["slack"].adds, [(BORIS_PERMALINK, "rubbing")])
+
+        legacy = tick(
+            [lane("t_legacy", "running", permalink=BORIS_PERMALINK)],
+            {},
+            boris_reaction_style="legacy",
+        )
+        self.assertEqual(legacy["slack"].adds, [(BORIS_PERMALINK, "thinkies")])
+
+    def test_busy_invocation_lock_exits_without_loading_processing_or_saving(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "watchdog.json"
+            lock_path = state_path.with_suffix(".lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with (
+                    mock.patch.object(m, "STATE_PATH", state_path),
+                    mock.patch.object(m, "load_json") as load,
+                    mock.patch.object(m, "process_tick") as process,
+                    mock.patch.object(m, "slack_reaction") as react,
+                    mock.patch.object(m, "save_json") as save,
+                ):
+                    self.assertEqual(m.main([]), 0)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        load.assert_not_called()
+        process.assert_not_called()
+        react.assert_not_called()
+        save.assert_not_called()
 
 
 # --- state migration / restart -------------------------------------------
@@ -1041,20 +1212,20 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"findings": "BLOCKER: unsafe", "github_review_submitted": True,
                          "github_review_state": "APPROVED", "approved": True}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_string_review_container_needs_fix_beats_approved_flags(self):
         self.assertEqual(
             self.status({"review": "NEEDS_FIX", "github_review_submitted": True,
                          "github_review_state": "APPROVED", "approved": True}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_dict_shaped_findings_naming_a_blocker_beat_approved_flags(self):
         self.assertEqual(
             self.status({"findings": {"1": "BLOCKER: drops rows"}, "approved_by_chadtao206": True}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_string_blocker_surface_blocks_even_without_blocking_vocabulary(self):
@@ -1062,7 +1233,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"blockers": "see the thread", "github_review_state": "APPROVED",
                          "github_review_id": 5}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_benign_empty_malformed_surface_is_not_a_block(self):
@@ -1071,7 +1242,7 @@ class FailClosedClassifierTest(unittest.TestCase):
             self.assertEqual(
                 self.status({"findings": empty, "github_review_submitted": True,
                              "github_review_state": "APPROVED"}),
-                ("signal", m.EMOJI_APPROVED), empty,
+                ("signal", m.STATE_APPROVED), empty,
             )
 
     # -- approval claims contradicted by a veto --
@@ -1094,7 +1265,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         # The veto is what quarantines, not the submitted claim itself.
         self.assertEqual(
             self.status({"approval_status": "submitted_and_refetched", "findings": []}),
-            ("signal", m.EMOJI_APPROVED),
+            ("signal", m.STATE_APPROVED),
         )
 
     def test_every_posted_alias_vetoes(self):
@@ -1118,7 +1289,7 @@ class FailClosedClassifierTest(unittest.TestCase):
             self.status({"approved": True, "findings": [], "github_review_id": 4797653504,
                          "github_review_state": "APPROVED",
                          "github_review_action": {"posted": True, "review_state": "APPROVED"}}),
-            ("signal", m.EMOJI_APPROVED),
+            ("signal", m.STATE_APPROVED),
         )
 
     def test_posted_false_outside_review_scope_does_not_veto(self):
@@ -1127,7 +1298,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"github_review_submitted": True, "github_review_state": "APPROVED",
                          "findings": [], "slack_summary": {"posted": False, "channel": "C1"}}),
-            ("signal", m.EMOJI_APPROVED),
+            ("signal", m.STATE_APPROVED),
         )
 
     # -- all aliases validated together, contradictions included --
@@ -1136,7 +1307,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"review": {"verdict": "NEEDS_FIX"},
                          "github_review": {"state": "APPROVED", "id": 5, "submitted": True}}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_contradictory_aliases_are_not_first_hit_wins(self):
@@ -1144,7 +1315,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"github_review": {"state": "APPROVED", "id": 5, "submitted": True},
                          "review": {"verdict": "NEEDS_FIX"}}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_commented_alias_beside_an_approved_alias_shows_comments(self):
@@ -1153,21 +1324,21 @@ class FailClosedClassifierTest(unittest.TestCase):
             self.status({"github_review": {"state": "COMMENTED", "id": 5},
                          "approval": {"submitted": True, "review_id": 7, "state": "APPROVED"},
                          "findings": []}),
-            ("signal", m.EMOJI_COMMENT),
+            ("signal", m.STATE_NOTES),
         )
 
     def test_changes_requested_alias_beside_an_approved_alias_blocks(self):
         self.assertEqual(
             self.status({"github_review": {"state": "CHANGES_REQUESTED", "id": 5},
                          "approval": {"submitted": True, "review_id": 7, "state": "APPROVED"}}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_nested_blocker_list_in_any_alias_blocks(self):
         for alias in m.ALL_CONTAINER_KEYS:
             self.assertEqual(
                 self.status({alias: {"blockers": ["unsafe"]}, "approved_by_chadtao206": True}),
-                ("signal", m.EMOJI_BLOCK), alias,
+                ("signal", m.STATE_BLOCKED), alias,
             )
 
     def test_bare_state_done_is_lane_bookkeeping_not_a_review_state(self):
@@ -1175,7 +1346,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"state": "done", "github_review_submitted": True,
                          "github_review_state": "APPROVED", "findings": []}),
-            ("signal", m.EMOJI_APPROVED),
+            ("signal", m.STATE_APPROVED),
         )
         self.assertEqual(self.status({"state": "done"}), ("none", None))
 
@@ -1190,7 +1361,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"blockers": object(), "github_review_submitted": True,
                          "github_review_state": "APPROVED"}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_list_shaped_review_container_naming_a_block_still_blocks(self):
@@ -1198,7 +1369,7 @@ class FailClosedClassifierTest(unittest.TestCase):
         self.assertEqual(
             self.status({"review": ["NEEDS_FIX"], "github_review_submitted": True,
                          "github_review_state": "APPROVED"}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_task_approval_does_not_resurrect_an_older_approval(self):
@@ -1255,14 +1426,14 @@ class NestedAliasFailClosedTest(unittest.TestCase):
         label = msg or repr(metadata)
         status, emoji = self.status(metadata)
         self.assertIn(status, ("signal", "quarantine"), label)
-        self.assertNotEqual(emoji, m.EMOJI_APPROVED, label)
+        self.assertNotEqual(emoji, m.STATE_APPROVED, label)
         run_row = {"id": "r", "profile": "reviewer", "ended_at": NOW - 60, "metadata": metadata}
         self.assertFalse(m.run_indicates_approval(run_row), label)
         payload = {"task": {"id": "t_n", "status": "done", "assignee": "reviewer"},
                    "runs": [run_row]}
         self.assertFalse(m.task_approval(payload)[0], label)
         lane_emoji = m.classify_task(payload)[0]
-        self.assertNotEqual(lane_emoji, m.EMOJI_APPROVED, label)
+        self.assertNotEqual(lane_emoji, m.STATE_APPROVED, label)
         if status == "quarantine":
             self.assertEqual(lane_emoji, m.QUARANTINE, label)
         else:
@@ -1271,13 +1442,13 @@ class NestedAliasFailClosedTest(unittest.TestCase):
     def assert_approves(self, metadata, msg=None):
         """The control direction: a clean nested approval still reaches ✅ on all three."""
         label = msg or repr(metadata)
-        self.assertEqual(self.status(metadata), ("signal", m.EMOJI_APPROVED), label)
+        self.assertEqual(self.status(metadata), ("signal", m.STATE_APPROVED), label)
         run_row = {"id": "r", "profile": "reviewer", "ended_at": NOW - 60, "metadata": metadata}
         self.assertTrue(m.run_indicates_approval(run_row), label)
         payload = {"task": {"id": "t_n", "status": "done", "assignee": "reviewer"},
                    "runs": [run_row]}
         self.assertTrue(m.task_approval(payload)[0], label)
-        self.assertEqual(m.classify_task(payload)[0], m.EMOJI_APPROVED, label)
+        self.assertEqual(m.classify_task(payload)[0], m.STATE_APPROVED, label)
 
     # -- the two probes named in the re-review REJECT --
 
@@ -1290,7 +1461,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
         self.assertEqual(
             self.status({"github_review_submitted": True, "github_review_state": "APPROVED",
                          "review": {"approval": {"findings": ["BLOCKER: unsafe migration"]}}}),
-            ("signal", m.EMOJI_BLOCK),
+            ("signal", m.STATE_BLOCKED),
         )
 
     def test_reject_probe_nested_review_approval_non_approved_state(self):
@@ -1307,7 +1478,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
             for inner in m.ALL_CONTAINER_KEYS:
                 metadata = {**self.APPROVED_TOP, "approved_by_chadtao206": True,
                             outer: {inner: {"blockers": ["unsafe migration"]}}}
-                self.assertEqual(self.status(metadata), ("signal", m.EMOJI_BLOCK),
+                self.assertEqual(self.status(metadata), ("signal", m.STATE_BLOCKED),
                                  f"{outer}.{inner}.blockers")
                 self.assert_never_approves(metadata, f"{outer}.{inner}.blockers")
 
@@ -1316,7 +1487,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
             for inner in m.ALL_CONTAINER_KEYS:
                 metadata = {**self.APPROVED_TOP, "findings": [],
                             outer: {inner: {"verdict": "NEEDS_FIX"}}}
-                self.assertEqual(self.status(metadata), ("signal", m.EMOJI_BLOCK),
+                self.assertEqual(self.status(metadata), ("signal", m.STATE_BLOCKED),
                                  f"{outer}.{inner}.verdict")
 
     def test_nesting_is_not_insertion_order_dependent(self):
@@ -1329,7 +1500,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
                        "review": {"approval": {"state": "APPROVED", "review_id": 9,
                                                "submitted": True, "blockers": ["unsafe"]}}}
         for metadata in (nested_first, nested_last):
-            self.assertEqual(self.status(metadata), ("signal", m.EMOJI_BLOCK), metadata)
+            self.assertEqual(self.status(metadata), ("signal", m.STATE_BLOCKED), metadata)
             self.assert_never_approves(metadata)
 
     def test_container_labels_are_independent_of_dict_insertion_order(self):
@@ -1386,12 +1557,12 @@ class NestedAliasFailClosedTest(unittest.TestCase):
     def test_a_readable_blocking_nested_finding_surface_blocks(self):
         metadata = {**self.APPROVED_TOP,
                     "review": {"approval": {"findings": "BLOCKER: drops rows"}}}
-        self.assertEqual(self.status(metadata), ("signal", m.EMOJI_BLOCK))
+        self.assertEqual(self.status(metadata), ("signal", m.STATE_BLOCKED))
 
     def test_a_readable_nested_comment_surface_shows_comments(self):
         metadata = {**self.APPROVED_TOP,
                     "review": {"approval": {"review_comments": "two nits in the migration"}}}
-        self.assertEqual(self.status(metadata), ("signal", m.EMOJI_COMMENT))
+        self.assertEqual(self.status(metadata), ("signal", m.STATE_NOTES))
 
     def test_a_nested_blocker_surface_names_its_full_path(self):
         reasons = [r for _kind, r in m.malformed_surfaces(
@@ -1405,7 +1576,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
         for key in ("github_review", "approval", "review")[:m.CONTAINER_NEST_DEPTH]:
             chain = {key: chain}
         metadata = {**self.APPROVED_TOP, "approved": True, **chain}
-        self.assertEqual(self.status(metadata), ("signal", m.EMOJI_BLOCK))
+        self.assertEqual(self.status(metadata), ("signal", m.STATE_BLOCKED))
         self.assert_never_approves(metadata)
 
     def test_an_alias_chain_past_the_depth_bound_quarantines_rather_than_approves(self):
@@ -1450,7 +1621,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
         for empty in ("none", "", "n/a", 0, False, [], {}):
             metadata = {**self.APPROVED_TOP, "findings": [],
                         "review": {"approval": {"findings": empty, "blockers": empty}}}
-            self.assertEqual(self.status(metadata), ("signal", m.EMOJI_APPROVED), repr(empty))
+            self.assertEqual(self.status(metadata), ("signal", m.STATE_APPROVED), repr(empty))
 
     def test_unrelated_nested_metadata_is_still_not_broad_scanned(self):
         # Only *known* alias keys are followed. A blocking-looking string parked in
@@ -1472,7 +1643,7 @@ class NestedAliasFailClosedTest(unittest.TestCase):
                               "review": {"approval": {"findings": ["BLOCKER: unsafe"]}}}},
             ],
         }
-        self.assertEqual(m.classify_task(payload)[0], m.EMOJI_BLOCK)
+        self.assertEqual(m.classify_task(payload)[0], m.STATE_BLOCKED)
         self.assertFalse(m.task_approval(payload)[0])
 
 
