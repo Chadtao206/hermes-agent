@@ -2765,7 +2765,7 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(retried["slack"].removes, [(PERMALINK, m.EMOJI_ACTIVE)])
         self.assertEqual(state["posts"][PERMALINK]["pending_removals"], [])
 
-    def test_boris_absent_reconciliation_removal_does_not_strand_pending_work(self):
+    def test_exit_three_not_reacted_reconciliation_settles_then_is_zero_write(self):
         state = m.migrate_state(None, NOW, backfill=True)[0]
         state["machine_baseline_at"] = 0
         state["posts"][BORIS_PERMALINK] = {
@@ -2781,8 +2781,12 @@ class ReconciliationTest(unittest.TestCase):
 
         def already_absent(cmd, *, timeout=120):
             commands.append(cmd)
+            if "--remove" not in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, '{"ok": true, "already_reacted": true}', ""
+                )
             return subprocess.CompletedProcess(
-                cmd, 0, '{"ok": false, "error": "not_reacted"}', ""
+                cmd, 3, '{"ok": false, "error": "not_reacted"}', ""
             )
 
         with mock.patch.object(m, "run", already_absent):
@@ -2998,6 +3002,49 @@ class SlackReactionResultTest(unittest.TestCase):
                     set(result), {"ok", "error", "already_reacted", "no_reaction", "raw"}
                 )
 
+    def test_remove_folds_exit_three_not_reacted_into_already_absent_shape(self):
+        result, _ = self.reaction(
+            3, '{"ok": false, "error": "not_reacted"}', remove=True
+        )
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["error"])
+        self.assertFalse(result["already_reacted"])
+        self.assertTrue(result["no_reaction"])
+
+    def test_exit_three_other_results_remain_failures(self):
+        payloads = (
+            {"ok": False, "error": "invalid_auth"},
+            {"ok": False, "error": "missing_scope"},
+            {"ok": False, "error": "ratelimited"},
+            {"ok": False, "error": "http_500"},
+            {"ok": False, "error": "other_error"},
+            {"ok": False, "error": "no_reaction"},
+            {"ok": True, "error": "not_reacted"},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                result, _ = self.reaction(3, json.dumps(payload), remove=True)
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["no_reaction"])
+
+    def test_exit_three_malformed_or_non_object_output_remains_a_failure(self):
+        for payload in ("", "not-json", "[]", '"not_reacted"'):
+            with self.subTest(payload=payload):
+                result, _ = self.reaction(3, payload, remove=True)
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["no_reaction"])
+
+    def test_other_nonzero_exits_with_not_reacted_remain_failures(self):
+        for returncode in (1, 2, 4, 75):
+            with self.subTest(returncode=returncode):
+                result, _ = self.reaction(
+                    returncode,
+                    '{"ok": false, "error": "not_reacted"}',
+                    remove=True,
+                )
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["no_reaction"])
+
     def test_remove_keeps_auth_rate_and_http_errors_as_failures(self):
         cases = (
             (0, "invalid_auth"),
@@ -3032,27 +3079,29 @@ class SlackReactionResultTest(unittest.TestCase):
                 self.assertFalse(result["no_reaction"])
 
     def test_not_reacted_add_failure_preserves_add_before_remove(self):
-        commands = []
+        for returncode in (0, 3):
+            with self.subTest(returncode=returncode):
+                commands = []
 
-        def not_reacted(cmd, *, timeout=120):
-            commands.append(cmd)
-            return subprocess.CompletedProcess(
-                cmd, 0, '{"ok": false, "error": "not_reacted"}', ""
-            )
+                def not_reacted(cmd, *, timeout=120):
+                    commands.append(cmd)
+                    return subprocess.CompletedProcess(
+                        cmd, returncode, '{"ok": false, "error": "not_reacted"}', ""
+                    )
 
-        with mock.patch.object(m, "run", not_reacted):
-            result = m.apply_transition(
-                PERMALINK,
-                m.EMOJI_BLOCK,
-                {"emoji": m.EMOJI_ACTIVE},
-                m.slack_reaction,
-                m.owned_reactions(PERMALINK),
-            )
+                with mock.patch.object(m, "run", not_reacted):
+                    result = m.apply_transition(
+                        PERMALINK,
+                        m.EMOJI_BLOCK,
+                        {"emoji": m.EMOJI_ACTIVE},
+                        m.slack_reaction,
+                        m.owned_reactions(PERMALINK),
+                    )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["prior"], m.EMOJI_ACTIVE)
-        self.assertEqual(len(commands), 1)
-        self.assertNotIn("--remove", commands[0])
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["prior"], m.EMOJI_ACTIVE)
+                self.assertEqual(len(commands), 1)
+                self.assertNotIn("--remove", commands[0])
 
     def test_remove_passes_the_remove_flag_and_exact_permalink(self):
         import subprocess

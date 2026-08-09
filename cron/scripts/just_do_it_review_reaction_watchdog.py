@@ -1100,9 +1100,11 @@ def slack_reaction(permalink: str, emoji: str, remove: bool, *, timeout: int = 6
     Fails closed on the helper's *result*, not just its exit code: success requires
     a parsed JSON object that explicitly says ``{"ok": true}``, except that an
     explicit ``no_reaction`` or ``not_reacted`` removal outcome also proves the
-    ensure-absent postcondition. An rc=0 run that printed nothing, printed non-JSON,
-    or printed a non-object proves nothing about the post, so it is reported as a
-    retryable failure instead of being believed.
+    ensure-absent postcondition. The helper reports ``not_reacted`` with its
+    dedicated semantic exit code 3; no other nonzero result is accepted. An rc=0
+    run that printed nothing, printed non-JSON, or printed a non-object proves
+    nothing about the post, so it is reported as a retryable failure instead of
+    being believed.
     """
     cmd = [str(SLACK_REACT), permalink, "--emoji", emoji]
     if remove:
@@ -1125,12 +1127,16 @@ def slack_reaction(permalink: str, emoji: str, remove: bool, *, timeout: int = 6
             "no_reaction": False,
             "raw": raw,
         }
-    already_absent = (
-        remove
-        and proc.returncode == 0
-        and payload.get("error") in ("no_reaction", "not_reacted")
+    error = payload.get("error")
+    already_absent = remove and (
+        (proc.returncode == 0 and error in ("no_reaction", "not_reacted"))
+        or (
+            proc.returncode == 3
+            and payload.get("ok") is False
+            and error == "not_reacted"
+        )
     )
-    ok = proc.returncode == 0 and (payload.get("ok") is True or already_absent)
+    ok = (proc.returncode == 0 and payload.get("ok") is True) or already_absent
     return {
         "ok": bool(ok),
         "error": (
