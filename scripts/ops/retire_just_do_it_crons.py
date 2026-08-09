@@ -49,6 +49,8 @@ RETIRE = {
 }
 RETAIN_ID = "6daa151da351"
 RETAIN_SCRIPT = "just_do_it_review_reaction_watchdog.py"
+RETAIN_PRE_MIGRATION_NAME = "just-do-it-review-reaction-state-watchdog"
+RETAIN_POST_MIGRATION_NAME = "boris-review-reaction-state-watchdog"
 DEPRECATED_CREATOR = "just-do-it-blocked-review-requeue-watchdog"
 DEPRECATED_IDEMPOTENCY_PREFIX = "just-do-it-rereview:"
 
@@ -1965,7 +1967,9 @@ def _latest_execution(path: Path, job_id: str) -> Optional[dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
-def _validate_retained_job(job: Optional[dict[str, Any]], paths: Paths) -> list[str]:
+def _validate_retained_job(
+    job: Optional[dict[str, Any]], paths: Paths, expected_name: str
+) -> list[str]:
     if job is None:
         return ["retained job is missing"]
     checks = {
@@ -1979,7 +1983,7 @@ def _validate_retained_job(job: Optional[dict[str, Any]], paths: Paths) -> list[
         "no_agent": job.get("no_agent") is True,
         "enabled": job.get("enabled") is True,
         "state": job.get("state") == "scheduled",
-        "name": job.get("name") == "boris-review-reaction-state-watchdog",
+        "name": job.get("name") == expected_name,
     }
     return [f"retained job {key} is invalid" for key, valid in checks.items() if not valid]
 
@@ -2128,7 +2132,19 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
         fingerprint = manifest.quiescent_files.get(key)
         if fingerprint is None or not _matches(fingerprint):
             errors.append(f"quiescent audit fingerprint mismatch: {key}")
-    errors.extend(_validate_retained_job(jobs_by_id.get(RETAIN_ID), paths))
+    reaction_checkpoints = manifest.component_checkpoints.get(
+        "retained-reaction", []
+    )
+    expected_retained_name = (
+        RETAIN_POST_MIGRATION_NAME
+        if reaction_checkpoints
+        else RETAIN_PRE_MIGRATION_NAME
+    )
+    errors.extend(
+        _validate_retained_job(
+            jobs_by_id.get(RETAIN_ID), paths, expected_retained_name
+        )
+    )
     try:
         latest = _latest_execution(paths.executions_path, RETAIN_ID)
         if latest is None or latest.get("status") != "completed":
@@ -2236,7 +2252,9 @@ def _validate_checkpoint(paths: Paths, manifest: Manifest, component: str) -> di
         if retained.get("enabled") is not False or retained.get("state") != "paused":
             raise RetirementError("retained job must be paused before reaction checkpoint")
     else:
-        retained_errors = _validate_retained_job(retained, paths)
+        retained_errors = _validate_retained_job(
+            retained, paths, RETAIN_POST_MIGRATION_NAME
+        )
         latest = _latest_execution(paths.executions_path, RETAIN_ID)
         if retained_errors or latest is None or latest.get("status") != "completed":
             raise RetirementError(

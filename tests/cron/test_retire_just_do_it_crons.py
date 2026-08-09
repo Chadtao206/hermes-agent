@@ -34,6 +34,8 @@ from scripts.ops.retire_just_do_it_crons import (
 
 RETIRE_IDS = {"ee4582d0598f", "ff865c33c5ea"}
 RETAIN_ID = "6daa151da351"
+PRE_MIGRATION_RETAINED_NAME = "just-do-it-review-reaction-state-watchdog"
+POST_MIGRATION_RETAINED_NAME = "boris-review-reaction-state-watchdog"
 DURABLE_RECOVERY_PATHS = (
     "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
     "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py",
@@ -83,10 +85,15 @@ def _use_canonical_stored_job_identities(fixture: RetirementFixture) -> None:
     for job in fixture.jobs:
         job["script"] = Path(job["script"]).name
         job["schedule"]["display"] = schedule_displays[job["id"]]
-    next(job for job in fixture.jobs if job["id"] == RETAIN_ID)["name"] = (
-        "boris-review-reaction-state-watchdog"
-    )
     fixture.write_jobs()
+
+
+def _set_retained_name(fixture: RetirementFixture, name: str) -> None:
+    with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            next(job for job in jobs if job["id"] == RETAIN_ID)["name"] = name
+            cron_jobs.save_jobs(jobs)
 
 
 def _configure_retained_progress_job(fixture: RetirementFixture) -> None:
@@ -476,7 +483,7 @@ def retirement_fixture(tmp_path) -> RetirementFixture:
         ),
         _job(
             RETAIN_ID,
-            "just-do-it-review-reaction-watchdog",
+            "just-do-it-review-reaction-state-watchdog",
             live_scripts / "just_do_it_review_reaction_watchdog.py",
             {"kind": "cron", "expr": "* * * * *"},
         ),
@@ -969,13 +976,10 @@ def test_quiescence_uses_injected_process_listing(retirement_fixture):
     assert any("retired script process" in error for error in errors)
 
 
-def test_verify_retired_accepts_the_guarded_final_state(retirement_fixture):
+def test_retained_name_phase_task8_final_state_accepts_pre_migration_name(
+    retirement_fixture,
+):
     manifest = retirement_fixture.complete_retirement()
-    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
-        with cron_jobs._jobs_lock():
-            jobs = cron_jobs.load_jobs()
-            jobs[0]["name"] = "boris-review-reaction-state-watchdog"
-            cron_jobs.save_jobs(jobs)
     retirement_fixture.insert_execution(
         RETAIN_ID,
         status="completed",
@@ -984,6 +988,96 @@ def test_verify_retired_accepts_the_guarded_final_state(retirement_fixture):
     assert verify_retired(
         retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
     ) == []
+
+
+def test_retained_name_phase_task8_rejects_premature_post_migration_name(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    _set_retained_name(retirement_fixture, POST_MIGRATION_RETAINED_NAME)
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert errors == ["retained job name is invalid"]
+
+
+def test_retained_name_phase_post_checkpoint_accepts_post_migration_name(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+
+    assert verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    ) == []
+
+
+def test_retained_name_phase_post_checkpoint_rejects_pre_migration_name(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    _set_retained_name(retirement_fixture, PRE_MIGRATION_RETAINED_NAME)
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert errors == ["retained job name is invalid"]
+
+
+@pytest.mark.parametrize(
+    ("retained_name", "accepted"),
+    (
+        pytest.param(PRE_MIGRATION_RETAINED_NAME, False, id="pre-migration"),
+        pytest.param(POST_MIGRATION_RETAINED_NAME, True, id="post-migration"),
+    ),
+)
+def test_retained_name_phase_boris_checkpoint_requires_post_migration_name(
+    retirement_fixture, retained_name, accepted
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    _set_retained_name(retirement_fixture, retained_name)
+
+    if not accepted:
+        with pytest.raises(
+            RetirementError,
+            match="retained watchdog must be enabled and healthy before Boris checkpoint",
+        ):
+            checkpoint_component(
+                retirement_fixture.paths,
+                manifest,
+                "boris-intake",
+                manifest.cutoff_epoch + 210,
+            )
+        return
+
+    checkpointed = checkpoint_component(
+        retirement_fixture.paths,
+        manifest,
+        "boris-intake",
+        manifest.cutoff_epoch + 210,
+    )
+    assert len(checkpointed.component_checkpoints["boris-intake"]) == 1
+
+
+@pytest.mark.parametrize("phase", ("pre-migration", "post-migration"))
+def test_retained_name_phase_rejects_arbitrary_name_in_every_phase(
+    retirement_fixture, phase
+):
+    manifest = retirement_fixture.complete_retirement()
+    if phase == "post-migration":
+        manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    _set_retained_name(retirement_fixture, "unapproved-review-reaction-watchdog")
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert errors == ["retained job name is invalid"]
 
 
 def test_manifest_does_not_embed_secret_config_contents(retirement_fixture):
@@ -2567,13 +2661,6 @@ def test_reaction_projection_classifies_reacted_records_by_permalink_key(
     changed = json.loads(retirement_fixture.reaction_state_path.read_text())
     changed["reacted"][f"boris-lane:{boris_permalink}"]["at"] = 200
     retirement_fixture.reaction_state_path.write_text(json.dumps(changed, indent=2))
-    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
-        with cron_jobs._jobs_lock():
-            jobs = cron_jobs.load_jobs()
-            next(job for job in jobs if job["id"] == RETAIN_ID)["name"] = (
-                "boris-review-reaction-state-watchdog"
-            )
-            cron_jobs.save_jobs(jobs)
     retirement_fixture.insert_execution(
         RETAIN_ID,
         status="completed",
