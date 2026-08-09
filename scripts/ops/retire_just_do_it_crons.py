@@ -2304,15 +2304,22 @@ def _validate_paused_retired_boundary(
         raise RetirementError(
             f"paused retained operation requires finalized manifest, found {manifest.phase}"
         )
-    by_id = {str(job.get("id")): job for job in jobs}
+    job_records = list(jobs)
+    retained_records = [
+        job for job in job_records if str(job.get("id")) == RETAIN_ID
+    ]
+    if len(retained_records) != 1:
+        raise RetirementError(
+            "expected exactly one retained job record, "
+            f"found {len(retained_records)}"
+        )
+    by_id = {str(job.get("id")): job for job in job_records}
     present_retired = sorted(set(RETIRE) & set(by_id))
     if present_retired:
         raise RetirementError(
             f"retired jobs remain registered: {', '.join(present_retired)}"
         )
-    retained = by_id.get(RETAIN_ID)
-    if retained is None:
-        raise RetirementError("retained job is missing")
+    retained = retained_records[0]
     paused_checks = {
         "id": retained.get("id") == RETAIN_ID,
         "name": retained.get("name") == RETAIN_POST_MIGRATION_NAME,
@@ -2397,17 +2404,25 @@ def configure_retained_boris_only_prompt(
                 job for job in expected_jobs if job.get("id") == RETAIN_ID
             )
             expected_retained["prompt"] = RETAIN_BORIS_ONLY_PROMPT
-            cron_jobs.save_jobs(expected_jobs)
-            reloaded = cron_jobs.load_jobs()
-            if reloaded != expected_jobs:
-                cron_jobs.save_jobs(jobs)
-                if cron_jobs.load_jobs() != jobs:
+            try:
+                cron_jobs.save_jobs(expected_jobs)
+                reloaded = cron_jobs.load_jobs()
+                if reloaded != expected_jobs:
+                    raise RetirementError(
+                        "retained prompt update changed unexpected job fields"
+                    )
+            except BaseException:
+                try:
+                    cron_jobs.save_jobs(jobs)
+                    if cron_jobs.load_jobs() != jobs:
+                        raise RetirementError(
+                            "restored registry differs from pre-update job records"
+                        )
+                except BaseException as restore_exc:
                     raise RetirementError(
                         "retained prompt verification failed and registry restoration failed"
-                    )
-                raise RetirementError(
-                    "retained prompt update changed unexpected job fields"
-                )
+                    ) from restore_exc
+                raise
             report["status"] = "configured"
             return report
 
@@ -2585,6 +2600,7 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
         with cron_jobs._jobs_lock():
             jobs = cron_jobs.load_jobs()
     jobs_by_id = {job.get("id"): job for job in jobs}
+    retained_records = [job for job in jobs if job.get("id") == RETAIN_ID]
     for job_id in RETIRE:
         if job_id in jobs_by_id:
             errors.append(f"retired job remains registered: {job_id}")
@@ -2645,14 +2661,22 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
         if reaction_checkpoints or boris_checkpoints
         else None
     )
-    errors.extend(
-        _validate_retained_job(
-            jobs_by_id.get(RETAIN_ID),
-            paths,
-            expected_retained_name,
-            expected_retained_prompt,
+    if not retained_records:
+        errors.append("retained job is missing")
+    elif len(retained_records) != 1:
+        errors.append(
+            "expected exactly one retained job record, "
+            f"found {len(retained_records)}"
         )
-    )
+    else:
+        errors.extend(
+            _validate_retained_job(
+                retained_records[0],
+                paths,
+                expected_retained_name,
+                expected_retained_prompt,
+            )
+        )
     try:
         latest = _latest_execution(paths.executions_path, RETAIN_ID)
         if latest is None or latest.get("status") != "completed":
@@ -2747,16 +2771,28 @@ def _load_jobs(paths: Paths) -> dict[str, dict[str, Any]]:
             return {job["id"]: copy.deepcopy(job) for job in cron_jobs.load_jobs()}
 
 
+def _load_job_records(paths: Paths) -> list[dict[str, Any]]:
+    with cron_jobs.use_cron_store(paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            return copy.deepcopy(cron_jobs.load_jobs())
+
+
 def _validate_checkpoint(paths: Paths, manifest: Manifest, component: str) -> dict[str, Any]:
     if component not in {"retained-reaction", "boris-intake"}:
         raise RetirementError(
             "component must be retained-reaction or boris-intake"
         )
     _assert_manifest_paths(paths, manifest)
-    jobs = _load_jobs(paths)
-    retained = jobs.get(RETAIN_ID)
-    if retained is None:
+    jobs = _load_job_records(paths)
+    retained_records = [job for job in jobs if job.get("id") == RETAIN_ID]
+    if not retained_records:
         raise RetirementError("retained job is missing")
+    if len(retained_records) != 1:
+        raise RetirementError(
+            "expected exactly one retained job record, "
+            f"found {len(retained_records)}"
+        )
+    retained = retained_records[0]
     if component == "retained-reaction":
         if retained.get("enabled") is not False or retained.get("state") != "paused":
             raise RetirementError("retained job must be paused before reaction checkpoint")

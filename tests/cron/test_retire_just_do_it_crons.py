@@ -3342,6 +3342,63 @@ def test_retained_prompt_configuration_requires_paused_job(retirement_fixture):
         )
 
 
+def test_retained_prompt_configuration_rejects_duplicate_retained_ids(
+    retirement_fixture,
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+            duplicate = copy.deepcopy(retained)
+            duplicate["prompt"] = BORIS_ONLY_RETAINED_PROMPT
+            jobs.append(duplicate)
+            cron_jobs.save_jobs(jobs)
+    before = retirement_fixture.paths.jobs_path.read_bytes()
+
+    with pytest.raises(
+        RetirementError,
+        match="expected exactly one retained job record",
+    ):
+        retirement_controller.configure_retained_boris_only_prompt(
+            retirement_fixture.paths,
+            manifest,
+            apply=True,
+        )
+
+    assert retirement_fixture.paths.jobs_path.read_bytes() == before
+
+
+def test_retained_prompt_configuration_restores_after_post_replace_failure(
+    retirement_fixture, monkeypatch
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    original_jobs = retirement_fixture.read_jobs()
+    real_save_jobs = cron_jobs.save_jobs
+    injected = False
+
+    def save_then_fail_once(jobs):
+        nonlocal injected
+        result = real_save_jobs(jobs)
+        retained = next(job for job in jobs if job.get("id") == RETAIN_ID)
+        if not injected and retained.get("prompt") == BORIS_ONLY_RETAINED_PROMPT:
+            injected = True
+            raise OSError("injected post-replace failure")
+        return result
+
+    monkeypatch.setattr(cron_jobs, "save_jobs", save_then_fail_once)
+
+    with pytest.raises(OSError, match="injected post-replace failure"):
+        retirement_controller.configure_retained_boris_only_prompt(
+            retirement_fixture.paths,
+            manifest,
+            apply=True,
+        )
+
+    assert injected is True
+    assert retirement_fixture.read_jobs() == original_jobs
+
+
 def test_cli_retained_prompt_configuration_dry_run_then_apply(
     retirement_fixture, capsys
 ):
@@ -3390,6 +3447,23 @@ def test_verify_retired_requires_boris_only_prompt_after_reaction_checkpoint(
     assert "retained job prompt is invalid" in errors
 
 
+def test_verify_retired_rejects_duplicate_retained_ids(retirement_fixture):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+            jobs.append(copy.deepcopy(retained))
+            cron_jobs.save_jobs(jobs)
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert "expected exactly one retained job record, found 2" in errors
+
+
 def test_boris_checkpoint_requires_boris_only_retained_prompt(retirement_fixture):
     manifest = retirement_fixture.complete_retirement()
     manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
@@ -3404,6 +3478,28 @@ def test_boris_checkpoint_requires_boris_only_retained_prompt(retirement_fixture
     with pytest.raises(
         RetirementError,
         match="retained watchdog must be enabled and healthy before Boris checkpoint",
+    ):
+        checkpoint_component(
+            retirement_fixture.paths,
+            manifest,
+            "boris-intake",
+            manifest.cutoff_epoch + 240,
+        )
+
+
+def test_boris_checkpoint_rejects_duplicate_retained_ids(retirement_fixture):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+            jobs.append(copy.deepcopy(retained))
+            cron_jobs.save_jobs(jobs)
+
+    with pytest.raises(
+        RetirementError,
+        match="expected exactly one retained job record",
     ):
         checkpoint_component(
             retirement_fixture.paths,

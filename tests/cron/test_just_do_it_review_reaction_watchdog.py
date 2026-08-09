@@ -1462,14 +1462,37 @@ class BorisMigrationTest(unittest.TestCase):
         }
         return initial
 
+    @staticmethod
+    def legacy_due_quarantine_state():
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["machine_baseline_at"] = 0
+        initial["posts"][PERMALINK_B] = {
+            "emoji": "review-no",
+            "applied_at": NOW - 600,
+            "pending_removals": ["thinkies"],
+            "lanes": {"t_legacy": "review-no"},
+            "deferred_at": NOW - 600,
+            # Deliberately sparse/malformed legacy provenance: main-level restart
+            # normalization changes this if its default channel fence regresses,
+            # while process_tick refreshes alerted_at if its own fence regresses.
+            "unresolved_lanes": ["quarantined legacy lane"],
+            "alerted_at": NOW - m.UNRESOLVED_ALERT_SECONDS,
+            "opaque": {"preserve": ["exactly", "as-is"]},
+        }
+        return initial
+
     def test_scheduled_default_preserves_due_legacy_repair(self):
-        initial = self.legacy_pending_state()
+        initial = self.legacy_due_quarantine_state()
         legacy_post_before = json.loads(json.dumps(initial["posts"][PERMALINK_B]))
         legacy_reacted_before = json.loads(json.dumps(initial["reacted"]))
         slack, after, _before_bytes, _after_bytes = self.run_persisted_main(initial, [])
 
         self.assertEqual(slack.calls, [])
         self.assertEqual(after["posts"][PERMALINK_B], legacy_post_before)
+        self.assertEqual(
+            after["posts"][PERMALINK_B]["alerted_at"],
+            NOW - m.UNRESOLVED_ALERT_SECONDS,
+        )
         self.assertEqual(after["reacted"], legacy_reacted_before)
 
     def test_explicit_legacy_channel_still_repairs_due_legacy_record(self):
@@ -1678,7 +1701,7 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after, initial)
         self.assertEqual(after_bytes, before_bytes)
 
-    def test_no_task_selector_still_processes_all_persisted_candidates(self):
+    def test_scheduled_default_processes_boris_discovery_repair_and_reconciliation(self):
         pending = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000060"
         due = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000061"
         initial = m.migrate_state(None, NOW, backfill=True)[0]
@@ -1700,10 +1723,25 @@ class BorisMigrationTest(unittest.TestCase):
                 "reconcile_due_at": NOW,
             },
         }
+        discovered = lane(
+            "t_discovered",
+            "running",
+            permalink=BORIS_PERMALINK,
+            created_at=NOW - 10,
+        )
 
-        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(initial, [])
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial,
+            [],
+            rows=[discovered],
+        )
 
-        self.assertEqual({call[0] for call in slack.calls}, {pending, due})
+        self.assertEqual(
+            {call[0] for call in slack.calls},
+            {BORIS_PERMALINK, pending, due},
+        )
+        self.assertIn((BORIS_PERMALINK, "rubbing"), slack.adds)
+        self.assertEqual(after["posts"][BORIS_PERMALINK]["state"], m.STATE_ACTIVE)
         self.assertEqual(after["posts"][pending]["pending_removals"], [])
         self.assertEqual(after["posts"][due]["reconcile_sweeps"], 1)
 
