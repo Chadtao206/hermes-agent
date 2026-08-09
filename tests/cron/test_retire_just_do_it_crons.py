@@ -36,6 +36,7 @@ RETIRE_IDS = {"ee4582d0598f", "ff865c33c5ea"}
 RETAIN_ID = "6daa151da351"
 PRE_MIGRATION_RETAINED_NAME = "just-do-it-review-reaction-state-watchdog"
 POST_MIGRATION_RETAINED_NAME = "boris-review-reaction-state-watchdog"
+BORIS_CHANNEL = "C0BPCKPEFCG"
 DURABLE_RECOVERY_PATHS = (
     "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
     "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py",
@@ -94,6 +95,63 @@ def _set_retained_name(fixture: RetirementFixture, name: str) -> None:
             jobs = cron_jobs.load_jobs()
             next(job for job in jobs if job["id"] == RETAIN_ID)["name"] = name
             cron_jobs.save_jobs(jobs)
+
+
+def _expected_legacy_projection_hash(raw: dict) -> str:
+    posts = {
+        permalink: record
+        for permalink, record in raw["posts"].items()
+        if f"/{BORIS_CHANNEL}/" not in permalink
+    }
+    reacted = {}
+    for key, record in raw["reacted"].items():
+        permalink = key.split(":", 1)[1] if ":" in key else ""
+        if f"/{BORIS_CHANNEL}/" not in permalink:
+            reacted[key] = record
+    encoded = json.dumps(
+        {"posts": posts, "reacted": reacted},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _set_legacy_alerted_at(fixture: RetirementFixture, value: str) -> None:
+    state = json.loads(fixture.reaction_state_path.read_text())
+    legacy_permalink = (
+        "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
+    )
+    state["posts"][legacy_permalink]["alerted_at"] = value
+    fixture.reaction_state_path.write_text(json.dumps(state, indent=2))
+
+
+def _complete_reaction_checkpoint(
+    fixture: RetirementFixture, manifest: Manifest
+) -> Manifest:
+    with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+        cron_jobs.pause_job(RETAIN_ID, reason="installation lock")
+    manifest = checkpoint_component(
+        fixture.paths,
+        manifest,
+        "retained-reaction",
+        manifest.cutoff_epoch + 200,
+    )
+    with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+            retained.update(
+                name=POST_MIGRATION_RETAINED_NAME,
+                enabled=True,
+                state="scheduled",
+            )
+            cron_jobs.save_jobs(jobs)
+    fixture.insert_execution(
+        RETAIN_ID,
+        status="completed",
+        claimed_at=fixture.utc_iso(manifest.cutoff_epoch + 201),
+    )
+    return manifest
 
 
 def _configure_retained_progress_job(fixture: RetirementFixture) -> None:
@@ -2601,56 +2659,206 @@ def test_rollback_detects_each_boris_install_surface_change(
     assert "boris-intake" in manifest.changed_components
 
 
-def test_reaction_checkpoint_refreshes_the_legacy_projection_baseline(
+def test_legacy_projection_baseline_immediate_verify_uses_quiescent_snapshot(
     retirement_fixture,
 ):
-    manifest = retirement_fixture.complete_retirement()
-    state = json.loads(retirement_fixture.reaction_state_path.read_text())
-    legacy_permalink = "https://ylopo.slack.com/archives/C07BU8AAPB3/p99"
-    state["posts"][legacy_permalink] = {
-        "state": "active",
-        "emoji": "thinkies",
-        "lanes": {"legacy-new": "active"},
-        "pending_removals": [],
-    }
-    state["reacted"][f"legacy-new:{legacy_permalink}"] = {"at": 123}
-    retirement_fixture.reaction_state_path.write_text(json.dumps(state, indent=2))
-    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
-        cron_jobs.pause_job(RETAIN_ID, reason="installation lock")
-    manifest = checkpoint_component(
-        retirement_fixture.paths,
-        manifest,
-        "retained-reaction",
-        manifest.cutoff_epoch + 200,
+    manifest = retirement_fixture.preflight_and_pause()
+    _set_legacy_alerted_at(retirement_fixture, "captured-before-finalize")
+    manifest = finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
     )
-    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
-        with cron_jobs._jobs_lock():
-            jobs = cron_jobs.load_jobs()
-            retained = next(job for job in jobs if job["id"] == RETAIN_ID)
-            retained.update(
-                name="boris-review-reaction-state-watchdog",
-                enabled=True,
-                state="scheduled",
-            )
-            cron_jobs.save_jobs(jobs)
     retirement_fixture.insert_execution(
         RETAIN_ID,
         status="completed",
-        claimed_at=retirement_fixture.utc_iso(manifest.cutoff_epoch + 201),
+        claimed_at=retirement_fixture.utc_iso(manifest.cutoff_epoch + 200),
+    )
+
+    assert verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    ) == []
+
+
+def test_legacy_projection_baseline_backward_manifest_uses_quiescent_snapshot_without_mutation(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    preflight_hash = manifest.legacy_reaction_projection_sha256
+    _set_legacy_alerted_at(retirement_fixture, "captured-before-finalize")
+    manifest = finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+    manifest.legacy_reaction_projection_sha256 = preflight_hash
+    manifest.save()
+    backward_manifest = Manifest.load(manifest.manifest_path)
+    before = backward_manifest.manifest_path.read_bytes()
+    retirement_fixture.insert_execution(
+        RETAIN_ID,
+        status="completed",
+        claimed_at=retirement_fixture.utc_iso(manifest.cutoff_epoch + 200),
+    )
+
+    errors = verify_retired(
+        retirement_fixture.paths,
+        backward_manifest,
+        backward_manifest.cutoff_epoch + 240,
+    )
+
+    assert errors == []
+    assert backward_manifest.manifest_path.read_bytes() == before
+
+
+def test_legacy_projection_baseline_rejects_drift_after_quiescent_snapshot(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    _set_legacy_alerted_at(retirement_fixture, "captured-before-finalize")
+    manifest = finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+    _set_legacy_alerted_at(retirement_fixture, "drift-after-finalize")
+    retirement_fixture.insert_execution(
+        RETAIN_ID,
+        status="completed",
+        claimed_at=retirement_fixture.utc_iso(manifest.cutoff_epoch + 200),
     )
 
     errors = verify_retired(
         retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
     )
 
-    assert not any("legacy reaction projection changed" in error for error in errors)
+    assert "legacy reaction projection changed" in errors
 
 
-def test_reaction_projection_classifies_reacted_records_by_permalink_key(
+@pytest.mark.parametrize(
+    ("damage", "expected_reason"),
+    (
+        pytest.param("missing", "snapshot is missing", id="missing"),
+        pytest.param("malformed", "snapshot is malformed", id="malformed"),
+        pytest.param(
+            "fingerprint-tampered",
+            "snapshot fingerprint mismatch",
+            id="fingerprint-tampered",
+        ),
+    ),
+)
+def test_legacy_projection_baseline_quiescent_archive_fails_closed(
+    retirement_fixture, damage, expected_reason
+):
+    manifest = retirement_fixture.complete_retirement()
+    fingerprint = manifest.quiescent_files["reaction-ledger"]
+    archive = fingerprint.archive_path
+    if damage == "missing":
+        archive.unlink()
+    elif damage == "malformed":
+        payload = b'{"posts":'
+        archive.write_bytes(payload)
+        manifest.quiescent_files["reaction-ledger"] = replace(
+            fingerprint,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size=len(payload),
+        )
+    else:
+        archive.write_bytes(archive.read_bytes() + b"\n")
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    reaction_errors = [
+        error for error in errors if error.startswith("reaction ledger verification failed:")
+    ]
+    assert len(reaction_errors) == 1
+    assert "quiescent reaction-ledger" in reaction_errors[0]
+    assert expected_reason in reaction_errors[0]
+
+
+def test_legacy_projection_baseline_latest_checkpoint_snapshot_takes_precedence(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    _set_legacy_alerted_at(retirement_fixture, "captured-before-checkpoint")
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    checkpoint = manifest.component_checkpoints["retained-reaction"][-1]
+    archived = json.loads(
+        Path(checkpoint["files"]["reaction-ledger"]["archive_path"]).read_bytes()
+    )
+    expected_hash = _expected_legacy_projection_hash(archived)
+    assert checkpoint["legacy_reaction_projection_sha256"] == expected_hash
+    assert manifest.legacy_reaction_projection_sha256 == expected_hash
+    checkpoint["legacy_reaction_projection_sha256"] = "f" * 64
+    manifest.legacy_reaction_projection_sha256 = "0" * 64
+    manifest.save()
+
+    assert verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    ) == []
+
+
+def test_legacy_projection_baseline_rejects_drift_after_latest_checkpoint(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    _set_legacy_alerted_at(retirement_fixture, "captured-before-checkpoint")
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    _set_legacy_alerted_at(retirement_fixture, "drift-after-checkpoint")
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert "legacy reaction projection changed" in errors
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_reason"),
+    (
+        pytest.param("missing", "snapshot is missing", id="missing"),
+        pytest.param("malformed", "snapshot is malformed", id="malformed"),
+        pytest.param(
+            "fingerprint-tampered",
+            "snapshot fingerprint mismatch",
+            id="fingerprint-tampered",
+        ),
+    ),
+)
+def test_legacy_projection_baseline_latest_checkpoint_archive_fails_closed(
+    retirement_fixture, damage, expected_reason
+):
+    manifest = retirement_fixture.complete_retirement()
+    _set_legacy_alerted_at(retirement_fixture, "captured-before-checkpoint")
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    checkpoint = manifest.component_checkpoints["retained-reaction"][-1]
+    fingerprint = checkpoint["files"]["reaction-ledger"]
+    archive = Path(fingerprint["archive_path"])
+    if damage == "missing":
+        archive.unlink()
+    elif damage == "malformed":
+        payload = b'{"posts":'
+        archive.write_bytes(payload)
+        fingerprint["sha256"] = hashlib.sha256(payload).hexdigest()
+        fingerprint["size"] = len(payload)
+    else:
+        archive.write_bytes(archive.read_bytes() + b"\n")
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    reaction_errors = [
+        error for error in errors if error.startswith("reaction ledger verification failed:")
+    ]
+    assert len(reaction_errors) == 1
+    assert "latest retained-reaction checkpoint reaction-ledger" in reaction_errors[0]
+    assert expected_reason in reaction_errors[0]
+
+
+def test_legacy_projection_baseline_ignores_boris_only_active_changes(
     retirement_fixture,
 ):
     state = json.loads(retirement_fixture.reaction_state_path.read_text())
-    boris_permalink = "https://ylopo.slack.com/archives/C0BPCKPEFCG/p1111111111111111"
+    boris_permalink = (
+        "https://ylopo.slack.com/archives/C0BPCKPEFCG/p1111111111111111"
+    )
     legacy_permalink = "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
     state["reacted"] = {
         f"boris-lane:{boris_permalink}": {"at": 100},
@@ -2671,7 +2879,46 @@ def test_reaction_projection_classifies_reacted_records_by_permalink_key(
         retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
     )
 
-    assert not any("legacy reaction projection changed" in error for error in errors)
+    assert errors == []
+
+
+def test_legacy_projection_baseline_finalize_hash_comes_from_archived_quiescent_bytes(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    _set_legacy_alerted_at(retirement_fixture, "captured-by-snapshot")
+    real_snapshot = retirement_controller._snapshot
+
+    def snapshot_then_change_active(source, destination):
+        fingerprint = real_snapshot(source, destination)
+        if source == retirement_fixture.reaction_state_path:
+            _set_legacy_alerted_at(retirement_fixture, "changed-after-snapshot")
+        return fingerprint
+
+    monkeypatch.setattr(retirement_controller, "_snapshot", snapshot_then_change_active)
+
+    manifest = finalize(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+    )
+    archived = json.loads(
+        manifest.quiescent_files["reaction-ledger"].archive_path.read_bytes()
+    )
+    active = json.loads(retirement_fixture.reaction_state_path.read_bytes())
+    legacy_permalink = (
+        "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
+    )
+
+    assert archived["posts"][legacy_permalink]["alerted_at"] == "captured-by-snapshot"
+    assert active["posts"][legacy_permalink]["alerted_at"] == "changed-after-snapshot"
+    assert (
+        manifest.legacy_reaction_projection_sha256
+        == _expected_legacy_projection_hash(archived)
+    )
+    persisted = Manifest.load(manifest.manifest_path)
+    assert (
+        persisted.legacy_reaction_projection_sha256
+        == _expected_legacy_projection_hash(archived)
+    )
 
 
 def test_reaction_rehearsal_rejects_a_vacuous_roundtrip(

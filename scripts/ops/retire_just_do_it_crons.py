@@ -1876,6 +1876,9 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
     for key, source in _quiescent_sources(paths).items():
         quiescent[key] = _snapshot(source, quiescent_dir / key)
     manifest.quiescent_files = quiescent
+    manifest.legacy_reaction_projection_sha256 = _json_hash(
+        _archived_legacy_projection(quiescent["reaction-ledger"], "quiescent")
+    )
     manifest.protected_output_paths = {
         job_id: manifest.archive_dir / "protected-output" / job_id
         for job_id in RETIRE
@@ -2074,6 +2077,63 @@ def _checkpoint_files(raw: Mapping[str, Any]) -> dict[str, FileFingerprint]:
     }
 
 
+def _archived_legacy_projection(
+    fingerprint: FileFingerprint, baseline_name: str
+) -> dict[str, Any]:
+    archive_path = fingerprint.archive_path
+    if not archive_path.exists():
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot is missing"
+        )
+    if not _matches(fingerprint, archive_path):
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot fingerprint mismatch"
+        )
+    try:
+        raw = json.loads(archive_path.read_bytes())
+    except (OSError, ValueError, TypeError) as exc:
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot is malformed: {exc}"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(raw.get("posts"), dict)
+        or not isinstance(raw.get("reacted"), dict)
+    ):
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot is malformed"
+        )
+    return _legacy_projection(raw)
+
+
+def _legacy_reaction_baseline(manifest: Manifest) -> dict[str, Any]:
+    checkpoints = manifest.component_checkpoints.get("retained-reaction", [])
+    if checkpoints:
+        baseline_name = "latest retained-reaction checkpoint"
+        try:
+            checkpoint = checkpoints[-1]
+            files = checkpoint["files"]
+            raw_fingerprint = files["reaction-ledger"]
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise RetirementError(
+                f"{baseline_name} reaction-ledger snapshot is missing"
+            ) from exc
+        try:
+            fingerprint = FileFingerprint.from_dict(raw_fingerprint)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise RetirementError(
+                f"{baseline_name} reaction-ledger fingerprint is malformed"
+            ) from exc
+    else:
+        baseline_name = "quiescent"
+        fingerprint = manifest.quiescent_files.get("reaction-ledger")
+        if fingerprint is None:
+            raise RetirementError(
+                f"{baseline_name} reaction-ledger snapshot is missing"
+            )
+    return _archived_legacy_projection(fingerprint, baseline_name)
+
+
 def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
     """Verify the complete retired state without mutating any live artifact."""
     del now  # verification is identity/state based once a cutoff exists
@@ -2152,14 +2212,14 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
     except (sqlite3.Error, RetirementError) as exc:
         errors.append(f"retained execution verification failed: {exc}")
     try:
+        baseline_projection = _legacy_reaction_baseline(manifest)
         reaction_raw = json.loads(
-            (paths.state_dir / "just_do_it_review_reactions.json").read_text(
-                encoding="utf-8"
-            )
+            (paths.state_dir / "just_do_it_review_reactions.json").read_bytes()
         )
-        if _json_hash(_legacy_projection(reaction_raw)) != manifest.legacy_reaction_projection_sha256:
+        current_projection = _legacy_projection(reaction_raw)
+        if current_projection != baseline_projection:
             errors.append("legacy reaction projection changed")
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, RetirementError, ValueError, TypeError) as exc:
         errors.append(f"reaction ledger verification failed: {exc}")
 
     boris_checkpoints = manifest.component_checkpoints.get("boris-intake", [])
