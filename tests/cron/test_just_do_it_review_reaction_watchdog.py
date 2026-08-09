@@ -1288,6 +1288,83 @@ class BorisMigrationTest(unittest.TestCase):
         })
         self.assertEqual(after_all["schema_version"], m.STATE_SCHEMA_VERSION)
 
+    def test_deferred_migration_does_not_reseed_selected_legacy_history_after_compaction(self):
+        compaction_trigger = (
+            f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000004"
+        )
+        selected_key = f"t_selected:{BORIS_PERMALINK}"
+        excluded_key = f"t_excluded:{PERMALINK_B}"
+        legacy_reacted = {
+            selected_key: {
+                "at": NOW - m.POST_RETENTION_SECONDS - 10,
+                "permalink": BORIS_PERMALINK,
+                "reason": "selected legacy approval",
+                "task_id": "t_selected",
+            },
+            excluded_key: {
+                "at": NOW - 600,
+                "permalink": PERMALINK_B,
+                "reason": "excluded legacy approval",
+                "task_id": "t_excluded",
+            },
+        }
+        initial = {
+            "baseline_completed_at": NOW - m.POST_RETENTION_SECONDS - 60,
+            "reacted": legacy_reacted,
+        }
+        trigger_row = lane(
+            "t_compaction_trigger",
+            "running",
+            permalink=compaction_trigger,
+            created_at=NOW + 1,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "watchdog.json"
+            state_path.write_text(json.dumps(initial, indent=2, sort_keys=True))
+            slack = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(
+                    m,
+                    "kanban_reviewer_lanes",
+                    side_effect=[[], [trigger_row], [], []],
+                ),
+                mock.patch.object(m, "slack_reaction", slack),
+            ):
+                with mock.patch.object(m.time, "time", return_value=NOW):
+                    self.assertEqual(m.main(["--channel", BORIS_CHANNEL]), 0)
+                after_seed = json.loads(state_path.read_text())
+                self.assertIn(BORIS_PERMALINK, after_seed["posts"])
+                self.assertNotIn(PERMALINK_B, after_seed["posts"])
+
+                with mock.patch.object(m.time, "time", return_value=NOW + 1):
+                    self.assertEqual(m.main(["--channel", BORIS_CHANNEL]), 0)
+                after_compaction = json.loads(state_path.read_text())
+                self.assertNotIn(BORIS_PERMALINK, after_compaction["posts"])
+                self.assertIn(compaction_trigger, after_compaction["posts"])
+
+                with mock.patch.object(m.time, "time", return_value=NOW + 2):
+                    self.assertEqual(m.main(["--channel", BORIS_CHANNEL]), 0)
+                with mock.patch.object(m.time, "time", return_value=NOW + 3):
+                    self.assertEqual(m.main([]), 0)
+
+            after_all = json.loads(state_path.read_text())
+
+        self.assertNotIn(BORIS_PERMALINK, after_all["posts"])
+        self.assertEqual(after_all["posts"][PERMALINK_B], {
+            "emoji": m.EMOJI_APPROVED,
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_excluded": m.EMOJI_APPROVED},
+            "source": "legacy_reacted",
+        })
+        self.assertEqual(after_all["reacted"], legacy_reacted)
+        self.assertEqual(after_all["schema_version"], m.STATE_SCHEMA_VERSION)
+        self.assertEqual({permalink for permalink, _emoji, _remove in slack.calls}, {
+            compaction_trigger,
+        })
+
     def test_boris_only_processes_selected_persisted_repairs_without_mutating_legacy_records(self):
         initial = m.migrate_state(None, NOW, backfill=True)[0]
         initial["machine_baseline_at"] = 0

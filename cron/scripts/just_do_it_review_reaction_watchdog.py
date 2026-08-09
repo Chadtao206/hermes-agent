@@ -1386,14 +1386,21 @@ def migrate_state(
     if version != STATE_SCHEMA_VERSION:
         migrated = 0
         deferred = 0
+        completed_raw = state.get("legacy_reacted_completed")
+        completed = {
+            key for key in completed_raw if isinstance(key, str)
+        } if isinstance(completed_raw, list) else set()
         for key, entry in state["reacted"].items():
             if not isinstance(key, str) or ":" not in key:
+                continue
+            if key in completed:
                 continue
             task_id, permalink = key.split(":", 1)
             if not PERMALINK_RE.fullmatch(permalink):
                 continue
             record = state["posts"].get(permalink)
             if record_state(record) is not None:
+                completed.add(key)
                 continue
             if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
                 deferred += 1
@@ -1406,7 +1413,10 @@ def migrate_state(
                 "lanes": {task_id: EMOJI_APPROVED},
                 "source": "legacy_reacted",
             }
+            completed.add(key)
             migrated += 1
+        if completed:
+            state["legacy_reacted_completed"] = sorted(completed)
         # New reaction states must not backfill history: only lanes that change
         # after this migration are eligible.
         if "machine_baseline_at" not in state:
