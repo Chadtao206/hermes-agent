@@ -1243,6 +1243,51 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
         self.assertEqual(after_bytes, before_bytes)
 
+    def test_boris_only_legacy_migration_defers_excluded_approval_history_for_all_channel_run(self):
+        legacy_reacted = {
+            f"t_legacy:{PERMALINK_B}": {
+                "at": NOW - 600,
+                "permalink": PERMALINK_B,
+                "reason": "legacy approval fixture",
+                "task_id": "t_legacy",
+            },
+        }
+        initial = {
+            "baseline_completed_at": NOW - 1200,
+            "reacted": legacy_reacted,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "watchdog.json"
+            state_path.write_text(json.dumps(initial, indent=2, sort_keys=True))
+            slack = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[]),
+                mock.patch.object(m, "slack_reaction", slack),
+            ):
+                with mock.patch.object(m.time, "time", return_value=NOW):
+                    self.assertEqual(m.main(["--channel", BORIS_CHANNEL]), 0)
+                after_boris = json.loads(state_path.read_text())
+                self.assertEqual(after_boris["reacted"], legacy_reacted)
+                self.assertNotIn(PERMALINK_B, after_boris["posts"])
+
+                with mock.patch.object(m.time, "time", return_value=NOW + 1):
+                    self.assertEqual(m.main([]), 0)
+
+            after_all = json.loads(state_path.read_text())
+
+        self.assertEqual(slack.calls, [])
+        self.assertIn(PERMALINK_B, after_all["posts"])
+        self.assertEqual(after_all["posts"][PERMALINK_B], {
+            "emoji": m.EMOJI_APPROVED,
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_legacy": m.EMOJI_APPROVED},
+            "source": "legacy_reacted",
+        })
+        self.assertEqual(after_all["schema_version"], m.STATE_SCHEMA_VERSION)
+
     def test_boris_only_processes_selected_persisted_repairs_without_mutating_legacy_records(self):
         initial = m.migrate_state(None, NOW, backfill=True)[0]
         initial["machine_baseline_at"] = 0

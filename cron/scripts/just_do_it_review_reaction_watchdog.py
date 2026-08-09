@@ -1385,16 +1385,18 @@ def migrate_state(
 
     if version != STATE_SCHEMA_VERSION:
         migrated = 0
+        deferred = 0
         for key, entry in state["reacted"].items():
             if not isinstance(key, str) or ":" not in key:
                 continue
             task_id, permalink = key.split(":", 1)
             if not PERMALINK_RE.fullmatch(permalink):
                 continue
-            if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
-                continue
             record = state["posts"].get(permalink)
             if record_state(record) is not None:
+                continue
+            if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+                deferred += 1
                 continue
             at = _epoch((entry or {}).get("at")) if isinstance(entry, dict) else 0
             state["posts"][permalink] = {
@@ -1409,8 +1411,17 @@ def migrate_state(
         # after this migration are eligible.
         if "machine_baseline_at" not in state:
             state["machine_baseline_at"] = 0 if backfill else now
-        state["schema_version"] = STATE_SCHEMA_VERSION
-        notes.append(f"migrated legacy state: posts_seeded={migrated} machine_baseline_at={state['machine_baseline_at']}")
+        if deferred:
+            notes.append(
+                f"deferred legacy migration: posts_seeded={migrated} "
+                f"posts_deferred={deferred} machine_baseline_at={state['machine_baseline_at']}"
+            )
+        else:
+            state["schema_version"] = STATE_SCHEMA_VERSION
+            notes.append(
+                f"migrated legacy state: posts_seeded={migrated} "
+                f"machine_baseline_at={state['machine_baseline_at']}"
+            )
 
     if not isinstance(state.get("baseline_completed_at"), int):
         state["baseline_completed_at"] = 0 if backfill else now
