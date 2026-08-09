@@ -1393,17 +1393,17 @@ def migrate_state(
         for key, entry in state["reacted"].items():
             if not isinstance(key, str) or ":" not in key:
                 continue
-            if key in completed:
-                continue
             task_id, permalink = key.split(":", 1)
             if not PERMALINK_RE.fullmatch(permalink):
+                continue
+            if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+                deferred += 1
+                continue
+            if key in completed:
                 continue
             record = state["posts"].get(permalink)
             if record_state(record) is not None:
                 completed.add(key)
-                continue
-            if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
-                deferred += 1
                 continue
             at = _epoch((entry or {}).get("at")) if isinstance(entry, dict) else 0
             state["posts"][permalink] = {

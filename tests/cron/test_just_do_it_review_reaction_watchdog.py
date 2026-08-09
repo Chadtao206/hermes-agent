@@ -1243,6 +1243,46 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
         self.assertEqual(after_bytes, before_bytes)
 
+    def test_boris_only_does_not_mark_an_existing_excluded_legacy_post_complete(self):
+        # An already-present post represents this legacy approval, but a narrowed
+        # run must not persist that bookkeeping for an excluded channel.
+        legacy_key = f"t_legacy:{PERMALINK_B}"
+        legacy_reacted = {
+            legacy_key: {
+                "at": NOW - 600,
+                "permalink": PERMALINK_B,
+                "reason": "legacy approval fixture",
+                "task_id": "t_legacy",
+            },
+        }
+        legacy_post = {
+            "emoji": m.EMOJI_APPROVED,
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_legacy": m.EMOJI_APPROVED},
+            "source": "legacy_reacted",
+        }
+        initial = {
+            "schema_version": m.STATE_SCHEMA_VERSION - 1,
+            "baseline_completed_at": NOW - 1200,
+            "machine_baseline_at": NOW - 1200,
+            "posts": {PERMALINK_B: legacy_post},
+            "reacted": legacy_reacted,
+            "failures": {},
+            "cursor": {"seen": {}, "attempts": {}, "last_list_at": NOW - 1},
+        }
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial, ["--channel", BORIS_CHANNEL]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertNotIn("legacy_reacted_completed", after)
+        self.assertEqual(after["posts"][PERMALINK_B], legacy_post)
+        self.assertEqual(after["reacted"], legacy_reacted)
+        self.assertEqual(after, initial)
+        self.assertEqual(after_bytes, before_bytes)
+
     def test_boris_only_legacy_migration_defers_excluded_approval_history_for_all_channel_run(self):
         legacy_reacted = {
             f"t_legacy:{PERMALINK_B}": {
