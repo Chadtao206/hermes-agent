@@ -37,6 +37,24 @@ RETIRE_IDS = {"ee4582d0598f", "ff865c33c5ea"}
 RETAIN_ID = "6daa151da351"
 PRE_MIGRATION_RETAINED_NAME = "just-do-it-review-reaction-state-watchdog"
 POST_MIGRATION_RETAINED_NAME = "boris-review-reaction-state-watchdog"
+ALL_CHANNEL_RETAINED_PROMPT = (
+    "No-agent authoritative state machine for source-linked Boris reviewer lanes "
+    "and historical legacy reviewer lanes. In #boris-reviews it maintains exactly "
+    "one owned reaction with precedence face_vomiting > doge_notes > rubbing > "
+    "blinkapproved. Legacy watched-channel reactions retain their prior vocabulary. "
+    "Quiet when settled; emits compact transition, hold, reconciliation, or failure "
+    "output. It never creates or mutates Kanban tasks. Do not schedule additional "
+    "cron jobs."
+)
+BORIS_ONLY_RETAINED_PROMPT = (
+    "No-agent authoritative state machine for source-linked Boris reviewer lanes. "
+    "In #boris-reviews it maintains exactly one owned reaction with precedence "
+    "face_vomiting > doge_notes > rubbing > blinkapproved. Scheduled/default "
+    "execution is Boris-only; explicit legacy-channel operation remains available "
+    "only for rollback and forensics. Quiet when settled; emits compact transition, "
+    "hold, reconciliation, or failure output. It never creates or mutates Kanban "
+    "tasks. Do not schedule additional cron jobs."
+)
 BORIS_CHANNEL = "C0BPCKPEFCG"
 LEGACY_PERMALINK = (
     "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
@@ -147,6 +165,7 @@ def _prepare_legacy_alert_compensation(
             jobs = cron_jobs.load_jobs()
             retained = next(job for job in jobs if job["id"] == RETAIN_ID)
             retained["name"] = POST_MIGRATION_RETAINED_NAME
+            retained["prompt"] = ALL_CHANNEL_RETAINED_PROMPT
             cron_jobs.save_jobs(jobs)
     _set_legacy_alerted_at(fixture, current)
     return manifest
@@ -169,6 +188,7 @@ def _complete_reaction_checkpoint(
             retained = next(job for job in jobs if job["id"] == RETAIN_ID)
             retained.update(
                 name=POST_MIGRATION_RETAINED_NAME,
+                prompt=BORIS_ONLY_RETAINED_PROMPT,
                 enabled=True,
                 state="scheduled",
             )
@@ -403,6 +423,7 @@ class RetirementFixture:
                     if job["id"] == RETAIN_ID:
                         job.update(
                             name="boris-review-reaction-state-watchdog",
+                            prompt=BORIS_ONLY_RETAINED_PROMPT,
                             enabled=True,
                             state="scheduled",
                         )
@@ -3121,6 +3142,239 @@ def test_cli_legacy_alert_compensation_dry_run_then_apply(
     assert applied["status"] == "compensated"
     state = json.loads(retirement_fixture.reaction_state_path.read_text())
     assert state["posts"][LEGACY_PERMALINK]["alerted_at"] == 111
+
+
+def test_retained_prompt_configuration_changes_only_prompt(retirement_fixture):
+    _configure_retained_progress_job(retirement_fixture)
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    before = next(
+        job
+        for job in retirement_fixture.read_jobs()
+        if job["id"] == RETAIN_ID
+    )
+    expected = copy.deepcopy(before)
+    expected["prompt"] = BORIS_ONLY_RETAINED_PROMPT
+
+    report = retirement_controller.configure_retained_boris_only_prompt(
+        retirement_fixture.paths,
+        manifest,
+        apply=True,
+    )
+
+    after = next(
+        job
+        for job in retirement_fixture.read_jobs()
+        if job["id"] == RETAIN_ID
+    )
+    assert after == expected
+    assert {key: value for key, value in after.items() if key != "prompt"} == {
+        key: value for key, value in before.items() if key != "prompt"
+    }
+    assert report == {
+        "apply": True,
+        "status": "configured",
+        "job_id": RETAIN_ID,
+        "before_prompt": ALL_CHANNEL_RETAINED_PROMPT,
+        "after_prompt": BORIS_ONLY_RETAINED_PROMPT,
+    }
+
+
+def test_retained_prompt_configuration_dry_run_is_read_only(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    before = {
+        "jobs": retirement_fixture.paths.jobs_path.read_bytes(),
+        "manifest": manifest.manifest_path.read_bytes(),
+        "archive_entries": sorted(
+            str(path.relative_to(manifest.archive_dir))
+            for path in manifest.archive_dir.rglob("*")
+        ),
+    }
+
+    report = retirement_controller.configure_retained_boris_only_prompt(
+        retirement_fixture.paths,
+        manifest,
+        apply=False,
+    )
+
+    assert report == {
+        "apply": False,
+        "status": "planned",
+        "job_id": RETAIN_ID,
+        "before_prompt": ALL_CHANNEL_RETAINED_PROMPT,
+        "after_prompt": BORIS_ONLY_RETAINED_PROMPT,
+    }
+    assert retirement_fixture.paths.jobs_path.read_bytes() == before["jobs"]
+    assert manifest.manifest_path.read_bytes() == before["manifest"]
+    assert sorted(
+        str(path.relative_to(manifest.archive_dir))
+        for path in manifest.archive_dir.rglob("*")
+    ) == before["archive_entries"]
+
+
+def test_retained_prompt_configuration_is_idempotent(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    first = retirement_controller.configure_retained_boris_only_prompt(
+        retirement_fixture.paths,
+        manifest,
+        apply=True,
+    )
+    after_first = retirement_fixture.paths.jobs_path.read_bytes()
+
+    second = retirement_controller.configure_retained_boris_only_prompt(
+        retirement_fixture.paths,
+        manifest,
+        apply=True,
+    )
+
+    assert first["status"] == "configured"
+    assert second == {
+        "apply": True,
+        "status": "already_configured",
+        "job_id": RETAIN_ID,
+        "before_prompt": BORIS_ONLY_RETAINED_PROMPT,
+        "after_prompt": BORIS_ONLY_RETAINED_PROMPT,
+    }
+    assert retirement_fixture.paths.jobs_path.read_bytes() == after_first
+
+
+def test_retained_prompt_configuration_rejects_unknown_current_prompt(
+    retirement_fixture,
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            next(job for job in jobs if job["id"] == RETAIN_ID)["prompt"] = (
+                "operator-owned prompt"
+            )
+            cron_jobs.save_jobs(jobs)
+    before = retirement_fixture.paths.jobs_path.read_bytes()
+
+    with pytest.raises(RetirementError, match="retained prompt precondition failed"):
+        retirement_controller.configure_retained_boris_only_prompt(
+            retirement_fixture.paths,
+            manifest,
+            apply=True,
+        )
+
+    assert retirement_fixture.paths.jobs_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        pytest.param("name", "wrong-name", id="name"),
+        pytest.param("script", "wrong.py", id="script"),
+        pytest.param(
+            "schedule",
+            {"kind": "cron", "expr": "*/2 * * * *"},
+            id="schedule",
+        ),
+    ),
+)
+def test_retained_prompt_configuration_rejects_wrong_job_identity(
+    retirement_fixture, field, value
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            next(job for job in jobs if job["id"] == RETAIN_ID)[field] = value
+            cron_jobs.save_jobs(jobs)
+    before = retirement_fixture.paths.jobs_path.read_bytes()
+
+    with pytest.raises(RetirementError, match="paused retained job fingerprint mismatch"):
+        retirement_controller.configure_retained_boris_only_prompt(
+            retirement_fixture.paths,
+            manifest,
+            apply=True,
+        )
+
+    assert retirement_fixture.paths.jobs_path.read_bytes() == before
+
+
+def test_retained_prompt_configuration_requires_paused_job(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        cron_jobs.resume_job(RETAIN_ID)
+
+    with pytest.raises(RetirementError, match="retained job must be paused"):
+        retirement_controller.configure_retained_boris_only_prompt(
+            retirement_fixture.paths,
+            manifest,
+            apply=True,
+        )
+
+
+def test_cli_retained_prompt_configuration_dry_run_then_apply(
+    retirement_fixture, capsys
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    command = [
+        "configure-retained-prompt",
+        "--manifest",
+        str(manifest.manifest_path),
+        "--now-epoch",
+        str(manifest.cutoff_epoch + 240),
+    ]
+    before = retirement_fixture.paths.jobs_path.read_bytes()
+
+    assert controller_main(command) == 0
+    assert retirement_fixture.paths.jobs_path.read_bytes() == before
+    assert json.loads(capsys.readouterr().out)["status"] == "planned"
+
+    assert controller_main([*command, "--apply"]) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["status"] == "configured"
+    retained = next(
+        job
+        for job in retirement_fixture.read_jobs()
+        if job["id"] == RETAIN_ID
+    )
+    assert retained["prompt"] == BORIS_ONLY_RETAINED_PROMPT
+
+
+def test_verify_retired_requires_boris_only_prompt_after_reaction_checkpoint(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            next(job for job in jobs if job["id"] == RETAIN_ID)["prompt"] = (
+                ALL_CHANNEL_RETAINED_PROMPT
+            )
+            cron_jobs.save_jobs(jobs)
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert "retained job prompt is invalid" in errors
+
+
+def test_boris_checkpoint_requires_boris_only_retained_prompt(retirement_fixture):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = _complete_reaction_checkpoint(retirement_fixture, manifest)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            next(job for job in jobs if job["id"] == RETAIN_ID)["prompt"] = (
+                ALL_CHANNEL_RETAINED_PROMPT
+            )
+            cron_jobs.save_jobs(jobs)
+
+    with pytest.raises(
+        RetirementError,
+        match="retained watchdog must be enabled and healthy before Boris checkpoint",
+    ):
+        checkpoint_component(
+            retirement_fixture.paths,
+            manifest,
+            "boris-intake",
+            manifest.cutoff_epoch + 240,
+        )
 
 
 @pytest.mark.parametrize(

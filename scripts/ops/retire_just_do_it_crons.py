@@ -53,6 +53,24 @@ RETAIN_ID = "6daa151da351"
 RETAIN_SCRIPT = "just_do_it_review_reaction_watchdog.py"
 RETAIN_PRE_MIGRATION_NAME = "just-do-it-review-reaction-state-watchdog"
 RETAIN_POST_MIGRATION_NAME = "boris-review-reaction-state-watchdog"
+RETAIN_ALL_CHANNEL_PROMPT = (
+    "No-agent authoritative state machine for source-linked Boris reviewer lanes "
+    "and historical legacy reviewer lanes. In #boris-reviews it maintains exactly "
+    "one owned reaction with precedence face_vomiting > doge_notes > rubbing > "
+    "blinkapproved. Legacy watched-channel reactions retain their prior vocabulary. "
+    "Quiet when settled; emits compact transition, hold, reconciliation, or failure "
+    "output. It never creates or mutates Kanban tasks. Do not schedule additional "
+    "cron jobs."
+)
+RETAIN_BORIS_ONLY_PROMPT = (
+    "No-agent authoritative state machine for source-linked Boris reviewer lanes. "
+    "In #boris-reviews it maintains exactly one owned reaction with precedence "
+    "face_vomiting > doge_notes > rubbing > blinkapproved. Scheduled/default "
+    "execution is Boris-only; explicit legacy-channel operation remains available "
+    "only for rollback and forensics. Quiet when settled; emits compact transition, "
+    "hold, reconciliation, or failure output. It never creates or mutates Kanban "
+    "tasks. Do not schedule additional cron jobs."
+)
 DEPRECATED_CREATOR = "just-do-it-blocked-review-requeue-watchdog"
 DEPRECATED_IDEMPOTENCY_PREFIX = "just-do-it-rereview:"
 
@@ -1997,7 +2015,10 @@ def _latest_execution(path: Path, job_id: str) -> Optional[dict[str, Any]]:
 
 
 def _validate_retained_job(
-    job: Optional[dict[str, Any]], paths: Paths, expected_name: str
+    job: Optional[dict[str, Any]],
+    paths: Paths,
+    expected_name: str,
+    expected_prompt: Optional[str] = None,
 ) -> list[str]:
     if job is None:
         return ["retained job is missing"]
@@ -2014,6 +2035,8 @@ def _validate_retained_job(
         "state": job.get("state") == "scheduled",
         "name": job.get("name") == expected_name,
     }
+    if expected_prompt is not None:
+        checks["prompt"] = job.get("prompt") == expected_prompt
     return [f"retained job {key} is invalid" for key, valid in checks.items() if not valid]
 
 
@@ -2279,7 +2302,7 @@ def _validate_paused_retired_boundary(
     _assert_manifest_paths(paths, manifest)
     if manifest.phase != "finalized":
         raise RetirementError(
-            f"legacy compensation requires finalized manifest, found {manifest.phase}"
+            f"paused retained operation requires finalized manifest, found {manifest.phase}"
         )
     by_id = {str(job.get("id")): job for job in jobs}
     present_retired = sorted(set(RETIRE) & set(by_id))
@@ -2333,6 +2356,60 @@ def _compensation_dir(manifest: Manifest, epoch: int) -> Path:
         candidate = Path(f"{base}-{counter}")
     candidate.mkdir(mode=0o700)
     return candidate
+
+
+def configure_retained_boris_only_prompt(
+    paths: Paths,
+    manifest: Manifest,
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    """Change only the paused retained job prompt under exact guards."""
+    with cron_jobs.use_cron_store(paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            _validate_paused_retired_boundary(paths, manifest, jobs)
+            retained = next(job for job in jobs if job.get("id") == RETAIN_ID)
+            current_prompt = retained.get("prompt")
+            if current_prompt not in {
+                RETAIN_ALL_CHANNEL_PROMPT,
+                RETAIN_BORIS_ONLY_PROMPT,
+            }:
+                raise RetirementError("retained prompt precondition failed")
+
+            status = (
+                "already_configured"
+                if current_prompt == RETAIN_BORIS_ONLY_PROMPT
+                else "planned"
+            )
+            report = {
+                "apply": bool(apply),
+                "status": status,
+                "job_id": RETAIN_ID,
+                "before_prompt": current_prompt,
+                "after_prompt": RETAIN_BORIS_ONLY_PROMPT,
+            }
+            if status == "already_configured" or not apply:
+                return report
+
+            expected_jobs = copy.deepcopy(jobs)
+            expected_retained = next(
+                job for job in expected_jobs if job.get("id") == RETAIN_ID
+            )
+            expected_retained["prompt"] = RETAIN_BORIS_ONLY_PROMPT
+            cron_jobs.save_jobs(expected_jobs)
+            reloaded = cron_jobs.load_jobs()
+            if reloaded != expected_jobs:
+                cron_jobs.save_jobs(jobs)
+                if cron_jobs.load_jobs() != jobs:
+                    raise RetirementError(
+                        "retained prompt verification failed and registry restoration failed"
+                    )
+                raise RetirementError(
+                    "retained prompt update changed unexpected job fields"
+                )
+            report["status"] = "configured"
+            return report
 
 
 def compensate_legacy_alerted_at(
@@ -2557,14 +2634,23 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
     reaction_checkpoints = manifest.component_checkpoints.get(
         "retained-reaction", []
     )
+    boris_checkpoints = manifest.component_checkpoints.get("boris-intake", [])
     expected_retained_name = (
         RETAIN_POST_MIGRATION_NAME
         if reaction_checkpoints
         else RETAIN_PRE_MIGRATION_NAME
     )
+    expected_retained_prompt = (
+        RETAIN_BORIS_ONLY_PROMPT
+        if reaction_checkpoints or boris_checkpoints
+        else None
+    )
     errors.extend(
         _validate_retained_job(
-            jobs_by_id.get(RETAIN_ID), paths, expected_retained_name
+            jobs_by_id.get(RETAIN_ID),
+            paths,
+            expected_retained_name,
+            expected_retained_prompt,
         )
     )
     try:
@@ -2586,7 +2672,6 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
     except (OSError, RetirementError, ValueError, TypeError) as exc:
         errors.append(f"reaction ledger verification failed: {exc}")
 
-    boris_checkpoints = manifest.component_checkpoints.get("boris-intake", [])
     if boris_checkpoints:
         checkpoint = boris_checkpoints[-1]
         fingerprints = _checkpoint_files(checkpoint)
@@ -2677,7 +2762,10 @@ def _validate_checkpoint(paths: Paths, manifest: Manifest, component: str) -> di
             raise RetirementError("retained job must be paused before reaction checkpoint")
     else:
         retained_errors = _validate_retained_job(
-            retained, paths, RETAIN_POST_MIGRATION_NAME
+            retained,
+            paths,
+            RETAIN_POST_MIGRATION_NAME,
+            RETAIN_BORIS_ONLY_PROMPT,
         )
         latest = _latest_execution(paths.executions_path, RETAIN_ID)
         if retained_errors or latest is None or latest.get("status") != "completed":
@@ -3185,6 +3273,8 @@ def _build_parser() -> argparse.ArgumentParser:
     compensation_parser.add_argument(
         "--expected-baseline-alerted-at", required=True, type=int
     )
+    retained_prompt_parser = subparsers.add_parser("configure-retained-prompt")
+    _add_manifest_options(retained_prompt_parser, apply=True)
     verify_parser = subparsers.add_parser("verify")
     _add_manifest_options(verify_parser)
     verify_parser.add_argument("--expect", required=True, choices=("retired", "restored"))
@@ -3236,6 +3326,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.expected_current_alerted_at,
                 args.expected_baseline_alerted_at,
                 now,
+                apply=args.apply,
+            )
+            _print(report)
+            return 0
+        elif args.command == "configure-retained-prompt":
+            report = configure_retained_boris_only_prompt(
+                paths,
+                manifest,
                 apply=args.apply,
             )
             _print(report)
