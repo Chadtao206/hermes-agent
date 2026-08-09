@@ -1159,6 +1159,119 @@ class BorisMigrationTest(unittest.TestCase):
             self.assertEqual(converged.calls, [])
             self.assertEqual(json.loads(state_path.read_text())["posts"][PERMALINK], legacy_before)
 
+    def run_persisted_main(self, initial, invocation):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "watchdog.json"
+            state_path.write_text(json.dumps(initial, indent=2, sort_keys=True))
+            before_bytes = state_path.read_bytes()
+            slack = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(m.time, "time", return_value=NOW),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[]),
+                mock.patch.object(m, "slack_reaction", slack),
+            ):
+                self.assertEqual(m.main(invocation), 0)
+            return slack, json.loads(state_path.read_text()), before_bytes, state_path.read_bytes()
+
+    def test_boris_only_clear_does_not_release_a_held_deferred_legacy_post(self):
+        # Removing this channel fence would clear the hold, retry the pending
+        # removals, and transition this legacy post despite the Boris-only run.
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["machine_baseline_at"] = 0
+        initial["cursor"]["last_list_at"] = NOW - 1
+        initial["posts"][PERMALINK_B] = {
+            "emoji": "review-no", "applied_at": NOW - 600,
+            "pending_removals": ["thinkies", "white_check_mark"],
+            "lanes": {"t_legacy": "doge_notes"}, "want": "doge_notes",
+            "deferred_at": NOW - 60,
+            "unresolved_lanes": {
+                "t_held": m.hold_provenance(m.HOLD_KIND_UNSHOWABLE, "show failed"),
+            },
+        }
+        legacy_before = json.loads(json.dumps(initial["posts"][PERMALINK_B]))
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial,
+            ["--channel", BORIS_CHANNEL, "--clear-unresolved", PERMALINK_B],
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
+        self.assertEqual(after_bytes, before_bytes)
+
+    def test_boris_only_does_not_sweep_a_due_reconciliation_legacy_post(self):
+        # Removing this channel fence would run reconciliation against legacy
+        # reactions and advance its persisted reconciliation schedule.
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["machine_baseline_at"] = 0
+        initial["cursor"]["last_list_at"] = NOW - 1
+        initial["posts"][PERMALINK_B] = {
+            "emoji": "review-no", "applied_at": NOW - 600,
+            "pending_removals": [], "lanes": {"t_legacy": "review-no"},
+            "reconcile_sweeps": 0, "reconcile_due_at": NOW,
+        }
+        legacy_before = json.loads(json.dumps(initial["posts"][PERMALINK_B]))
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial, ["--channel", BORIS_CHANNEL]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
+        self.assertEqual(after_bytes, before_bytes)
+
+    def test_boris_only_processes_selected_persisted_repairs_without_mutating_legacy_records(self):
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["machine_baseline_at"] = 0
+        initial["posts"] = {
+            BORIS_PERMALINK: {
+                "emoji": "rubbing", "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": {"t_boris": "rubbing"},
+            },
+            PERMALINK_B: {
+                "emoji": "review-no", "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": {"t_legacy": "doge_notes"}, "want": "doge_notes",
+                "deferred_at": NOW - 60,
+                "unresolved_lanes": {
+                    "t_held": m.hold_provenance(m.HOLD_KIND_UNSHOWABLE, "show failed"),
+                },
+                "reconcile_sweeps": 0, "reconcile_due_at": NOW,
+                "opaque": {"keep": ["deeply", "equal"]},
+            },
+        }
+        legacy_before = json.loads(json.dumps(initial["posts"][PERMALINK_B]))
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial, ["--channel", BORIS_CHANNEL]
+        )
+
+        self.assertEqual(slack.calls, [
+            (BORIS_PERMALINK, "rubbing", False),
+            (BORIS_PERMALINK, "thinkies", True),
+        ])
+        self.assertEqual(after["posts"][BORIS_PERMALINK]["pending_removals"], [])
+        self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
+
+    def test_scheduled_all_channel_run_still_repairs_an_eligible_legacy_post(self):
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["machine_baseline_at"] = 0
+        initial["posts"][PERMALINK_B] = {
+            "emoji": "review-no", "applied_at": NOW - 600,
+            "pending_removals": ["thinkies"],
+            "lanes": {"t_legacy": "review-no"},
+        }
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(initial, [])
+
+        self.assertEqual(slack.calls, [
+            (PERMALINK_B, "review-no", False),
+            (PERMALINK_B, "thinkies", True),
+        ])
+        self.assertEqual(after["posts"][PERMALINK_B]["pending_removals"], [])
+
 
 class UnknownPersistedLaneTest(unittest.TestCase):
     def migrated_state(self):

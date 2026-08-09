@@ -1476,7 +1476,9 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
     return state, notes
 
 
-def compact_state(state: dict[str, Any], now: int) -> None:
+def compact_state(
+    state: dict[str, Any], now: int, *, allowed_channels: set[str] | None = None
+) -> None:
     """Keep the cursor and post registry bounded across long uptimes."""
     cursor = state["cursor"]
     cursor["seen"] = {
@@ -1490,6 +1492,8 @@ def compact_state(state: dict[str, Any], now: int) -> None:
         if isinstance(attempt, dict) and now - _epoch(attempt.get("last_at")) <= SEEN_RETENTION_SECONDS
     }
     for permalink, record in list(state["posts"].items()):
+        if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+            continue
         applied = _epoch(record.get("applied_at"))
         # A held post is never compacted away: dropping it would silently release
         # the hold and let the post transition on its remaining lanes.
@@ -1622,6 +1626,9 @@ def process_tick(
     max_shows = int(getattr(args, "max_shows", MAX_SHOWS_PER_TICK) or MAX_SHOWS_PER_TICK)
     cleared_posts: set[str] = set()
 
+    def is_selected_permalink(permalink: str) -> bool:
+        return source_channel(permalink) in allowed_channels
+
     # Operator escape hatch: explicitly release a hold an operator has classified by
     # hand. This is the only way a hold ends without the lane reclassifying, and it
     # is deliberately manual — it is never reached from a cron tick.
@@ -1632,6 +1639,8 @@ def process_tick(
     # make the override a no-op. The clearance suppresses only holds that carry no new
     # information — a lane that is read again and quarantines again consumes it.
     for permalink in set(getattr(args, "clear_unresolved", None) or []):
+        if not is_selected_permalink(permalink):
+            continue
         record = posts.get(permalink)
         held = isinstance(record, dict) and (record.get("unresolved_lanes") or record.get("deferred_at"))
         if isinstance(record, dict) and held:
@@ -1657,8 +1666,6 @@ def process_tick(
     except Exception as exc:  # noqa: BLE001 - cron surface: report, do not raise
         outputs.append(f"JUST_DO_IT_REVIEW_REACTIONS kanban_list_failed: {str(exc)[-500:]}")
         return 1, outputs, metrics
-    cursor["last_list_at"] = now
-
     fresh: dict[str, dict[str, dict[str, str]]] = {}
     queue: list[tuple[int, str, dict[str, Any], list[str]]] = []
     for row in rows:
@@ -1784,12 +1791,17 @@ def process_tick(
     for permalink, record in posts.items():
         if not isinstance(record, dict):
             continue
+        if not is_selected_permalink(permalink):
+            continue
         if (record.get("pending_removals") or record.get("last_error")
                 or record.get("want") or record.get("deferred_at")
                 or record.get("unresolved_lanes") or reconcile_due(record, now)):
             candidates.add(permalink)
 
-    for permalink in sorted(candidates):
+    if candidates:
+        cursor["last_list_at"] = now
+
+    for permalink in sorted(permalink for permalink in candidates if is_selected_permalink(permalink)):
         record = posts.get(permalink) if isinstance(posts.get(permalink), dict) else None
         semantic_lanes = lane_states(record)
         unknown_lanes = unknown_lane_values(record)
@@ -1999,7 +2011,8 @@ def process_tick(
                          "reason": reasons or "reaction state machine", "output": "reaction-state-machine"},
                     )
 
-    compact_state(state, now)
+    if candidates:
+        compact_state(state, now, allowed_channels=allowed_channels)
     return (1 if hard_failed else 0), outputs, metrics
 
 
