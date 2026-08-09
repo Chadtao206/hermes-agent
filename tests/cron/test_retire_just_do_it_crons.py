@@ -201,6 +201,17 @@ def _complete_reaction_checkpoint(
     return manifest
 
 
+def _prepare_checkpoint_manifest(
+    fixture: RetirementFixture, component: str
+) -> Manifest:
+    manifest = fixture.complete_retirement()
+    if component == "retained-reaction":
+        with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+            cron_jobs.pause_job(RETAIN_ID, reason="installation lock")
+        return manifest
+    return _complete_reaction_checkpoint(fixture, manifest)
+
+
 def _configure_retained_progress_job(fixture: RetirementFixture) -> None:
     """Give the retained fixture the complete mutable scheduler record shape."""
     workdir = fixture.root / "retained-workdir"
@@ -1013,13 +1024,74 @@ def test_rollback_restores_sources_before_jobs(retirement_fixture):
 
 
 def test_reaction_checkpoint_requires_retained_job_paused(retirement_fixture):
-    manifest = retirement_fixture.preflight_only()
+    manifest = retirement_fixture.complete_retirement()
     with pytest.raises(RetirementError, match="retained job must be paused"):
         checkpoint_component(
             retirement_fixture.paths,
             manifest,
             "retained-reaction",
             retirement_fixture.now,
+        )
+
+
+@pytest.mark.parametrize("component", ("retained-reaction", "boris-intake"))
+def test_checkpoint_requires_a_finalized_retirement_manifest(
+    retirement_fixture, component
+):
+    manifest = _prepare_checkpoint_manifest(retirement_fixture, component)
+    manifest.phase = "paused"
+
+    with pytest.raises(
+        RetirementError, match="checkpoint requires finalized manifest"
+    ):
+        checkpoint_component(
+            retirement_fixture.paths,
+            manifest,
+            component,
+            manifest.cutoff_epoch + 240,
+        )
+
+
+@pytest.mark.parametrize("component", ("retained-reaction", "boris-intake"))
+@pytest.mark.parametrize("retired_id", sorted(RETIRE_IDS))
+def test_checkpoint_rejects_a_reintroduced_retired_job(
+    retirement_fixture, component, retired_id
+):
+    manifest = _prepare_checkpoint_manifest(retirement_fixture, component)
+    jobs = retirement_fixture.read_jobs()
+    jobs.append(copy.deepcopy(manifest.jobs[retired_id]))
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(RetirementError, match="retired jobs remain registered"):
+        checkpoint_component(
+            retirement_fixture.paths,
+            manifest,
+            component,
+            manifest.cutoff_epoch + 240,
+        )
+
+
+@pytest.mark.parametrize("component", ("retained-reaction", "boris-intake"))
+@pytest.mark.parametrize("drift", ("active", "archive"))
+def test_checkpoint_rejects_retired_entrypoint_boundary_drift(
+    retirement_fixture, component, drift
+):
+    manifest = _prepare_checkpoint_manifest(retirement_fixture, component)
+    fingerprint = manifest.files["retired-channel-script"]
+    if drift == "active":
+        shutil.copy2(fingerprint.archive_path, fingerprint.active_path)
+        expected = "retired entrypoint remains active"
+    else:
+        fingerprint.archive_path.write_text("tampered retired archive\n")
+        expected = "retired archive fingerprint mismatch"
+
+    with pytest.raises(RetirementError, match=expected):
+        checkpoint_component(
+            retirement_fixture.paths,
+            manifest,
+            component,
+            manifest.cutoff_epoch + 240,
         )
 
 
@@ -1252,6 +1324,38 @@ def test_finalize_revalidates_the_paused_job_fingerprint(retirement_fixture):
         finalize(
             retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
         )
+    assert all(path.exists() for path in retirement_fixture.retired_live_paths())
+    assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
+
+
+@pytest.mark.parametrize("duplicate_id", (*sorted(RETIRE_IDS), RETAIN_ID))
+@pytest.mark.parametrize("apply", (False, True), ids=("dry-run", "apply"))
+def test_finalize_rejects_duplicate_protected_job_records_before_mutation(
+    retirement_fixture, capsys, duplicate_id, apply
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    jobs.append(copy.deepcopy(next(job for job in jobs if job["id"] == duplicate_id)))
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+    jobs_before = retirement_fixture.paths.jobs_path.read_bytes()
+    manifest_before = manifest.manifest_path.read_bytes()
+    command = [
+        "finalize",
+        "--manifest",
+        str(manifest.manifest_path),
+        "--now-epoch",
+        str(manifest.cutoff_epoch + 181),
+    ]
+    if apply:
+        command.append("--apply")
+
+    result = controller_main(command)
+
+    assert result == 2
+    assert "expected exactly one" in capsys.readouterr().out
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
     assert all(path.exists() for path in retirement_fixture.retired_live_paths())
     assert retirement_fixture.output_paths_are_present_for(RETIRE_IDS)
 
@@ -2513,6 +2617,55 @@ def test_finalize_compensates_a_persisted_removal_when_output_verification_fails
     assert all(path.exists() for path in retirement_fixture.retired_live_paths())
 
 
+def test_finalize_compensates_a_one_shot_output_move_back_failure_and_can_retry(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    paused_jobs = retirement_fixture.read_jobs()
+    audit_before = retirement_fixture.audit_hashes()
+    target_id = sorted(RETIRE_IDS)[0]
+    output = retirement_fixture.paths.cron_output / target_id
+    protected = manifest.archive_dir / "protected-output" / target_id
+    real_replace = os.replace
+    injected = False
+
+    def fail_first_output_move_back(source, destination):
+        nonlocal injected
+        if (
+            not injected
+            and Path(source) == protected
+            and Path(destination) == output
+        ):
+            injected = True
+            raise OSError("injected output move-back failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_first_output_move_back)
+
+    with pytest.raises(OSError, match="injected output move-back failure"):
+        finalize(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 181
+        )
+
+    assert injected is True
+    assert {
+        job["id"]: job for job in retirement_fixture.read_jobs()
+    } == {job["id"]: job for job in paused_jobs}
+    assert retirement_fixture.audit_hashes() == audit_before
+    assert all(path.exists() for path in retirement_fixture.retired_live_paths())
+    assert all(
+        not (manifest.archive_dir / "protected-output" / job_id).exists()
+        for job_id in RETIRE_IDS
+    )
+    assert Manifest.load(manifest.manifest_path).phase == "paused"
+
+    recovered = Manifest.load(manifest.manifest_path)
+    finalize(
+        retirement_fixture.paths, recovered, recovered.cutoff_epoch + 182
+    )
+    assert {job["id"] for job in retirement_fixture.read_jobs()} == {RETAIN_ID}
+
+
 def test_finalize_compensates_a_failed_final_manifest_save_and_can_retry(
     retirement_fixture, monkeypatch
 ):
@@ -2619,6 +2772,27 @@ def test_pause_dry_run_accepts_the_same_verified_paused_noop(
     assert result == 0
     assert '"apply": false' in capsys.readouterr().out
     assert Manifest.load(manifest.manifest_path).cutoff_epoch == cutoff
+    assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
+    assert manifest.manifest_path.read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize("duplicate_id", (*sorted(RETIRE_IDS), RETAIN_ID))
+def test_repeated_pause_rejects_duplicate_protected_job_records(
+    retirement_fixture, duplicate_id
+):
+    manifest = retirement_fixture.preflight_and_pause()
+    jobs = retirement_fixture.read_jobs()
+    jobs.append(copy.deepcopy(next(job for job in jobs if job["id"] == duplicate_id)))
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+    jobs_before = retirement_fixture.paths.jobs_path.read_bytes()
+    manifest_before = manifest.manifest_path.read_bytes()
+
+    with pytest.raises(RetirementError, match="expected exactly one"):
+        pause_producers(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 600
+        )
+
     assert retirement_fixture.paths.jobs_path.read_bytes() == jobs_before
     assert manifest.manifest_path.read_bytes() == manifest_before
 
@@ -4213,3 +4387,25 @@ def test_completed_rollback_is_idempotent_without_replaying_component_restore(
         retirement_fixture.paths, manifest, manifest.cutoff_epoch + 300
     )
     assert config.read_text() == "unrelated_after_completed_rollback: preserve-me\n"
+
+
+@pytest.mark.parametrize("duplicate_id", (*sorted(RETIRE_IDS), RETAIN_ID))
+def test_completed_rollback_rejects_duplicate_protected_job_records(
+    retirement_fixture, duplicate_id
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = rollback(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+    jobs = retirement_fixture.read_jobs()
+    jobs.append(copy.deepcopy(next(job for job in jobs if job["id"] == duplicate_id)))
+    retirement_fixture.jobs = jobs
+    retirement_fixture.write_jobs()
+
+    with pytest.raises(
+        RetirementError,
+        match="completed rollback no longer verifies: job record not restored exactly",
+    ):
+        rollback(
+            retirement_fixture.paths, manifest, manifest.cutoff_epoch + 300
+        )

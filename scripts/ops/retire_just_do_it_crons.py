@@ -583,20 +583,30 @@ def _assert_store_paths(paths: Paths) -> None:
         )
 
 
+def _select_exact_job_records(
+    jobs: Iterable[Mapping[str, Any]], job_ids: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    job_records = list(jobs)
+    selected: dict[str, dict[str, Any]] = {}
+    for wanted in job_ids:
+        matches = [job for job in job_records if str(job.get("id")) == wanted]
+        if len(matches) != 1:
+            subject = "retained job" if wanted == RETAIN_ID else f"job {wanted}"
+            raise RetirementError(
+                f"{subject} fingerprint mismatch: expected exactly one record, "
+                f"found {len(matches)}"
+            )
+        selected[wanted] = copy.deepcopy(dict(matches[0]))
+    return selected
+
+
 def _job_map_locked(paths: Paths) -> dict[str, dict[str, Any]]:
     _assert_store_paths(paths)
     with cron_jobs.use_cron_store(paths.hermes_home):
         with cron_jobs._jobs_lock():
-            jobs = cron_jobs.load_jobs()
-            selected: dict[str, dict[str, Any]] = {}
-            for wanted in (*sorted(RETIRE), RETAIN_ID):
-                matches = [job for job in jobs if job.get("id") == wanted]
-                if len(matches) != 1:
-                    raise RetirementError(
-                        f"job fingerprint mismatch: expected exactly one record for {wanted}"
-                    )
-                selected[wanted] = copy.deepcopy(matches[0])
-            return selected
+            return _select_exact_job_records(
+                cron_jobs.load_jobs(), (*sorted(RETIRE), RETAIN_ID)
+            )
 
 
 def _validate_job_fingerprints(paths: Paths, selected: Mapping[str, dict[str, Any]]) -> None:
@@ -1481,6 +1491,32 @@ def _protect_remove_output(paths: Paths, manifest: Manifest, job_id: str) -> Non
         raise removal_error
 
 
+def _restore_protected_outputs(
+    paths: Paths, manifest: Manifest
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    for job_id in sorted(RETIRE):
+        try:
+            output = paths.cron_output / job_id
+            expected = manifest.quiescent_files[f"retired-output-{job_id}"]
+            protected = manifest.protected_output_paths[job_id]
+            if protected.exists():
+                if output.exists():
+                    raise RetirementError(
+                        "output path and protected staging path both exist during "
+                        f"finalize compensation: {output}"
+                    )
+                os.replace(protected, output)
+            _require_match(expected, output)
+            if protected.exists():
+                raise RetirementError(
+                    f"protected output staging path remains after compensation: {protected}"
+                )
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
+
+
 def _validate_paused_retiring_record(
     paths: Paths, job_id: str, job: Mapping[str, Any]
 ) -> None:
@@ -1850,7 +1886,9 @@ def _validate_retained_record_progress(
 def _validate_paused_registry(
     paths: Paths, manifest: Manifest, observation_now: Any
 ) -> dict[str, dict[str, Any]]:
-    jobs = _load_jobs(paths)
+    jobs = _select_exact_job_records(
+        _load_job_records(paths), (*sorted(RETIRE), RETAIN_ID)
+    )
     for job_id in RETIRE:
         job = jobs.get(job_id)
         if job is None:
@@ -1973,7 +2011,9 @@ def finalize(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
                 source_compensation_errors.append(exc)
             manifest.files[key] = original_fingerprint
         compensation_errors.extend(source_compensation_errors)
-        if not source_compensation_errors:
+        output_compensation_errors = _restore_protected_outputs(paths, manifest)
+        compensation_errors.extend(output_compensation_errors)
+        if not source_compensation_errors and not output_compensation_errors:
             try:
                 _restore_paused_registry(
                     paths,
@@ -2294,15 +2334,17 @@ def _reaction_ledger_lock(state_path: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _validate_paused_retired_boundary(
+def _validate_finalized_retired_boundary(
     paths: Paths,
     manifest: Manifest,
     jobs: Iterable[Mapping[str, Any]],
-) -> None:
+    *,
+    operation: str,
+) -> Mapping[str, Any]:
     _assert_manifest_paths(paths, manifest)
     if manifest.phase != "finalized":
         raise RetirementError(
-            f"paused retained operation requires finalized manifest, found {manifest.phase}"
+            f"{operation} requires finalized manifest, found {manifest.phase}"
         )
     job_records = list(jobs)
     retained_records = [
@@ -2320,6 +2362,30 @@ def _validate_paused_retired_boundary(
             f"retired jobs remain registered: {', '.join(present_retired)}"
         )
     retained = retained_records[0]
+    for key in ENTRYPOINTS:
+        fingerprint = manifest.files[key]
+        if fingerprint.active_path.exists():
+            raise RetirementError(
+                f"retired entrypoint remains active: {fingerprint.active_path}"
+            )
+        if not _matches(fingerprint, fingerprint.archive_path):
+            raise RetirementError(
+                f"retired archive fingerprint mismatch: {fingerprint.archive_path}"
+            )
+    return retained
+
+
+def _validate_paused_retired_boundary(
+    paths: Paths,
+    manifest: Manifest,
+    jobs: Iterable[Mapping[str, Any]],
+) -> None:
+    retained = _validate_finalized_retired_boundary(
+        paths,
+        manifest,
+        jobs,
+        operation="paused retained operation",
+    )
     paused_checks = {
         "id": retained.get("id") == RETAIN_ID,
         "name": retained.get("name") == RETAIN_POST_MIGRATION_NAME,
@@ -2340,16 +2406,6 @@ def _validate_paused_retired_boundary(
         raise RetirementError(
             f"paused retained job fingerprint mismatch: {', '.join(failed)}"
         )
-    for key in ENTRYPOINTS:
-        fingerprint = manifest.files[key]
-        if fingerprint.active_path.exists():
-            raise RetirementError(
-                f"retired entrypoint remains active: {fingerprint.active_path}"
-            )
-        if not _matches(fingerprint, fingerprint.archive_path):
-            raise RetirementError(
-                f"retired archive fingerprint mismatch: {fingerprint.archive_path}"
-            )
 
 
 def _compensation_dir(manifest: Manifest, epoch: int) -> Path:
@@ -2765,12 +2821,6 @@ def _new_checkpoint_dir(manifest: Manifest, component: str, epoch: int) -> Path:
     return candidate
 
 
-def _load_jobs(paths: Paths) -> dict[str, dict[str, Any]]:
-    with cron_jobs.use_cron_store(paths.hermes_home):
-        with cron_jobs._jobs_lock():
-            return {job["id"]: copy.deepcopy(job) for job in cron_jobs.load_jobs()}
-
-
 def _load_job_records(paths: Paths) -> list[dict[str, Any]]:
     with cron_jobs.use_cron_store(paths.hermes_home):
         with cron_jobs._jobs_lock():
@@ -2782,17 +2832,13 @@ def _validate_checkpoint(paths: Paths, manifest: Manifest, component: str) -> di
         raise RetirementError(
             "component must be retained-reaction or boris-intake"
         )
-    _assert_manifest_paths(paths, manifest)
     jobs = _load_job_records(paths)
-    retained_records = [job for job in jobs if job.get("id") == RETAIN_ID]
-    if not retained_records:
-        raise RetirementError("retained job is missing")
-    if len(retained_records) != 1:
-        raise RetirementError(
-            "expected exactly one retained job record, "
-            f"found {len(retained_records)}"
-        )
-    retained = retained_records[0]
+    retained = _validate_finalized_retired_boundary(
+        paths,
+        manifest,
+        jobs,
+        operation="checkpoint",
+    )
     if component == "retained-reaction":
         if retained.get("enabled") is not False or retained.get("state") != "paused":
             raise RetirementError("retained job must be paused before reaction checkpoint")
@@ -3169,9 +3215,10 @@ def rehearse_reaction_roundtrip(
 
 def _verify_restored(paths: Paths, manifest: Manifest) -> list[str]:
     errors: list[str] = []
-    jobs = _load_jobs(paths)
+    jobs = _load_job_records(paths)
     for job_id, expected in manifest.jobs.items():
-        if jobs.get(job_id) != expected:
+        matches = [job for job in jobs if str(job.get("id")) == job_id]
+        if matches != [expected]:
             errors.append(f"job record not restored exactly: {job_id}")
     for key in ENTRYPOINTS:
         if not _matches(manifest.files[key]):
