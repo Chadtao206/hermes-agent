@@ -1128,7 +1128,7 @@ def slack_reaction(permalink: str, emoji: str, remove: bool, *, timeout: int = 6
     already_absent = (
         remove
         and proc.returncode == 0
-        and payload.get("error") in {"no_reaction", "not_reacted"}
+        and payload.get("error") in ("no_reaction", "not_reacted")
     )
     ok = proc.returncode == 0 and (payload.get("ok") is True or already_absent)
     return {

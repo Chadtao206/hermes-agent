@@ -2869,6 +2869,42 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(len(commands), writes_after_repair)
         self.assertEqual(quiet["metrics"]["reaction_calls"], 0)
 
+    def test_malformed_removal_error_stays_pending_instead_of_crashing(self):
+        state = m.migrate_state(None, NOW, backfill=True)[0]
+        state["machine_baseline_at"] = 0
+        state["posts"][BORIS_PERMALINK] = {
+            "state": m.STATE_BLOCKED,
+            "emoji": "face_vomiting",
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_boris": m.STATE_BLOCKED},
+            "reconcile_sweeps": 0,
+            "reconcile_due_at": NOW,
+        }
+
+        def malformed_doge_error(cmd, *, timeout=120):
+            emoji = cmd[cmd.index("--emoji") + 1]
+            payload = (
+                {"ok": False, "error": []}
+                if emoji == "doge_notes"
+                else {"ok": True, "no_reaction": True}
+            )
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        with mock.patch.object(m, "run", malformed_doge_error):
+            try:
+                result = tick(
+                    [], {}, state=state, slack=m.slack_reaction, now=NOW,
+                    channels=[BORIS_CHANNEL],
+                )
+            except TypeError as exc:
+                self.fail(f"malformed Slack error escaped fail-closed bookkeeping: {exc}")
+
+        self.assertEqual(
+            state["posts"][BORIS_PERMALINK]["pending_removals"], ["doge_notes"]
+        )
+        self.assertIn("reconcile_remove_failed", "\n".join(result["outputs"]))
+
     def test_a_held_post_is_never_swept(self):
         # Holding means "touch nothing", including the blind repair sweep.
         rows = [lane("t_a", "done"), lane("t_missing", "done")]
@@ -2978,6 +3014,21 @@ class SlackReactionResultTest(unittest.TestCase):
                 )
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["error"], error)
+                self.assertFalse(result["no_reaction"])
+
+    def test_remove_with_list_or_object_error_remains_a_failure(self):
+        for error in ([], {"code": "not_reacted"}):
+            with self.subTest(error=error):
+                try:
+                    result, _ = self.reaction(
+                        0,
+                        json.dumps({"ok": False, "error": error}),
+                        remove=True,
+                    )
+                except TypeError as exc:
+                    self.fail(f"malformed Slack error escaped helper validation: {exc}")
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["error"])
                 self.assertFalse(result["no_reaction"])
 
     def test_not_reacted_add_failure_preserves_add_before_remove(self):
