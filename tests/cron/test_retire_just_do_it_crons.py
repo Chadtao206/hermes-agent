@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +38,9 @@ RETAIN_ID = "6daa151da351"
 PRE_MIGRATION_RETAINED_NAME = "just-do-it-review-reaction-state-watchdog"
 POST_MIGRATION_RETAINED_NAME = "boris-review-reaction-state-watchdog"
 BORIS_CHANNEL = "C0BPCKPEFCG"
+LEGACY_PERMALINK = (
+    "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
+)
 DURABLE_RECOVERY_PATHS = (
     "cron/scripts/just_do_it_blocked_review_requeue_watchdog.py",
     "tests/cron/test_just_do_it_blocked_review_requeue_watchdog.py",
@@ -116,13 +120,36 @@ def _expected_legacy_projection_hash(raw: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _set_legacy_alerted_at(fixture: RetirementFixture, value: str) -> None:
+def _set_legacy_alerted_at(fixture: RetirementFixture, value: object) -> None:
     state = json.loads(fixture.reaction_state_path.read_text())
-    legacy_permalink = (
-        "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
-    )
-    state["posts"][legacy_permalink]["alerted_at"] = value
+    state["posts"][LEGACY_PERMALINK]["alerted_at"] = value
     fixture.reaction_state_path.write_text(json.dumps(state, indent=2))
+
+
+def _prepare_legacy_alert_compensation(
+    fixture: RetirementFixture,
+    *,
+    baseline: int = 111,
+    current: int = 222,
+) -> Manifest:
+    manifest = fixture.complete_retirement()
+    _set_legacy_alerted_at(fixture, baseline)
+    with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+        cron_jobs.pause_job(RETAIN_ID, reason="Boris-only scheduling installation")
+    manifest = checkpoint_component(
+        fixture.paths,
+        manifest,
+        "retained-reaction",
+        manifest.cutoff_epoch + 200,
+    )
+    with cron_jobs.use_cron_store(fixture.paths.hermes_home):
+        with cron_jobs._jobs_lock():
+            jobs = cron_jobs.load_jobs()
+            retained = next(job for job in jobs if job["id"] == RETAIN_ID)
+            retained["name"] = POST_MIGRATION_RETAINED_NAME
+            cron_jobs.save_jobs(jobs)
+    _set_legacy_alerted_at(fixture, current)
+    return manifest
 
 
 def _complete_reaction_checkpoint(
@@ -2807,6 +2834,293 @@ def test_legacy_projection_baseline_rejects_drift_after_latest_checkpoint(
     )
 
     assert "legacy reaction projection changed" in errors
+
+
+def test_legacy_alert_compensation_restores_only_checkpoint_alerted_at(
+    retirement_fixture,
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    before = json.loads(retirement_fixture.reaction_state_path.read_text())
+    expected = copy.deepcopy(before)
+    expected["posts"][LEGACY_PERMALINK]["alerted_at"] = 111
+    boris_before = {
+        permalink: record
+        for permalink, record in before["posts"].items()
+        if f"/{BORIS_CHANNEL}/" in permalink
+    }
+
+    report = retirement_controller.compensate_legacy_alerted_at(
+        retirement_fixture.paths,
+        manifest,
+        LEGACY_PERMALINK,
+        222,
+        111,
+        manifest.cutoff_epoch + 240,
+        apply=True,
+    )
+
+    after = json.loads(retirement_fixture.reaction_state_path.read_text())
+    assert after == expected
+    assert {
+        permalink: record
+        for permalink, record in after["posts"].items()
+        if f"/{BORIS_CHANNEL}/" in permalink
+    } == boris_before
+    assert report["status"] == "compensated"
+    evidence_path = Path(report["evidence_path"])
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["permalink"] == LEGACY_PERMALINK
+    assert evidence["before_alerted_at"] == 222
+    assert evidence["after_alerted_at"] == 111
+    for key in ("before", "after"):
+        fingerprint = evidence["files"][key]
+        archived = Path(fingerprint["archive_path"])
+        assert archived.exists()
+        assert _hash_file(archived) == fingerprint["sha256"]
+
+
+def test_legacy_alert_compensation_dry_run_is_read_only(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    before = {
+        "ledger": retirement_fixture.reaction_state_path.read_bytes(),
+        "jobs": retirement_fixture.paths.jobs_path.read_bytes(),
+        "manifest": manifest.manifest_path.read_bytes(),
+        "archive_entries": sorted(
+            str(path.relative_to(manifest.archive_dir))
+            for path in manifest.archive_dir.rglob("*")
+        ),
+    }
+
+    report = retirement_controller.compensate_legacy_alerted_at(
+        retirement_fixture.paths,
+        manifest,
+        LEGACY_PERMALINK,
+        222,
+        111,
+        manifest.cutoff_epoch + 240,
+        apply=False,
+    )
+
+    assert report == {
+        "apply": False,
+        "status": "planned",
+        "permalink": LEGACY_PERMALINK,
+        "before_alerted_at": 222,
+        "after_alerted_at": 111,
+    }
+    assert retirement_fixture.reaction_state_path.read_bytes() == before["ledger"]
+    assert retirement_fixture.paths.jobs_path.read_bytes() == before["jobs"]
+    assert manifest.manifest_path.read_bytes() == before["manifest"]
+    assert sorted(
+        str(path.relative_to(manifest.archive_dir))
+        for path in manifest.archive_dir.rglob("*")
+    ) == before["archive_entries"]
+
+
+def test_legacy_alert_compensation_is_idempotent_at_exact_baseline(
+    retirement_fixture,
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    first = retirement_controller.compensate_legacy_alerted_at(
+        retirement_fixture.paths,
+        manifest,
+        LEGACY_PERMALINK,
+        222,
+        111,
+        manifest.cutoff_epoch + 240,
+        apply=True,
+    )
+    after_first = retirement_fixture.reaction_state_path.read_bytes()
+    evidence_dirs = sorted((manifest.archive_dir / "compensations").iterdir())
+
+    second = retirement_controller.compensate_legacy_alerted_at(
+        retirement_fixture.paths,
+        manifest,
+        LEGACY_PERMALINK,
+        222,
+        111,
+        manifest.cutoff_epoch + 241,
+        apply=True,
+    )
+
+    assert first["status"] == "compensated"
+    assert second == {
+        "apply": True,
+        "status": "already_compensated",
+        "permalink": LEGACY_PERMALINK,
+        "before_alerted_at": 111,
+        "after_alerted_at": 111,
+    }
+    assert retirement_fixture.reaction_state_path.read_bytes() == after_first
+    assert sorted((manifest.archive_dir / "compensations").iterdir()) == evidence_dirs
+
+
+def test_legacy_alert_compensation_rejects_boris_permalink(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    boris_permalink = next(
+        permalink
+        for permalink in json.loads(
+            retirement_fixture.reaction_state_path.read_text()
+        )["posts"]
+        if f"/{BORIS_CHANNEL}/" in permalink
+    )
+
+    with pytest.raises(RetirementError, match="selected permalink is not legacy"):
+        retirement_controller.compensate_legacy_alerted_at(
+            retirement_fixture.paths,
+            manifest,
+            boris_permalink,
+            222,
+            111,
+            manifest.cutoff_epoch + 240,
+            apply=True,
+        )
+
+
+def test_legacy_alert_compensation_rejects_extra_legacy_drift(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    before = retirement_fixture.reaction_state_path.read_bytes()
+    state = json.loads(before)
+    state["posts"][LEGACY_PERMALINK]["opaque"]["unexpected"] = True
+    retirement_fixture.reaction_state_path.write_text(json.dumps(state, indent=2))
+    drifted = retirement_fixture.reaction_state_path.read_bytes()
+
+    with pytest.raises(
+        RetirementError,
+        match="legacy drift is not limited to the selected alerted_at",
+    ):
+        retirement_controller.compensate_legacy_alerted_at(
+            retirement_fixture.paths,
+            manifest,
+            LEGACY_PERMALINK,
+            222,
+            111,
+            manifest.cutoff_epoch + 240,
+            apply=True,
+        )
+
+    assert retirement_fixture.reaction_state_path.read_bytes() == drifted
+
+
+@pytest.mark.parametrize(
+    ("current", "baseline", "message"),
+    (
+        pytest.param(999, 111, "current alerted_at precondition failed", id="current"),
+        pytest.param(222, 999, "baseline alerted_at precondition failed", id="baseline"),
+    ),
+)
+def test_legacy_alert_compensation_rejects_wrong_explicit_values(
+    retirement_fixture, current, baseline, message
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    before = retirement_fixture.reaction_state_path.read_bytes()
+
+    with pytest.raises(RetirementError, match=message):
+        retirement_controller.compensate_legacy_alerted_at(
+            retirement_fixture.paths,
+            manifest,
+            LEGACY_PERMALINK,
+            current,
+            baseline,
+            manifest.cutoff_epoch + 240,
+            apply=True,
+        )
+
+    assert retirement_fixture.reaction_state_path.read_bytes() == before
+
+
+def test_legacy_alert_compensation_requires_retained_job_paused(
+    retirement_fixture,
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    with cron_jobs.use_cron_store(retirement_fixture.paths.hermes_home):
+        cron_jobs.resume_job(RETAIN_ID)
+
+    with pytest.raises(RetirementError, match="retained job must be paused"):
+        retirement_controller.compensate_legacy_alerted_at(
+            retirement_fixture.paths,
+            manifest,
+            LEGACY_PERMALINK,
+            222,
+            111,
+            manifest.cutoff_epoch + 240,
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize("damage", ("missing", "changed"))
+def test_legacy_alert_compensation_rejects_retired_archive_damage(
+    retirement_fixture, damage
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    archive = manifest.files["retired-channel-script"].archive_path
+    if damage == "missing":
+        archive.unlink()
+    else:
+        archive.write_bytes(archive.read_bytes() + b"changed")
+
+    with pytest.raises(RetirementError, match="retired archive fingerprint mismatch"):
+        retirement_controller.compensate_legacy_alerted_at(
+            retirement_fixture.paths,
+            manifest,
+            LEGACY_PERMALINK,
+            222,
+            111,
+            manifest.cutoff_epoch + 240,
+            apply=True,
+        )
+
+
+def test_legacy_alert_compensation_rejects_busy_watchdog_lock(retirement_fixture):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    lock_path = retirement_fixture.reaction_state_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RetirementError, match="reaction ledger lock is busy"):
+            retirement_controller.compensate_legacy_alerted_at(
+                retirement_fixture.paths,
+                manifest,
+                LEGACY_PERMALINK,
+                222,
+                111,
+                manifest.cutoff_epoch + 240,
+                apply=True,
+            )
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def test_cli_legacy_alert_compensation_dry_run_then_apply(
+    retirement_fixture, capsys
+):
+    manifest = _prepare_legacy_alert_compensation(retirement_fixture)
+    command = [
+        "compensate-legacy-alerted-at",
+        "--manifest",
+        str(manifest.manifest_path),
+        "--permalink",
+        LEGACY_PERMALINK,
+        "--expected-current-alerted-at",
+        "222",
+        "--expected-baseline-alerted-at",
+        "111",
+        "--now-epoch",
+        str(manifest.cutoff_epoch + 240),
+    ]
+    before = retirement_fixture.reaction_state_path.read_bytes()
+
+    assert controller_main(command) == 0
+    assert retirement_fixture.reaction_state_path.read_bytes() == before
+    dry_run = json.loads(capsys.readouterr().out)
+    assert dry_run["apply"] is False
+    assert dry_run["status"] == "planned"
+
+    assert controller_main([*command, "--apply"]) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["apply"] is True
+    assert applied["status"] == "compensated"
+    state = json.loads(retirement_fixture.reaction_state_path.read_text())
+    assert state["posts"][LEGACY_PERMALINK]["alerted_at"] == 111
 
 
 @pytest.mark.parametrize(

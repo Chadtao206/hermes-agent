@@ -9,7 +9,9 @@ exact job IDs, and every recoverable input is fingerprinted before use.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -78,6 +80,11 @@ RETAINED_DURABLE_PATHS = (
     "tests/cron/boris_intake",
 )
 _FULL_COMMIT_ID = re.compile(r"[0-9a-fA-F]{40}")
+_REACTION_PERMALINK = re.compile(
+    r"https://ylopo\.slack\.com/archives/(?P<channel>[A-Z0-9]+)/p\d{16}(?!\d)"
+    r"(?:\?[^\s)>\'\"]*)?",
+    re.IGNORECASE,
+)
 
 
 class RetirementError(RuntimeError):
@@ -742,6 +749,22 @@ def _legacy_projection(raw: Any) -> dict[str, Any]:
     return {"posts": legacy_posts, "reacted": legacy_reacted}
 
 
+def _boris_projection(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"invalid": True}
+    posts = raw.get("posts") if isinstance(raw.get("posts"), dict) else {}
+    reacted = raw.get("reacted") if isinstance(raw.get("reacted"), dict) else {}
+    boris_posts = {
+        key: value for key, value in posts.items() if f"/{BORIS_CHANNEL}/" in key
+    }
+    boris_reacted: dict[str, Any] = {}
+    for key, value in reacted.items():
+        permalink = key.split(":", 1)[1] if isinstance(key, str) and ":" in key else ""
+        if f"/{BORIS_CHANNEL}/" in permalink:
+            boris_reacted[key] = value
+    return {"posts": boris_posts, "reacted": boris_reacted}
+
+
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
@@ -1016,7 +1039,7 @@ def pause_producers(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
                 restore_errors: list[BaseException] = []
                 try:
                     cron_jobs.save_jobs(original_jobs)
-                except BaseException as exc:
+                except BaseException:
                     restore_errors.append(exc)
                 try:
                     _atomic_write_bytes(
@@ -2218,6 +2241,261 @@ def _legacy_reaction_baseline(manifest: Manifest) -> dict[str, Any]:
     return _archived_legacy_projection(fingerprint, baseline_name)
 
 
+def _latest_reaction_checkpoint_fingerprint(manifest: Manifest) -> FileFingerprint:
+    checkpoints = manifest.component_checkpoints.get("retained-reaction", [])
+    if not checkpoints:
+        raise RetirementError("retained-reaction checkpoint is missing")
+    try:
+        raw = checkpoints[-1]["files"]["reaction-ledger"]
+        fingerprint = FileFingerprint.from_dict(raw)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RetirementError(
+            "latest retained-reaction checkpoint fingerprint is malformed"
+        ) from exc
+    _verified_archive_bytes(fingerprint, "latest retained-reaction checkpoint")
+    return fingerprint
+
+
+@contextlib.contextmanager
+def _reaction_ledger_lock(state_path: Path):
+    lock_path = state_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RetirementError("reaction ledger lock is busy") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _validate_paused_retired_boundary(
+    paths: Paths,
+    manifest: Manifest,
+    jobs: Iterable[Mapping[str, Any]],
+) -> None:
+    _assert_manifest_paths(paths, manifest)
+    if manifest.phase != "finalized":
+        raise RetirementError(
+            f"legacy compensation requires finalized manifest, found {manifest.phase}"
+        )
+    by_id = {str(job.get("id")): job for job in jobs}
+    present_retired = sorted(set(RETIRE) & set(by_id))
+    if present_retired:
+        raise RetirementError(
+            f"retired jobs remain registered: {', '.join(present_retired)}"
+        )
+    retained = by_id.get(RETAIN_ID)
+    if retained is None:
+        raise RetirementError("retained job is missing")
+    paused_checks = {
+        "id": retained.get("id") == RETAIN_ID,
+        "name": retained.get("name") == RETAIN_POST_MIGRATION_NAME,
+        "script": _matches_script_identity(
+            retained.get("script"), paths.live_scripts, RETAIN_SCRIPT
+        ),
+        "schedule": _matches_schedule_identity(
+            retained.get("schedule"), {"kind": "cron", "expr": "* * * * *"}
+        ),
+        "no_agent": retained.get("no_agent") is True,
+        "enabled": retained.get("enabled") is False,
+        "state": retained.get("state") == "paused",
+    }
+    failed = [name for name, valid in paused_checks.items() if not valid]
+    if failed:
+        if set(failed) & {"enabled", "state"}:
+            raise RetirementError("retained job must be paused")
+        raise RetirementError(
+            f"paused retained job fingerprint mismatch: {', '.join(failed)}"
+        )
+    for key in ENTRYPOINTS:
+        fingerprint = manifest.files[key]
+        if fingerprint.active_path.exists():
+            raise RetirementError(
+                f"retired entrypoint remains active: {fingerprint.active_path}"
+            )
+        if not _matches(fingerprint, fingerprint.archive_path):
+            raise RetirementError(
+                f"retired archive fingerprint mismatch: {fingerprint.archive_path}"
+            )
+
+
+def _compensation_dir(manifest: Manifest, epoch: int) -> Path:
+    root = manifest.archive_dir / "compensations"
+    root.mkdir(parents=True, exist_ok=True)
+    base = root / f"legacy-alerted-at-{epoch}"
+    candidate = base
+    counter = 0
+    while candidate.exists():
+        counter += 1
+        candidate = Path(f"{base}-{counter}")
+    candidate.mkdir(mode=0o700)
+    return candidate
+
+
+def compensate_legacy_alerted_at(
+    paths: Paths,
+    manifest: Manifest,
+    permalink: str,
+    expected_current: int,
+    expected_baseline: int,
+    now: Any,
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    """Restore one proven legacy alert timestamp from the immutable checkpoint."""
+    match = _REACTION_PERMALINK.fullmatch(str(permalink or ""))
+    if match is None or match.group("channel").upper() not in LEGACY_CHANNELS:
+        raise RetirementError("selected permalink is not legacy")
+    if isinstance(expected_current, bool) or not isinstance(expected_current, int):
+        raise RetirementError("expected current alerted_at must be an integer")
+    if isinstance(expected_baseline, bool) or not isinstance(expected_baseline, int):
+        raise RetirementError("expected baseline alerted_at must be an integer")
+
+    state_path = paths.state_dir / "just_do_it_review_reactions.json"
+    with _reaction_ledger_lock(state_path):
+        with cron_jobs.use_cron_store(paths.hermes_home):
+            with cron_jobs._jobs_lock():
+                jobs = cron_jobs.load_jobs()
+                _validate_paused_retired_boundary(paths, manifest, jobs)
+
+                checkpoint_fingerprint = _latest_reaction_checkpoint_fingerprint(
+                    manifest
+                )
+                checkpoint_legacy = _legacy_reaction_baseline(manifest)
+                try:
+                    current_raw = json.loads(state_path.read_bytes())
+                except (OSError, ValueError, TypeError) as exc:
+                    raise RetirementError(
+                        f"live reaction ledger is unreadable: {exc}"
+                    ) from exc
+                if (
+                    not isinstance(current_raw, dict)
+                    or not isinstance(current_raw.get("posts"), dict)
+                    or not isinstance(current_raw.get("reacted"), dict)
+                ):
+                    raise RetirementError("live reaction ledger is malformed")
+
+                baseline_record = checkpoint_legacy["posts"].get(permalink)
+                current_record = current_raw["posts"].get(permalink)
+                if not isinstance(baseline_record, dict):
+                    raise RetirementError(
+                        "selected permalink is missing from the checkpoint"
+                    )
+                if not isinstance(current_record, dict):
+                    raise RetirementError("selected permalink is missing from live state")
+                baseline_alerted_at = baseline_record.get("alerted_at")
+                current_alerted_at = current_record.get("alerted_at")
+                if baseline_alerted_at != expected_baseline:
+                    raise RetirementError("baseline alerted_at precondition failed")
+
+                current_legacy = _legacy_projection(current_raw)
+                if _canonical_json_bytes(current_legacy) == _canonical_json_bytes(
+                    checkpoint_legacy
+                ):
+                    return {
+                        "apply": bool(apply),
+                        "status": "already_compensated",
+                        "permalink": permalink,
+                        "before_alerted_at": current_alerted_at,
+                        "after_alerted_at": baseline_alerted_at,
+                    }
+                if current_alerted_at != expected_current:
+                    raise RetirementError("current alerted_at precondition failed")
+
+                expected = copy.deepcopy(current_raw)
+                expected["posts"][permalink]["alerted_at"] = expected_baseline
+                if _canonical_json_bytes(
+                    _legacy_projection(expected)
+                ) != _canonical_json_bytes(checkpoint_legacy):
+                    raise RetirementError(
+                        "legacy drift is not limited to the selected alerted_at"
+                    )
+                planned = {
+                    "apply": False,
+                    "status": "planned",
+                    "permalink": permalink,
+                    "before_alerted_at": current_alerted_at,
+                    "after_alerted_at": expected_baseline,
+                }
+                if not apply:
+                    return planned
+
+                epoch = _epoch(now)
+                evidence_dir = _compensation_dir(manifest, epoch)
+                before_fingerprint = _snapshot(
+                    state_path, evidence_dir / "reaction-ledger-before.json"
+                )
+                payload = json.dumps(expected, indent=2, sort_keys=True).encode()
+                state_mode = stat.S_IMODE(state_path.stat().st_mode)
+                try:
+                    _atomic_write_bytes(state_path, payload, state_mode)
+                    reloaded = json.loads(state_path.read_bytes())
+                    if _canonical_json_bytes(reloaded) != _canonical_json_bytes(
+                        expected
+                    ):
+                        raise RetirementError(
+                            "compensated ledger differs from the exact expected state"
+                        )
+                    if _canonical_json_bytes(
+                        _legacy_projection(reloaded)
+                    ) != _canonical_json_bytes(checkpoint_legacy):
+                        raise RetirementError(
+                            "compensated legacy projection does not match checkpoint"
+                        )
+                    if _canonical_json_bytes(
+                        _boris_projection(reloaded)
+                    ) != _canonical_json_bytes(_boris_projection(current_raw)):
+                        raise RetirementError(
+                            "Boris projection changed during legacy compensation"
+                        )
+                    after_fingerprint = _snapshot(
+                        state_path, evidence_dir / "reaction-ledger-after.json"
+                    )
+                    evidence = {
+                        "created_epoch": epoch,
+                        "created_iso": _iso(epoch),
+                        "permalink": permalink,
+                        "before_alerted_at": current_alerted_at,
+                        "after_alerted_at": expected_baseline,
+                        "checkpoint": checkpoint_fingerprint.to_dict(),
+                        "files": {
+                            "before": before_fingerprint.to_dict(),
+                            "after": after_fingerprint.to_dict(),
+                        },
+                    }
+                    evidence_path = evidence_dir / "evidence.json"
+                    _atomic_write_bytes(
+                        evidence_path,
+                        (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode(),
+                        0o600,
+                    )
+                except BaseException:
+                    try:
+                        _atomic_write_bytes(
+                            state_path,
+                            before_fingerprint.archive_path.read_bytes(),
+                            before_fingerprint.mode,
+                        )
+                        _require_match(before_fingerprint)
+                    except BaseException as restore_exc:
+                        raise RetirementError(
+                            "legacy compensation failed and original ledger restoration failed"
+                        ) from restore_exc
+                    raise
+
+                return {
+                    "apply": True,
+                    "status": "compensated",
+                    "permalink": permalink,
+                    "before_alerted_at": current_alerted_at,
+                    "after_alerted_at": expected_baseline,
+                    "evidence_path": str(evidence_path),
+                }
+
+
 def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
     """Verify the complete retired state without mutating any live artifact."""
     del now  # verification is identity/state based once a cutoff exists
@@ -2896,6 +3174,17 @@ def _build_parser() -> argparse.ArgumentParser:
     checkpoint_parser.add_argument(
         "--component", required=True, choices=("retained-reaction", "boris-intake")
     )
+    compensation_parser = subparsers.add_parser(
+        "compensate-legacy-alerted-at"
+    )
+    _add_manifest_options(compensation_parser, apply=True)
+    compensation_parser.add_argument("--permalink", required=True)
+    compensation_parser.add_argument(
+        "--expected-current-alerted-at", required=True, type=int
+    )
+    compensation_parser.add_argument(
+        "--expected-baseline-alerted-at", required=True, type=int
+    )
     verify_parser = subparsers.add_parser("verify")
     _add_manifest_options(verify_parser)
     verify_parser.add_argument("--expect", required=True, choices=("retired", "restored"))
@@ -2939,6 +3228,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                 _print({"apply": False, "action": "checkpoint", "component": args.component})
                 return 0
             checkpoint_component(paths, manifest, args.component, now)
+        elif args.command == "compensate-legacy-alerted-at":
+            report = compensate_legacy_alerted_at(
+                paths,
+                manifest,
+                args.permalink,
+                args.expected_current_alerted_at,
+                args.expected_baseline_alerted_at,
+                now,
+                apply=args.apply,
+            )
+            _print(report)
+            return 0
         elif args.command == "finalize":
             if not args.apply:
                 _validate_finalize_plan(paths, manifest, now)
