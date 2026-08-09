@@ -2412,6 +2412,42 @@ def test_failed_pause_manifest_save_restores_registry_and_manifest(
     assert manifest.cutoff_epoch is None
 
 
+def test_failed_pause_registry_restoration_reports_guarded_failure(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.preflight_only()
+    real_save_jobs = cron_jobs.save_jobs
+
+    def fail_manifest_save():
+        raise OSError("injected manifest save failure")
+
+    def fail_original_registry_restore(jobs):
+        retiring = {
+            job["id"]: job for job in jobs if job.get("id") in RETIRE_IDS
+        }
+        if set(retiring) == RETIRE_IDS and all(
+            job.get("enabled") is True for job in retiring.values()
+        ):
+            raise OSError("injected registry restore failure")
+        return real_save_jobs(jobs)
+
+    monkeypatch.setattr(manifest, "save", fail_manifest_save)
+    monkeypatch.setattr(cron_jobs, "save_jobs", fail_original_registry_restore)
+
+    with pytest.raises(
+        RetirementError,
+        match="producer pause failed and exact preflight state could not be restored",
+    ) as caught:
+        pause_producers(
+            retirement_fixture.paths,
+            manifest,
+            retirement_fixture.now + 1,
+        )
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert str(caught.value.__cause__) == "injected registry restore failure"
+
+
 def test_finalize_compensation_never_writes_enabled_retired_records(
     retirement_fixture, monkeypatch
 ):

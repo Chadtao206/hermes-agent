@@ -1057,7 +1057,7 @@ def pause_producers(paths: Paths, manifest: Manifest, now: Any) -> Manifest:
                 restore_errors: list[BaseException] = []
                 try:
                     cron_jobs.save_jobs(original_jobs)
-                except BaseException:
+                except BaseException as exc:
                     restore_errors.append(exc)
                 try:
                     _atomic_write_bytes(
