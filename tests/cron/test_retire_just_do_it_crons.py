@@ -126,7 +126,7 @@ def _set_legacy_alerted_at(fixture: RetirementFixture, value: str) -> None:
 
 
 def _complete_reaction_checkpoint(
-    fixture: RetirementFixture, manifest: Manifest
+    fixture: RetirementFixture, manifest: Manifest, *, offset: int = 200
 ) -> Manifest:
     with cron_jobs.use_cron_store(fixture.paths.hermes_home):
         cron_jobs.pause_job(RETAIN_ID, reason="installation lock")
@@ -134,7 +134,7 @@ def _complete_reaction_checkpoint(
         fixture.paths,
         manifest,
         "retained-reaction",
-        manifest.cutoff_epoch + 200,
+        manifest.cutoff_epoch + offset,
     )
     with cron_jobs.use_cron_store(fixture.paths.hermes_home):
         with cron_jobs._jobs_lock():
@@ -149,7 +149,7 @@ def _complete_reaction_checkpoint(
     fixture.insert_execution(
         RETAIN_ID,
         status="completed",
-        claimed_at=fixture.utc_iso(manifest.cutoff_epoch + 201),
+        claimed_at=fixture.utc_iso(manifest.cutoff_epoch + offset + 1),
     )
     return manifest
 
@@ -2918,6 +2918,171 @@ def test_legacy_projection_baseline_finalize_hash_comes_from_archived_quiescent_
     assert (
         persisted.legacy_reaction_projection_sha256
         == _expected_legacy_projection_hash(archived)
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        pytest.param(True, id="integer-to-boolean"),
+        pytest.param(1.0, id="integer-to-float"),
+    ),
+)
+def test_legacy_projection_fix_round_1_rejects_json_type_representation_drift(
+    retirement_fixture, replacement
+):
+    manifest = retirement_fixture.complete_retirement()
+    state = json.loads(retirement_fixture.reaction_state_path.read_text())
+    legacy_permalink = (
+        "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
+    )
+    assert state["posts"][legacy_permalink]["opaque"]["preserve"][0] == 1
+    state["posts"][legacy_permalink]["opaque"]["preserve"][0] = replacement
+    retirement_fixture.reaction_state_path.write_text(json.dumps(state, indent=2))
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert errors == ["legacy reaction projection changed"]
+
+
+def test_legacy_projection_fix_round_1_fails_if_archive_path_changes_during_verified_read(
+    retirement_fixture, monkeypatch
+):
+    manifest = retirement_fixture.complete_retirement()
+    fingerprint = manifest.quiescent_files["reaction-ledger"]
+    archive = fingerprint.archive_path
+    replacement = archive.with_name("reaction-ledger-race-replacement")
+    replacement_state = json.loads(archive.read_bytes())
+    legacy_permalink = (
+        "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
+    )
+    replacement_state["posts"][legacy_permalink]["alerted_at"] = (
+        "unvalidated-replacement"
+    )
+    replacement_payload = json.dumps(replacement_state, indent=2).encode()
+    replacement.write_bytes(replacement_payload)
+    replacement.chmod(fingerprint.mode)
+    retirement_fixture.reaction_state_path.write_bytes(replacement_payload)
+
+    real_path_open = Path.open
+    real_os_open = os.open
+    archive_open_count = 0
+    replaced = False
+
+    def replace_archive_path() -> None:
+        nonlocal replaced
+        if not replaced:
+            os.replace(replacement, archive)
+            replaced = True
+
+    def racing_path_open(path, *args, **kwargs):
+        nonlocal archive_open_count
+        if path == archive:
+            archive_open_count += 1
+            if archive_open_count == 2:
+                replace_archive_path()
+        return real_path_open(path, *args, **kwargs)
+
+    def racing_os_open(path, flags, mode=0o777, *, dir_fd=None):
+        fd = real_os_open(path, flags, mode, dir_fd=dir_fd)
+        if isinstance(path, (str, os.PathLike)) and Path(path) == archive:
+            replace_archive_path()
+        return fd
+
+    monkeypatch.setattr(Path, "open", racing_path_open)
+    monkeypatch.setattr(os, "open", racing_os_open)
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert any("snapshot changed during verified read" in error for error in errors)
+
+
+def test_legacy_projection_fix_round_1_uses_second_of_two_completed_checkpoints(
+    retirement_fixture,
+):
+    manifest = retirement_fixture.complete_retirement()
+    _set_legacy_alerted_at(retirement_fixture, "first-checkpoint")
+    manifest = _complete_reaction_checkpoint(
+        retirement_fixture, manifest, offset=200
+    )
+    _set_legacy_alerted_at(retirement_fixture, "second-checkpoint")
+    manifest = _complete_reaction_checkpoint(
+        retirement_fixture, manifest, offset=210
+    )
+    checkpoints = manifest.component_checkpoints["retained-reaction"]
+    first = json.loads(
+        Path(checkpoints[0]["files"]["reaction-ledger"]["archive_path"]).read_bytes()
+    )
+    second = json.loads(
+        Path(checkpoints[1]["files"]["reaction-ledger"]["archive_path"]).read_bytes()
+    )
+    legacy_permalink = (
+        "https://ylopo.slack.com/archives/C08K8FQKX9S/p2222222222222222"
+    )
+    assert first["posts"][legacy_permalink]["alerted_at"] == "first-checkpoint"
+    assert second["posts"][legacy_permalink]["alerted_at"] == "second-checkpoint"
+    manifest.legacy_reaction_projection_sha256 = "0" * 64
+    checkpoints[0]["legacy_reaction_projection_sha256"] = "1" * 64
+    checkpoints[1]["legacy_reaction_projection_sha256"] = "2" * 64
+
+    assert verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    ) == []
+
+
+@pytest.mark.parametrize("shape", ("symlink", "directory"))
+def test_legacy_projection_fix_round_1_rejects_non_regular_reaction_archive(
+    retirement_fixture, shape
+):
+    manifest = retirement_fixture.complete_retirement()
+    fingerprint = manifest.quiescent_files["reaction-ledger"]
+    archive = fingerprint.archive_path
+    if shape == "symlink":
+        target = archive.with_name("reaction-ledger-symlink-target")
+        target.write_bytes(archive.read_bytes())
+        target.chmod(fingerprint.mode)
+        archive.unlink()
+        archive.symlink_to(target)
+    else:
+        archive.unlink()
+        archive.mkdir()
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert any(
+        "reaction-ledger snapshot is not a regular file" in error for error in errors
+    )
+
+
+@pytest.mark.parametrize("dimension", ("mode", "size", "hash"))
+def test_legacy_projection_fix_round_1_rejects_each_fingerprint_dimension(
+    retirement_fixture, dimension
+):
+    manifest = retirement_fixture.complete_retirement()
+    fingerprint = manifest.quiescent_files["reaction-ledger"]
+    if dimension == "mode":
+        fingerprint.archive_path.chmod(fingerprint.mode ^ 0o100)
+    elif dimension == "size":
+        manifest.quiescent_files["reaction-ledger"] = replace(
+            fingerprint, size=fingerprint.size + 1
+        )
+    else:
+        manifest.quiescent_files["reaction-ledger"] = replace(
+            fingerprint, sha256="0" * 64
+        )
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    assert any(
+        "reaction-ledger snapshot fingerprint mismatch" in error for error in errors
     )
 
 

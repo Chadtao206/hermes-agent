@@ -742,9 +742,12 @@ def _legacy_projection(raw: Any) -> dict[str, Any]:
     return {"posts": legacy_posts, "reacted": legacy_reacted}
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
 def _json_hash(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
 def _repository_identity(
@@ -2077,21 +2080,102 @@ def _checkpoint_files(raw: Mapping[str, Any]) -> dict[str, FileFingerprint]:
     }
 
 
-def _archived_legacy_projection(
+def _verified_archive_bytes(
     fingerprint: FileFingerprint, baseline_name: str
-) -> dict[str, Any]:
+) -> bytes:
     archive_path = fingerprint.archive_path
-    if not archive_path.exists():
+    try:
+        path_before = os.lstat(archive_path)
+    except FileNotFoundError as exc:
         raise RetirementError(
             f"{baseline_name} reaction-ledger snapshot is missing"
+        ) from exc
+    except OSError as exc:
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot could not be inspected: {exc}"
+        ) from exc
+    if fingerprint.kind != "file" or not stat.S_ISREG(path_before.st_mode):
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot is not a regular file"
         )
-    if not _matches(fingerprint, archive_path):
+
+    flags = os.O_RDONLY
+    for option in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= int(getattr(os, option, 0))
+    try:
+        descriptor = os.open(archive_path, flags)
+    except OSError as exc:
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot changed during verified read"
+        ) from exc
+
+    def stable_state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    try:
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise RetirementError(
+                    f"{baseline_name} reaction-ledger snapshot is not a regular file"
+                )
+            if stable_state(path_before) != stable_state(opened):
+                raise RetirementError(
+                    f"{baseline_name} reaction-ledger snapshot changed during verified read"
+                )
+            if (
+                stat.S_IMODE(opened.st_mode) != fingerprint.mode
+                or opened.st_size != fingerprint.size
+            ):
+                raise RetirementError(
+                    f"{baseline_name} reaction-ledger snapshot fingerprint mismatch"
+                )
+            payload = handle.read(fingerprint.size + 1)
+            after_read = os.fstat(handle.fileno())
+    except RetirementError:
+        raise
+    except OSError as exc:
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot changed during verified read"
+        ) from exc
+
+    try:
+        path_after = os.lstat(archive_path)
+    except OSError as exc:
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot changed during verified read"
+        ) from exc
+    if (
+        not stat.S_ISREG(path_after.st_mode)
+        or stable_state(opened) != stable_state(after_read)
+        or stable_state(after_read) != stable_state(path_after)
+    ):
+        raise RetirementError(
+            f"{baseline_name} reaction-ledger snapshot changed during verified read"
+        )
+    if (
+        len(payload) != fingerprint.size
+        or hashlib.sha256(payload).hexdigest() != fingerprint.sha256
+    ):
         raise RetirementError(
             f"{baseline_name} reaction-ledger snapshot fingerprint mismatch"
         )
+    return payload
+
+
+def _archived_legacy_projection(
+    fingerprint: FileFingerprint, baseline_name: str
+) -> dict[str, Any]:
     try:
-        raw = json.loads(archive_path.read_bytes())
-    except (OSError, ValueError, TypeError) as exc:
+        raw = json.loads(_verified_archive_bytes(fingerprint, baseline_name))
+    except (ValueError, TypeError) as exc:
         raise RetirementError(
             f"{baseline_name} reaction-ledger snapshot is malformed: {exc}"
         ) from exc
@@ -2217,7 +2301,9 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
             (paths.state_dir / "just_do_it_review_reactions.json").read_bytes()
         )
         current_projection = _legacy_projection(reaction_raw)
-        if current_projection != baseline_projection:
+        if _canonical_json_bytes(current_projection) != _canonical_json_bytes(
+            baseline_projection
+        ):
             errors.append("legacy reaction projection changed")
     except (OSError, RetirementError, ValueError, TypeError) as exc:
         errors.append(f"reaction ledger verification failed: {exc}")
