@@ -1456,6 +1456,260 @@ class BorisMigrationTest(unittest.TestCase):
         ])
         self.assertEqual(after["posts"][PERMALINK_B]["pending_removals"], [])
 
+    def test_only_task_main_fences_mixed_persisted_pending_and_due_work(self):
+        selected_pending = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000010"
+        selected_due = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000011"
+        excluded_pending = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000012"
+        excluded_due = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000013"
+        excluded_compactable = (
+            f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000014"
+        )
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["cursor"]["seen"] = {
+            "t_excluded": NOW - m.SEEN_RETENTION_SECONDS - 1,
+        }
+        initial["cursor"]["attempts"] = {
+            "t_excluded": {"count": 2, "last_at": NOW - m.SEEN_RETENTION_SECONDS - 1},
+        }
+        initial["posts"] = {
+            selected_pending: {
+                "state": m.STATE_ACTIVE,
+                "emoji": "rubbing",
+                "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": {"t_selected": m.STATE_ACTIVE},
+            },
+            selected_due: {
+                "state": m.STATE_BLOCKED,
+                "emoji": "face_vomiting",
+                "applied_at": NOW - 600,
+                "pending_removals": [],
+                "lanes": {"t_selected": m.STATE_BLOCKED},
+                "reconcile_sweeps": 0,
+                "reconcile_due_at": NOW,
+            },
+            excluded_pending: {
+                "state": m.STATE_ACTIVE,
+                "emoji": "rubbing",
+                "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": {"t_excluded": m.STATE_ACTIVE},
+                "opaque": {"keep": ["pending", "deeply", "equal"]},
+            },
+            excluded_due: {
+                "state": m.STATE_BLOCKED,
+                "emoji": "face_vomiting",
+                "applied_at": NOW - 600,
+                "pending_removals": [],
+                "lanes": {"t_excluded": m.STATE_BLOCKED},
+                "reconcile_sweeps": 0,
+                "reconcile_due_at": NOW,
+                "opaque": {"keep": ["due", "deeply", "equal"]},
+            },
+            excluded_compactable: {
+                "state": m.STATE_APPROVED,
+                "emoji": "blinkapproved",
+                "applied_at": NOW - m.POST_RETENTION_SECONDS - 1,
+                "pending_removals": [],
+                "lanes": {"t_excluded": m.STATE_APPROVED},
+                "opaque": {"keep": ["compaction", "deeply", "equal"]},
+            },
+        }
+        excluded_before = {
+            permalink: json.loads(json.dumps(initial["posts"][permalink]))
+            for permalink in (excluded_pending, excluded_due, excluded_compactable)
+        }
+        excluded_seen_before = json.loads(json.dumps(initial["cursor"]["seen"]))
+        excluded_attempts_before = json.loads(json.dumps(initial["cursor"]["attempts"]))
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial,
+            ["--channel", BORIS_CHANNEL, "--only-task", "t_selected"],
+        )
+
+        selected_calls = [call for call in slack.calls if call[0] in {selected_pending, selected_due}]
+        self.assertEqual(len(selected_calls), 8)
+        self.assertEqual({call[0] for call in slack.calls}, {selected_pending, selected_due})
+        self.assertEqual(after["posts"][selected_pending]["pending_removals"], [])
+        self.assertEqual(after["posts"][selected_due]["reconcile_sweeps"], 1)
+        for permalink, record in excluded_before.items():
+            self.assertEqual(after["posts"][permalink], record)
+        self.assertEqual(after["cursor"]["seen"], excluded_seen_before)
+        self.assertEqual(after["cursor"]["attempts"], excluded_attempts_before)
+
+    def test_only_task_excluded_only_repair_is_zero_call_and_byte_identical(self):
+        excluded = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000020"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["cursor"]["last_list_at"] = NOW - 1
+        initial["cursor"]["seen"] = {
+            "t_other": NOW - m.SEEN_RETENTION_SECONDS - 1,
+        }
+        initial["posts"][excluded] = {
+            "state": m.STATE_ACTIVE,
+            "emoji": "rubbing",
+            "applied_at": NOW - 600,
+            "pending_removals": ["thinkies"],
+            "lanes": {"t_other": m.STATE_ACTIVE},
+            "opaque": {"keep": ["the", "whole", "record"]},
+        }
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial, ["--only-task", "t_selected"]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after, initial)
+        self.assertEqual(after_bytes, before_bytes)
+
+    def test_only_task_missing_malformed_and_near_match_provenance_fail_closed(self):
+        missing = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000030"
+        malformed = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000031"
+        near_match = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000032"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["cursor"]["last_list_at"] = NOW - 1
+        initial["posts"] = {
+            missing: {
+                "state": m.STATE_ACTIVE,
+                "emoji": "rubbing",
+                "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "source": "free text mentioning t_selected is not lane provenance",
+            },
+            malformed: {
+                "state": m.STATE_ACTIVE,
+                "emoji": "rubbing",
+                "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": ["t_selected"],
+            },
+            near_match: {
+                "state": m.STATE_ACTIVE,
+                "emoji": "rubbing",
+                "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": {"t_selected_extra": m.STATE_ACTIVE},
+            },
+        }
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial, ["--only-task", "t_selected"]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after, initial)
+        self.assertEqual(after_bytes, before_bytes)
+
+    def test_only_task_selects_whole_multi_lane_post_for_precedence(self):
+        permalink = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000040"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["posts"][permalink] = {
+            "state": m.STATE_APPROVED,
+            "emoji": "blinkapproved",
+            "applied_at": NOW - 600,
+            "pending_removals": ["thinkies"],
+            "lanes": {
+                "t_selected": m.STATE_APPROVED,
+                "t_blocking_sibling": m.STATE_BLOCKED,
+            },
+        }
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial, ["--only-task", "t_selected"]
+        )
+
+        self.assertEqual(slack.calls[0], (permalink, "face_vomiting", False))
+        self.assertEqual(after["posts"][permalink]["state"], m.STATE_BLOCKED)
+        self.assertEqual(after["posts"][permalink]["lanes"], {
+            "t_selected": m.STATE_APPROVED,
+            "t_blocking_sibling": m.STATE_BLOCKED,
+        })
+
+    def test_only_task_does_not_clear_an_excluded_persisted_hold(self):
+        excluded = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000050"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["cursor"]["last_list_at"] = NOW - 1
+        initial["posts"][excluded] = {
+            "state": m.STATE_ACTIVE,
+            "emoji": "rubbing",
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_other": m.STATE_NOTES},
+            "want": "doge_notes",
+            "deferred_at": NOW - 60,
+            "unresolved_lanes": {
+                "t_other": m.hold_provenance(m.HOLD_KIND_UNSHOWABLE, "show failed"),
+            },
+        }
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial,
+            ["--only-task", "t_selected", "--clear-unresolved", excluded],
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after, initial)
+        self.assertEqual(after_bytes, before_bytes)
+
+    def test_no_task_selector_still_processes_all_persisted_candidates(self):
+        pending = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000060"
+        due = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000061"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["posts"] = {
+            pending: {
+                "state": m.STATE_ACTIVE,
+                "emoji": "rubbing",
+                "applied_at": NOW - 600,
+                "pending_removals": ["thinkies"],
+                "lanes": {"t_pending": m.STATE_ACTIVE},
+            },
+            due: {
+                "state": m.STATE_BLOCKED,
+                "emoji": "face_vomiting",
+                "applied_at": NOW - 600,
+                "pending_removals": [],
+                "lanes": {"t_due": m.STATE_BLOCKED},
+                "reconcile_sweeps": 0,
+                "reconcile_due_at": NOW,
+            },
+        }
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(initial, [])
+
+        self.assertEqual({call[0] for call in slack.calls}, {pending, due})
+        self.assertEqual(after["posts"][pending]["pending_removals"], [])
+        self.assertEqual(after["posts"][due]["reconcile_sweeps"], 1)
+
+    def test_only_task_defers_excluded_legacy_reacted_migration_bookkeeping(self):
+        selected_key = f"t_selected:{BORIS_PERMALINK}"
+        excluded_permalink = (
+            f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000070"
+        )
+        excluded_key = f"t_other:{excluded_permalink}"
+        initial = {
+            "schema_version": m.STATE_SCHEMA_VERSION - 1,
+            "baseline_completed_at": NOW - 1200,
+            "machine_baseline_at": NOW - 1200,
+            "posts": {},
+            "reacted": {
+                selected_key: {"at": NOW - 600, "task_id": "t_selected",
+                               "permalink": BORIS_PERMALINK, "reason": "selected"},
+                excluded_key: {"at": NOW - 600, "task_id": "t_other",
+                               "permalink": excluded_permalink, "reason": "excluded"},
+            },
+            "failures": {},
+            "cursor": {"seen": {}, "attempts": {}, "last_list_at": NOW - 1},
+        }
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial, ["--only-task", "t_selected"]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertIn(BORIS_PERMALINK, after["posts"])
+        self.assertNotIn(excluded_permalink, after["posts"])
+        self.assertEqual(after["legacy_reacted_completed"], [selected_key])
+        self.assertEqual(after["schema_version"], m.STATE_SCHEMA_VERSION - 1)
+
 
 class UnknownPersistedLaneTest(unittest.TestCase):
     def migrated_state(self):

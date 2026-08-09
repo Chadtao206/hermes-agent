@@ -1350,6 +1350,24 @@ def unknown_lane_values(record: object) -> dict[str, object]:
     }
 
 
+def matches_selected_tasks(
+    record: object,
+    selected_tasks: set[str] | None,
+    *,
+    extra_task_ids: Iterable[str] = (),
+) -> bool:
+    """Whether exact, trustworthy lane provenance intersects a task selector."""
+    if not selected_tasks:
+        return True
+    provenance = {str(task_id) for task_id in extra_task_ids}
+    if isinstance(record, dict):
+        for field in ("lanes", "unresolved_lanes", "cleared_lanes"):
+            task_map = record.get(field)
+            if isinstance(task_map, dict):
+                provenance.update(str(task_id) for task_id in task_map)
+    return not selected_tasks.isdisjoint(provenance)
+
+
 def _new_state(now: int, *, backfill: bool = False) -> dict[str, Any]:
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1368,6 +1386,7 @@ def migrate_state(
     *,
     backfill: bool = False,
     allowed_channels: set[str] | None = None,
+    selected_tasks: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Upgrade legacy ✅-only state in place; never lose or replay history.
 
@@ -1414,7 +1433,9 @@ def migrate_state(
             task_id, permalink = key.split(":", 1)
             if not PERMALINK_RE.fullmatch(permalink):
                 continue
-            if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+            if ((allowed_channels is not None
+                 and source_channel(permalink) not in allowed_channels)
+                    or (selected_tasks and task_id not in selected_tasks)):
                 deferred += 1
                 continue
             if key in completed:
@@ -1462,6 +1483,8 @@ def migrate_state(
         if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
             continue
         record = state["posts"][permalink]
+        if not matches_selected_tasks(record, selected_tasks):
+            continue
         if not isinstance(record, dict):
             state["posts"].pop(permalink, None)
             continue
@@ -1526,22 +1549,31 @@ def migrate_state(
 
 
 def compact_state(
-    state: dict[str, Any], now: int, *, allowed_channels: set[str] | None = None
+    state: dict[str, Any],
+    now: int,
+    *,
+    allowed_channels: set[str] | None = None,
+    selected_tasks: set[str] | None = None,
 ) -> None:
     """Keep the cursor and post registry bounded across long uptimes."""
     cursor = state["cursor"]
     cursor["seen"] = {
         task_id: epoch
         for task_id, epoch in cursor["seen"].items()
-        if isinstance(epoch, int) and now - epoch <= SEEN_RETENTION_SECONDS
+        if ((selected_tasks and str(task_id) not in selected_tasks)
+            or (isinstance(epoch, int) and now - epoch <= SEEN_RETENTION_SECONDS))
     }
     cursor["attempts"] = {
         task_id: attempt
         for task_id, attempt in cursor["attempts"].items()
-        if isinstance(attempt, dict) and now - _epoch(attempt.get("last_at")) <= SEEN_RETENTION_SECONDS
+        if ((selected_tasks and str(task_id) not in selected_tasks)
+            or (isinstance(attempt, dict)
+                and now - _epoch(attempt.get("last_at")) <= SEEN_RETENTION_SECONDS))
     }
     for permalink, record in list(state["posts"].items()):
         if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+            continue
+        if not matches_selected_tasks(record, selected_tasks):
             continue
         applied = _epoch(record.get("applied_at"))
         # A held post is never compacted away: dropping it would silently release
@@ -1675,8 +1707,15 @@ def process_tick(
     max_shows = int(getattr(args, "max_shows", MAX_SHOWS_PER_TICK) or MAX_SHOWS_PER_TICK)
     cleared_posts: set[str] = set()
 
-    def is_selected_permalink(permalink: str) -> bool:
-        return source_channel(permalink) in allowed_channels
+    def is_selected_permalink(
+        permalink: str, *, extra_task_ids: Iterable[str] = ()
+    ) -> bool:
+        return (
+            source_channel(permalink) in allowed_channels
+            and matches_selected_tasks(
+                posts.get(permalink), only_tasks, extra_task_ids=extra_task_ids
+            )
+        )
 
     # Operator escape hatch: explicitly release a hold an operator has classified by
     # hand. This is the only way a hold ends without the lane reclassifying, and it
@@ -1847,10 +1886,26 @@ def process_tick(
                 or record.get("unresolved_lanes") or reconcile_due(record, now)):
             candidates.add(permalink)
 
-    if candidates:
+    def discovered_task_ids(permalink: str) -> set[str]:
+        return (
+            set(fresh.get(permalink) or {})
+            | set(quarantined.get(permalink) or {})
+            | set(unshowable.get(permalink) or {})
+            | set(resolved.get(permalink) or ())
+        )
+
+    selected_candidates = {
+        permalink
+        for permalink in candidates
+        if is_selected_permalink(
+            permalink, extra_task_ids=discovered_task_ids(permalink)
+        )
+    }
+
+    if selected_candidates:
         cursor["last_list_at"] = now
 
-    for permalink in sorted(permalink for permalink in candidates if is_selected_permalink(permalink)):
+    for permalink in sorted(selected_candidates):
         record = posts.get(permalink) if isinstance(posts.get(permalink), dict) else None
         semantic_lanes = lane_states(record)
         unknown_lanes = unknown_lane_values(record)
@@ -2060,8 +2115,13 @@ def process_tick(
                          "reason": reasons or "reaction state machine", "output": "reaction-state-machine"},
                     )
 
-    if candidates:
-        compact_state(state, now, allowed_channels=allowed_channels)
+    if selected_candidates:
+        compact_state(
+            state,
+            now,
+            allowed_channels=allowed_channels,
+            selected_tasks=only_tasks,
+        )
     return (1 if hard_failed else 0), outputs, metrics
 
 
@@ -2106,6 +2166,7 @@ def main(argv: list[str] | None = None) -> int:
             now,
             backfill=args.backfill_existing,
             allowed_channels=set(args.channels or DEFAULT_ALLOWED_CHANNELS),
+            selected_tasks=set(args.only_task or []),
         )
         if notes and raw_text is not None and not args.dry_run:
             backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
