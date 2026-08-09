@@ -1368,6 +1368,30 @@ def matches_selected_tasks(
     return not selected_tasks.isdisjoint(provenance)
 
 
+def state_has_selected_task_provenance(
+    state: object,
+    selected_tasks: set[str],
+    allowed_channels: set[str],
+) -> bool:
+    """Whether persisted post or legacy-source provenance enters this task scope."""
+    if not selected_tasks or not isinstance(state, dict):
+        return not selected_tasks
+    posts = state.get("posts")
+    for permalink, record in (posts.items() if isinstance(posts, dict) else []):
+        if (source_channel(str(permalink)) in allowed_channels
+                and matches_selected_tasks(record, selected_tasks)):
+            return True
+    reacted = state.get("reacted")
+    for key in (reacted if isinstance(reacted, dict) else {}):
+        if not isinstance(key, str) or ":" not in key:
+            continue
+        task_id, permalink = key.split(":", 1)
+        if (task_id in selected_tasks and PERMALINK_RE.fullmatch(permalink)
+                and source_channel(permalink) in allowed_channels):
+            return True
+    return False
+
+
 def _new_state(now: int, *, backfill: bool = False) -> dict[str, Any]:
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1917,11 +1941,22 @@ def process_tick(
         # (aged past --lookback-seconds, archived, or simply absent from this tick's
         # list) keeps holding its post, because "we stopped looking" is not evidence
         # that the lane was safe.
-        unresolved: dict[str, str] = {
-            str(task_id): str(why)
-            for task_id, why in ((record or {}).get("unresolved_lanes") or {}).items()
-        }
-        cleared_lanes: dict[str, int] = dict((record or {}).get("cleared_lanes") or {})
+        # A selected fresh lane can admit a record that task-scoped migration had
+        # deliberately left untouched. Consume its persisted mappings defensively:
+        # malformed hold provenance must hold fail-closed, while malformed release
+        # bookkeeping grants no release.
+        raw_unresolved = (record or {}).get("unresolved_lanes")
+        unresolved: dict[str, str] = (
+            {str(task_id): str(why) for task_id, why in raw_unresolved.items()}
+            if isinstance(raw_unresolved, dict)
+            else ({"unknown": "unreadable hold provenance"} if raw_unresolved else {})
+        )
+        raw_cleared = (record or {}).get("cleared_lanes")
+        cleared_lanes: dict[str, int] = (
+            {str(task_id): _epoch(at) for task_id, at in raw_cleared.items()}
+            if isinstance(raw_cleared, dict)
+            else {}
+        )
         unresolved.update(unshowable.get(permalink) or {})
         # An operator release applies to holds carrying no new information: a persisted
         # hold, or the same lane deferring again.
@@ -2168,14 +2203,6 @@ def main(argv: list[str] | None = None) -> int:
             allowed_channels=set(args.channels or DEFAULT_ALLOWED_CHANNELS),
             selected_tasks=set(args.only_task or []),
         )
-        if notes and raw_text is not None and not args.dry_run:
-            backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
-            if not backup.exists():
-                try:
-                    backup.write_text(raw_text)
-                except OSError as exc:  # pragma: no cover - disk failure only
-                    notes.append(f"state backup failed: {exc}")
-
         code, outputs, metrics = process_tick(
             args,
             now,
@@ -2184,7 +2211,21 @@ def main(argv: list[str] | None = None) -> int:
             shower=kanban_show,
             reactor=slack_reaction,
         )
-        if not args.dry_run:
+        selected_tasks = set(args.only_task or [])
+        allowed_channels = set(args.channels or DEFAULT_ALLOWED_CHANNELS)
+        has_selected_work = (
+            state_has_selected_task_provenance(state, selected_tasks, allowed_channels)
+            or metrics["task_show_calls"] > 0
+        )
+        persist_state = raw_text is None or not selected_tasks or has_selected_work
+        if notes and raw_text is not None and not args.dry_run and persist_state:
+            backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
+            if not backup.exists():
+                try:
+                    backup.write_text(raw_text)
+                except OSError as exc:  # pragma: no cover - disk failure only
+                    notes.append(f"state backup failed: {exc}")
+        if not args.dry_run and persist_state:
             save_json(STATE_PATH, state)
 
         lines = [f"JUST_DO_IT_REVIEW_REACTIONS {note}" for note in notes] + outputs

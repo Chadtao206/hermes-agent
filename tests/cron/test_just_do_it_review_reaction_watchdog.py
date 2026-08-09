@@ -1159,7 +1159,7 @@ class BorisMigrationTest(unittest.TestCase):
             self.assertEqual(converged.calls, [])
             self.assertEqual(json.loads(state_path.read_text())["posts"][PERMALINK], legacy_before)
 
-    def run_persisted_main(self, initial, invocation):
+    def run_persisted_main(self, initial, invocation, *, rows=None):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "watchdog.json"
             state_path.write_text(json.dumps(initial, indent=2, sort_keys=True))
@@ -1168,7 +1168,7 @@ class BorisMigrationTest(unittest.TestCase):
             with (
                 mock.patch.object(m, "STATE_PATH", state_path),
                 mock.patch.object(m.time, "time", return_value=NOW),
-                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[]),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=rows or []),
                 mock.patch.object(m, "slack_reaction", slack),
             ):
                 self.assertEqual(m.main(invocation), 0)
@@ -1709,6 +1709,65 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertNotIn(excluded_permalink, after["posts"])
         self.assertEqual(after["legacy_reacted_completed"], [selected_key])
         self.assertEqual(after["schema_version"], m.STATE_SCHEMA_VERSION - 1)
+
+    def test_only_task_excluded_only_sparse_legacy_state_is_byte_identical(self):
+        excluded_permalink = (
+            f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000071"
+        )
+        excluded_key = f"t_other:{excluded_permalink}"
+        initial = {
+            "baseline_completed_at": NOW - 1200,
+            "reacted": {
+                excluded_key: {
+                    "at": NOW - 600,
+                    "task_id": "t_other",
+                    "permalink": excluded_permalink,
+                    "reason": "excluded sparse legacy source",
+                },
+            },
+        }
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial, ["--only-task", "t_selected"]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after, initial)
+        self.assertEqual(after_bytes, before_bytes)
+
+    def test_only_task_fresh_discovery_fails_closed_on_malformed_persisted_hold(self):
+        permalink = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000080"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["posts"][permalink] = {
+            "state": m.STATE_ACTIVE,
+            "emoji": "rubbing",
+            "applied_at": NOW - 600,
+            "pending_removals": ["thinkies"],
+            "lanes": {"t_other": m.STATE_BLOCKED},
+            "unresolved_lanes": ["t_selected"],
+            "opaque": {"keep": ["fresh", "re-admission"]},
+        }
+        selected_row = lane(
+            "t_selected",
+            "running",
+            permalink=permalink,
+            created_at=NOW + 1,
+        )
+
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial,
+            ["--only-task", "t_selected"],
+            rows=[selected_row],
+        )
+
+        self.assertEqual(slack.calls, [])
+        record = after["posts"][permalink]
+        self.assertEqual(m.hold_kind(record["unresolved_lanes"]["unknown"]),
+                         m.HOLD_KIND_UNKNOWN)
+        self.assertEqual(record["lanes"], {
+            "t_other": m.STATE_BLOCKED,
+            "t_selected": m.STATE_ACTIVE,
+        })
 
 
 class UnknownPersistedLaneTest(unittest.TestCase):
