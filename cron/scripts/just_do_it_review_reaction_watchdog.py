@@ -1344,7 +1344,13 @@ def _new_state(now: int, *, backfill: bool = False) -> dict[str, Any]:
     }
 
 
-def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[str, Any], list[str]]:
+def migrate_state(
+    raw: Any,
+    now: int,
+    *,
+    backfill: bool = False,
+    allowed_channels: set[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     """Upgrade legacy ✅-only state in place; never lose or replay history.
 
     Legacy `reacted` entries become known :white_check_mark: post states so a
@@ -1385,6 +1391,8 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
             task_id, permalink = key.split(":", 1)
             if not PERMALINK_RE.fullmatch(permalink):
                 continue
+            if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+                continue
             record = state["posts"].get(permalink)
             if record_state(record) is not None:
                 continue
@@ -1412,6 +1420,8 @@ def migrate_state(raw: Any, now: int, *, backfill: bool = False) -> tuple[dict[s
     # Drop unusable post records rather than acting on them. A record with no
     # applied emoji is kept only while it still carries repair intent.
     for permalink in list(state["posts"]):
+        if allowed_channels is not None and source_channel(permalink) not in allowed_channels:
+            continue
         record = state["posts"][permalink]
         if not isinstance(record, dict):
             state["posts"].pop(permalink, None)
@@ -2052,7 +2062,12 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             raw_text = None
         raw = load_json(STATE_PATH, None)
-        state, notes = migrate_state(raw, now, backfill=args.backfill_existing)
+        state, notes = migrate_state(
+            raw,
+            now,
+            backfill=args.backfill_existing,
+            allowed_channels=set(args.channels or DEFAULT_ALLOWED_CHANNELS),
+        )
         if notes and raw_text is not None and not args.dry_run:
             backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
             if not backup.exists():

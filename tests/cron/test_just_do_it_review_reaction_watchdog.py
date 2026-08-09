@@ -1221,6 +1221,28 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
         self.assertEqual(after_bytes, before_bytes)
 
+    def test_boris_only_does_not_normalize_an_excluded_current_schema_repair_record(self):
+        # A current-schema ledger can still contain a sparse repair record. Channel
+        # fencing must precede restart normalization, which otherwise adds fields
+        # and rewrites this excluded-only ledger despite making no Slack calls.
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["machine_baseline_at"] = 0
+        initial["cursor"]["last_list_at"] = NOW - 1
+        initial["posts"][PERMALINK_B] = {
+            "emoji": "review-no",
+            "applied_at": NOW - 600,
+            "last_error": "legacy repair still pending",
+        }
+        legacy_before = json.loads(json.dumps(initial["posts"][PERMALINK_B]))
+
+        slack, after, before_bytes, after_bytes = self.run_persisted_main(
+            initial, ["--channel", BORIS_CHANNEL]
+        )
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
+        self.assertEqual(after_bytes, before_bytes)
+
     def test_boris_only_processes_selected_persisted_repairs_without_mutating_legacy_records(self):
         initial = m.migrate_state(None, NOW, backfill=True)[0]
         initial["machine_baseline_at"] = 0
