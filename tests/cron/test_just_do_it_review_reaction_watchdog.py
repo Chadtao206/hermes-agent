@@ -2765,6 +2765,110 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(retried["slack"].removes, [(PERMALINK, m.EMOJI_ACTIVE)])
         self.assertEqual(state["posts"][PERMALINK]["pending_removals"], [])
 
+    def test_boris_absent_reconciliation_removal_does_not_strand_pending_work(self):
+        state = m.migrate_state(None, NOW, backfill=True)[0]
+        state["machine_baseline_at"] = 0
+        state["posts"][BORIS_PERMALINK] = {
+            "state": m.STATE_BLOCKED,
+            "emoji": "face_vomiting",
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_boris": m.STATE_BLOCKED},
+            "reconcile_sweeps": 0,
+            "reconcile_due_at": NOW,
+        }
+        commands = []
+
+        def already_absent(cmd, *, timeout=120):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, 0, '{"ok": false, "error": "not_reacted"}', ""
+            )
+
+        with mock.patch.object(m, "run", already_absent):
+            reconciled = tick(
+                [], {}, state=state, slack=m.slack_reaction, now=NOW,
+                channels=[BORIS_CHANNEL],
+            )
+            writes_after_reconcile = len(commands)
+            quiet = tick(
+                [], {}, state=state, slack=m.slack_reaction, now=NOW + 1,
+                channels=[BORIS_CHANNEL],
+            )
+
+        self.assertGreater(writes_after_reconcile, 0)
+        self.assertEqual(state["posts"][BORIS_PERMALINK]["pending_removals"], [])
+        self.assertNotIn("reconcile_remove_failed", "\n".join(reconciled["outputs"]))
+        self.assertEqual(len(commands), writes_after_reconcile)
+        self.assertEqual(quiet["metrics"]["reaction_calls"], 0)
+
+    def test_applied_then_http_failure_settles_when_retry_reports_not_reacted(self):
+        state = m.migrate_state(None, NOW, backfill=True)[0]
+        state["machine_baseline_at"] = 0
+        state["posts"][BORIS_PERMALINK] = {
+            "state": m.STATE_BLOCKED,
+            "emoji": "face_vomiting",
+            "applied_at": NOW - 600,
+            "pending_removals": [],
+            "lanes": {"t_boris": m.STATE_BLOCKED},
+            "reconcile_sweeps": 0,
+            "reconcile_due_at": NOW,
+        }
+        live = {"face_vomiting", "doge_notes"}
+        commands = []
+        doge_remove_attempts = 0
+
+        def ambiguous_then_absent(cmd, *, timeout=120):
+            nonlocal doge_remove_attempts
+            commands.append(cmd)
+            emoji = cmd[cmd.index("--emoji") + 1]
+            if "--remove" not in cmd:
+                already = emoji in live
+                live.add(emoji)
+                payload = {"ok": True, "already_reacted": already}
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+            was_present = emoji in live
+            live.discard(emoji)
+            if emoji == "doge_notes":
+                doge_remove_attempts += 1
+                if doge_remove_attempts == 1:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, '{"ok": false, "error": "http_500"}', ""
+                    )
+                self.assertFalse(was_present)
+                return subprocess.CompletedProcess(
+                    cmd, 0, '{"ok": false, "error": "not_reacted"}', ""
+                )
+            payload = {"ok": True, "no_reaction": not was_present}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        with mock.patch.object(m, "run", ambiguous_then_absent):
+            failed = tick(
+                [], {}, state=state, slack=m.slack_reaction, now=NOW,
+                channels=[BORIS_CHANNEL],
+            )
+            self.assertEqual(
+                state["posts"][BORIS_PERMALINK]["pending_removals"], ["doge_notes"]
+            )
+            self.assertIn("reconcile_remove_failed", "\n".join(failed["outputs"]))
+
+            repaired = tick(
+                [], {}, state=state, slack=m.slack_reaction, now=NOW + 1,
+                channels=[BORIS_CHANNEL],
+            )
+            writes_after_repair = len(commands)
+            quiet = tick(
+                [], {}, state=state, slack=m.slack_reaction, now=NOW + 2,
+                channels=[BORIS_CHANNEL],
+            )
+
+        self.assertEqual(doge_remove_attempts, 2)
+        self.assertEqual(live, {"face_vomiting"})
+        self.assertEqual(state["posts"][BORIS_PERMALINK]["pending_removals"], [])
+        self.assertEqual(repaired["code"], 0)
+        self.assertEqual(len(commands), writes_after_repair)
+        self.assertEqual(quiet["metrics"]["reaction_calls"], 0)
+
     def test_a_held_post_is_never_swept(self):
         # Holding means "touch nothing", including the blind repair sweep.
         rows = [lane("t_a", "done"), lane("t_missing", "done")]
@@ -2784,7 +2888,7 @@ class ReconciliationTest(unittest.TestCase):
 class SlackReactionResultTest(unittest.TestCase):
     """Blocker 4: the helper's *result* is validated, not just its exit code."""
 
-    def reaction(self, returncode, stdout, stderr=""):
+    def reaction(self, returncode, stdout, stderr="", *, remove=False):
         import subprocess
 
         recorded = {}
@@ -2796,7 +2900,7 @@ class SlackReactionResultTest(unittest.TestCase):
         original = m.run
         m.run = fake_run
         try:
-            return m.slack_reaction(PERMALINK, m.EMOJI_ACTIVE, False), recorded
+            return m.slack_reaction(PERMALINK, m.EMOJI_ACTIVE, remove), recorded
         finally:
             m.run = original
 
@@ -2843,6 +2947,61 @@ class SlackReactionResultTest(unittest.TestCase):
         self.assertTrue(result["ok"] and result["already_reacted"])
         result, _ = self.reaction(0, '{"ok": true, "no_reaction": true}')
         self.assertTrue(result["ok"] and result["no_reaction"])
+
+    def test_remove_folds_not_reacted_into_existing_already_absent_shape(self):
+        for error in ("not_reacted", "no_reaction"):
+            with self.subTest(error=error):
+                result, _ = self.reaction(
+                    0, json.dumps({"ok": False, "error": error}), remove=True
+                )
+                self.assertTrue(result["ok"])
+                self.assertIsNone(result["error"])
+                self.assertFalse(result["already_reacted"])
+                self.assertTrue(result["no_reaction"])
+                self.assertEqual(
+                    set(result), {"ok", "error", "already_reacted", "no_reaction", "raw"}
+                )
+
+    def test_remove_keeps_auth_rate_and_http_errors_as_failures(self):
+        cases = (
+            (0, "invalid_auth"),
+            (0, "missing_scope"),
+            (0, "ratelimited"),
+            (1, "http_500"),
+        )
+        for returncode, error in cases:
+            with self.subTest(error=error):
+                result, _ = self.reaction(
+                    returncode,
+                    json.dumps({"ok": False, "error": error}),
+                    remove=True,
+                )
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], error)
+                self.assertFalse(result["no_reaction"])
+
+    def test_not_reacted_add_failure_preserves_add_before_remove(self):
+        commands = []
+
+        def not_reacted(cmd, *, timeout=120):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, 0, '{"ok": false, "error": "not_reacted"}', ""
+            )
+
+        with mock.patch.object(m, "run", not_reacted):
+            result = m.apply_transition(
+                PERMALINK,
+                m.EMOJI_BLOCK,
+                {"emoji": m.EMOJI_ACTIVE},
+                m.slack_reaction,
+                m.owned_reactions(PERMALINK),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["prior"], m.EMOJI_ACTIVE)
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn("--remove", commands[0])
 
     def test_remove_passes_the_remove_flag_and_exact_permalink(self):
         import subprocess

@@ -21,8 +21,9 @@ state, because the channel-watch policy forbids REQUEST_CHANGES.
 
 Transitions are idempotent: the desired reaction is added FIRST, then stale
 Son-of-Chad-owned reactions are removed, so a failure never leaves the post
-bare. ``already_reacted`` and ``no_reaction`` are successes. If the add fails the
-prior reaction is retained and the post is retried with backoff.
+bare. ``already_reacted``, ``no_reaction``, and removal-only ``not_reacted`` are
+successes. If the add fails, the prior reaction is retained and the post is retried
+with backoff.
 
 Three fail-closed invariants hold everywhere:
 
@@ -1097,9 +1098,11 @@ def slack_reaction(permalink: str, emoji: str, remove: bool, *, timeout: int = 6
     """Add/remove one Son of Chad reaction via slack_react.py (subprocess).
 
     Fails closed on the helper's *result*, not just its exit code: success requires
-    a parsed JSON object that explicitly says ``{"ok": true}``. An rc=0 run that
-    printed nothing, printed non-JSON, or printed a non-object proves nothing about
-    the post, so it is reported as a retryable failure instead of being believed.
+    a parsed JSON object that explicitly says ``{"ok": true}``, except that an
+    explicit ``no_reaction`` or ``not_reacted`` removal outcome also proves the
+    ensure-absent postcondition. An rc=0 run that printed nothing, printed non-JSON,
+    or printed a non-object proves nothing about the post, so it is reported as a
+    retryable failure instead of being believed.
     """
     cmd = [str(SLACK_REACT), permalink, "--emoji", emoji]
     if remove:
@@ -1122,12 +1125,21 @@ def slack_reaction(permalink: str, emoji: str, remove: bool, *, timeout: int = 6
             "no_reaction": False,
             "raw": raw,
         }
-    ok = proc.returncode == 0 and payload.get("ok") is True
+    already_absent = (
+        remove
+        and proc.returncode == 0
+        and payload.get("error") in {"no_reaction", "not_reacted"}
+    )
+    ok = proc.returncode == 0 and (payload.get("ok") is True or already_absent)
     return {
         "ok": bool(ok),
-        "error": payload.get("error") or (None if ok else f"slack_react rc={proc.returncode}"),
+        "error": (
+            None
+            if already_absent
+            else payload.get("error") or (None if ok else f"slack_react rc={proc.returncode}")
+        ),
         "already_reacted": bool(payload.get("already_reacted")),
-        "no_reaction": bool(payload.get("no_reaction")),
+        "no_reaction": bool(payload.get("no_reaction") or already_absent),
         "raw": raw,
     }
 
