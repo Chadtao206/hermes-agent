@@ -2443,6 +2443,55 @@ def test_boris_verification_rejects_source_or_watermark_regression(
     assert any("Boris watermark regressed" in error for error in errors)
 
 
+@pytest.mark.parametrize(
+    ("table", "expect_regression"),
+    (
+        pytest.param("requests", False, id="rolling-requests"),
+        pytest.param("counters", True, id="durable-counters"),
+    ),
+)
+def test_boris_verification_applies_monotonic_counts_only_to_durable_tables(
+    retirement_fixture, table, expect_regression
+):
+    manifest = retirement_fixture.complete_retirement()
+    manifest = retirement_fixture.checkpoint_and_change_reaction(manifest)
+    database = retirement_fixture.paths.state_dir / "boris_intake.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """CREATE TABLE requests (user_id TEXT NOT NULL, at REAL NOT NULL);
+               CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+               INSERT INTO requests VALUES ('U1', 1.0), ('U1', 2.0);
+               INSERT INTO counters VALUES ('accepted', 1), ('rejected', 1);"""
+        )
+    manifest = checkpoint_component(
+        retirement_fixture.paths,
+        manifest,
+        "boris-intake",
+        manifest.cutoff_epoch + 210,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(f'DELETE FROM "{table}" WHERE rowid = 1')
+
+    live_source = retirement_fixture.paths.live_scripts / "boris_intake"
+    versioned_source = (
+        retirement_fixture.paths.source_root / "cron" / "scripts" / "boris_intake"
+    )
+    shutil.rmtree(live_source)
+    shutil.copytree(versioned_source, live_source)
+    heartbeat = retirement_fixture.paths.state_dir / "boris_intake_heartbeat"
+    checkpoint_mtime = manifest.component_checkpoints["boris-intake"][-1][
+        "heartbeat_mtime"
+    ]
+    os.utime(heartbeat, (checkpoint_mtime + 5, checkpoint_mtime + 5))
+
+    errors = verify_retired(
+        retirement_fixture.paths, manifest, manifest.cutoff_epoch + 240
+    )
+
+    regression = f"Boris store row count regressed for {table}"
+    assert (regression in errors) is expect_regression
+
+
 def test_failed_second_pause_restores_preflight_records_and_can_retry(
     retirement_fixture, monkeypatch
 ):

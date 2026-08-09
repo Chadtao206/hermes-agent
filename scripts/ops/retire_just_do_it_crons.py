@@ -76,6 +76,7 @@ DEPRECATED_IDEMPOTENCY_PREFIX = "just-do-it-rereview:"
 
 BORIS_CHANNEL = "C0BPCKPEFCG"
 BORIS_LAUNCHD_LABEL = "ai.hermes.boris-intake"
+BORIS_ROLLING_COUNT_TABLES = frozenset({"requests"})
 LEGACY_CHANNELS = ("C08K8FQKX9S", "C07BU8AAPB3", "C09339EGZ9U")
 ENTRYPOINTS = {
     "retired-channel-script": "slack_channel_watch.py",
@@ -2772,6 +2773,8 @@ def verify_retired(paths: Paths, manifest: Manifest, now: Any) -> list[str]:
             if current_db["integrity"] != "ok" or current_db["tables"] != baseline["tables"]:
                 errors.append("Boris store schema/integrity continuity failed")
             for table, count in baseline["counts"].items():
+                if table in BORIS_ROLLING_COUNT_TABLES:
+                    continue
                 if current_db["counts"].get(table, -1) < count:
                     errors.append(f"Boris store row count regressed for {table}")
             if not _sqlite_baseline_is_subset(
