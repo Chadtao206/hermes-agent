@@ -1735,6 +1735,46 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after, initial)
         self.assertEqual(after_bytes, before_bytes)
 
+    def test_only_task_persists_reconciliation_that_compacts_its_last_selected_post(self):
+        permalink = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000072"
+        initial = m.migrate_state(None, NOW, backfill=True)[0]
+        initial["posts"][permalink] = {
+            "state": m.STATE_BLOCKED,
+            "emoji": "face_vomiting",
+            "applied_at": NOW - m.POST_RETENTION_SECONDS - 1,
+            "pending_removals": [],
+            "lanes": {"t_selected": m.STATE_BLOCKED},
+            "reconcile_sweeps": 0,
+            "reconcile_due_at": NOW,
+        }
+        invocation = ["--only-task", "t_selected"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "watchdog.json"
+            state_path.write_text(json.dumps(initial, indent=2, sort_keys=True))
+            slack = FakeSlack()
+            with (
+                mock.patch.object(m, "STATE_PATH", state_path),
+                mock.patch.object(m, "kanban_reviewer_lanes", return_value=[]),
+                mock.patch.object(m, "slack_reaction", slack),
+            ):
+                with mock.patch.object(m.time, "time", return_value=NOW):
+                    self.assertEqual(m.main(invocation), 0)
+                after_first = json.loads(state_path.read_text())
+                calls_after_first = list(slack.calls)
+
+                with mock.patch.object(m.time, "time", return_value=NOW + 1):
+                    self.assertEqual(m.main(invocation), 0)
+                after_second = json.loads(state_path.read_text())
+
+        self.assertEqual(len(calls_after_first), 6)
+        self.assertEqual({call[0] for call in calls_after_first}, {permalink})
+        self.assertTrue(all(remove for _permalink, _emoji, remove in calls_after_first))
+        self.assertNotIn(permalink, after_first["posts"])
+        self.assertEqual(after_first["cursor"]["last_list_at"], NOW)
+        self.assertEqual(slack.calls, calls_after_first)
+        self.assertEqual(after_second, after_first)
+
     def test_only_task_fresh_discovery_fails_closed_on_malformed_persisted_hold(self):
         permalink = f"https://ylopo.slack.com/archives/{BORIS_CHANNEL}/p1785000000000080"
         initial = m.migrate_state(None, NOW, backfill=True)[0]

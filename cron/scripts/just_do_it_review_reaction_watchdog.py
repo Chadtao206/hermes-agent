@@ -2196,12 +2196,17 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             raw_text = None
         raw = load_json(STATE_PATH, None)
+        selected_tasks = set(args.only_task or [])
+        allowed_channels = set(args.channels or DEFAULT_ALLOWED_CHANNELS)
         state, notes = migrate_state(
             raw,
             now,
             backfill=args.backfill_existing,
-            allowed_channels=set(args.channels or DEFAULT_ALLOWED_CHANNELS),
-            selected_tasks=set(args.only_task or []),
+            allowed_channels=allowed_channels,
+            selected_tasks=selected_tasks,
+        )
+        has_selected_work = state_has_selected_task_provenance(
+            state, selected_tasks, allowed_channels
         )
         code, outputs, metrics = process_tick(
             args,
@@ -2211,9 +2216,7 @@ def main(argv: list[str] | None = None) -> int:
             shower=kanban_show,
             reactor=slack_reaction,
         )
-        selected_tasks = set(args.only_task or [])
-        allowed_channels = set(args.channels or DEFAULT_ALLOWED_CHANNELS)
-        has_selected_work = (
+        has_selected_work = has_selected_work or (
             state_has_selected_task_provenance(state, selected_tasks, allowed_channels)
             or metrics["task_show_calls"] > 0
         )
