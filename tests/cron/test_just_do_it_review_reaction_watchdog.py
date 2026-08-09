@@ -123,7 +123,9 @@ def args(**overrides):
     values = {
         "dry_run": False,
         "lookback_seconds": m.DEFAULT_LOOKBACK_SECONDS,
-        "channels": None,
+        # Unit-level state-machine tests select their fixtures explicitly. CLI
+        # default-channel behavior is covered through main() below.
+        "channels": [CHANNEL, OTHER_WATCHED, "C09339EGZ9U", BORIS_CHANNEL],
         "only_task": [],
         "backfill_existing": False,
         "max_shows": m.MAX_SHOWS_PER_TICK,
@@ -1283,7 +1285,7 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after, initial)
         self.assertEqual(after_bytes, before_bytes)
 
-    def test_boris_only_legacy_migration_defers_excluded_approval_history_for_all_channel_run(self):
+    def test_boris_only_legacy_migration_defers_excluded_approval_history_for_explicit_legacy_run(self):
         legacy_reacted = {
             f"t_legacy:{PERMALINK_B}": {
                 "at": NOW - 600,
@@ -1313,7 +1315,7 @@ class BorisMigrationTest(unittest.TestCase):
                 self.assertNotIn(PERMALINK_B, after_boris["posts"])
 
                 with mock.patch.object(m.time, "time", return_value=NOW + 1):
-                    self.assertEqual(m.main([]), 0)
+                    self.assertEqual(m.main(["--channel", OTHER_WATCHED]), 0)
 
             after_all = json.loads(state_path.read_text())
 
@@ -1387,7 +1389,17 @@ class BorisMigrationTest(unittest.TestCase):
                 with mock.patch.object(m.time, "time", return_value=NOW + 2):
                     self.assertEqual(m.main(["--channel", BORIS_CHANNEL]), 0)
                 with mock.patch.object(m.time, "time", return_value=NOW + 3):
-                    self.assertEqual(m.main([]), 0)
+                    self.assertEqual(
+                        m.main(
+                            [
+                                "--channel",
+                                BORIS_CHANNEL,
+                                "--channel",
+                                OTHER_WATCHED,
+                            ]
+                        ),
+                        0,
+                    )
 
             after_all = json.loads(state_path.read_text())
 
@@ -1439,7 +1451,8 @@ class BorisMigrationTest(unittest.TestCase):
         self.assertEqual(after["posts"][BORIS_PERMALINK]["pending_removals"], [])
         self.assertEqual(after["posts"][PERMALINK_B], legacy_before)
 
-    def test_scheduled_all_channel_run_still_repairs_an_eligible_legacy_post(self):
+    @staticmethod
+    def legacy_pending_state():
         initial = m.migrate_state(None, NOW, backfill=True)[0]
         initial["machine_baseline_at"] = 0
         initial["posts"][PERMALINK_B] = {
@@ -1447,8 +1460,23 @@ class BorisMigrationTest(unittest.TestCase):
             "pending_removals": ["thinkies"],
             "lanes": {"t_legacy": "review-no"},
         }
+        return initial
 
+    def test_scheduled_default_preserves_due_legacy_repair(self):
+        initial = self.legacy_pending_state()
+        legacy_post_before = json.loads(json.dumps(initial["posts"][PERMALINK_B]))
+        legacy_reacted_before = json.loads(json.dumps(initial["reacted"]))
         slack, after, _before_bytes, _after_bytes = self.run_persisted_main(initial, [])
+
+        self.assertEqual(slack.calls, [])
+        self.assertEqual(after["posts"][PERMALINK_B], legacy_post_before)
+        self.assertEqual(after["reacted"], legacy_reacted_before)
+
+    def test_explicit_legacy_channel_still_repairs_due_legacy_record(self):
+        initial = self.legacy_pending_state()
+        slack, after, _before_bytes, _after_bytes = self.run_persisted_main(
+            initial, ["--channel", OTHER_WATCHED]
+        )
 
         self.assertEqual(slack.calls, [
             (PERMALINK_B, "review-no", False),

@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""Drive the Son of Chad reaction state machine on watched Slack PR-review posts.
+"""Drive the Son of Chad reaction state machine on Boris Slack PR-review posts.
 
-Deterministic backstop for the just-do-it-channel-watch cron. Chad's accepted
-mapping (meeting-room thread 1785232913.074359) gives a watched PR post exactly
-one Son of Chad reaction reflecting the reviewer lane's current state:
+Scheduled/no-argument operation is limited to #boris-reviews. Explicit
+``--channel`` arguments retain the historical watched channels as operator-only
+rollback and forensic tooling. A source PR post receives exactly one Son of Chad
+reaction reflecting the reviewer lane's current state.
 
-    reviewer lane kicked off / still active   -> :thinkies:
+The modern Boris mapping is:
+
+    reviewer lane kicked off / still active   -> :rubbing:
     Boris left non-blocking review comments   -> :doge_notes:
-    Boris reported blocked / not ready        -> :review-no:
-    clean approval (or existing head approval)-> :white_check_mark:   (pre-existing behavior)
+    Boris reported blocked / not ready        -> :face_vomiting:
+    clean approval (or existing head approval)-> :blinkapproved:
+
+Explicit legacy-channel operation retains ``thinkies``, ``doge_notes``,
+``review-no``, and ``white_check_mark`` without rewriting retired-channel
+history.
 
 When one Slack post spawned several PR reviews, the post shows the highest-
 precedence state across all of its lanes:
 
-    review-no > doge_notes > thinkies > white_check_mark
+    blocked > notes > active > approved
 
-`review-no` is Boris's SEMANTIC not-ready verdict (NEEDS_FIX / REJECT / explicit
-blocking findings). It is deliberately not tied to a GitHub blocking review
-state, because the channel-watch policy forbids REQUEST_CHANGES.
+The semantic ``blocked`` state is Boris's not-ready verdict (NEEDS_FIX / REJECT /
+explicit blocking findings). It is deliberately not tied to a GitHub blocking
+review state, because the review policy forbids REQUEST_CHANGES.
 
 Transitions are idempotent: the desired reaction is added FIRST, then stale
 Son-of-Chad-owned reactions are removed, so a failure never leaves the post
@@ -44,9 +51,9 @@ Three fail-closed invariants hold everywhere:
   survives the ``--lookback-seconds`` boundary, a lane dropping out of a later
   successful ``kanban list``, restarts, and compaction, and ends only when that lane
   reclassifies or an operator passes ``--clear-unresolved``.
-* **This watchdog is the single authoritative writer.** The channel-watch prompt is
-  a best-effort second writer allowed exactly one verb (add ``thinkies``). Its late
-  adds are invisible to local state, so every transition arms a bounded number of
+* **This watchdog is the single authoritative state writer.** Boris intake is a
+  best-effort seam allowed exactly one verb (add the initial ``rubbing``). Its late
+  add is invisible to local state, so every transition arms a bounded number of
   blind reconciliation sweeps that re-assert the desired end state; afterwards a
   settled post is back to zero Slack calls.
 
@@ -82,11 +89,10 @@ MAX_SHOW_ATTEMPTS = 5  # alert threshold; the lane keeps deferring its post, it 
 MAX_SHOWS_PER_TICK = 12
 SEEN_RETENTION_SECONDS = 14 * 24 * 3600
 POST_RETENTION_SECONDS = 30 * 24 * 3600
-# Bounded reconciliation after a post converges: a second best-effort writer (the
-# channel-watch prompt) can land a late `thinkies`/`white_check_mark` add *after*
-# this watchdog removed the stale reactions, and local state alone can never see
-# it. Each transition therefore schedules a bounded number of blind removal
-# sweeps, then convergence goes back to costing zero Slack calls.
+# Bounded reconciliation after a Boris post converges: the intake seam can land a
+# late best-effort `rubbing` add *after* this watchdog removed stale reactions, and
+# local state alone can never see it. Each transition therefore schedules a bounded
+# number of blind removal sweeps, then convergence returns to zero Slack calls.
 RECONCILE_DELAYS_SECONDS = (300, 3600)
 # How often an unresolved (deferred / quarantined) post re-alerts while it is held.
 UNRESOLVED_ALERT_SECONDS = 6 * 3600
@@ -187,17 +193,16 @@ def owned_reactions(permalink: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(reaction for table in tables for reaction in table.values()))
 
 
-DEFAULT_ALLOWED_CHANNELS = {
+LEGACY_CHANNELS = {
     "C08K8FQKX9S",  # #just-do-it / ticket-hub
     "C07BU8AAPB3",
     "C09339EGZ9U",  # #eng-midnight-vulcan
-    # boris_intake (Slack remote control) writes the same
-    # "Source Slack message: <permalink>" contract into its reviewer lanes, so
-    # this watchdog owns their reaction state too. Without this entry
-    # extract_permalinks() drops the link and those posts would keep the
-    # initial :thinkies: forever, never reaching doge_notes/review-no/✅.
-    BORIS_CHANNEL,  # #boris-reviews
 }
+SUPPORTED_CHANNELS = LEGACY_CHANNELS | {BORIS_CHANNEL}
+SCHEDULED_DEFAULT_CHANNELS = {BORIS_CHANNEL}
+# Backward-compatible name for callers that deliberately request every supported
+# channel. Scheduled/default execution uses SCHEDULED_DEFAULT_CHANNELS instead.
+DEFAULT_ALLOWED_CHANNELS = SUPPORTED_CHANNELS
 
 EMOJI_BLOCK = "review-no"
 EMOJI_COMMENT = "doge_notes"
@@ -1284,12 +1289,12 @@ def _reconcile_converged(
 ) -> None:
     """Run the bounded repair sweep on an already-converged post, if one is due.
 
-    This is the watchdog half of the race-safe handoff. The channel-watch prompt is
-    a best-effort writer that may only ever *add* an initial ``thinkies``; that add
-    can land after this watchdog converged the post, and local state can never see
-    it. Rather than trusting state, each transition schedules a bounded number of
-    blind sweeps that re-assert "exactly ``desired``". After the last scheduled
-    sweep a settled post is back to costing zero Slack calls.
+    This is the watchdog half of the race-safe handoff. Boris intake is a
+    best-effort writer that may only ever *add* an initial ``rubbing``; that add can
+    land after this watchdog converged the post, and local state can never see it.
+    Rather than trusting state, each transition schedules a bounded number of blind
+    sweeps that re-assert "exactly ``desired``". After the last scheduled sweep a
+    settled post is back to costing zero Slack calls.
     """
     if not reconcile_due(record, now):
         return
@@ -1720,7 +1725,7 @@ def process_tick(
         "reconcile_repairs": 0,
     }
     hard_failed = False
-    allowed_channels = set(args.channels or DEFAULT_ALLOWED_CHANNELS)
+    allowed_channels = set(args.channels or SCHEDULED_DEFAULT_CHANNELS)
     only_tasks = set(args.only_task or [])
     forced = bool(only_tasks or args.backfill_existing)
     baseline = 0 if forced else int(state.get("machine_baseline_at") or 0)
@@ -2165,7 +2170,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--lookback-seconds", type=int, default=DEFAULT_LOOKBACK_SECONDS)
     ap.add_argument("--channel", action="append", dest="channels",
-                    help="Allowed source Slack channel id; repeatable. Default: the watched channels.")
+                    help="Allowed source Slack channel id; repeatable. "
+                         "Default: #boris-reviews only. Legacy channels are explicit "
+                         "operator rollback/forensic inputs.")
     ap.add_argument("--only-task", action="append", default=[])
     ap.add_argument("--backfill-existing", action="store_true",
                     help="Consider lanes that changed before the state-machine baseline (historical backfill).")
@@ -2197,7 +2204,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_text = None
         raw = load_json(STATE_PATH, None)
         selected_tasks = set(args.only_task or [])
-        allowed_channels = set(args.channels or DEFAULT_ALLOWED_CHANNELS)
+        allowed_channels = set(args.channels or SCHEDULED_DEFAULT_CHANNELS)
         state, notes = migrate_state(
             raw,
             now,
