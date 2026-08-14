@@ -9,6 +9,7 @@ def run(args, scope="Ylopo/repo#1"):
     return subprocess.run(
         [str(GHX_RO), *args], capture_output=True, text=True,
         env={"PATH": "/usr/bin:/bin", "BORIS_PR_SCOPE": scope,
+             "BORIS_PR_HEAD_SHA": "a" * 40,
              "BORIS_GH_TOKEN_PATH": str(TOKEN_FIXTURE), "GHX_RO_DRY_RUN": "1"},
     )
 
@@ -67,13 +68,38 @@ def test_allows_pr_diff():
     assert run(["pr", "diff", "1", "-R", "Ylopo/repo"]).returncode == 0
 
 
-def test_allows_comment_review_in_scope():
+def test_refuses_comment_review_even_in_scope():
     r = run(["pr", "review", "1", "-R", "Ylopo/repo", "--comment",
              "--body-file", "/tmp/b.md"])
-    assert r.returncode == 0
+    assert r.returncode == 3 and "REFUSED" in r.stderr
 
 
 def test_refuses_comment_review_out_of_scope():
     r = run(["pr", "review", "9", "-R", "Ylopo/other", "--comment",
              "--body-file", "/tmp/b.md"], scope="Ylopo/repo#1")
-    assert r.returncode == 3 and "scope" in r.stderr.lower()
+    assert r.returncode == 3 and "REFUSED" in r.stderr
+
+
+def test_refuses_pr_comment_even_in_scope():
+    assert run(["pr", "comment", "1", "-R", "Ylopo/repo", "--body", "x"]).returncode == 3
+
+
+def test_refuses_out_of_scope_pr_reads():
+    assert run(["pr", "view", "9", "-R", "Ylopo/other"]).returncode == 3
+
+
+def test_allows_only_file_content_api_at_the_pinned_head():
+    good = "/repos/Ylopo/repo/contents/src/app.py?ref=" + "a" * 40
+    bad_ref = "/repos/Ylopo/repo/contents/src/app.py?ref=" + "b" * 40
+    assert run(["api", good]).returncode == 0
+    assert run(["api", bad_ref]).returncode == 3
+    assert run(["api", "/repos/Ylopo/repo/issues/1"]).returncode == 3
+
+
+def test_file_content_api_rejects_traversal_alternate_hosts_and_body_flags():
+    route = "/repos/Ylopo/repo/contents/src/app.py?ref=" + "a" * 40
+    traversal = "/repos/Ylopo/repo/contents/src/../secret?ref=" + "a" * 40
+    assert run(["api", traversal]).returncode == 3
+    assert run(["api", "--hostname", "evil.test", route]).returncode == 3
+    assert run(["api", "-F", "x=y", route]).returncode == 3
+    assert run(["api", "--method=POST", route]).returncode == 3
