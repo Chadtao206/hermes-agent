@@ -14,11 +14,10 @@ GOOD = Identity("U1", "a@ylopo.com", "T02PND103", False, False, False, False)
 OPEN_PR = PRInfo("f" * 40, "zjenkins", "OPEN")
 
 
-def deps(identity=GOOD, pr=OPEN_PR, lane=None, rate="ok"):
+def deps(identity=GOOD, pr=OPEN_PR, rate="ok"):
     return GateDeps(
         identity=lambda uid: identity,
         pr_info=lambda o, r, n: pr,
-        lane_for=lambda k: lane,
         rate_verdict=lambda uid: rate,
         now=lambda: 1_000_000.0,
     )
@@ -106,12 +105,9 @@ def test_thread_chatter_without_a_link_stays_silent_in_passive_channel():
     assert all(x.silent for x in r.rejections)
 
 
-def test_thread_repost_at_unchanged_head_is_deduped_not_re_reviewed():
-    # The safety net that makes bare thread links safe: discussing the same PR
-    # in-thread cannot spawn duplicate reviews.
-    r = evaluate(ev(thread_ts="0.5"), CFG, deps(lane="t_existing"))
-    assert not r.accepted
-    assert ReasonCode.DUPLICATE in reasons(r)
+def test_thread_repost_reaches_atomic_admission_dedup():
+    r = evaluate(ev(thread_ts="0.5"), CFG, deps())
+    assert r.accepted
 
 
 def test_thread_reply_with_mention_accepted():
@@ -152,12 +148,6 @@ def test_closed_pr_rejected():
 def test_missing_pr_rejected():
     r = evaluate(ev(), CFG, deps(pr=None))
     assert ReasonCode.PR_NOT_FOUND in reasons(r)
-
-
-def test_duplicate_head_sha_rejected():
-    r = evaluate(ev(), CFG, deps(lane="t_existing"))
-    assert ReasonCode.DUPLICATE in reasons(r)
-    assert "t_existing" in r.rejections[0].detail
 
 
 def test_rate_limited_rejected():
@@ -205,7 +195,6 @@ def test_unknown_flag_rejects_entire_message_before_remote_lookups():
     guarded = GateDeps(
         identity=lambda uid: calls.append("identity"),
         pr_info=lambda o, r, n: calls.append("pr"),
-        lane_for=lambda k: calls.append("lane"),
         rate_verdict=lambda uid: calls.append("rate"),
         now=lambda: 1_000_000.0,
     )

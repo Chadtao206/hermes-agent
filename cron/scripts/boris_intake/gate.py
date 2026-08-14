@@ -25,7 +25,6 @@ from boris_intake.models import (
 class GateDeps:
     identity: Callable[[str], Identity | None]
     pr_info: Callable[[str, str, int], PRInfo | None]
-    lane_for: Callable[[str], str | None]
     rate_verdict: Callable[[str], str]
     now: Callable[[], float]
 
@@ -125,13 +124,6 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
             permalink=_permalink(event.channel_id, event.ts),
             policy=policy,
         )
-
-        # 7: lane dedup on (repo, pr, head_sha)
-        existing = deps.lane_for(cmd.idempotency_key)
-        if existing:
-            rejections.append(Rejection(
-                ReasonCode.DUPLICATE, f"{slug} @ {cmd.head_sha[:7]} -> {existing}"))
-            continue
 
         # 8b: burst cap. The rate check above is per-message, so without this a
         # single paste of N links would create N lanes on one check.
