@@ -13,11 +13,11 @@ from dataclasses import dataclass
 from typing import Callable
 
 from boris_intake.config import Config
-from boris_intake.grammar import extract_pr_refs, mentions_bot
+from boris_intake.grammar import mentions_bot, parse_request
 from boris_intake.identity import is_trusted
 from boris_intake.models import (
     GateResult, Identity, NormalizedEvent, PRInfo, ReasonCode, Rejection,
-    ReviewCommand,
+    ReviewCommand, ReviewPolicy,
 )
 
 
@@ -67,11 +67,17 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
         return _reject(ReasonCode.THREAD_REPLY_NO_MENTION)
 
     # 4: grammar. Everything not matched here is discarded.
-    refs = extract_pr_refs(event.text)
-    if not refs:
+    parsed = parse_request(event.text)
+    if not parsed.refs:
         return _reject(ReasonCode.NO_PR_URL)
     if not is_passive and not mentioned:
         return _reject(ReasonCode.MENTION_REQUIRED)
+    if parsed.unknown_flags:
+        return _reject(
+            ReasonCode.UNKNOWN_FLAG,
+            f"Unknown review flag: {parsed.unknown_flags[0]}. "
+            "Supported flags: --ignore-ci",
+        )
 
     # 3: identity. Fail closed on lookup failure.
     identity = deps.identity(event.user_id)
@@ -86,10 +92,14 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
         return _reject(ReasonCode.RATE_LIMITED, verdict)
 
     allowed_orgs = {o.lower() for o in cfg.orgs}
+    policy = ReviewPolicy(
+        ignore_ci="--ignore-ci" in parsed.flags,
+        rubric_version=cfg.rubric_version,
+    )
     commands: list[ReviewCommand] = []
     rejections: list[Rejection] = []
 
-    for ref in refs:
+    for ref in parsed.refs:
         slug = f"{ref.owner}/{ref.repo}#{ref.number}"
 
         # 5: repo allowlist
@@ -111,7 +121,9 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
             head_sha=info.head_sha, pr_author=info.author,
             requester_user_id=event.user_id, requester_email=identity.email,
             channel_id=event.channel_id, message_ts=event.ts,
+            root_thread_ts=event.thread_ts or event.ts,
             permalink=_permalink(event.channel_id, event.ts),
+            policy=policy,
         )
 
         # 7: lane dedup on (repo, pr, head_sha)

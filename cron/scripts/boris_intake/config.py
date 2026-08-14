@@ -43,6 +43,7 @@ class Config:
     email_domains: tuple[str, ...] = DEFAULT_DOMAINS
     orgs: tuple[str, ...] = ("Ylopo",)
     github_token_path: Path = DEFAULT_TOKEN_PATH
+    rubric_version: str = "2"
     limits: Limits = field(default_factory=Limits)
 
 
@@ -78,6 +79,7 @@ def load_config(path: Path | None = None) -> Config:
                        if k in Limits.__dataclass_fields__})
 
     token_path = block.get("github_token_path")
+    rubric_version = str(block.get("rubric_version") or "2").strip() or "2"
     return Config(
         mode=mode,
         team_id=str(block.get("team_id", "T02PND103")),
@@ -88,5 +90,6 @@ def load_config(path: Path | None = None) -> Config:
         orgs=_tuple(block.get("orgs"), ("Ylopo",)),
         github_token_path=(Path(str(token_path)).expanduser() if token_path
                            else DEFAULT_TOKEN_PATH),
+        rubric_version=rubric_version,
         limits=limits,
     )

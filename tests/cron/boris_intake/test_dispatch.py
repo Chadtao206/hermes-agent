@@ -6,13 +6,15 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from boris_intake import audit, dispatch, template
-from boris_intake.models import ReviewCommand
+from boris_intake.models import ReviewCommand, ReviewPolicy
 
 CMD = ReviewCommand(
     owner="Ylopo", repo="repo", pr_number=5, head_sha="f" * 40,
     pr_author="zjenkins", requester_user_id="U1", requester_email="a@ylopo.com",
     channel_id="C1", message_ts="1785988200.123456",
+    root_thread_ts="1785988200.123456",
     permalink="https://ylopo.slack.com/archives/C1/p1785988200123456",
+    policy=ReviewPolicy(ignore_ci=False),
 )
 
 

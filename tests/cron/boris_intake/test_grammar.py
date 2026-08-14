@@ -1,8 +1,11 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from boris_intake import grammar
 from boris_intake.grammar import PRRef, extract_pr_refs, mentions_bot
 
 BOT = "U0B9TK6B41M"
@@ -78,3 +81,50 @@ def test_issue_url_is_not_a_pr():
 
 def test_number_overflow_is_rejected():
     assert extract_pr_refs("https://github.com/Ylopo/repo/pull/" + "9" * 30) == []
+
+
+@pytest.mark.parametrize("position", ("before", "between", "after"))
+def test_parse_request_applies_ignore_ci_regardless_of_flag_position(position):
+    first = "https://github.com/Ylopo/a/pull/1"
+    second = "https://github.com/Ylopo/b/pull/2"
+    text = {
+        "before": f"--ignore-ci {first} {second}",
+        "between": f"{first} --ignore-ci {second}",
+        "after": f"{first} {second} --ignore-ci",
+    }[position]
+
+    parsed = grammar.parse_request(text)
+
+    assert parsed.refs == (PRRef("Ylopo", "a", 1), PRRef("Ylopo", "b", 2))
+    assert parsed.flags == ("--ignore-ci",)
+    assert parsed.unknown_flags == ()
+
+
+def test_parse_request_normalizes_repeated_ignore_ci_flag():
+    parsed = grammar.parse_request(
+        "--ignore-ci https://github.com/Ylopo/a/pull/1 --ignore-ci"
+    )
+
+    assert parsed.flags == ("--ignore-ci",)
+    assert parsed.unknown_flags == ()
+
+
+@pytest.mark.parametrize("flag", ("--Ignore-ci", "--IGNORE-CI", "--ignore-cii"))
+def test_parse_request_treats_non_exact_flag_spelling_as_unknown(flag):
+    parsed = grammar.parse_request(
+        f"https://github.com/Ylopo/a/pull/1 {flag}"
+    )
+
+    assert parsed.flags == ()
+    assert parsed.unknown_flags == (flag,)
+
+
+def test_parse_request_discards_prose_mentions_and_non_flag_dashes():
+    parsed = grammar.parse_request(
+        f"<@{BOT}> please -- review --- this "
+        "https://github.com/Ylopo/a/pull/1 immediately"
+    )
+
+    assert parsed == grammar.ParsedRequest(
+        refs=(PRRef("Ylopo", "a", 1),), flags=(), unknown_flags=()
+    )
