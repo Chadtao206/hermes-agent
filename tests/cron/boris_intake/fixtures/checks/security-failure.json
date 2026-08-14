@@ -1,0 +1,8 @@
+[
+  {
+    "name": "CodeQL",
+    "state": "FAILURE",
+    "link": "https://ci.example/codeql",
+    "required": true
+  }
+]
