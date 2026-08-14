@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1319,3 +1320,124 @@ def test_uneditable_child_is_replaced_in_the_original_thread(tmp_path):
     assert completed.status_message_ts != original_ts
     assert slack.posts == 2
     assert "READY" in slack.messages[admitted.request_id][1]
+
+
+def test_shadow_runner_only_refreshes_heartbeat(tmp_path):
+    from boris_intake.config import Config
+    from boris_intake.reconciler import ReconcilerDeps, run_once
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    deps = ReconcilerDeps(
+        slack=SlackFake(),
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+    heartbeat = tmp_path / "reconciler-heartbeat"
+
+    assert run_once(
+        store,
+        deps,
+        Config(mode="shadow"),
+        heartbeat_path=heartbeat,
+        limit=1,
+    ) == 0
+    assert heartbeat.read_text(encoding="utf-8") == "1000000\n"
+    assert store.get_request(admitted.request_id).workflow_state is WorkflowState.ADMITTED
+
+
+def test_live_runner_processes_only_the_bounded_batch(tmp_path):
+    from boris_intake.config import Config
+    from boris_intake.reconciler import ReconcilerDeps, run_once
+
+    store, admitted = admit_batch(tmp_path)
+    clock = Clock()
+    deps = ReconcilerDeps(
+        slack=SlackFake(),
+        github=GitHubFake(admitted[0].gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+
+    assert run_once(
+        store,
+        deps,
+        Config(mode="live"),
+        heartbeat_path=tmp_path / "reconciler-heartbeat",
+        limit=1,
+    ) == 1
+    states = [store.get_request(request.request_id).workflow_state for request in admitted]
+    assert states.count(WorkflowState.STATUS_MESSAGE_PENDING) == 1
+    assert states.count(WorkflowState.ADMITTED) == len(admitted) - 1
+
+
+def test_service_loop_stops_after_signal_event(tmp_path):
+    from boris_intake.config import Config
+    from boris_intake.reconciler import ReconcilerDeps, run_service
+
+    store, admitted = admit_request(tmp_path)
+    stop = threading.Event()
+
+    def stop_on_first_iteration():
+        stop.set()
+        return 1_000_000.0
+
+    deps = ReconcilerDeps(
+        slack=SlackFake(),
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=stop_on_first_iteration,
+    )
+    heartbeat = tmp_path / "reconciler-heartbeat"
+
+    run_service(
+        store,
+        deps,
+        Config(mode="shadow"),
+        stop=stop,
+        heartbeat_path=heartbeat,
+        interval_seconds=60,
+    )
+
+    assert heartbeat.read_text(encoding="utf-8") == "1000000\n"
+    assert store.get_request(admitted.request_id).workflow_state is WorkflowState.ADMITTED
+
+
+def test_real_dependency_builder_uses_live_lifecycle_adapters(tmp_path):
+    from boris_intake.config import Config
+    from boris_intake.dispatch import KanbanIO
+    from boris_intake.github import GitHubIO
+    from boris_intake.reconciler import build_deps
+    from boris_intake.slack_io import SlackIO
+
+    token_path = tmp_path / "github-token"
+    cfg = Config(mode="live", github_token_path=token_path)
+
+    deps = build_deps(
+        cfg,
+        "slack-token",
+        slack_caller=lambda *_args, **_kwargs: {"ok": True},
+        kanban_db=tmp_path / "kanban.db",
+        now=lambda: 123.0,
+    )
+
+    assert isinstance(deps.slack, SlackIO)
+    assert deps.slack.dry_run is False
+    assert isinstance(deps.github, GitHubIO)
+    assert isinstance(deps.kanban, KanbanIO)
+    assert deps.now() == 123.0
+
+
+def test_main_fails_closed_when_slack_token_is_missing(monkeypatch, tmp_path):
+    from boris_intake import reconciler
+    from boris_intake.config import Config
+
+    monkeypatch.setattr(reconciler, "load_config", lambda: Config(mode="live"))
+    monkeypatch.setattr(reconciler, "parse_env", lambda _path: {})
+    monkeypatch.setattr(reconciler, "DB_PATH", tmp_path / "must-not-be-created.db")
+    monkeypatch.setattr(reconciler, "HEARTBEAT", tmp_path / "must-not-be-written")
+
+    assert reconciler.main() == 2
+    assert not Path(reconciler.DB_PATH).exists()
+    assert not Path(reconciler.HEARTBEAT).exists()

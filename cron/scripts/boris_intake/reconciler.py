@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import json
+import signal
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Protocol
 
-from boris_intake.config import Config
+sys.path.insert(0, "/Users/ctao/.hermes/scripts")
+
+from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
+
+from boris_intake.config import Config, load_config
+from boris_intake.dispatch import KANBAN_DB, KanbanIO
+from boris_intake.github import GitHubIO
 from boris_intake.models import (
     GateSnapshot,
     LifecycleRequest,
@@ -28,13 +39,21 @@ from boris_intake.result import (
     validate_judgment,
 )
 from boris_intake.store import Store
-from boris_intake.slack_io import SlackRootUnavailable, SlackStatusMissing
+from boris_intake.slack_io import (
+    SlackIO,
+    SlackRootUnavailable,
+    SlackStatusMissing,
+)
 
 GATE_WAIT_SECONDS = 30 * 60
 GATE_POLL_SECONDS = 15
 REVIEW_POLL_SECONDS = 15
 RETRY_BASE_SECONDS = 5
 RETRY_MAX_SECONDS = 5 * 60
+LOOP_SECONDS = 5
+STATE_DIR = Path("/Users/ctao/.hermes/state")
+DB_PATH = STATE_DIR / "boris_intake.db"
+HEARTBEAT = STATE_DIR / "boris_review_reconciler_heartbeat"
 
 
 class SlackLifecycleAdapter(Protocol):
@@ -754,3 +773,76 @@ def tick(
         finally:
             store.release_claim(request.request_id)
     return processed
+
+
+def build_deps(
+    cfg: Config,
+    token: str,
+    *,
+    slack_caller: Callable = slack_call,
+    kanban_db: Path = Path(KANBAN_DB),
+    now: Callable[[], float] = time.time,
+) -> ReconcilerDeps:
+    return ReconcilerDeps(
+        slack=SlackIO(slack_caller, token, dry_run=False),
+        github=GitHubIO(cfg.github_token_path),
+        kanban=KanbanIO(kanban_db),
+        now=now,
+    )
+
+
+def run_once(
+    store: Store,
+    deps: ReconcilerDeps,
+    cfg: Config,
+    *,
+    heartbeat_path: Path = HEARTBEAT,
+    limit: int = 25,
+) -> int:
+    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat_path.write_text(f"{deps.now():.0f}\n", encoding="utf-8")
+    if cfg.mode != "live":
+        return 0
+    return tick(store, deps, cfg, limit=limit)
+
+
+def run_service(
+    store: Store,
+    deps: ReconcilerDeps,
+    cfg: Config,
+    *,
+    stop: threading.Event,
+    heartbeat_path: Path = HEARTBEAT,
+    interval_seconds: float = LOOP_SECONDS,
+) -> None:
+    while not stop.is_set():
+        run_once(store, deps, cfg, heartbeat_path=heartbeat_path)
+        stop.wait(interval_seconds)
+
+
+def main() -> int:
+    cfg = load_config()
+    token = parse_env(ENV_PATH).get("TICKET_HUB_SLACK_BOT_TOKEN", "")
+    if not token:
+        sys.stderr.write(
+            "boris_review_reconciler: TICKET_HUB_SLACK_BOT_TOKEN missing from .env\n"
+        )
+        return 2
+
+    store = Store(DB_PATH)
+    deps = build_deps(cfg, token)
+    stop = threading.Event()
+
+    def request_stop(_signum, _frame) -> None:
+        stop.set()
+
+    for caught_signal in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(caught_signal, request_stop)
+    sys.stderr.write(f"boris_review_reconciler: started, mode={cfg.mode}\n")
+    sys.stderr.flush()
+    run_service(store, deps, cfg, stop=stop)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
