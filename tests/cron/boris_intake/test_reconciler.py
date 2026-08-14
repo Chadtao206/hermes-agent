@@ -339,6 +339,26 @@ def test_aggregate_source_reaction_precedence(requests, expected):
     assert _aggregate_source_reaction(tuple(requests)) == expected
 
 
+def test_unchanged_source_reaction_is_not_written_twice(tmp_path):
+    from boris_intake.reconciler import ReconcilerDeps, _reconcile_source_reaction
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    deps = ReconcilerDeps(
+        slack=slack,
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+    request = store.get_request(admitted.request_id)
+
+    _reconcile_source_reaction(store, request, deps)
+    _reconcile_source_reaction(store, request, deps)
+
+    assert slack.source_reactions == ["rubbing"]
+
+
 def test_terminal_child_waits_and_retries_when_source_reaction_fails(tmp_path):
     from boris_intake.reconciler import ReconcilerDeps, tick
 
@@ -914,8 +934,9 @@ def test_deleted_child_is_replaced_but_deleted_root_never_gets_an_orphan(
         assert admitted.request_id not in slack.messages
 
 
+@pytest.mark.parametrize("terminal_status", ("done", "archived", "blocked"))
 def test_active_lane_without_submission_polls_then_terminal_lane_becomes_incomplete(
-    tmp_path,
+    tmp_path, terminal_status
 ):
     from boris_intake.reconciler import ReconcilerDeps, tick
 
@@ -940,7 +961,7 @@ def test_active_lane_without_submission_polls_then_terminal_lane_becomes_incompl
     assert reviewing.next_attempt_at == polled_at + 15
     assert store.judgment_for_request(admitted.request_id) is None
 
-    kanban.status = "done"
+    kanban.status = terminal_status
     clock.advance(15)
     for _ in range(4):
         tick(store, deps)

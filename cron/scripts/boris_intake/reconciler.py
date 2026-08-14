@@ -17,7 +17,7 @@ sys.path.insert(0, "/Users/ctao/.hermes/scripts")
 from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
 
 from boris_intake.config import Config, load_config
-from boris_intake.dispatch import KANBAN_DB, KanbanIO
+from boris_intake.dispatch import KANBAN_DB, TERMINAL_STATUSES, KanbanIO
 from boris_intake.github import GitHubIO
 from boris_intake.models import (
     GateSnapshot,
@@ -198,10 +198,14 @@ def _reconcile_source_reaction(
         requests = store.requests_for_source(request.channel_id, request.message_ts)
         if not requests:
             raise ValueError("review request has no source batch")
+        reaction = _aggregate_source_reaction(requests, delivered_request_id)
+        if store.source_reaction(request.channel_id, request.message_ts) == reaction:
+            return
         deps.slack.reconcile_source_reaction(
             request,
-            _aggregate_source_reaction(requests, delivered_request_id),
+            reaction,
         )
+        store.record_source_reaction(request.request_id, reaction, deps.now())
     finally:
         store.release_source_reaction_lease(request.channel_id, request.message_ts)
 
@@ -354,7 +358,7 @@ def _reconcile_reviewing(
         if request.lane_id is None:
             raise ValueError("reviewing request has no Kanban lane identity")
         status = deps.kanban.lane_status(request.lane_id)
-        if status in {"done", "archived"}:
+        if status in TERMINAL_STATUSES:
             _transition_system_incomplete(
                 store,
                 request,

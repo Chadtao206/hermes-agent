@@ -619,6 +619,34 @@ class Store:
         self._db.commit()
         return cur.rowcount == 1
 
+    def source_reaction(self, channel: str, message_ts: str) -> str | None:
+        row = self._db.execute(
+            "SELECT e.detail_json FROM request_events e "
+            "JOIN review_requests r ON r.request_id=e.request_id "
+            "WHERE r.source_channel=? AND r.source_message_ts=? "
+            "AND e.kind='source_reaction' ORDER BY e.id DESC LIMIT 1",
+            (channel, message_ts),
+        ).fetchone()
+        if row is None:
+            return None
+        reaction = json.loads(row["detail_json"]).get("reaction")
+        return str(reaction) if reaction else None
+
+    def record_source_reaction(
+        self, request_id: str, reaction: str, now: float
+    ) -> None:
+        self._db.execute(
+            "INSERT INTO request_events "
+            "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+            (
+                request_id,
+                "source_reaction",
+                json.dumps({"reaction": reaction}, separators=(",", ":")),
+                now,
+            ),
+        )
+        self._db.commit()
+
     def renew_claim(
         self,
         request_id: str,

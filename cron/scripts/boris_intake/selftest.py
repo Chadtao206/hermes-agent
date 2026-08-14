@@ -60,6 +60,16 @@ def _check_profile() -> list[str]:
         or len(included) != len(_EXPECTED_TOOLS)
     ):
         return ["boris profile MCP tool allowlist is not sealed"]
+    env = server.get("env")
+    required_binding = {
+        "HERMES_PROFILE": "boris_on_demand",
+        "HERMES_KANBAN_TASK": "${HERMES_KANBAN_TASK}",
+        "HERMES_KANBAN_RUN_ID": "${HERMES_KANBAN_RUN_ID}",
+    }
+    if not isinstance(env, dict) or any(
+        env.get(name) != value for name, value in required_binding.items()
+    ):
+        return ["boris profile does not preserve the worker task binding"]
     command = Path(str(server.get("command") or ""))
     args = server.get("args")
     script = Path(str(args[0])) if isinstance(args, list) and args else Path("")

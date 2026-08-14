@@ -120,7 +120,7 @@ def test_active_lane_count_counts_only_in_flight_intake_lanes(tmp_path):
         ("t6", "pr-review-cron", "todo"),
     ])
     con.commit(); con.close()
-    assert dispatch.active_lane_count(str(db)) == 3
+    assert dispatch.active_lane_count(str(db)) == 2
 
 
 def test_active_lane_count_returns_zero_on_error(tmp_path):

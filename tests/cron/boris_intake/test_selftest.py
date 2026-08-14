@@ -66,3 +66,20 @@ def test_selftest_fails_closed_on_unsealed_profile(hermetic_selftest):
     )
 
     assert any("profile" in failure for failure in failures)
+
+
+def test_selftest_fails_closed_without_worker_task_binding(hermetic_selftest):
+    hermetic_selftest.token_path.write_text("test-token\n")
+    hermetic_selftest.token_path.chmod(0o600)
+    profile = hermetic_selftest.profile_path.read_text()
+    hermetic_selftest.profile_path.write_text(
+        profile.replace(
+            "      HERMES_KANBAN_TASK: ${HERMES_KANBAN_TASK}\n", ""
+        )
+    )
+
+    failures = run_selftest(
+        Config(mode="live", github_token_path=hermetic_selftest.token_path)
+    )
+
+    assert any("task binding" in failure for failure in failures)
