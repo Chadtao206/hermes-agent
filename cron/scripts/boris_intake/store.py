@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS review_requests (
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL DEFAULT 0,
     last_error TEXT,
+    lease_owner TEXT,
+    lease_expires_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     completed_at REAL,
@@ -112,6 +114,7 @@ CREATE TABLE IF NOT EXISTS review_judgments (
 """
 
 _TERMINAL_STATES = (WorkflowState.COMPLETE, WorkflowState.SLACK_UNAVAILABLE)
+DEFAULT_LEASE_SECONDS = 5 * 60
 
 _ALLOWED_TRANSITIONS = {
     WorkflowState.ADMITTED: {WorkflowState.STATUS_MESSAGE_PENDING},
@@ -160,14 +163,32 @@ _TRANSITION_FIELDS = {
 class Store:
     def __init__(self, db_path: Path):
         self.path = Path(db_path)
+        self._lease_owner = uuid.uuid4().hex
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.path), timeout=10)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
-        self._db.execute("PRAGMA user_version=3")
-        self._db.commit()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row["name"])
+                for row in self._db.execute("PRAGMA table_info(review_requests)")
+            }
+            if "lease_owner" not in columns:
+                self._db.execute(
+                    "ALTER TABLE review_requests ADD COLUMN lease_owner TEXT"
+                )
+            if "lease_expires_at" not in columns:
+                self._db.execute(
+                    "ALTER TABLE review_requests ADD COLUMN lease_expires_at REAL"
+                )
+            self._db.execute("PRAGMA user_version=4")
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
 
     def close(self) -> None:
         self._db.close()
@@ -336,6 +357,13 @@ class Store:
         ).fetchone()
         return str(row["canonical_json"]) if row else None
 
+    def judgment_accepted_at(self, request_id: str) -> float | None:
+        row = self._db.execute(
+            "SELECT accepted_at FROM review_judgments WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        return float(row["accepted_at"]) if row else None
+
     def judgment_task_completed(self, request_id: str) -> bool:
         row = self._db.execute(
             "SELECT task_completed FROM review_judgments WHERE request_id=?",
@@ -484,21 +512,78 @@ class Store:
             self._db.rollback()
             raise
 
-    def claim_due(self, now: float, limit: int = 25) -> tuple[LifecycleRequest, ...]:
+    def claim_due(
+        self,
+        now: float,
+        limit: int = 25,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ) -> tuple[LifecycleRequest, ...]:
         terminal = tuple(state.value for state in _TERMINAL_STATES)
-        rows = self._db.execute(
-            "SELECT * FROM review_requests "
-            "WHERE workflow_state NOT IN (?,?) AND next_attempt_at<=? "
-            "ORDER BY created_at, request_id LIMIT ?",
-            (*terminal, now, int(limit)),
-        ).fetchall()
-        return tuple(self._request_from_row(row) for row in rows)
+        expires_at = now + lease_seconds
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            ids = [
+                str(row["request_id"])
+                for row in self._db.execute(
+                    "SELECT request_id FROM review_requests "
+                    "WHERE workflow_state NOT IN (?,?) AND next_attempt_at<=? "
+                    "AND (lease_owner IS NULL OR lease_expires_at<=?) "
+                    "ORDER BY created_at, request_id LIMIT ?",
+                    (*terminal, now, now, int(limit)),
+                ).fetchall()
+            ]
+            if not ids:
+                self._db.commit()
+                return ()
+            placeholders = ",".join("?" for _ in ids)
+            self._db.execute(
+                f"UPDATE review_requests SET lease_owner=?, lease_expires_at=? "
+                f"WHERE request_id IN ({placeholders})",
+                (self._lease_owner, expires_at, *ids),
+            )
+            rows = self._db.execute(
+                f"SELECT * FROM review_requests WHERE request_id IN ({placeholders}) "
+                "AND lease_owner=? ORDER BY created_at, request_id",
+                (*ids, self._lease_owner),
+            ).fetchall()
+            self._db.commit()
+            return tuple(self._request_from_row(row) for row in rows)
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def renew_claim(
+        self,
+        request_id: str,
+        now: float,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ) -> bool:
+        cur = self._db.execute(
+            "UPDATE review_requests SET lease_expires_at=? "
+            "WHERE request_id=? AND lease_owner=? AND lease_expires_at>?",
+            (now + lease_seconds, request_id, self._lease_owner, now),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def release_claim(self, request_id: str) -> bool:
+        cur = self._db.execute(
+            "UPDATE review_requests SET lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE request_id=? AND lease_owner=?",
+            (request_id, self._lease_owner),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
 
     def transition(
         self,
         request_id: str,
         expected: WorkflowState,
         target: WorkflowState,
+        *,
+        now: float | None = None,
         **fields: Any,
     ) -> bool:
         unknown = set(fields) - _TRANSITION_FIELDS
@@ -506,11 +591,20 @@ class Store:
             raise ValueError(f"unsupported transition fields: {sorted(unknown)}")
         self._db.execute("BEGIN IMMEDIATE")
         try:
+            changed_at = time.time() if now is None else float(now)
             row = self._db.execute(
-                "SELECT workflow_state FROM review_requests WHERE request_id=?",
+                "SELECT workflow_state, lease_owner, lease_expires_at "
+                "FROM review_requests WHERE request_id=?",
                 (request_id,),
             ).fetchone()
             if not row or row["workflow_state"] != expected.value:
+                self._db.rollback()
+                return False
+            if row["lease_owner"] is not None and (
+                row["lease_owner"] != self._lease_owner
+                or row["lease_expires_at"] is None
+                or float(row["lease_expires_at"]) <= changed_at
+            ):
                 self._db.rollback()
                 return False
             if target not in _ALLOWED_TRANSITIONS[expected]:
@@ -522,7 +616,6 @@ class Store:
                 snapshot = converted["gate_snapshot_json"]
                 converted["gate_snapshot_json"] = snapshot.canonical_json()
                 converted.setdefault("gate_fingerprint", snapshot.fingerprint)
-            changed_at = time.time()
             converted["workflow_state"] = target.value
             converted["updated_at"] = changed_at
             if target in _TERMINAL_STATES:
@@ -531,8 +624,10 @@ class Store:
             params = [*converted.values(), request_id, expected.value]
             cur = self._db.execute(
                 f"UPDATE review_requests SET {assignments} "
-                "WHERE request_id=? AND workflow_state=?",
-                params,
+                "WHERE request_id=? AND workflow_state=? "
+                "AND (lease_owner IS NULL OR "
+                "(lease_owner=? AND lease_expires_at>?))",
+                (*params, self._lease_owner, changed_at),
             )
             if cur.rowcount != 1:
                 self._db.rollback()
@@ -541,8 +636,14 @@ class Store:
                 "INSERT INTO request_events "
                 "(request_id, kind, from_state, to_state, detail_json, at) "
                 "VALUES (?,?,?,?,?,?)",
-                (request_id, "transition", expected.value, target.value,
-                 json.dumps(fields, default=str, separators=(",", ":")), changed_at),
+                (
+                    request_id,
+                    "transition",
+                    expected.value,
+                    target.value,
+                    json.dumps(fields, default=str, separators=(",", ":")),
+                    changed_at,
+                ),
             )
             self._db.commit()
             return True
@@ -550,26 +651,111 @@ class Store:
             self._db.rollback()
             raise
 
-    def record_error(self, request_id: str, stage: str, error: str,
-                     next_attempt_at: float) -> None:
-        changed_at = time.time()
+    def checkpoint(
+        self,
+        request_id: str,
+        expected: WorkflowState,
+        *,
+        now: float | None = None,
+        **fields: Any,
+    ) -> bool:
+        unknown = set(fields) - _TRANSITION_FIELDS
+        if unknown:
+            raise ValueError(f"unsupported checkpoint fields: {sorted(unknown)}")
+        converted = dict(fields)
+        if isinstance(converted.get("semantic_outcome"), SemanticOutcome):
+            converted["semantic_outcome"] = converted["semantic_outcome"].value
+        if isinstance(converted.get("gate_snapshot_json"), GateSnapshot):
+            snapshot = converted["gate_snapshot_json"]
+            converted["gate_snapshot_json"] = snapshot.canonical_json()
+            converted.setdefault("gate_fingerprint", snapshot.fingerprint)
+        changed_at = time.time() if now is None else float(now)
+        converted["updated_at"] = changed_at
+        assignments = ", ".join(f"{name}=?" for name in converted)
+        params = [*converted.values(), request_id, expected.value]
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._db.execute(
+                f"UPDATE review_requests SET {assignments} "
+                "WHERE request_id=? AND workflow_state=? "
+                "AND (lease_owner IS NULL OR "
+                "(lease_owner=? AND lease_expires_at>?))",
+                (*params, self._lease_owner, changed_at),
+            )
+            if cur.rowcount != 1:
+                self._db.rollback()
+                return False
+            self._db.execute(
+                "INSERT INTO request_events "
+                "(request_id, kind, from_state, to_state, detail_json, at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    request_id,
+                    "checkpoint",
+                    expected.value,
+                    expected.value,
+                    json.dumps(fields, default=str, separators=(",", ":")),
+                    changed_at,
+                ),
+            )
+            self._db.commit()
+            return True
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def record_error(
+        self,
+        request_id: str,
+        stage: str,
+        error: str,
+        next_attempt_at: float,
+        *,
+        now: float | None = None,
+        attempt: int | None = None,
+        alert_threshold: int = 5,
+    ) -> bool:
+        changed_at = time.time() if now is None else float(now)
         detail = json.dumps(
             {"stage": stage, "error": str(error)[:300]}, separators=(",", ":")
         )
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            self._db.execute(
+            cur = self._db.execute(
                 "UPDATE review_requests SET last_error=?, next_attempt_at=?, "
-                "updated_at=? WHERE request_id=?",
-                (f"{stage}: {str(error)[:300]}", next_attempt_at,
-                 changed_at, request_id),
+                "updated_at=? WHERE request_id=? "
+                "AND (lease_owner IS NULL OR "
+                "(lease_owner=? AND lease_expires_at>?))",
+                (
+                    f"{stage}: {str(error)[:300]}",
+                    next_attempt_at,
+                    changed_at,
+                    request_id,
+                    self._lease_owner,
+                    changed_at,
+                ),
             )
+            if cur.rowcount != 1:
+                self._db.rollback()
+                return False
             self._db.execute(
                 "INSERT INTO request_events "
                 "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
                 (request_id, "error", detail, changed_at),
             )
+            if attempt == alert_threshold:
+                alert = json.dumps(
+                    {"attempt": attempt, "stage": stage},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                self._db.execute(
+                    "INSERT INTO request_events "
+                    "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                    (request_id, "retry_alert", alert, changed_at),
+                )
             self._db.commit()
+            return True
         except Exception:
             self._db.rollback()
             raise
@@ -589,6 +775,13 @@ class Store:
                 "at": float(row["at"]),
             }
             for row in rows
+        )
+
+    def error_count(self, request_id: str, stage: str) -> int:
+        return sum(
+            1
+            for event in self.request_events(request_id)
+            if event["kind"] == "error" and event["detail"].get("stage") == stage
         )
 
     # --- event dedup ------------------------------------------------------

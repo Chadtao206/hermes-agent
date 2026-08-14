@@ -330,3 +330,91 @@ def test_claim_due_excludes_terminal_and_future_requests(tmp_path):
     s._db.commit()
 
     assert [r.request_id for r in s.claim_due(1_000_001.0)] == [due.request_id]
+
+
+def test_claim_due_excludes_live_claims_and_recovers_expired_claims(tmp_path):
+    db_path = tmp_path / "s.db"
+    first = Store(db_path)
+    request = first.admit_event(
+        event(), (command(),), (snapshot(),), 1_000_000.0
+    ).admitted[0]
+    second = Store(db_path)
+
+    assert [
+        item.request_id
+        for item in first.claim_due(1_000_001.0, lease_seconds=30)
+    ] == [request.request_id]
+    assert second.claim_due(1_000_030.999, lease_seconds=30) == ()
+    assert [
+        item.request_id
+        for item in second.claim_due(1_000_031.0, lease_seconds=30)
+    ] == [request.request_id]
+    assert first.transition(
+        request.request_id,
+        models.WorkflowState.ADMITTED,
+        models.WorkflowState.STATUS_MESSAGE_PENDING,
+        now=1_000_031.0,
+    ) is False
+    assert second.transition(
+        request.request_id,
+        models.WorkflowState.ADMITTED,
+        models.WorkflowState.STATUS_MESSAGE_PENDING,
+        now=1_000_031.0,
+    ) is True
+
+
+def test_lifecycle_mutations_use_the_caller_clock(tmp_path):
+    s = Store(tmp_path / "s.db")
+    request = s.admit_event(
+        event(), (command(),), (snapshot(),), 1_000_000.0
+    ).admitted[0]
+
+    assert s.transition(
+        request.request_id,
+        models.WorkflowState.ADMITTED,
+        models.WorkflowState.STATUS_MESSAGE_PENDING,
+        now=1_000_010.0,
+    ) is True
+    assert s.checkpoint(
+        request.request_id,
+        models.WorkflowState.STATUS_MESSAGE_PENDING,
+        next_attempt_at=1_000_020.0,
+        now=1_000_011.0,
+    ) is True
+    assert s.record_error(
+        request.request_id,
+        "status",
+        "temporary failure",
+        1_000_025.0,
+        now=1_000_012.0,
+    ) is True
+
+    stored = s.get_request(request.request_id)
+    assert stored.updated_at == 1_000_012.0
+    assert [event["at"] for event in s.request_events(request.request_id)[-3:]] == [
+        1_000_010.0,
+        1_000_011.0,
+        1_000_012.0,
+    ]
+
+
+def test_store_migrates_existing_lifecycle_rows_for_leasing(tmp_path):
+    db_path = tmp_path / "s.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE review_requests ("
+        "request_id TEXT PRIMARY KEY, workflow_state TEXT NOT NULL, "
+        "next_attempt_at REAL NOT NULL, created_at REAL NOT NULL, lane_id TEXT)"
+    )
+    connection.execute("PRAGMA user_version=3")
+    connection.commit()
+    connection.close()
+
+    store = Store(db_path)
+    columns = {
+        str(row["name"])
+        for row in store._db.execute("PRAGMA table_info(review_requests)")
+    }
+
+    assert {"lease_owner", "lease_expires_at"} <= columns
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4

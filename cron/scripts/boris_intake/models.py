@@ -238,6 +238,19 @@ class LifecycleRequest:
 
 
 @dataclass(frozen=True)
+class SlackStatus:
+    message_ts: str
+    text: str
+
+
+@dataclass(frozen=True)
+class PublishedReview:
+    review_id: str
+    url: str
+    body: str
+
+
+@dataclass(frozen=True)
 class AdmissionResult:
     admitted: tuple[LifecycleRequest, ...] = ()
     duplicates: tuple[LifecycleRequest, ...] = ()
