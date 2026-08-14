@@ -17,7 +17,6 @@ _tokfile="${BORIS_GH_TOKEN_PATH:-/Users/ctao/.hermes/state/.gh_token}"
 refuse() { echo "ghx_ro: REFUSED $*" >&2; exit 3; }
 
 [ -n "$_scope" ] || refuse "BORIS_PR_SCOPE is unset"
-[[ "$_head" =~ ^[0-9a-f]{40}$ ]] || refuse "BORIS_PR_HEAD_SHA is invalid"
 _scope_repo="${_scope%%#*}"
 _scope_num="${_scope##*#}"
 
@@ -65,6 +64,7 @@ case "$verb" in
     case "$_api_path" in
       *"/../"*|*"/./"*|*"%2e"*|*"%2E"*) refuse "api path traversal" ;;
     esac
+    [[ "$_head" =~ ^[0-9a-f]{40}$ ]] || refuse "BORIS_PR_HEAD_SHA is invalid"
     [[ "$_api_path" == "/repos/${_scope_repo}/contents/"*"?ref=${_head}" ]] ||
       refuse "api path is outside the pinned repository head" ;;
   *) refuse "verb '$verb'" ;;
