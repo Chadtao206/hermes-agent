@@ -43,6 +43,10 @@ class SlackLifecycleAdapter(Protocol):
     def update_status(
         self, request: LifecycleRequest, message_ts: str, text: str
     ) -> None: ...
+    def replace_status(self, request: LifecycleRequest, text: str) -> str: ...
+    def reconcile_source_reaction(
+        self, request: LifecycleRequest, reaction: str
+    ) -> None: ...
 
 
 class GitHubLifecycleAdapter(Protocol):
@@ -126,6 +130,61 @@ def _load_result(request: LifecycleRequest) -> StructuredResult:
 
 def _semantic(result: StructuredResult) -> SemanticOutcome:
     return SemanticOutcome(result.derived.outcome)
+
+
+def _aggregate_source_reaction(
+    requests: tuple[LifecycleRequest, ...],
+    delivered_request_id: str | None = None,
+) -> str:
+    delivered = tuple(
+        request
+        for request in requests
+        if request.workflow_state is WorkflowState.COMPLETE
+        or getattr(request, "terminal_status_confirmed", False)
+        or request.request_id == delivered_request_id
+    )
+    outcomes = {request.semantic_outcome for request in delivered}
+    if SemanticOutcome.ISSUES_FOUND in outcomes:
+        return "face_vomiting"
+    if SemanticOutcome.REVIEW_INCOMPLETE in outcomes:
+        return "warning"
+    if len(delivered) != len(requests):
+        return "rubbing"
+    presentations = set()
+    for request in delivered:
+        if request.semantic_outcome is not SemanticOutcome.READY_FOR_HUMAN_REVIEW:
+            raise ValueError("delivered request has no aggregate reaction outcome")
+        if not request.validated_result_json:
+            raise ValueError("ready request has no validated result")
+        raw = json.loads(request.validated_result_json)
+        derived = raw.get("derived")
+        presentation = derived.get("presentation") if isinstance(derived, dict) else None
+        if presentation not in {"READY_CLEAN", "READY_WITH_COMMENTS"}:
+            raise ValueError("ready request has no valid presentation")
+        presentations.add(presentation)
+    return "doge_notes" if "READY_WITH_COMMENTS" in presentations else "blinkapproved"
+
+
+def _reconcile_source_reaction(
+    store: Store,
+    request: LifecycleRequest,
+    deps: ReconcilerDeps,
+    delivered_request_id: str | None = None,
+) -> None:
+    if not store.acquire_source_reaction_lease(
+        request.channel_id, request.message_ts, deps.now()
+    ):
+        raise RuntimeError("source reaction is already claimed")
+    try:
+        requests = store.requests_for_source(request.channel_id, request.message_ts)
+        if not requests:
+            raise ValueError("review request has no source batch")
+        deps.slack.reconcile_source_reaction(
+            request,
+            _aggregate_source_reaction(requests, delivered_request_id),
+        )
+    finally:
+        store.release_source_reaction_lease(request.channel_id, request.message_ts)
 
 
 def _transition_system_incomplete(
@@ -241,7 +300,7 @@ def _reconcile_starting(
                 try:
                     deps.slack.update_status(request, status.message_ts, reviewing_text)
                 except SlackStatusMissing:
-                    status_ts = deps.slack.post_status(request, reviewing_text)
+                    status_ts = deps.slack.replace_status(request, reviewing_text)
     except SlackRootUnavailable:
         _transition_system_incomplete(
             store,
@@ -559,7 +618,7 @@ def _reconcile_delivery(
                 delivery_attempts=request.delivery_attempts + 1,
             ):
                 return
-            status_ts = deps.slack.post_status(request, terminal_text)
+            status_ts = deps.slack.replace_status(request, terminal_text)
         else:
             status_ts = status.message_ts
             if status.text != terminal_text:
@@ -573,7 +632,24 @@ def _reconcile_delivery(
                 try:
                     deps.slack.update_status(request, status.message_ts, terminal_text)
                 except SlackStatusMissing:
-                    status_ts = deps.slack.post_status(request, terminal_text)
+                    status_ts = deps.slack.replace_status(request, terminal_text)
+        if (
+            not request.terminal_status_confirmed
+            or request.status_message_ts != status_ts
+        ) and not store.checkpoint(
+            request.request_id,
+            WorkflowState.DELIVERY_PENDING,
+            now=deps.now(),
+            status_message_ts=status_ts,
+            terminal_status_confirmed=True,
+        ):
+            return
+        _reconcile_source_reaction(
+            store,
+            request,
+            deps,
+            delivered_request_id=request.request_id,
+        )
     except SlackRootUnavailable:
         store.transition(
             request.request_id,
@@ -605,6 +681,7 @@ def reconcile_one(
     request = store.get_request(request_id)
     if request is None:
         return
+    delivery = request.workflow_state is WorkflowState.DELIVERY_PENDING
     if request.workflow_state is WorkflowState.ADMITTED:
         store.transition(
             request.request_id,
@@ -625,6 +702,16 @@ def reconcile_one(
         _reconcile_publication(store, request, deps)
     elif request.workflow_state is WorkflowState.DELIVERY_PENDING:
         _reconcile_delivery(store, request, deps)
+    if delivery:
+        return
+    updated = store.get_request(request_id)
+    if (
+        updated is not None
+        and updated.status_message_ts is not None
+        and updated.workflow_state
+        not in {WorkflowState.COMPLETE, WorkflowState.SLACK_UNAVAILABLE}
+    ):
+        _reconcile_source_reaction(store, updated, deps)
 
 
 def tick(

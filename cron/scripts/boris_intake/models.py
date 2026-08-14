@@ -219,6 +219,7 @@ class LifecycleRequest:
     github_review_url: str | None
     publication_attempts: int
     delivery_attempts: int
+    terminal_status_confirmed: bool
     next_attempt_at: float
     last_error: str | None
     created_at: float
