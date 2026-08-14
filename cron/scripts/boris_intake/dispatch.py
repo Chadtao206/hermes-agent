@@ -1,11 +1,11 @@
-"""Create the reviewer lane. The assignee is the ROLE KEY `reviewer`, never `boris`."""
+"""Create a task-scoped reviewer lane for a durable lifecycle request."""
 from __future__ import annotations
 
 import json
 import os
 import subprocess
 
-from boris_intake.models import ReviewCommand
+from boris_intake.models import LifecycleRequest
 from boris_intake.template import render
 
 PY = "/Users/ctao/.hermes/hermes-agent/venv/bin/python"
@@ -43,14 +43,17 @@ def active_lane_count(db_path: str = KANBAN_DB) -> int:
     return int(row[0]) if row else 0
 
 
-def create_lane(cmd: ReviewCommand, runner=subprocess.run) -> str:
-    title, body = render(cmd)
+def create_lane(request: LifecycleRequest, runner=subprocess.run) -> str:
+    title, body = render(request)
+    idempotency_key = (
+        request.review_identity + ":gate=" + request.gate_snapshot.fingerprint
+    )
     argv = [
         PY, "-m", "hermes_cli.main", "kanban", "create", title,
         "--body", body,
-        "--assignee", "reviewer",
+        "--assignee", "boris_on_demand",
         "--created-by", CREATED_BY,
-        "--idempotency-key", cmd.idempotency_key,
+        "--idempotency-key", idempotency_key,
         "--json",
     ]
     proc = runner(

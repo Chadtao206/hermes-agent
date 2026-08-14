@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path, PurePosixPath
+from typing import Literal
+from urllib.parse import quote
+
+from mcp.server.fastmcp import FastMCP
+
+from boris_intake.models import LifecycleRequest
+from boris_intake.result import ValidationError, canonicalize_judgment, validate_judgment
+from boris_intake.store import Store
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+GHX_RO = "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"
+GITHUB_RUNNER = subprocess.run
+_PROFILE = "boris_on_demand"
+_TASK_ID = re.compile(r"^t_[A-Za-z0-9_:-]{1,128}$")
+_OPERATIONS = frozenset({
+    "pr_metadata",
+    "pr_diff",
+    "pr_checks",
+    "pr_comments",
+    "file_at_head",
+})
+_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+
+
+def _bound_request() -> tuple[Store, LifecycleRequest, str]:
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "")
+    if not _TASK_ID.fullmatch(task_id):
+        raise ToolError("missing or malformed task binding")
+    if os.environ.get("HERMES_PROFILE") != _PROFILE:
+        raise ToolError("review profile binding is missing or invalid")
+    raw_db = os.environ.get("BORIS_REVIEW_DB", "")
+    db_path = Path(raw_db) if raw_db else None
+    if db_path is None or not db_path.is_absolute() or not db_path.is_file():
+        raise ToolError("review database configuration is missing or invalid")
+    try:
+        store = Store(db_path)
+        request = store.request_for_lane(task_id)
+    except Exception as error:
+        raise ToolError("review database could not resolve the task binding") from error
+    if request is None:
+        store.close()
+        raise ToolError("task binding is not authorized for a review request")
+    return store, request, task_id
+
+
+def _validate_file_path(path: str | None) -> str:
+    if not isinstance(path, str) or not path or len(path) > 1_024:
+        raise ToolError("file path is required")
+    if "\\" in path or "://" in path or path.startswith("/") or "\x00" in path:
+        raise ToolError("file path must be repository-relative")
+    parts = PurePosixPath(path).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ToolError("file path traversal is not allowed")
+    return path
+
+
+def _token_path() -> str:
+    raw = os.environ.get("BORIS_GH_TOKEN_PATH", "")
+    path = Path(raw) if raw else None
+    if path is None or not path.is_absolute() or not path.is_file():
+        raise ToolError("GitHub credential configuration is missing or invalid")
+    return str(path)
+
+
+def _github(
+    request: LifecycleRequest,
+    args: list[str],
+    *,
+    expect_json: bool,
+    allowed_codes: tuple[int, ...] = (0,),
+):
+    runner = GITHUB_RUNNER
+    if runner is None:
+        raise ToolError("GitHub adapter is not configured")
+    try:
+        proc = runner(
+            [GHX_RO, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                "PATH": _PATH,
+                "BORIS_PR_SCOPE": request.slug,
+                "BORIS_PR_HEAD_SHA": request.head_sha,
+                "BORIS_GH_TOKEN_PATH": _token_path(),
+            },
+        )
+    except ToolError:
+        raise
+    except Exception as error:
+        raise ToolError("GitHub evidence read failed") from error
+    if proc.returncode not in allowed_codes:
+        raise ToolError(f"GitHub evidence read failed with status {proc.returncode}")
+    output = proc.stdout or ""
+    if len(output.encode()) > 2 * 1024 * 1024:
+        raise ToolError("GitHub evidence response exceeds 2 MiB")
+    if not expect_json:
+        return output
+    try:
+        return json.loads(output)
+    except ValueError as error:
+        raise ToolError("GitHub evidence returned malformed JSON") from error
+
+
+def _metadata(request: LifecycleRequest) -> dict:
+    data = _github(
+        request,
+        [
+            "pr",
+            "view",
+            str(request.pr_number),
+            "-R",
+            f"{request.owner}/{request.repo}",
+            "--json",
+            "headRefOid,title,body,author,state,baseRefName,headRefName,comments,reviews",
+        ],
+        expect_json=True,
+    )
+    if not isinstance(data, dict):
+        raise ToolError("GitHub metadata response is not an object")
+    head = str(data.get("headRefOid") or "").lower()
+    if head != request.head_sha.lower():
+        raise ToolError("pull request head no longer matches the bound review")
+    return data
+
+
+def _ensure_current_head(request: LifecycleRequest) -> None:
+    _metadata(request)
+
+
+server = FastMCP("boris_review")
+
+
+@server.tool()
+def read_github_evidence(
+    operation: Literal[
+        "pr_metadata",
+        "pr_diff",
+        "pr_checks",
+        "pr_comments",
+        "file_at_head",
+    ],
+    path: str | None = None,
+) -> dict:
+    if operation not in _OPERATIONS:
+        raise ToolError("unknown GitHub evidence operation")
+    if operation == "file_at_head":
+        file_path = _validate_file_path(path)
+    elif path is not None:
+        raise ToolError("path is valid only for file_at_head")
+    else:
+        file_path = ""
+
+    store, request, _ = _bound_request()
+    try:
+        if operation == "pr_metadata":
+            data = _metadata(request)
+        else:
+            _ensure_current_head(request)
+            repository = f"{request.owner}/{request.repo}"
+            if operation == "pr_diff":
+                data = _github(
+                    request,
+                    ["pr", "diff", str(request.pr_number), "-R", repository],
+                    expect_json=False,
+                )
+            elif operation == "pr_checks":
+                data = _github(
+                    request,
+                    [
+                        "pr",
+                        "checks",
+                        str(request.pr_number),
+                        "-R",
+                        repository,
+                        "--json",
+                        "name,state,link",
+                    ],
+                    expect_json=True,
+                    allowed_codes=(0, 1),
+                )
+            elif operation == "pr_comments":
+                data = _github(
+                    request,
+                    [
+                        "pr",
+                        "view",
+                        str(request.pr_number),
+                        "-R",
+                        repository,
+                        "--json",
+                        "comments,reviews",
+                    ],
+                    expect_json=True,
+                )
+            else:
+                route = (
+                    f"/repos/{quote(request.owner, safe='')}/{quote(request.repo, safe='')}"
+                    f"/contents/{quote(file_path, safe='/')}?ref={request.head_sha}"
+                )
+                data = _github(request, ["api", route], expect_json=True)
+        return {"operation": operation, "head_sha": request.head_sha, "data": data}
+    finally:
+        store.close()
+
+
+@server.tool()
+def read_acceptance_evidence(reference: str) -> dict:
+    if not isinstance(reference, str) or not reference or len(reference) > 512:
+        raise ToolError("acceptance evidence reference is invalid")
+    store, request, _ = _bound_request()
+    try:
+        evidence = store.acceptance_evidence(request.request_id, reference)
+        if evidence is None:
+            raise ToolError("reference is not authorized for this review request")
+        return evidence
+    finally:
+        store.close()
+
+
+def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> bool:
+    raw_db = os.environ.get("HERMES_KANBAN_DB", "")
+    db_path = Path(raw_db) if raw_db else None
+    if db_path is None or not db_path.is_absolute() or not db_path.is_file():
+        raise ToolError("Kanban database configuration is missing or invalid")
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        run_id = int(run_id_raw) if run_id_raw else None
+    except ValueError as error:
+        raise ToolError("Kanban run binding is malformed") from error
+    from hermes_cli import kanban_db
+
+    operation_id = f"boris-review-submit:{request_id}:{judgment_hash}"
+    with kanban_db.connect_closing(db_path) as connection:
+        return kanban_db.complete_task(
+            connection,
+            task_id,
+            summary="Structured Boris review judgment accepted.",
+            expected_run_id=run_id,
+            operation_id=operation_id,
+        )
+
+
+@server.tool()
+def submit_review_result(payload: dict) -> dict:
+    judgment = validate_judgment(payload)
+    canonical = canonicalize_judgment(judgment)
+    digest = f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
+    store, request, task_id = _bound_request()
+    try:
+        try:
+            status = store.submit_judgment(request.request_id, canonical, time.time())
+        except ValueError as error:
+            raise ToolError(str(error)) from error
+        if status == "conflict":
+            raise ToolError("conflicting judgment rejected; the first valid judgment is authoritative")
+        if store.judgment_task_completed(request.request_id):
+            return {"status": status, "task_completed": True}
+        try:
+            completed = _complete_bound_task(task_id, request.request_id, digest)
+        except Exception as error:
+            raise ToolError(
+                "judgment accepted but task completion failed; retry the identical payload"
+            ) from error
+        if not completed:
+            raise ToolError(
+                "judgment accepted but task completion failed; retry the identical payload"
+            )
+        store.mark_judgment_task_completed(request.request_id, time.time())
+        return {"status": status, "task_completed": True}
+    finally:
+        store.close()
+
+
+def main() -> None:
+    server.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

@@ -5,6 +5,7 @@ and because Slack redelivery makes event dedup correctness-critical.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -70,6 +71,8 @@ CREATE TABLE IF NOT EXISTS review_requests (
 );
 CREATE INDEX IF NOT EXISTS review_requests_due
     ON review_requests (workflow_state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS review_requests_lane
+    ON review_requests (lane_id) WHERE lane_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS event_requests (
     channel TEXT NOT NULL,
     ts TEXT NOT NULL,
@@ -91,6 +94,21 @@ CREATE TABLE IF NOT EXISTS request_events (
 );
 CREATE INDEX IF NOT EXISTS request_events_request_id
     ON request_events (request_id, id);
+CREATE TABLE IF NOT EXISTS request_acceptance_evidence (
+    request_id TEXT NOT NULL,
+    reference TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    PRIMARY KEY (request_id, reference),
+    FOREIGN KEY (request_id) REFERENCES review_requests (request_id)
+);
+CREATE TABLE IF NOT EXISTS review_judgments (
+    request_id TEXT PRIMARY KEY,
+    canonical_json TEXT NOT NULL,
+    judgment_hash TEXT NOT NULL,
+    accepted_at REAL NOT NULL,
+    task_completed INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (request_id) REFERENCES review_requests (request_id)
+);
 """
 
 _TERMINAL_STATES = (WorkflowState.COMPLETE, WorkflowState.SLACK_UNAVAILABLE)
@@ -148,8 +166,11 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
-        self._db.execute("PRAGMA user_version=2")
+        self._db.execute("PRAGMA user_version=3")
         self._db.commit()
+
+    def close(self) -> None:
+        self._db.close()
 
     def _request_from_row(self, row: sqlite3.Row) -> LifecycleRequest:
         policy_raw = json.loads(row["policy_json"])
@@ -206,6 +227,145 @@ class Store:
             "SELECT * FROM review_requests WHERE request_id=?", (request_id,)
         ).fetchone()
         return self._request_from_row(row) if row else None
+
+    def request_for_lane(self, lane_id: str) -> LifecycleRequest | None:
+        row = self._db.execute(
+            "SELECT * FROM review_requests WHERE lane_id=?", (lane_id,)
+        ).fetchone()
+        return self._request_from_row(row) if row else None
+
+    def authorize_acceptance_evidence(
+        self,
+        request_id: str,
+        reference: str,
+        evidence: dict[str, Any],
+    ) -> None:
+        if not reference or len(reference) > 512:
+            raise ValueError("acceptance evidence reference is invalid")
+        if not isinstance(evidence, dict):
+            raise ValueError("acceptance evidence must be an object")
+        canonical = json.dumps(evidence, separators=(",", ":"), sort_keys=True)
+        if len(canonical.encode()) > 64 * 1024:
+            raise ValueError("acceptance evidence exceeds 64 KiB")
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._db.execute(
+                "SELECT evidence_json FROM request_acceptance_evidence "
+                "WHERE request_id=? AND reference=?",
+                (request_id, reference),
+            ).fetchone()
+            if existing:
+                if existing["evidence_json"] != canonical:
+                    raise ValueError("acceptance evidence authorization conflict")
+            else:
+                self._db.execute(
+                    "INSERT INTO request_acceptance_evidence "
+                    "(request_id, reference, evidence_json) VALUES (?,?,?)",
+                    (request_id, reference, canonical),
+                )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def acceptance_evidence(self, request_id: str, reference: str) -> dict[str, Any] | None:
+        row = self._db.execute(
+            "SELECT evidence_json FROM request_acceptance_evidence "
+            "WHERE request_id=? AND reference=?",
+            (request_id, reference),
+        ).fetchone()
+        return json.loads(row["evidence_json"]) if row else None
+
+    def submit_judgment(self, request_id: str, canonical_json: str, now: float) -> str:
+        digest = f"sha256:{hashlib.sha256(canonical_json.encode()).hexdigest()}"
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            request = self._db.execute(
+                "SELECT workflow_state FROM review_requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if not request:
+                raise ValueError("unknown review request")
+            existing = self._db.execute(
+                "SELECT canonical_json, judgment_hash FROM review_judgments WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if existing:
+                if existing["canonical_json"] == canonical_json:
+                    self._db.commit()
+                    return "idempotent"
+                detail = json.dumps(
+                    {"accepted_hash": existing["judgment_hash"], "rejected_hash": digest},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                self._db.execute(
+                    "INSERT INTO request_events "
+                    "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                    (request_id, "judgment_conflict", detail, now),
+                )
+                self._db.commit()
+                return "conflict"
+            if request["workflow_state"] != WorkflowState.REVIEWING.value:
+                raise ValueError("review request is not accepting a judgment")
+            self._db.execute(
+                "INSERT INTO review_judgments "
+                "(request_id, canonical_json, judgment_hash, accepted_at) VALUES (?,?,?,?)",
+                (request_id, canonical_json, digest, now),
+            )
+            self._db.execute(
+                "INSERT INTO request_events "
+                "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                (
+                    request_id,
+                    "judgment_accepted",
+                    json.dumps({"judgment_hash": digest}, separators=(",", ":")),
+                    now,
+                ),
+            )
+            self._db.commit()
+            return "accepted"
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def judgment_for_request(self, request_id: str) -> str | None:
+        row = self._db.execute(
+            "SELECT canonical_json FROM review_judgments WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        return str(row["canonical_json"]) if row else None
+
+    def judgment_task_completed(self, request_id: str) -> bool:
+        row = self._db.execute(
+            "SELECT task_completed FROM review_judgments WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        return bool(row and row["task_completed"])
+
+    def mark_judgment_task_completed(self, request_id: str, now: float) -> None:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._db.execute(
+                "SELECT task_completed FROM review_judgments WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("no accepted judgment")
+            if not row["task_completed"]:
+                self._db.execute(
+                    "UPDATE review_judgments SET task_completed=1 WHERE request_id=?",
+                    (request_id,),
+                )
+                self._db.execute(
+                    "INSERT INTO request_events "
+                    "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                    (request_id, "reviewer_task_completed", "{}", now),
+                )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
 
     def requests_for_event(self, channel: str, ts: str) -> tuple[LifecycleRequest, ...]:
         return self._requests_for_link(channel, ts, "admitted")
