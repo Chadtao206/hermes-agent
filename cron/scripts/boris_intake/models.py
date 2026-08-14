@@ -10,6 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class ReasonCode(str, Enum):
@@ -90,6 +91,82 @@ class ReviewPolicy:
 
 
 @dataclass(frozen=True)
+class GateCheck:
+    check_name: str
+    check_class: str
+    status: str
+    conclusion: str
+    url: str
+    required: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "check_name": self.check_name,
+            "class": self.check_class,
+            "status": self.status,
+            "conclusion": self.conclusion,
+            "url": self.url,
+            "required": self.required,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> GateCheck:
+        return cls(
+            check_name=str(value["check_name"]),
+            check_class=str(value["class"]),
+            status=str(value["status"]),
+            conclusion=str(value["conclusion"]),
+            url=str(value["url"]),
+            required=bool(value.get("required", True)),
+        )
+
+
+@dataclass(frozen=True)
+class GateSnapshot:
+    fingerprint: str
+    captured_at: str
+    checks: tuple[GateCheck, ...] = ()
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            {
+                "fingerprint": self.fingerprint,
+                "captured_at": self.captured_at,
+                "checks": [check.to_dict() for check in self.checks],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> GateSnapshot:
+        raw = json.loads(value)
+        return cls(
+            fingerprint=str(raw["fingerprint"]),
+            captured_at=str(raw["captured_at"]),
+            checks=tuple(GateCheck.from_dict(check) for check in raw["checks"]),
+        )
+
+
+class WorkflowState(str, Enum):
+    ADMITTED = "admitted"
+    STATUS_MESSAGE_PENDING = "status_message_pending"
+    STARTING_REVIEW = "starting_review"
+    REVIEWING = "reviewing"
+    GATE_WAIT_PENDING = "gate_wait_pending"
+    PUBLICATION_PENDING = "publication_pending"
+    DELIVERY_PENDING = "delivery_pending"
+    COMPLETE = "complete"
+    SLACK_UNAVAILABLE = "slack_unavailable"
+
+
+class SemanticOutcome(str, Enum):
+    READY_FOR_HUMAN_REVIEW = "READY_FOR_HUMAN_REVIEW"
+    ISSUES_FOUND = "ISSUES_FOUND"
+    REVIEW_INCOMPLETE = "REVIEW_INCOMPLETE"
+
+
+@dataclass(frozen=True)
 class ReviewCommand:
     owner: str
     repo: str
@@ -114,6 +191,57 @@ class ReviewCommand:
             f"borisslack:{self.owner}/{self.repo}#{self.pr_number}@{self.head_sha}"
             f":policy={self.policy.fingerprint()}"
         )
+
+
+@dataclass(frozen=True)
+class LifecycleRequest:
+    request_id: str
+    owner: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    pr_author: str
+    policy: ReviewPolicy
+    policy_fingerprint: str
+    gate_snapshot: GateSnapshot
+    requester_user_id: str
+    requester_email: str
+    channel_id: str
+    message_ts: str
+    root_thread_ts: str
+    permalink: str
+    workflow_state: WorkflowState
+    semantic_outcome: SemanticOutcome | None
+    status_message_ts: str | None
+    lane_id: str | None
+    validated_result_json: str | None
+    github_review_id: str | None
+    github_review_url: str | None
+    publication_attempts: int
+    delivery_attempts: int
+    next_attempt_at: float
+    last_error: str | None
+    created_at: float
+    updated_at: float
+    completed_at: float | None
+
+    @property
+    def slug(self) -> str:
+        return f"{self.owner}/{self.repo}#{self.pr_number}"
+
+    @property
+    def review_identity(self) -> str:
+        return (
+            f"borisslack:{self.owner}/{self.repo}#{self.pr_number}@{self.head_sha}"
+            f":policy={self.policy_fingerprint}"
+        )
+
+
+@dataclass(frozen=True)
+class AdmissionResult:
+    admitted: tuple[LifecycleRequest, ...] = ()
+    duplicates: tuple[LifecycleRequest, ...] = ()
+    redelivered: bool = False
 
 
 @dataclass(frozen=True)
