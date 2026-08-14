@@ -1,8 +1,7 @@
-"""Slack writes for legacy intake replies and durable lifecycle status messages.
+"""Slack writes for legacy intake and the durable review lifecycle.
 
-Reaction ownership: this module adds the initial :rubbing: and nothing else.
-just_do_it_review_reaction_watchdog.py is the single authoritative writer for
-every later state (doge_notes / review-no / white_check_mark).
+The lifecycle reconciler owns its per-PR statuses and aggregate reactions. Legacy
+best-effort intake writes remain here until intake becomes admission-only.
 """
 
 from __future__ import annotations
@@ -12,6 +11,13 @@ from typing import Callable
 from boris_intake.models import LifecycleRequest, Rejection, ReviewCommand, SlackStatus
 
 _STATUS_EVENT_TYPE = "boris_review_status_v2"
+_LIFECYCLE_REACTIONS = (
+    "face_vomiting",
+    "warning",
+    "rubbing",
+    "doge_notes",
+    "blinkapproved",
+)
 
 
 class SlackLifecycleError(RuntimeError):
@@ -56,7 +62,9 @@ class SlackIO:
         except Exception:
             pass  # best effort; the watchdogs reconcile reaction state
 
-    def _lifecycle_call(self, method: str, **kw) -> dict:
+    def _lifecycle_call(
+        self, method: str, *, accepted_errors: frozenset[str] = frozenset(), **kw
+    ) -> dict:
         if self.dry_run:
             self.dry_run_log.append((method, kw))
             raise SlackLifecycleError("lifecycle writes are disabled in dry-run mode")
@@ -70,6 +78,8 @@ class SlackIO:
                 if isinstance(response, dict)
                 else "invalid_response"
             )
+            if code in accepted_errors:
+                return response
             if code in {"thread_not_found", "channel_not_found"}:
                 raise SlackRootUnavailable(code)
             if method == "chat.update" and code in {
@@ -173,6 +183,28 @@ class SlackIO:
 
     def replace_status(self, request: LifecycleRequest, text: str) -> str:
         return self.post_status(request, text)
+
+    def reconcile_source_reaction(
+        self, request: LifecycleRequest, reaction: str
+    ) -> None:
+        if reaction not in _LIFECYCLE_REACTIONS:
+            raise ValueError(f"unsupported lifecycle reaction: {reaction}")
+        target = {"channel": request.channel_id, "timestamp": request.message_ts}
+        self._lifecycle_call(
+            "reactions.add",
+            accepted_errors=frozenset({"already_reacted"}),
+            **target,
+            name=reaction,
+        )
+        for stale in _LIFECYCLE_REACTIONS:
+            if stale == reaction:
+                continue
+            self._lifecycle_call(
+                "reactions.remove",
+                accepted_errors=frozenset({"no_reaction", "not_reacted"}),
+                **target,
+                name=stale,
+            )
 
     def add_reviewing_reaction(self, channel: str, ts: str) -> None:
         self._post("reactions.add", channel=channel, timestamp=ts, name="rubbing")

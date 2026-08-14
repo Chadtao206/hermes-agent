@@ -128,6 +128,7 @@ PERMALINK_RE = re.compile(
 # Source channels whose posts this watchdog may react to. #meeting-room and
 # other chatter channels must never be reacted to.
 BORIS_CHANNEL = "C0BPCKPEFCG"
+LIFECYCLE_CREATED_BY = "boris-slack-intake"
 
 STATE_BLOCKED = "blocked"
 STATE_NOTES = "notes"
@@ -1791,6 +1792,15 @@ def process_tick(
         task_id = str(row.get("id") or row.get("task_id") or "")
         if not task_id or (only_tasks and task_id not in only_tasks):
             continue
+        lifecycle_watermark = _epoch(
+            getattr(args, "lifecycle_rollout_watermark", 0)
+        )
+        if (
+            lifecycle_watermark
+            and row.get("created_by") == LIFECYCLE_CREATED_BY
+            and _epoch(row.get("created_at")) >= lifecycle_watermark
+        ):
+            continue
         if row.get("assignee") != "reviewer":
             continue
         kind = lane_status_kind(row.get("status"))
@@ -2188,6 +2198,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=("modern", "legacy"),
         default="modern",
         help="Render #boris-reviews with modern reactions (default) or legacy reactions for rollback.",
+    )
+    ap.add_argument(
+        "--lifecycle-rollout-watermark",
+        type=int,
+        default=0,
+        help="Skip lifecycle-managed lanes created at or after this epoch (disabled at 0).",
     )
     ap.add_argument("--verbose", action="store_true", help="Always print the METRICS line.")
     args = ap.parse_args(argv)

@@ -363,6 +363,26 @@ def test_claim_due_excludes_live_claims_and_recovers_expired_claims(tmp_path):
     ) is True
 
 
+def test_source_reaction_lease_excludes_live_owner_and_recovers_after_expiry(
+    tmp_path,
+):
+    db_path = tmp_path / "s.db"
+    first = Store(db_path)
+    second = Store(db_path)
+
+    assert first.acquire_source_reaction_lease(
+        "C1", "1.0", 1_000_000.0, lease_seconds=30
+    ) is True
+    assert second.acquire_source_reaction_lease(
+        "C1", "1.0", 1_000_029.999, lease_seconds=30
+    ) is False
+    assert second.acquire_source_reaction_lease(
+        "C1", "1.0", 1_000_030.0, lease_seconds=30
+    ) is True
+    assert first.release_source_reaction_lease("C1", "1.0") is False
+    assert second.release_source_reaction_lease("C1", "1.0") is True
+
+
 def test_lifecycle_mutations_use_the_caller_clock(tmp_path):
     s = Store(tmp_path / "s.db")
     request = s.admit_event(
@@ -415,6 +435,17 @@ def test_store_migrates_existing_lifecycle_rows_for_leasing(tmp_path):
         str(row["name"])
         for row in store._db.execute("PRAGMA table_info(review_requests)")
     }
+    source_lease_columns = {
+        str(row["name"])
+        for row in store._db.execute("PRAGMA table_info(source_reaction_leases)")
+    }
 
     assert {"lease_owner", "lease_expires_at"} <= columns
-    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert "terminal_status_confirmed" in columns
+    assert source_lease_columns == {
+        "channel",
+        "message_ts",
+        "lease_owner",
+        "lease_expires_at",
+    }
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5

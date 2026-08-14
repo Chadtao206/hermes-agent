@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS review_requests (
     github_review_url TEXT,
     publication_attempts INTEGER NOT NULL DEFAULT 0,
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    terminal_status_confirmed INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL DEFAULT 0,
     last_error TEXT,
     lease_owner TEXT,
@@ -75,6 +76,13 @@ CREATE INDEX IF NOT EXISTS review_requests_due
     ON review_requests (workflow_state, next_attempt_at, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS review_requests_lane
     ON review_requests (lane_id) WHERE lane_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS source_reaction_leases (
+    channel TEXT NOT NULL,
+    message_ts TEXT NOT NULL,
+    lease_owner TEXT NOT NULL,
+    lease_expires_at REAL NOT NULL,
+    PRIMARY KEY (channel, message_ts)
+);
 CREATE TABLE IF NOT EXISTS event_requests (
     channel TEXT NOT NULL,
     ts TEXT NOT NULL,
@@ -153,6 +161,7 @@ _TRANSITION_FIELDS = {
     "github_review_url",
     "publication_attempts",
     "delivery_attempts",
+    "terminal_status_confirmed",
     "next_attempt_at",
     "last_error",
     "gate_snapshot_json",
@@ -184,7 +193,12 @@ class Store:
                 self._db.execute(
                     "ALTER TABLE review_requests ADD COLUMN lease_expires_at REAL"
                 )
-            self._db.execute("PRAGMA user_version=4")
+            if "terminal_status_confirmed" not in columns:
+                self._db.execute(
+                    "ALTER TABLE review_requests ADD COLUMN "
+                    "terminal_status_confirmed INTEGER NOT NULL DEFAULT 0"
+                )
+            self._db.execute("PRAGMA user_version=5")
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -224,6 +238,7 @@ class Store:
             github_review_url=row["github_review_url"],
             publication_attempts=int(row["publication_attempts"]),
             delivery_attempts=int(row["delivery_attempts"]),
+            terminal_status_confirmed=bool(row["terminal_status_confirmed"]),
             next_attempt_at=float(row["next_attempt_at"]),
             last_error=row["last_error"],
             created_at=float(row["created_at"]),
@@ -242,6 +257,11 @@ class Store:
             (channel, ts, disposition),
         ).fetchall()
         return tuple(self._request_from_row(row) for row in rows)
+
+    def requests_for_source(
+        self, channel: str, ts: str
+    ) -> tuple[LifecycleRequest, ...]:
+        return self._requests_for_link(channel, ts, "admitted")
 
     def get_request(self, request_id: str) -> LifecycleRequest | None:
         row = self._db.execute(
@@ -552,6 +572,52 @@ class Store:
         except Exception:
             self._db.rollback()
             raise
+
+    def acquire_source_reaction_lease(
+        self,
+        channel: str,
+        message_ts: str,
+        now: float,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ) -> bool:
+        expires_at = now + lease_seconds
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._db.execute(
+                "INSERT INTO source_reaction_leases "
+                "(channel, message_ts, lease_owner, lease_expires_at) "
+                "VALUES (?,?,?,?) "
+                "ON CONFLICT(channel, message_ts) DO UPDATE SET "
+                "lease_owner=excluded.lease_owner, "
+                "lease_expires_at=excluded.lease_expires_at "
+                "WHERE source_reaction_leases.lease_owner=? "
+                "OR source_reaction_leases.lease_expires_at<=?",
+                (
+                    channel,
+                    message_ts,
+                    self._lease_owner,
+                    expires_at,
+                    self._lease_owner,
+                    now,
+                ),
+            )
+            self._db.commit()
+            return cur.rowcount == 1
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def release_source_reaction_lease(
+        self, channel: str, message_ts: str
+    ) -> bool:
+        cur = self._db.execute(
+            "DELETE FROM source_reaction_leases "
+            "WHERE channel=? AND message_ts=? AND lease_owner=?",
+            (channel, message_ts, self._lease_owner),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
 
     def renew_claim(
         self,

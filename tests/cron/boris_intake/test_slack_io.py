@@ -135,6 +135,7 @@ def lifecycle_request():
     return SimpleNamespace(
         request_id="br_123",
         channel_id="C1",
+        message_ts="0.5",
         root_thread_ts="0.5",
     )
 
@@ -259,3 +260,47 @@ def test_lifecycle_slack_failures_are_typed(method, error, exception_name):
 
     with pytest.raises(getattr(slack_io, exception_name)):
         operation()
+
+
+def test_lifecycle_reaction_adds_first_and_removes_only_other_managed_names():
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append((method, kw))
+        if method == "reactions.add":
+            return {"ok": False, "error": "already_reacted"}
+        return {"ok": False, "error": "no_reaction"}
+
+    SlackIO(call, "t", dry_run=False).reconcile_source_reaction(
+        lifecycle_request(), "doge_notes"
+    )
+
+    assert calls[0] == (
+        "reactions.add",
+        {"channel": "C1", "timestamp": "0.5", "name": "doge_notes"},
+    )
+    removed = {kw["name"] for method, kw in calls[1:] if method == "reactions.remove"}
+    assert removed == {"face_vomiting", "warning", "rubbing", "blinkapproved"}
+    assert "review-no" not in removed
+    assert "eyes" not in removed
+
+
+@pytest.mark.parametrize("failure_method", ("reactions.add", "reactions.remove"))
+def test_lifecycle_reaction_failures_are_typed_and_stop_reconciliation(failure_method):
+    from boris_intake.slack_io import SlackLifecycleError
+
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append(method)
+        if method == failure_method:
+            return {"ok": False, "error": "ratelimited"}
+        return {"ok": True}
+
+    with pytest.raises(SlackLifecycleError, match="ratelimited"):
+        SlackIO(call, "t", dry_run=False).reconcile_source_reaction(
+            lifecycle_request(), "warning"
+        )
+
+    if failure_method == "reactions.add":
+        assert calls == ["reactions.add"]

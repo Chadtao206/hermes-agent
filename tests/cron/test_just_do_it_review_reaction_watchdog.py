@@ -131,6 +131,7 @@ def args(**overrides):
         "max_shows": m.MAX_SHOWS_PER_TICK,
         "clear_unresolved": [],
         "boris_reaction_style": "modern",
+        "lifecycle_rollout_watermark": 0,
         "verbose": False,
     }
     values.update(overrides)
@@ -216,6 +217,45 @@ def tick(rows, shows, *, state=None, slack=None, now=NOW, **arg_overrides):
         "shown": shown,
         "list_calls": len(listed),
     }
+
+
+class LifecycleOwnershipTest(unittest.TestCase):
+    def test_managed_lane_at_watermark_is_skipped_before_show_or_classification(self):
+        row = lane("t_managed", "done", created_at=NOW - 10)
+        row["created_by"] = "boris-slack-intake"
+
+        result = tick(
+            [row],
+            {},
+            lifecycle_rollout_watermark=NOW - 10,
+        )
+
+        self.assertEqual(result["shown"], [])
+        self.assertEqual(result["slack"].calls, [])
+        self.assertNotIn(PERMALINK, result["state"]["posts"])
+
+    def test_older_managed_and_new_unrelated_lanes_keep_legacy_behavior(self):
+        old = lane("t_old", "running", created_at=NOW - 20)
+        old["created_by"] = "boris-slack-intake"
+        unrelated = lane("t_unrelated", "running", created_at=NOW - 5)
+        unrelated["created_by"] = "other-review-intake"
+
+        old_result = tick(
+            [old],
+            {},
+            lifecycle_rollout_watermark=NOW - 10,
+        )
+        unrelated_result = tick(
+            [unrelated],
+            {},
+            lifecycle_rollout_watermark=NOW - 10,
+        )
+
+        self.assertEqual(old_result["slack"].adds, [(PERMALINK, "thinkies")])
+        self.assertEqual(
+            unrelated_result["slack"].adds,
+            [(PERMALINK, "thinkies")],
+        )
 
 
 # --- retained approval-path coverage (pre-existing behavior) ---------------

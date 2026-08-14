@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from boris_intake.models import (
     PRInfo,
     ReviewCommand,
     ReviewPolicy,
+    SemanticOutcome,
     WorkflowState,
 )
 from boris_intake.result import canonicalize_judgment, validate_judgment
@@ -105,8 +107,10 @@ class SlackFake:
         self.updates = []
         self.crashes = crashes or CrashOnce()
         self.fail_terminal = 0
+        self.fail_reaction = 0
         self.root_available = True
         self.uneditable = False
+        self.source_reactions = []
 
     def find_status(self, request):
         from boris_intake.reconciler import SlackRootUnavailable, SlackStatus
@@ -128,6 +132,9 @@ class SlackFake:
         self.crashes.after("status_post")
         return ts
 
+    def replace_status(self, request, text):
+        return self.post_status(request, text)
+
     def update_status(self, request, message_ts, text):
         from boris_intake.reconciler import SlackRootUnavailable, SlackStatusMissing
 
@@ -146,6 +153,16 @@ class SlackFake:
         self.updates.append(text)
         point = "terminal_update" if "READY" in text else "reviewing_update"
         self.crashes.after(point)
+
+    def reconcile_source_reaction(self, request, reaction):
+        if not self.root_available:
+            from boris_intake.reconciler import SlackRootUnavailable
+
+            raise SlackRootUnavailable("thread_not_found")
+        if self.fail_reaction:
+            self.fail_reaction -= 1
+            raise RuntimeError("reaction temporarily unavailable")
+        self.source_reactions.append(reaction)
 
 
 class GitHubFake:
@@ -197,13 +214,278 @@ class KanbanFake:
 
     def create_lane(self, request):
         self.creations += 1
-        lane_id = "t_review_1"
+        lane_id = f"t_review_{self.creations}"
         self.lanes[request.review_identity] = lane_id
         self.crashes.after("lane_create")
         return lane_id
 
     def lane_status(self, lane_id):
         return self.status
+
+
+def admit_batch(tmp_path):
+    store = Store(tmp_path / "review.db")
+    event = NormalizedEvent(
+        "C1", "channel", "U1", "1.0", None, "discarded", False, None
+    )
+    commands = tuple(
+        ReviewCommand(
+            owner="Ylopo",
+            repo=f"example-{index}",
+            pr_number=40 + index,
+            head_sha="a" * 40,
+            pr_author="octocat",
+            requester_user_id="U1",
+            requester_email="a@ylopo.com",
+            channel_id="C1",
+            message_ts="1.0",
+            root_thread_ts="1.0",
+            permalink="https://ylopo.slack.com/archives/C1/p10",
+            policy=ReviewPolicy(ignore_ci=False, rubric_version="2"),
+        )
+        for index in range(1, 4)
+    )
+    snapshot = GateSnapshot("sha256:empty", "2026-08-14T12:00:00Z", ())
+    requests = store.admit_event(
+        event, commands, (snapshot, snapshot, snapshot), 1_000_000.0
+    ).admitted
+    return store, requests
+
+
+@pytest.mark.parametrize("completion_order", ((1, 0, 2), (2, 0, 1)))
+def test_three_pr_children_complete_independently_and_aggregate_in_any_order(
+    tmp_path, completion_order
+):
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, requests = admit_batch(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    github = GitHubFake(requests[0].gate_snapshot)
+    kanban = KanbanFake()
+    kanban.status = "in_progress"
+    deps = ReconcilerDeps(slack=slack, github=github, kanban=kanban, now=clock)
+
+    while any(
+        store.get_request(request.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+        for request in requests
+    ):
+        tick(store, deps)
+        clock.advance()
+
+    children = [store.get_request(request.request_id) for request in requests]
+    assert len({request.status_message_ts for request in children}) == 3
+    assert all("REVIEWING" in slack.messages[request.request_id][1] for request in children)
+    assert slack.source_reactions[-1] == "rubbing"
+
+    payloads = {
+        0: canonicalize_judgment(validate_judgment(valid_payload())),
+        1: canonicalize_judgment(
+            validate_judgment(
+                valid_payload(
+                    nits=[{
+                        "title": "Rename local variable",
+                        "location": "src/update.py:12",
+                        "suggestion": "Use owner_id.",
+                    }]
+                )
+            )
+        ),
+        2: '{"summary":"untyped"}',
+    }
+    completed = set()
+    for index in completion_order:
+        request = requests[index]
+        store.submit_judgment(request.request_id, payloads[index], clock())
+        for _ in range(8):
+            tick(store, deps)
+            if (
+                store.get_request(request.request_id).workflow_state
+                is WorkflowState.COMPLETE
+            ):
+                break
+            clock.advance(15)
+        assert (
+            store.get_request(request.request_id).workflow_state
+            is WorkflowState.COMPLETE
+        )
+        completed.add(index)
+        assert slack.source_reactions[-1] == (
+            "warning" if 2 in completed else "rubbing"
+        )
+
+    assert slack.messages[requests[0].request_id][1].startswith("READY —")
+    assert "READY WITH COMMENTS" in slack.messages[requests[1].request_id][1]
+    assert "REVIEW INCOMPLETE" in slack.messages[requests[2].request_id][1]
+    assert github.publications == 2
+
+
+@pytest.mark.parametrize(
+    ("requests", "expected"),
+    (
+        ([SimpleNamespace(request_id="a", workflow_state=WorkflowState.REVIEWING, semantic_outcome=None, validated_result_json=None)], "rubbing"),
+        ([SimpleNamespace(request_id="a", workflow_state=WorkflowState.COMPLETE, semantic_outcome=SemanticOutcome.READY_FOR_HUMAN_REVIEW, validated_result_json='{"derived":{"presentation":"READY_CLEAN"}}')], "blinkapproved"),
+        ([SimpleNamespace(request_id="a", workflow_state=WorkflowState.COMPLETE, semantic_outcome=SemanticOutcome.READY_FOR_HUMAN_REVIEW, validated_result_json='{"derived":{"presentation":"READY_WITH_COMMENTS"}}')], "doge_notes"),
+        ([SimpleNamespace(request_id="a", workflow_state=WorkflowState.COMPLETE, semantic_outcome=SemanticOutcome.REVIEW_INCOMPLETE, validated_result_json="{}"), SimpleNamespace(request_id="b", workflow_state=WorkflowState.REVIEWING, semantic_outcome=None, validated_result_json=None)], "warning"),
+        ([SimpleNamespace(request_id="a", workflow_state=WorkflowState.COMPLETE, semantic_outcome=SemanticOutcome.ISSUES_FOUND, validated_result_json="{}"), SimpleNamespace(request_id="b", workflow_state=WorkflowState.COMPLETE, semantic_outcome=SemanticOutcome.REVIEW_INCOMPLETE, validated_result_json="{}")], "face_vomiting"),
+        ([SimpleNamespace(request_id="a", workflow_state=WorkflowState.DELIVERY_PENDING, semantic_outcome=SemanticOutcome.ISSUES_FOUND, validated_result_json="{}", terminal_status_confirmed=True), SimpleNamespace(request_id="b", workflow_state=WorkflowState.DELIVERY_PENDING, semantic_outcome=SemanticOutcome.READY_FOR_HUMAN_REVIEW, validated_result_json='{"derived":{"presentation":"READY_CLEAN"}}', terminal_status_confirmed=False)], "face_vomiting"),
+    ),
+)
+def test_aggregate_source_reaction_precedence(requests, expected):
+    from boris_intake.reconciler import _aggregate_source_reaction
+
+    assert _aggregate_source_reaction(tuple(requests)) == expected
+
+
+def test_terminal_child_waits_and_retries_when_source_reaction_fails(tmp_path):
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    github = GitHubFake(admitted.gate_snapshot)
+    kanban = KanbanFake()
+    deps = ReconcilerDeps(slack=slack, github=github, kanban=kanban, now=clock)
+
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+    judgment = validate_judgment(valid_payload())
+    store.submit_judgment(
+        admitted.request_id, canonicalize_judgment(judgment), clock()
+    )
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.DELIVERY_PENDING
+    ):
+        tick(store, deps)
+        clock.advance()
+
+    slack.fail_reaction = 1
+    attempted_at = clock()
+    tick(store, deps)
+
+    pending = store.get_request(admitted.request_id)
+    assert pending.workflow_state is WorkflowState.DELIVERY_PENDING
+    assert pending.terminal_status_confirmed is True
+    assert pending.next_attempt_at == attempted_at + 5
+    terminal_updates = [text for text in slack.updates if "READY" in text]
+    assert len(terminal_updates) == 1
+
+    clock.advance(5)
+    tick(store, deps)
+
+    assert store.get_request(admitted.request_id).workflow_state is WorkflowState.COMPLETE
+    assert len([text for text in slack.updates if "READY" in text]) == 1
+    assert slack.source_reactions[-1] == "blinkapproved"
+
+
+def test_sibling_workers_serialize_the_shared_source_reaction(tmp_path):
+    from boris_intake.reconciler import (
+        ReconcilerDeps,
+        _reconcile_source_reaction,
+    )
+
+    store, requests = admit_batch(tmp_path)
+    store._db.execute(
+        "UPDATE review_requests SET workflow_state=?, semantic_outcome=?, "
+        "validated_result_json=? WHERE request_id=?",
+        (
+            WorkflowState.DELIVERY_PENDING.value,
+            SemanticOutcome.REVIEW_INCOMPLETE.value,
+            "{}",
+            requests[0].request_id,
+        ),
+    )
+    store._db.execute(
+        "UPDATE review_requests SET workflow_state=?, semantic_outcome=?, "
+        "validated_result_json=? WHERE request_id=?",
+        (
+            WorkflowState.DELIVERY_PENDING.value,
+            SemanticOutcome.READY_FOR_HUMAN_REVIEW.value,
+            '{"derived":{"presentation":"READY_CLEAN"}}',
+            requests[1].request_id,
+        ),
+    )
+    store._db.commit()
+    clock = Clock()
+    slack = SlackFake()
+    deps = ReconcilerDeps(
+        slack=slack,
+        github=GitHubFake(requests[0].gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+    entered = threading.Event()
+    resume = threading.Event()
+    original_reconcile = slack.reconcile_source_reaction
+
+    def pause_after_first_reaction(request, reaction):
+        original_reconcile(request, reaction)
+        if not entered.is_set():
+            entered.set()
+            if not resume.wait(timeout=5):
+                raise AssertionError("source reaction owner did not resume")
+
+    slack.reconcile_source_reaction = pause_after_first_reaction
+    db_path = store.path
+    store.close()
+    owner_errors = []
+
+    def run_owner():
+        owner = Store(db_path)
+        try:
+            current = owner.get_request(requests[0].request_id)
+            _reconcile_source_reaction(
+                owner,
+                current,
+                deps,
+                delivered_request_id=current.request_id,
+            )
+        except BaseException as error:
+            owner_errors.append(error)
+        finally:
+            owner.close()
+
+    owner_thread = threading.Thread(target=run_owner)
+    owner_thread.start()
+    assert entered.wait(timeout=5)
+    sibling = Store(db_path)
+    current = sibling.get_request(requests[1].request_id)
+    try:
+        with pytest.raises(RuntimeError, match="source reaction is already claimed"):
+            _reconcile_source_reaction(
+                sibling,
+                current,
+                deps,
+                delivered_request_id=current.request_id,
+            )
+    finally:
+        resume.set()
+    owner_thread.join(timeout=5)
+
+    assert owner_thread.is_alive() is False
+    assert owner_errors == []
+    assert slack.source_reactions == ["warning"]
+
+    sibling._db.execute(
+        "UPDATE review_requests SET workflow_state=? WHERE request_id=?",
+        (WorkflowState.COMPLETE.value, requests[0].request_id),
+    )
+    sibling._db.commit()
+    _reconcile_source_reaction(
+        sibling,
+        current,
+        deps,
+        delivered_request_id=current.request_id,
+    )
+    sibling.close()
+
+    assert slack.source_reactions[-1] == "warning"
 
 
 @pytest.mark.parametrize(
