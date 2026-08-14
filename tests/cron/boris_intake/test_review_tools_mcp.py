@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 from types import SimpleNamespace
@@ -103,6 +104,91 @@ def test_public_handlers_accept_no_caller_selected_identity_or_destination():
     assert github_params == ("operation", "path")
     assert acceptance_params == ("reference",)
     assert submission_params == ("payload",)
+
+
+def test_submission_tool_exposes_the_complete_judgment_contract():
+    from boris_intake import review_tools_mcp
+
+    tools = asyncio.run(review_tools_mcp.server.list_tools())
+    schema = next(
+        tool for tool in tools if tool.name == "submit_review_result"
+    ).inputSchema
+    payload = schema["properties"]["payload"]
+
+    assert payload["additionalProperties"] is False
+    assert set(payload["required"]) == {
+        "summary",
+        "evidence_reviewed",
+        "verification_limits",
+        "blocking_issues",
+        "non_blocking_issues",
+        "risk_hypotheses",
+        "verification_gaps",
+        "release_conditions",
+        "nits",
+    }
+    anchor = payload["properties"]["evidence_reviewed"]["items"]
+    assert set(anchor["required"]) == {"kind", "reference"}
+    assert set(anchor["properties"]) == {"kind", "reference", "detail"}
+    assert set(anchor["properties"]["kind"]["enum"]) == {
+        "diff",
+        "test",
+        "ci",
+        "ticket",
+        "log",
+        "documentation",
+    }
+
+    issue = payload["properties"]["blocking_issues"]["items"]
+    assert set(issue["required"]) == {
+        "title",
+        "expected_behavior",
+        "changed_mechanism",
+        "trigger",
+        "consequence",
+        "impact_scope",
+        "evidence_anchors",
+        "action",
+    }
+    assert issue["properties"]["evidence_anchors"]["items"] == anchor
+
+    risk = payload["properties"]["risk_hypotheses"]["items"]
+    assert set(risk["required"]) == {
+        "title",
+        "observed_facts",
+        "hypothesized_link",
+        "unresolved_link",
+        "evidence_anchors",
+        "verification_step",
+    }
+    gap = payload["properties"]["verification_gaps"]["items"]
+    assert set(gap["required"]) == {
+        "title",
+        "unassessed_claim",
+        "evidence_inspected",
+        "missing_evidence",
+        "prevents_core_assessment",
+        "next_step",
+    }
+    assert "reason_code" in gap["properties"]
+    release = payload["properties"]["release_conditions"]["items"]
+    assert set(release["required"]) == {
+        "title",
+        "requirement",
+        "authoritative_source",
+        "phase",
+        "completion_criterion",
+    }
+    assert set(release["properties"]["phase"]["enum"]) == {
+        "merge",
+        "deployment",
+        "migration",
+        "rollout",
+        "production_validation",
+    }
+    nit = payload["properties"]["nits"]["items"]
+    assert set(nit["required"]) == {"title", "location"}
+    assert "suggestion" in nit["properties"]
 
 
 def test_missing_or_unbound_task_context_fails_closed(tmp_path, monkeypatch):
@@ -248,14 +334,25 @@ def test_submission_validates_and_is_idempotent_for_the_bound_task(tmp_path, mon
     assert json.loads(store.judgment_for_request(request.request_id))["summary"].startswith("No substantiated")
 
 
-def test_invalid_or_conflicting_submission_never_replaces_the_first_judgment(tmp_path, monkeypatch):
+def test_invalid_submission_returns_retryable_feedback_without_storing_a_judgment(
+    tmp_path, monkeypatch
+):
     module, store, request = bind_request(tmp_path, monkeypatch)
-    monkeypatch.setattr(module, "_complete_bound_task", lambda task, req, digest: True)
     invalid = valid_payload(code_owned="not allowed")
 
-    with pytest.raises(module.ValidationError, match="unknown field"):
-        module.submit_review_result(invalid)
+    result = module.submit_review_result(invalid)
+
+    assert result["status"] == "validation_error"
+    assert result["error"] == "judgment has unknown field code_owned"
+    assert result["retry_same_judgment"] is True
     assert store.judgment_for_request(request.request_id) is None
+
+
+def test_conflicting_submission_never_replaces_the_first_judgment(
+    tmp_path, monkeypatch
+):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "_complete_bound_task", lambda task, req, digest: True)
 
     module.submit_review_result(valid_payload())
     first = store.judgment_for_request(request.request_id)

@@ -7,13 +7,18 @@ import re
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import WithJsonSchema
 
 from boris_intake.models import LifecycleRequest
-from boris_intake.result import ValidationError, canonicalize_judgment, validate_judgment
+from boris_intake.result import (
+    ValidationError,
+    canonicalize_judgment,
+    validate_judgment,
+)
 from boris_intake.store import Store
 
 
@@ -33,6 +38,171 @@ _OPERATIONS = frozenset({
     "file_at_head",
 })
 _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+
+_STRING_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 2_000}
+_ANCHOR_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["diff", "test", "ci", "ticket", "log", "documentation"],
+        },
+        "reference": _STRING_SCHEMA,
+        "detail": _STRING_SCHEMA,
+    },
+    "required": ["kind", "reference"],
+}
+_ANCHORS_SCHEMA = {
+    "type": "array",
+    "items": _ANCHOR_SCHEMA,
+    "minItems": 1,
+    "maxItems": 50,
+}
+_ISSUE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": _STRING_SCHEMA,
+        "expected_behavior": _STRING_SCHEMA,
+        "changed_mechanism": _STRING_SCHEMA,
+        "trigger": _STRING_SCHEMA,
+        "consequence": _STRING_SCHEMA,
+        "impact_scope": _STRING_SCHEMA,
+        "evidence_anchors": _ANCHORS_SCHEMA,
+        "action": _STRING_SCHEMA,
+    },
+    "required": [
+        "title",
+        "expected_behavior",
+        "changed_mechanism",
+        "trigger",
+        "consequence",
+        "impact_scope",
+        "evidence_anchors",
+        "action",
+    ],
+}
+_RISK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": _STRING_SCHEMA,
+        "observed_facts": _STRING_SCHEMA,
+        "hypothesized_link": _STRING_SCHEMA,
+        "unresolved_link": _STRING_SCHEMA,
+        "evidence_anchors": _ANCHORS_SCHEMA,
+        "verification_step": _STRING_SCHEMA,
+    },
+    "required": [
+        "title",
+        "observed_facts",
+        "hypothesized_link",
+        "unresolved_link",
+        "evidence_anchors",
+        "verification_step",
+    ],
+}
+_GAP_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": _STRING_SCHEMA,
+        "unassessed_claim": _STRING_SCHEMA,
+        "evidence_inspected": _ANCHORS_SCHEMA,
+        "missing_evidence": _STRING_SCHEMA,
+        "prevents_core_assessment": {"type": "boolean"},
+        "next_step": _STRING_SCHEMA,
+        "reason_code": {"type": "string", "minLength": 1, "maxLength": 128},
+    },
+    "required": [
+        "title",
+        "unassessed_claim",
+        "evidence_inspected",
+        "missing_evidence",
+        "prevents_core_assessment",
+        "next_step",
+    ],
+}
+_RELEASE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": _STRING_SCHEMA,
+        "requirement": _STRING_SCHEMA,
+        "authoritative_source": _STRING_SCHEMA,
+        "phase": {
+            "type": "string",
+            "enum": [
+                "merge",
+                "deployment",
+                "migration",
+                "rollout",
+                "production_validation",
+            ],
+        },
+        "completion_criterion": _STRING_SCHEMA,
+    },
+    "required": [
+        "title",
+        "requirement",
+        "authoritative_source",
+        "phase",
+        "completion_criterion",
+    ],
+}
+_NIT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": _STRING_SCHEMA,
+        "location": _STRING_SCHEMA,
+        "suggestion": _STRING_SCHEMA,
+    },
+    "required": ["title", "location"],
+}
+_JUDGMENT_PAYLOAD_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string", "minLength": 1, "maxLength": 4_000},
+        "evidence_reviewed": _ANCHORS_SCHEMA,
+        "verification_limits": {
+            "type": "array",
+            "items": _STRING_SCHEMA,
+            "maxItems": 50,
+        },
+        "blocking_issues": {"type": "array", "items": _ISSUE_SCHEMA, "maxItems": 50},
+        "non_blocking_issues": {
+            "type": "array",
+            "items": _ISSUE_SCHEMA,
+            "maxItems": 50,
+        },
+        "risk_hypotheses": {"type": "array", "items": _RISK_SCHEMA, "maxItems": 50},
+        "verification_gaps": {"type": "array", "items": _GAP_SCHEMA, "maxItems": 50},
+        "release_conditions": {
+            "type": "array",
+            "items": _RELEASE_SCHEMA,
+            "maxItems": 50,
+        },
+        "nits": {"type": "array", "items": _NIT_SCHEMA, "maxItems": 50},
+    },
+    "required": [
+        "summary",
+        "evidence_reviewed",
+        "verification_limits",
+        "blocking_issues",
+        "non_blocking_issues",
+        "risk_hypotheses",
+        "verification_gaps",
+        "release_conditions",
+        "nits",
+    ],
+}
+JudgmentPayload = Annotated[
+    dict[str, object],
+    WithJsonSchema(_JUDGMENT_PAYLOAD_SCHEMA),
+]
 
 
 def _bound_request() -> tuple[Store, LifecycleRequest, str]:
@@ -255,8 +425,15 @@ def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> b
 
 
 @server.tool()
-def submit_review_result(payload: dict) -> dict:
-    judgment = validate_judgment(payload)
+def submit_review_result(payload: JudgmentPayload) -> dict:
+    try:
+        judgment = validate_judgment(payload)
+    except ValidationError as error:
+        return {
+            "status": "validation_error",
+            "error": str(error),
+            "retry_same_judgment": True,
+        }
     canonical = canonicalize_judgment(judgment)
     digest = f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
     store, request, task_id = _bound_request()
