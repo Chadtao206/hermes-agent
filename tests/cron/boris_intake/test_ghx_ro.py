@@ -5,12 +5,18 @@ GHX_RO = Path(__file__).with_name("fixtures") / "ghx_ro.sh"
 TOKEN_FIXTURE = GHX_RO.with_name("gh_token")
 
 
-def run(args, scope="Ylopo/repo#1"):
+def run(args, scope="Ylopo/repo#1", head="a" * 40):
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "BORIS_PR_SCOPE": scope,
+        "BORIS_GH_TOKEN_PATH": str(TOKEN_FIXTURE),
+        "GHX_RO_DRY_RUN": "1",
+    }
+    if head is not None:
+        env["BORIS_PR_HEAD_SHA"] = head
     return subprocess.run(
         [str(GHX_RO), *args], capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "BORIS_PR_SCOPE": scope,
-             "BORIS_PR_HEAD_SHA": "a" * 40,
-             "BORIS_GH_TOKEN_PATH": str(TOKEN_FIXTURE), "GHX_RO_DRY_RUN": "1"},
+        env=env,
     )
 
 
@@ -62,6 +68,13 @@ def test_refuses_api_outside_org():
 
 def test_allows_pr_view():
     assert run(["pr", "view", "1", "-R", "Ylopo/repo"]).returncode == 0
+
+
+def test_allows_pr_head_discovery_before_a_head_is_pinned():
+    assert run(
+        ["pr", "view", "1", "-R", "Ylopo/repo"],
+        head=None,
+    ).returncode == 0
 
 
 def test_allows_pr_diff():
