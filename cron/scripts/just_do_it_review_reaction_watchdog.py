@@ -371,7 +371,7 @@ def run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[st
 
 def load_json(path: Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
 
