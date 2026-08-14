@@ -26,12 +26,22 @@ _PR_URL = re.compile(
     r"(?![0-9])"
 )
 
+_FLAG_TOKEN = re.compile(r"(?<!\S)--[A-Za-z][A-Za-z0-9-]*(?=$|\s)")
+_KNOWN_FLAGS = frozenset({"--ignore-ci"})
+
 
 @dataclass(frozen=True)
 class PRRef:
     owner: str
     repo: str
     number: int
+
+
+@dataclass(frozen=True)
+class ParsedRequest:
+    refs: tuple[PRRef, ...]
+    flags: tuple[str, ...]
+    unknown_flags: tuple[str, ...]
 
 
 def extract_pr_refs(text: str) -> list[PRRef]:
@@ -52,6 +62,23 @@ def extract_pr_refs(text: str) -> list[PRRef]:
         seen.add(key)
         refs.append(PRRef(m.group("owner"), m.group("repo"), number))
     return refs
+
+
+def parse_request(text: str) -> ParsedRequest:
+    text = text or ""
+    flags: list[str] = []
+    unknown: list[str] = []
+    seen: set[str] = set()
+    for match in _FLAG_TOKEN.finditer(text):
+        flag = match.group(0)
+        if flag in seen:
+            continue
+        seen.add(flag)
+        if flag in _KNOWN_FLAGS:
+            flags.append(flag)
+        else:
+            unknown.append(flag)
+    return ParsedRequest(tuple(extract_pr_refs(text)), tuple(flags), tuple(unknown))
 
 
 def mentions_bot(text: str, bot_user_id: str) -> bool:

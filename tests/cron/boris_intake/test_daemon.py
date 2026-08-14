@@ -15,7 +15,10 @@ BOT = "U0B9TK6B41M"
 LIVE = Config(mode="live", channels=("C1",), passive_channels=("C1",), bot_user_id=BOT)
 SHADOW = Config(mode="shadow", channels=("C1",), passive_channels=("C1",), bot_user_id=BOT)
 GOOD = Identity("U1", "a@ylopo.com", "T02PND103", False, False, False, False)
-KEY = "borisslack:Ylopo/repo#5@" + "f" * 40
+KEY = (
+    "borisslack:Ylopo/repo#5@" + "f" * 40
+    + ":policy=sha256:eef25c2554a4acb3fbe3ce70422a3149c8cc37d1bdf22f1934fef38bea96c936"
+)
 
 
 def msg(**kw):

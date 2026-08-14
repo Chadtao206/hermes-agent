@@ -3,11 +3,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from boris_intake.models import ReasonCode, Rejection, ReviewCommand
+from boris_intake.models import ReasonCode, Rejection, ReviewCommand, ReviewPolicy
 from boris_intake.slack_io import SlackIO
 
 CMD = ReviewCommand("Ylopo", "repo", 5, "f" * 40, "zjenkins", "U1", "a@ylopo.com",
-                    "C1", "1.0", "https://ylopo.slack.com/archives/C1/p10")
+                    "C1", "1.0", "1.0",
+                    "https://ylopo.slack.com/archives/C1/p10", ReviewPolicy(False))
 
 
 def recorder():
@@ -79,6 +80,17 @@ def test_rejection_reply_includes_reason():
     _, kw = calls[0]
     assert "Evil/x#1" in kw["text"]
     assert kw["thread_ts"] == "1.0"
+
+
+def test_unknown_flag_reply_is_the_supported_flags_contract():
+    calls, call = recorder()
+    detail = "Unknown review flag: --ignore-cii. Supported flags: --ignore-ci"
+
+    SlackIO(call, "t", dry_run=False).reply_rejection(
+        "C1", "1.0", Rejection(ReasonCode.UNKNOWN_FLAG, detail)
+    )
+
+    assert calls[0][1]["text"] == detail
 
 
 def test_dry_run_performs_no_network_calls():

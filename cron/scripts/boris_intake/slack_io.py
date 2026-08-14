@@ -58,6 +58,10 @@ class SlackIO:
             text=f"Boris is reviewing {cmd.slug} @ {cmd.head_sha[:7]}")
 
     def reply_rejection(self, channel: str, ts: str, rejection: Rejection) -> None:
+        if rejection.reason.value == "unknown_flag" and rejection.detail:
+            self._post("chat.postMessage", channel=channel, thread_ts=ts,
+                       text=rejection.detail)
+            return
         base = REASON_TEXT.get(rejection.reason.value, "I can't take that request.")
         detail = f" ({rejection.detail})" if rejection.detail else ""
         self._post("chat.postMessage", channel=channel, thread_ts=ts,

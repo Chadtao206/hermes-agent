@@ -177,6 +177,67 @@ def test_multiple_prs_yield_multiple_commands():
     assert [c.slug for c in r.commands] == ["Ylopo/a#1", "Ylopo/b#2"]
 
 
+def test_ignore_ci_policy_applies_to_every_pr_in_one_message():
+    text = (
+        "https://github.com/Ylopo/a/pull/1 --ignore-ci "
+        "https://github.com/Ylopo/b/pull/2"
+    )
+
+    r = evaluate(ev(text=text), CFG, deps())
+
+    assert len(r.commands) == 2
+    assert all(c.policy.ignore_ci for c in r.commands)
+    assert all(c.policy.rubric_version == "2" for c in r.commands)
+
+
+def test_policy_changes_review_idempotency_identity():
+    normal = evaluate(ev(), CFG, deps()).commands[0]
+    waived = evaluate(
+        ev(text="https://github.com/Ylopo/repo/pull/5 --ignore-ci"), CFG, deps()
+    ).commands[0]
+
+    assert normal.head_sha == waived.head_sha
+    assert normal.idempotency_key != waived.idempotency_key
+
+
+def test_unknown_flag_rejects_entire_message_before_remote_lookups():
+    calls = []
+    guarded = GateDeps(
+        identity=lambda uid: calls.append("identity"),
+        pr_info=lambda o, r, n: calls.append("pr"),
+        lane_for=lambda k: calls.append("lane"),
+        rate_verdict=lambda uid: calls.append("rate"),
+        now=lambda: 1_000_000.0,
+    )
+
+    r = evaluate(
+        ev(text="https://github.com/Ylopo/a/pull/1 --ignore-cii"), CFG, guarded
+    )
+
+    assert not r.accepted
+    assert reasons(r) == {ReasonCode.UNKNOWN_FLAG}
+    assert r.rejections[0].detail == (
+        "Unknown review flag: --ignore-cii. Supported flags: --ignore-ci"
+    )
+    assert calls == []
+
+
+def test_command_uses_source_thread_root_and_discards_slack_prose():
+    r = evaluate(
+        ev(
+            ts="3.0",
+            thread_ts="1.0",
+            text="secret prose https://github.com/Ylopo/repo/pull/5 --ignore-ci",
+        ),
+        CFG,
+        deps(),
+    )
+
+    cmd = r.commands[0]
+    assert cmd.root_thread_ts == "1.0"
+    assert "secret prose" not in repr(cmd)
+
+
 def test_mixed_org_message_accepts_only_allowed_org():
     text = "https://github.com/Ylopo/a/pull/1 https://github.com/Evil/b/pull/2"
     r = evaluate(ev(text=text), CFG, deps())

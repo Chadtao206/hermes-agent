@@ -6,6 +6,8 @@ it is the only thing that crosses into lane construction.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import Enum
 
@@ -23,6 +25,7 @@ class ReasonCode(str, Enum):
     ORG_NOT_ALLOWED = "org_not_allowed"
     PR_NOT_FOUND = "pr_not_found"
     PR_NOT_OPEN = "pr_not_open"
+    UNKNOWN_FLAG = "unknown_flag"
     DUPLICATE = "duplicate"
     RATE_LIMITED = "rate_limited"
 
@@ -71,6 +74,22 @@ class PRInfo:
 
 
 @dataclass(frozen=True)
+class ReviewPolicy:
+    ignore_ci: bool
+    rubric_version: str = "2"
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            {"ignore_ci": self.ignore_ci, "rubric_version": self.rubric_version},
+            separators=(",", ":"),
+        )
+
+    def fingerprint(self) -> str:
+        digest = hashlib.sha256(self.canonical_json().encode()).hexdigest()
+        return f"sha256:{digest}"
+
+
+@dataclass(frozen=True)
 class ReviewCommand:
     owner: str
     repo: str
@@ -81,7 +100,9 @@ class ReviewCommand:
     requester_email: str
     channel_id: str
     message_ts: str
+    root_thread_ts: str
     permalink: str
+    policy: ReviewPolicy
 
     @property
     def slug(self) -> str:
@@ -89,7 +110,10 @@ class ReviewCommand:
 
     @property
     def idempotency_key(self) -> str:
-        return f"borisslack:{self.owner}/{self.repo}#{self.pr_number}@{self.head_sha}"
+        return (
+            f"borisslack:{self.owner}/{self.repo}#{self.pr_number}@{self.head_sha}"
+            f":policy={self.policy.fingerprint()}"
+        )
 
 
 @dataclass(frozen=True)
