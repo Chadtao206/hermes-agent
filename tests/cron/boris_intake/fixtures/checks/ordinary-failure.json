@@ -1,0 +1,8 @@
+[
+  {
+    "name": "unit-tests",
+    "state": "FAILURE",
+    "link": "https://ci.example/unit-tests",
+    "required": true
+  }
+]
