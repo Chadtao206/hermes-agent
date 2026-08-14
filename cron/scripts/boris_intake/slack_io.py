@@ -40,6 +40,9 @@ REASON_TEXT = {
     "identity_lookup_failed": "I couldn't verify your Slack account just now — try again.",
     "org_not_allowed": "I only review PRs in the Ylopo GitHub org.",
     "pr_not_found": "I couldn't find that PR (or I can't see it).",
+    "gate_snapshot_unavailable": (
+        "I couldn't capture the required PR check state just now — try again."
+    ),
     "pr_not_open": "That PR isn't open.",
     "duplicate": "Already reviewed or in progress at that head.",
     "rate_limited": "Rate limited.",
@@ -229,12 +232,14 @@ class SlackIO:
 
     def reply_rejection(self, channel: str, ts: str, rejection: Rejection) -> None:
         if rejection.reason.value == "unknown_flag" and rejection.detail:
-            self._post(
-                "chat.postMessage", channel=channel, thread_ts=ts, text=rejection.detail
+            text = rejection.detail
+        else:
+            base = REASON_TEXT.get(rejection.reason.value, "I can't take that request.")
+            detail = f" ({rejection.detail})" if rejection.detail else ""
+            text = f"{base}{detail}"
+        if self.dry_run:
+            self._post("chat.postMessage", channel=channel, thread_ts=ts, text=text)
+        else:
+            self._lifecycle_call(
+                "chat.postMessage", channel=channel, thread_ts=ts, text=text
             )
-            return
-        base = REASON_TEXT.get(rejection.reason.value, "I can't take that request.")
-        detail = f" ({rejection.detail})" if rejection.detail else ""
-        self._post(
-            "chat.postMessage", channel=channel, thread_ts=ts, text=f"{base}{detail}"
-        )

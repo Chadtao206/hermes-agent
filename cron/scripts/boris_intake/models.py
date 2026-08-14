@@ -25,6 +25,7 @@ class ReasonCode(str, Enum):
     IDENTITY_NOT_TRUSTED = "identity_not_trusted"
     ORG_NOT_ALLOWED = "org_not_allowed"
     PR_NOT_FOUND = "pr_not_found"
+    GATE_SNAPSHOT_UNAVAILABLE = "gate_snapshot_unavailable"
     PR_NOT_OPEN = "pr_not_open"
     UNKNOWN_FLAG = "unknown_flag"
     DUPLICATE = "duplicate"

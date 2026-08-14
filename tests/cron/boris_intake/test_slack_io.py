@@ -101,6 +101,20 @@ def test_rejection_reply_includes_reason():
     assert kw["thread_ts"] == "1.0"
 
 
+def test_gate_snapshot_failure_reply_does_not_claim_the_pr_is_missing():
+    calls, call = recorder()
+
+    SlackIO(call, "t", dry_run=False).reply_rejection(
+        "C1",
+        "1.0",
+        Rejection(ReasonCode.GATE_SNAPSHOT_UNAVAILABLE, "Ylopo/repo#5"),
+    )
+
+    text = calls[0][1]["text"]
+    assert "required PR check state" in text
+    assert "couldn't find that PR" not in text
+
+
 def test_unknown_flag_reply_is_the_supported_flags_contract():
     calls, call = recorder()
     detail = "Unknown review flag: --ignore-cii. Supported flags: --ignore-ci"
@@ -110,6 +124,18 @@ def test_unknown_flag_reply_is_the_supported_flags_contract():
     )
 
     assert calls[0][1]["text"] == detail
+
+
+def test_rejection_reply_failure_is_typed():
+    from boris_intake.slack_io import SlackLifecycleError
+
+    def call(token, method, **kwargs):
+        return {"ok": False, "error": "ratelimited"}
+
+    with pytest.raises(SlackLifecycleError, match="ratelimited"):
+        SlackIO(call, "t", dry_run=False).reply_rejection(
+            "C1", "1.0", Rejection(ReasonCode.UNKNOWN_FLAG, "unsupported flag")
+        )
 
 
 def test_dry_run_performs_no_network_calls():
