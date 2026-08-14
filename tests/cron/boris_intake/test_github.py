@@ -99,6 +99,38 @@ def test_fetch_gate_snapshot_accepts_check_failure_exit_with_valid_json():
     ) is not None
 
 
+def test_fetch_gate_snapshot_treats_no_required_checks_exit_as_empty():
+    def run(cmd, **kwargs):
+        if "view" in cmd:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"headRefOid": "a" * 40}),
+                stderr="",
+            )
+        if "--required" in cmd:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="no required checks reported on the 'feature' branch\n",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([
+                {"name": "optional-lint", "state": "SUCCESS", "link": "https://ci/lint"}
+            ]),
+            stderr="",
+        )
+
+    snapshot = github.fetch_gate_snapshot(
+        "Ylopo", "repo", 1, "a" * 40, "2026-08-14T12:00:00Z", runner=run
+    )
+
+    assert snapshot is not None
+    assert [(check.check_name, check.required) for check in snapshot.checks] == [
+        ("optional-lint", False)
+    ]
+
+
 def test_fetch_gate_snapshot_fails_closed_when_required_check_is_missing_from_rollup():
     def run(cmd, **kwargs):
         if "view" in cmd:

@@ -72,6 +72,7 @@ def _run_json(
     runner,
     allowed_codes=(0,),
     token_path: Path | None = None,
+    empty_stderr_prefix: str | None = None,
 ):
     try:
         proc = runner(
@@ -89,6 +90,12 @@ def _run_json(
         return None
     if proc.returncode not in allowed_codes:
         return None
+    if (
+        empty_stderr_prefix
+        and not (proc.stdout or "").strip()
+        and str(proc.stderr or "").strip().startswith(empty_stderr_prefix)
+    ):
+        return []
     try:
         return json.loads(proc.stdout)
     except (TypeError, ValueError):
@@ -150,6 +157,7 @@ def fetch_gate_snapshot(
         runner,
         (0, 1),
         token_path,
+        "no required checks reported on the ",
     )
     if not isinstance(checks, list) or not isinstance(required, list):
         return None
