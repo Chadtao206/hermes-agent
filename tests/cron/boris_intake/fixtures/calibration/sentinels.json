@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "synthetic-missing-test-only",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000001",
+        "path": "synthetic://missing-test-only"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-01",
+        "case_type": "nonblocking",
+        "expected_outcome": "READY_FOR_HUMAN_REVIEW",
+        "expected_classification": "verification_gap:missing-test-is-not-a-defect"
+      },
+      "baseline_result_refs": ["synthetic://baseline/missing-test-only"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    },
+    {
+      "case_id": "synthetic-unresolved-inference",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000002",
+        "path": "synthetic://unresolved-inference"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-02",
+        "case_type": "nonblocking",
+        "expected_outcome": "READY_FOR_HUMAN_REVIEW",
+        "expected_classification": "risk_hypothesis:specific-unresolved-link"
+      },
+      "baseline_result_refs": ["synthetic://baseline/unresolved-inference"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    },
+    {
+      "case_id": "synthetic-limited-impact-defect",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000003",
+        "path": "synthetic://limited-impact-defect"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-03",
+        "case_type": "nonblocking",
+        "expected_outcome": "READY_FOR_HUMAN_REVIEW",
+        "expected_classification": "non_blocking_issue:limited-impact"
+      },
+      "baseline_result_refs": ["synthetic://baseline/limited-impact-defect"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    },
+    {
+      "case_id": "synthetic-material-auth-defect",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000004",
+        "path": "synthetic://material-auth-defect"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-04",
+        "case_type": "material_defect",
+        "expected_outcome": "ISSUES_FOUND",
+        "expected_classification": "blocking_issue:reachable-auth-bypass"
+      },
+      "baseline_result_refs": ["synthetic://baseline/material-auth-defect"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    },
+    {
+      "case_id": "synthetic-root-cause-deduplication",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000005",
+        "path": "synthetic://root-cause-deduplication"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-05",
+        "case_type": "material_defect",
+        "expected_outcome": "ISSUES_FOUND",
+        "expected_classification": "blocking_issue:one-root-cause-many-symptoms"
+      },
+      "baseline_result_refs": ["synthetic://baseline/root-cause-deduplication"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    },
+    {
+      "case_id": "synthetic-release-obligation",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000006",
+        "path": "synthetic://release-obligation"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-06",
+        "case_type": "nonblocking",
+        "expected_outcome": "READY_FOR_HUMAN_REVIEW",
+        "expected_classification": "release_condition:authoritative-migration-step"
+      },
+      "baseline_result_refs": ["synthetic://baseline/release-obligation"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    },
+    {
+      "case_id": "synthetic-required-ci-gate",
+      "evidence_bundle": {
+        "repository": "Ylopo/synthetic",
+        "head_sha": "0000000000000000000000000000000000000007",
+        "path": "synthetic://required-ci-gate"
+      },
+      "adjudication": {
+        "label_id": "synthetic-label-07",
+        "case_type": "gate_only",
+        "expected_outcome": "ISSUES_FOUND",
+        "expected_classification": "gate_only:required-ci-failure"
+      },
+      "baseline_result_refs": ["synthetic://baseline/required-ci-gate"],
+      "holdout": false,
+      "sentinel": true,
+      "baseline_false_blocker": false,
+      "synthetic": true
+    }
+  ]
+}
