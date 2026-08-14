@@ -18,7 +18,7 @@ CREATED_BY = "boris-slack-intake"
 KANBAN_DB = "/Users/ctao/.hermes/kanban.db"
 
 #: Statuses that mean a lane is finished. Anything else counts as in flight.
-TERMINAL_STATUSES = ("done", "archived")
+TERMINAL_STATUSES = ("done", "archived", "blocked")
 
 
 def lane_idempotency_key(request: LifecycleRequest) -> str:
