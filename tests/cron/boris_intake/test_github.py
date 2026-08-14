@@ -7,6 +7,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from boris_intake import github
 from boris_intake.github import fetch_pr
+from boris_intake.models import (
+    GateSnapshot,
+    NormalizedEvent,
+    ReviewCommand,
+    ReviewPolicy,
+)
+from boris_intake.store import Store
 
 
 def fake_runner(payload, returncode=0):
@@ -105,3 +112,105 @@ def test_fetch_gate_snapshot_fails_closed_when_required_check_is_missing_from_ro
     assert github.fetch_gate_snapshot(
         "Ylopo", "repo", 1, "a" * 40, "2026-08-14T12:00:00Z", runner=run
     ) is None
+
+
+def lifecycle_request(tmp_path):
+    store = Store(tmp_path / "review.db")
+    command = ReviewCommand(
+        owner="Ylopo",
+        repo="example",
+        pr_number=42,
+        head_sha="a" * 40,
+        pr_author="octocat",
+        requester_user_id="U1",
+        requester_email="a@ylopo.com",
+        channel_id="C1",
+        message_ts="1.0",
+        root_thread_ts="1.0",
+        permalink="https://ylopo.slack.com/archives/C1/p10",
+        policy=ReviewPolicy(False),
+    )
+    event = NormalizedEvent(
+        "C1", "channel", "U1", "1.0", None, "discarded", False, None
+    )
+    snapshot = GateSnapshot("sha256:empty", "2026-08-14T12:00:00Z", ())
+    return store.admit_event(event, (command,), (snapshot,), 1_000_000.0).admitted[0]
+
+
+def test_lifecycle_review_lookup_matches_only_the_hidden_request_marker(tmp_path):
+    request = lifecycle_request(tmp_path)
+    token = tmp_path / "token"
+    token.write_text("secret", encoding="utf-8")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        payload = [
+            [
+                {
+                    "id": 1,
+                    "html_url": "https://github/reviews/1",
+                    "body": "ordinary comment",
+                },
+                {
+                    "id": 2,
+                    "html_url": "https://github/reviews/2",
+                    "body": (
+                        "ready\n<!-- boris-review request_id="
+                        f"{request.request_id} result_hash=sha256:{'a' * 64} -->"
+                    ),
+                },
+            ]
+        ]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    found = github.GitHubIO(token, runner=run).find_review(request)
+
+    assert found.review_id == "2"
+    assert found.url == "https://github/reviews/2"
+    assert found.body.startswith("ready")
+    assert calls[0][0] == [
+        "/opt/homebrew/bin/gh",
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/Ylopo/example/pulls/42/reviews?per_page=100",
+    ]
+    assert calls[0][1]["env"]["GH_TOKEN"] == "secret"
+
+
+def test_lifecycle_publication_posts_comment_review_with_body_on_json_input(tmp_path):
+    request = lifecycle_request(tmp_path)
+    token = tmp_path / "token"
+    token.write_text("secret", encoding="utf-8")
+    seen = {}
+
+    def run(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        payload = {
+            "id": 7,
+            "html_url": "https://github/reviews/7",
+            "body": "rendered body",
+        }
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    published = github.GitHubIO(token, runner=run).publish_review(
+        request, "rendered body"
+    )
+
+    assert published.review_id == "7"
+    assert seen["command"] == [
+        "/opt/homebrew/bin/gh",
+        "api",
+        "--method",
+        "POST",
+        "repos/Ylopo/example/pulls/42/reviews",
+        "--input",
+        "-",
+    ]
+    assert json.loads(seen["kwargs"]["input"]) == {
+        "event": "COMMENT",
+        "body": "rendered body",
+    }
+    assert "rendered body" not in seen["command"]

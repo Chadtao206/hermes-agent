@@ -125,3 +125,45 @@ def test_active_lane_count_counts_only_in_flight_intake_lanes(tmp_path):
 
 def test_active_lane_count_returns_zero_on_error(tmp_path):
     assert dispatch.active_lane_count(str(tmp_path / "missing.db")) == 0
+
+
+def test_kanban_lifecycle_lookup_uses_gate_aware_idempotency_and_reads_status(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "kanban.db"
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, idempotency_key TEXT, status TEXT)"
+    )
+    request = lifecycle_request(tmp_path)
+    key = request.review_identity + ":gate=" + request.gate_snapshot.fingerprint
+    connection.execute(
+        "INSERT INTO tasks VALUES (?,?,?)", ("t_exact", key, "in_progress")
+    )
+    connection.execute("INSERT INTO tasks VALUES (?,?,?)", ("t_other", "other", "done"))
+    connection.commit()
+    connection.close()
+
+    adapter = dispatch.KanbanIO(db)
+
+    assert adapter.find_lane(request) == "t_exact"
+    assert adapter.lane_status("t_exact") == "in_progress"
+    assert adapter.lane_status("t_missing") is None
+
+
+def test_kanban_lifecycle_create_delegates_to_the_typed_request(tmp_path):
+    request = lifecycle_request(tmp_path)
+    seen = []
+
+    def runner(command, **kwargs):
+        seen.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"id": "t_created"}),
+            stderr="",
+        )
+
+    adapter = dispatch.KanbanIO(tmp_path / "unused.db", runner=runner)
+
+    assert adapter.create_lane(request) == "t_created"
+    assert seen
