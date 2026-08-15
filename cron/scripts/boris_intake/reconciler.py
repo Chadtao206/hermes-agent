@@ -80,8 +80,10 @@ class GitHubLifecycleAdapter(Protocol):
 
 
 class KanbanAdapter(Protocol):
-    def find_lane(self, request: LifecycleRequest) -> str | None: ...
-    def create_lane(self, request: LifecycleRequest) -> str: ...
+    def find_lane(
+        self, request: LifecycleRequest, *, retry: bool = False
+    ) -> str | None: ...
+    def create_lane(self, request: LifecycleRequest, *, retry: bool = False) -> str: ...
     def lane_status(self, lane_id: str) -> str | None: ...
 
 
@@ -149,6 +151,7 @@ def _load_result(request: LifecycleRequest) -> StructuredResult:
 
 def _semantic(result: StructuredResult) -> SemanticOutcome:
     return SemanticOutcome(result.derived.outcome)
+
 
 
 def _aggregate_source_reaction(
@@ -310,6 +313,10 @@ def _reconcile_starting(
     lane_id = deps.kanban.find_lane(request)
     if lane_id is None:
         lane_id = deps.kanban.create_lane(request)
+    elif store.request_for_lane(lane_id) is not None:
+        lane_id = deps.kanban.find_lane(request, retry=True)
+        if lane_id is None:
+            lane_id = deps.kanban.create_lane(request, retry=True)
     if request.status_message_ts is None:
         raise ValueError("starting request has no Slack status identity")
     reviewing_text = _active_text(request, "REVIEWING")

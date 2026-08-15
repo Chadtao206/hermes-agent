@@ -456,6 +456,42 @@ class Store:
                     "WHERE review_identity=? AND gate_fingerprint=?",
                     (command.idempotency_key, snapshot.fingerprint),
                 ).fetchone()
+                if (
+                    existing
+                    and existing["workflow_state"]
+                    in (
+                        WorkflowState.COMPLETE.value,
+                        WorkflowState.SLACK_UNAVAILABLE.value,
+                    )
+                    and existing["semantic_outcome"]
+                    == SemanticOutcome.REVIEW_INCOMPLETE.value
+                    and existing["github_review_id"] is None
+                    and existing["github_review_url"] is None
+                ):
+                    self._db.execute(
+                        "UPDATE review_requests SET review_identity=? "
+                        "WHERE request_id=?",
+                        (
+                            f'{existing["review_identity"]}:retired='
+                            f'{existing["request_id"]}',
+                            existing["request_id"],
+                        ),
+                    )
+                    self._db.execute(
+                        "INSERT INTO request_events "
+                        "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                        (
+                            existing["request_id"],
+                            "retry_unlocked",
+                            json.dumps(
+                                {"channel": event.channel_id, "ts": event.ts},
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+                    existing = None
                 if existing:
                     request = self._request_from_row(existing)
                     duplicates.append(request)
