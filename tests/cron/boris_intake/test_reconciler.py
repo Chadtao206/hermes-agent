@@ -224,6 +224,86 @@ class KanbanFake:
         return self.status
 
 
+@pytest.mark.parametrize("existing_retry_lane", (None, "t_retry"))
+def test_prior_bound_lane_uses_request_scoped_retry_lane(
+    tmp_path, existing_retry_lane
+):
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    class TerminalLaneKanban:
+        def __init__(self):
+            self.retry_requested = False
+
+        def find_lane(self, request, *, retry=False):
+            return existing_retry_lane if retry else "t_prior"
+
+        def create_lane(self, request, *, retry=False):
+            self.retry_requested = retry
+            return "t_retry"
+
+        def lane_status(self, lane_id):
+            return "in_progress"
+
+    store, original = admit_request(tmp_path)
+    expected = WorkflowState.ADMITTED
+    for target in (
+        WorkflowState.STATUS_MESSAGE_PENDING,
+        WorkflowState.STARTING_REVIEW,
+        WorkflowState.REVIEWING,
+        WorkflowState.DELIVERY_PENDING,
+    ):
+        fields = {"lane_id": "t_prior"} if target is WorkflowState.REVIEWING else {}
+        assert store.transition(original.request_id, expected, target, **fields)
+        expected = target
+    assert store.transition(
+        original.request_id,
+        WorkflowState.DELIVERY_PENDING,
+        WorkflowState.COMPLETE,
+        semantic_outcome=SemanticOutcome.REVIEW_INCOMPLETE,
+        validated_result_json="{}",
+        terminal_status_confirmed=True,
+    )
+    retry_command = ReviewCommand(
+        owner=original.owner,
+        repo=original.repo,
+        pr_number=original.pr_number,
+        head_sha=original.head_sha,
+        pr_author=original.pr_author,
+        requester_user_id=original.requester_user_id,
+        requester_email=original.requester_email,
+        channel_id=original.channel_id,
+        message_ts="2.0",
+        root_thread_ts="2.0",
+        permalink="https://ylopo.slack.com/archives/C1/p20",
+        policy=original.policy,
+    )
+    retry_event = NormalizedEvent(
+        "C1", "channel", "U1", "2.0", None, "discarded", False, None
+    )
+    admitted = store.admit_event(
+        retry_event, (retry_command,), (original.gate_snapshot,), 1_000_001.0
+    ).admitted[0]
+    clock = Clock()
+    kanban = TerminalLaneKanban()
+    deps = ReconcilerDeps(
+        slack=SlackFake(),
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=kanban,
+        now=clock,
+    )
+
+    for _ in range(4):
+        tick(store, deps)
+        clock.advance()
+        if store.get_request(admitted.request_id).workflow_state is WorkflowState.REVIEWING:
+            break
+
+    reviewing = store.get_request(admitted.request_id)
+    assert reviewing.workflow_state is WorkflowState.REVIEWING
+    assert reviewing.lane_id == "t_retry"
+    assert kanban.retry_requested is (existing_retry_lane is None)
+
+
 def admit_batch(tmp_path):
     store = Store(tmp_path / "review.db")
     event = NormalizedEvent(

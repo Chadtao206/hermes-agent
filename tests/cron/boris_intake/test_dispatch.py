@@ -84,6 +84,25 @@ def test_create_lane_uses_dedicated_profile_and_gate_aware_idempotency(tmp_path)
     )
 
 
+def test_retry_lane_scopes_idempotency_to_the_new_request(tmp_path):
+    request = lifecycle_request(tmp_path)
+    seen = {}
+
+    def runner(cmd, **kw):
+        seen["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"id": "t_retry"}), stderr="")
+
+    assert dispatch.create_lane(request, runner=runner, retry=True) == "t_retry"
+    argv = seen["cmd"]
+    assert argv[argv.index("--idempotency-key") + 1] == (
+        request.review_identity
+        + ":gate="
+        + request.gate_snapshot.fingerprint
+        + ":retry="
+        + request.request_id
+    )
+
+
 def test_create_lane_raises_when_no_id_returned(tmp_path):
     def runner(cmd, **kw):
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
@@ -149,6 +168,29 @@ def test_kanban_lifecycle_lookup_uses_gate_aware_idempotency_and_reads_status(tm
     assert adapter.find_lane(request) == "t_exact"
     assert adapter.lane_status("t_exact") == "in_progress"
     assert adapter.lane_status("t_missing") is None
+
+
+def test_kanban_retry_lookup_includes_archived_lane(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "kanban.db"
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, idempotency_key TEXT, status TEXT)"
+    )
+    request = lifecycle_request(tmp_path)
+    connection.execute(
+        "INSERT INTO tasks VALUES (?,?,?)",
+        (
+            "t_retry",
+            dispatch.lane_idempotency_key(request, retry=True),
+            "archived",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    assert dispatch.KanbanIO(db).find_lane(request, retry=True) == "t_retry"
 
 
 def test_kanban_lifecycle_create_delegates_to_the_typed_request(tmp_path):

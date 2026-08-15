@@ -232,6 +232,49 @@ def test_equivalent_completed_request_is_still_a_duplicate(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "terminal_state",
+    (models.WorkflowState.COMPLETE, models.WorkflowState.SLACK_UNAVAILABLE),
+)
+def test_unpublished_incomplete_terminal_request_permits_a_new_attempt(
+    tmp_path, terminal_state
+):
+    s = Store(tmp_path / "s.db")
+    original = s.admit_event(
+        event("1.0"), (command(ts="1.0"),), (snapshot(),), 1_000_000.0
+    ).admitted[0]
+    transitions = (
+        models.WorkflowState.STATUS_MESSAGE_PENDING,
+        models.WorkflowState.STARTING_REVIEW,
+        models.WorkflowState.REVIEWING,
+        models.WorkflowState.DELIVERY_PENDING,
+    )
+    expected = models.WorkflowState.ADMITTED
+    for target in transitions:
+        assert s.transition(original.request_id, expected, target)
+        expected = target
+    assert s.transition(
+        original.request_id,
+        models.WorkflowState.DELIVERY_PENDING,
+        terminal_state,
+        semantic_outcome=models.SemanticOutcome.REVIEW_INCOMPLETE,
+        validated_result_json="{}",
+        terminal_status_confirmed=True,
+    )
+
+    result = s.admit_event(
+        event("2.0"),
+        (replace(command(ts="2.0"), root_thread_ts="2.0"),),
+        (snapshot(),),
+        1_000_001.0,
+    )
+
+    assert len(result.admitted) == 1
+    assert result.admitted[0].request_id != original.request_id
+    assert result.duplicates == ()
+    assert s.get_request(original.request_id).workflow_state is terminal_state
+
+
+@pytest.mark.parametrize(
     ("command_changes", "gate_fingerprint"),
     (
         ({"head": "b" * 40}, "sha256:gate-a"),

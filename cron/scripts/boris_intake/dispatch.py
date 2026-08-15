@@ -21,8 +21,9 @@ KANBAN_DB = "/Users/ctao/.hermes/kanban.db"
 TERMINAL_STATUSES = ("done", "archived", "blocked")
 
 
-def lane_idempotency_key(request: LifecycleRequest) -> str:
-    return request.review_identity + ":gate=" + request.gate_snapshot.fingerprint
+def lane_idempotency_key(request: LifecycleRequest, *, retry: bool = False) -> str:
+    key = request.review_identity + ":gate=" + request.gate_snapshot.fingerprint
+    return f"{key}:retry={request.request_id}" if retry else key
 
 
 def active_lane_count(db_path: str = KANBAN_DB) -> int:
@@ -51,9 +52,11 @@ def active_lane_count(db_path: str = KANBAN_DB) -> int:
     return int(row[0]) if row else 0
 
 
-def create_lane(request: LifecycleRequest, runner=subprocess.run) -> str:
+def create_lane(
+    request: LifecycleRequest, runner=subprocess.run, *, retry: bool = False
+) -> str:
     title, body = render(request)
-    idempotency_key = lane_idempotency_key(request)
+    idempotency_key = lane_idempotency_key(request, retry=retry)
     argv = [
         PY,
         "-m",
@@ -112,17 +115,19 @@ class KanbanIO:
         except sqlite3.Error as error:
             raise RuntimeError("Kanban lifecycle lookup failed") from error
 
-    def find_lane(self, request: LifecycleRequest) -> str | None:
+    def find_lane(
+        self, request: LifecycleRequest, *, retry: bool = False
+    ) -> str | None:
         rows = self._query(
             "SELECT id FROM tasks WHERE idempotency_key=? ORDER BY id",
-            (lane_idempotency_key(request),),
+            (lane_idempotency_key(request, retry=retry),),
         )
         if len(rows) > 1:
             raise RuntimeError("multiple Kanban lanes have the review idempotency key")
         return str(rows[0]["id"]) if rows else None
 
-    def create_lane(self, request: LifecycleRequest) -> str:
-        return create_lane(request, runner=self._runner)
+    def create_lane(self, request: LifecycleRequest, *, retry: bool = False) -> str:
+        return create_lane(request, runner=self._runner, retry=retry)
 
     def lane_status(self, lane_id: str) -> str | None:
         rows = self._query(
