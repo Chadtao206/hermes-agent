@@ -58,6 +58,12 @@ contract rather than treating test absence itself as the defect.
 Set `prevents_core_assessment` only when unavailable evidence makes the changed
 behavior itself impossible to assess. Such a gap requires a stable `reason_code`
 and concrete retry step. Otherwise it is a Ready with Comments observation.
+Diff size alone never qualifies: page through `pr_diff` and read the changed
+files directly before claiming the diff was unavailable. Unavailable acceptance
+evidence never qualifies either: an unauthorized `read_acceptance_evidence`
+reference limits contract-conformance judgment, not assessment of the changed
+behavior. Record the gap, state the limit, and assess the changed code on its
+own terms.
 Do not add a duplicate verification finding when a concrete defect is already
 substantiated.
 
