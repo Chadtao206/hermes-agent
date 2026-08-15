@@ -3598,9 +3598,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
 
     _migrate_review_generation_registry(conn)
-    _add_column_if_missing(
-        conn, "kanban_controller_claims", "tenant", "tenant TEXT NOT NULL DEFAULT ''"
-    )
+    claims_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='kanban_controller_claims'"
+    ).fetchone() is not None
+    if claims_table_exists:
+        _add_column_if_missing(
+            conn, "kanban_controller_claims", "tenant", "tenant TEXT NOT NULL DEFAULT ''"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
