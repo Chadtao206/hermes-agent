@@ -153,6 +153,13 @@ def _semantic(result: StructuredResult) -> SemanticOutcome:
     return SemanticOutcome(result.derived.outcome)
 
 
+def _slack_only(result: StructuredResult) -> bool:
+    """Incomplete reviews skip GitHub unless they carry findings worth publishing."""
+    return (
+        result.derived.outcome == SemanticOutcome.REVIEW_INCOMPLETE.value
+        and result.derived.presentation != "INCOMPLETE_WITH_FINDINGS"
+    )
+
 
 def _aggregate_source_reaction(
     requests: tuple[LifecycleRequest, ...],
@@ -430,7 +437,7 @@ def _reconcile_reviewing(
         )
         target = (
             WorkflowState.DELIVERY_PENDING
-            if result.derived.outcome == SemanticOutcome.REVIEW_INCOMPLETE.value
+            if _slack_only(result)
             else WorkflowState.PUBLICATION_PENDING
         )
         fields = {
@@ -506,7 +513,7 @@ def _reconcile_gate_wait(
         )
         target = (
             WorkflowState.DELIVERY_PENDING
-            if result.derived.outcome == SemanticOutcome.REVIEW_INCOMPLETE.value
+            if _slack_only(result)
             else WorkflowState.PUBLICATION_PENDING
         )
     store.transition(

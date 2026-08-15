@@ -1462,3 +1462,35 @@ def test_main_fails_closed_when_slack_token_is_missing(monkeypatch, tmp_path):
     assert reconciler.main() == 2
     assert not Path(reconciler.DB_PATH).exists()
     assert not Path(reconciler.HEARTBEAT).exists()
+
+
+def test_slack_only_routing_sends_findings_to_github_and_bare_incompletes_to_slack(tmp_path):
+    from boris_intake.reconciler import _slack_only
+    from boris_intake import result as result_module
+
+    store, admitted = admit_request(tmp_path)
+
+    def assemble(**payload_changes):
+        judgment = validate_judgment(valid_payload(**payload_changes))
+        return result_module.assemble_result(
+            admitted, judgment, admitted.gate_snapshot, None, "2026-08-14T12:01:00Z"
+        )
+
+    core_gap = {
+        "title": "Cross-repo states unassessed",
+        "unassessed_claim": "The linked PR states are accurate.",
+        "evidence_inspected": [{"kind": "diff", "reference": "PR diff"}],
+        "missing_evidence": "Snapshots of each linked repository.",
+        "prevents_core_assessment": True,
+        "next_step": "Attach immutable snapshots for each linked PR.",
+        "reason_code": "CROSS_REPO_STATUS_EVIDENCE_UNAVAILABLE",
+    }
+    bare = assemble(verification_gaps=[core_gap])
+    with_findings = assemble(
+        verification_gaps=[core_gap],
+        nits=[{"title": "Rename var", "location": "src/a.py:1", "suggestion": "Use owner_id."}],
+    )
+
+    assert _slack_only(bare) is True
+    assert _slack_only(with_findings) is False
+    assert _slack_only(assemble()) is False
