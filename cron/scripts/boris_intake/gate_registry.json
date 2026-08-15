@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "security_checks": [
+    "CodeQL",
+    "Snyk Security"
+  ],
+  "ordinary_checks": [
+    "build",
+    "deployment",
+    "lint",
+    "optional-lint",
+    "test",
+    "unit-tests"
+  ]
+}

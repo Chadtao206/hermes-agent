@@ -1,0 +1,8 @@
+[
+  {
+    "name": "unit-tests",
+    "state": "IN_PROGRESS",
+    "link": "https://ci.example/unit-tests",
+    "required": true
+  }
+]
