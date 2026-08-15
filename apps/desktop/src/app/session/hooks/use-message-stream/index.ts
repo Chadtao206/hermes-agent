@@ -13,6 +13,7 @@ import {
   mergeFinalAssistantText,
   reasoningPart,
   renderMediaTags,
+  sealOpenToolParts,
   upsertToolPart
 } from '@/lib/chat-messages'
 import {
@@ -22,6 +23,7 @@ import {
 } from '@/lib/generated-images'
 import { parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
+import { isDiskFullErrorMessage, notifyError } from '@/store/notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { upsertSubagent } from '@/store/subagents'
 import { setSessionTodos } from '@/store/todos'
@@ -187,6 +189,9 @@ export function useMessageStream({
   // What the previous flush cost on the main thread — drives the adaptive
   // flush floor in scheduleDeltaFlush so multi-stream load yields to input.
   const lastFlushCostRef = useRef<number>(0)
+  // The pending commit-cost measurement rAF, so a newer flush (or unmount)
+  // can cancel it instead of letting parked callbacks pile up while hidden.
+  const measureRafRef = useRef<number | null>(null)
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
   // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
   const compactedTurnRef = useRef<Set<string>>(new Set())
@@ -256,6 +261,8 @@ export function useMessageStream({
     // keeps the thread ~75% idle for input at any load: cheap flushes stay at
     // 30fps of text growth, expensive multi-stream flushes degrade text fps
     // instead of interactivity — capped so text never updates slower than 4/s.
+    // The cost has to include the deferred view-sync frame where the commit
+    // actually happens; see runFlush below.
     const sinceLast = performance.now() - lastFlushAtRef.current
 
     const adaptiveFloor = Math.min(
@@ -268,23 +275,57 @@ export function useMessageStream({
       const startedAt = performance.now()
       lastFlushAtRef.current = startedAt
       flushQueuedDeltas()
-      lastFlushCostRef.current = performance.now() - startedAt
+      // The store write above is only the cheap half of a flush. While a
+      // session streams, syncSessionStateToView defers the $messages publish
+      // (and with it the React commit + Streamdown re-parse the floor is meant
+      // to account for) to its own rAF inside updateSessionState, which runs
+      // after this timer task. Stopping the clock here pins lastFlushCostRef
+      // near zero and collapses the adaptive floor to 33ms no matter the load.
+      // Our rAF is registered after the view-sync one, so it runs in the same
+      // frame right after that commit; its timestamp marks frame start, so
+      // (now - frameStart) counts only work done inside the frame, not the
+      // vsync wait. A hidden renderer never fires rAF, so the write cost
+      // stays as the fallback.
+      const writeCost = performance.now() - startedAt
+      lastFlushCostRef.current = writeCost
+
+      // At most one measurement rAF may be pending: only the newest flush's
+      // measurement matters (the guard below discards stale frames), and a
+      // hidden renderer parks rAF callbacks — without cancellation a long
+      // hidden stream at the floor would accumulate thousands of parked
+      // closures that all fire in the first frame on refocus.
+      if (measureRafRef.current !== null) {
+        window.cancelAnimationFrame(measureRafRef.current)
+      }
+
+      measureRafRef.current = window.requestAnimationFrame(frameStart => {
+        measureRafRef.current = null
+
+        // A newer flush already started; its own measurement wins.
+        if (lastFlushAtRef.current !== startedAt) {
+          return
+        }
+
+        lastFlushCostRef.current = writeCost + Math.max(0, performance.now() - frameStart)
+      })
     }
 
     // Always a timer, never requestAnimationFrame. Chromium pauses rAF for a
     // renderer it considers hidden, and "hidden" is not something this code can
-    // verify: `backgroundThrottling: false` plus the process-level switches in
-    // electron/main.ts cover the blurred and occluded cases, but they don't
-    // cover a minimized window, a fully off-screen one, or a renderer the
-    // compositor has otherwise parked. In those states an rAF-gated flush never
-    // runs, so a finished answer sits in this queue until some later input or
-    // focus event happens to wake a frame — the reply looks stalled, then
-    // arrives all at once on refocus.
+    // verify: while a turn is in flight the main process unthrottles every chat
+    // window (stream-throttle.ts), but that doesn't guarantee frames for a
+    // minimized window, a fully off-screen one, or a renderer the compositor
+    // has otherwise parked. In those states an rAF-gated flush never runs, so a
+    // finished answer sits in this queue until some later input or focus event
+    // happens to wake a frame — the reply looks stalled, then arrives all at
+    // once on refocus.
     //
     // A timer keeps the same coalescing cadence (that's what the floor above is
     // for) while guaranteeing delivery without user interaction. Timers are
-    // clamped in background renderers rather than suspended, and
-    // disable-background-timer-throttling already opts out of that clamp.
+    // clamped in background renderers rather than suspended, and the
+    // stream-aware unthrottle lifts even that clamp for the life of the turn;
+    // in the worst case (a delta arriving before the unthrottle lands) the
+    // clamp only stretches one flush to ~1s in a window nobody can see.
     flushHandleRef.current = window.setTimeout(runFlush, Math.max(0, adaptiveFloor - sinceLast))
   }, [flushQueuedDeltas])
 
@@ -309,10 +350,45 @@ export function useMessageStream({
       }
 
       flushHandleRef.current = null
+
+      if (measureRafRef.current !== null && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(measureRafRef.current)
+      }
+
+      measureRafRef.current = null
       flushQueuedDeltas()
     },
     [flushQueuedDeltas]
   )
+
+  // Page Visibility does not report every Windows/Linux focus transition.
+  // Flush queued deltas on both signals so returning to a chat cannot leave a
+  // completed chunk waiting for the next throttled timer.
+  // eslint-disable-next-line no-restricted-syntax -- timer-handle clear inside effect, not an atom mirror
+  useEffect(() => {
+    const flushPendingDeltas = () => {
+      if (flushHandleRef.current !== null) {
+        window.clearTimeout(flushHandleRef.current)
+        flushHandleRef.current = null
+      }
+
+      flushQueuedDeltas()
+    }
+
+    const flushWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        flushPendingDeltas()
+      }
+    }
+
+    document.addEventListener('visibilitychange', flushWhenVisible)
+    window.addEventListener('focus', flushPendingDeltas)
+
+    return () => {
+      document.removeEventListener('visibilitychange', flushWhenVisible)
+      window.removeEventListener('focus', flushPendingDeltas)
+    }
+  }, [flushQueuedDeltas])
 
   const appendAssistantDelta = useCallback(
     (sessionId: string, delta: string) => {
@@ -557,16 +633,29 @@ export function useMessageStream({
               nextMessages = prev.map((message, messageIndex) =>
                 messageIndex === index ? completeMessage(message) : message
               )
-            } else if (interimBoundaryPending && (responsePreviewed || finalContinuesInterim)) {
+            } else if ((interimBoundaryPending && responsePreviewed) || finalContinuesInterim) {
               // Settle the interim in place instead of creating a duplicate —
-              // the DB has one row, so the live UI must agree. Previously this
-              // was gated on `responsePreviewed` alone, so a NON-previewed
-              // tool-call turn whose final matched its sealed interim appended a
-              // second bubble (the "renders twice: partial first copy + clean
-              // final" bug, #63679). `finalContinuesInterim` closes that gap
-              // for ordinary tool-call turns while `responsePreviewed` still
-              // covers the verify-on-stop continuation-budget case even when the
-              // final text was rewritten and no longer shares a prefix.
+              // the DB has one row, so the live UI must agree. Two distinct
+              // settle paths with different boundary requirements:
+              //
+              // • responsePreviewed covers the verify-on-stop continuation-
+              //   budget case, where the final may be a rewrite sharing no
+              //   prefix with the interim. Because there is no continuity
+              //   guarantee, it must stay gated on the session's
+              //   `interimBoundaryPending` flag: after a new `message.start`
+              //   resets the flag, a previewed final is a DISTINCT reply and
+              //   must append its own bubble, never overwrite the interim
+              //   (otherwise interim('old') → message.start →
+              //   complete({response_previewed: true, text: 'new'}) would
+              //   silently destroy 'old').
+              //
+              // • finalContinuesInterim (prefix-either-way continuity, same
+              //   text or one a prefix of the other) is safe to settle
+              //   flag-free: continuity can only hold for the SAME message,
+              //   so a `message.start` reset landing between this turn's
+              //   `message.interim` and `message.complete` must not force an
+              //   append of a duplicate bubble (#74560). This also closes the
+              //   non-previewed tool-call gap from #63679.
               nextMessages = prev.map((message, messageIndex) =>
                 messageIndex === index ? completeMessage(message) : message
               )
@@ -578,15 +667,30 @@ export function useMessageStream({
           }
         }
 
+        // Turn-settle reconciliation: a `tool.complete` event lost to a
+        // degraded websocket leaves its tool row spinning forever. The turn is
+        // provably done here — nothing can still be running — so seal any
+        // tool-call parts that never saw their completion event.
+        nextMessages = sealOpenToolParts(nextMessages)
+
         const hasInlineError = nextMessages.some(m => m.role === 'assistant' && m.error && !m.hidden)
         const lastVisible = [...nextMessages].reverse().find(m => !m.hidden)
         const unresolvedUserTail = lastVisible?.role === 'user'
+        // Having streamed the reply normally means this window owns the whole
+        // turn and re-reading stored history would be wasted work. That only
+        // holds for a turn it STARTED: an adopted one (resumed onto a session
+        // already running elsewhere) arrives reply-first, with no prompt row,
+        // so it has to hydrate or the user's own message never shows up.
         shouldHydrate =
-          !completionError && !hasInlineError && !unresolvedUserTail && (!state.sawAssistantPayload || !finalText)
+          !completionError &&
+          !hasInlineError &&
+          !unresolvedUserTail &&
+          (state.adoptedRunningTurn || !state.sawAssistantPayload || !finalText)
 
         return {
           ...state,
           messages: nextMessages,
+          adoptedRunningTurn: false,
           streamId: null,
           pendingBranchGroup: null,
           awaitingResponse: false,
@@ -596,6 +700,17 @@ export function useMessageStream({
           turnStartedAt: null
         }
       })
+
+      // Persistence / mid-turn disk-full failures land as a terminal frame with
+      // an error string, not a rejected prompt.submit. Toast them here so a
+      // full disk never looks like a silent no-reply. Only fire on actual
+      // failure signals — never on a healthy reply that happens to say
+      // "disk full".
+      const diskFullSignal = failure?.error || (failure ? text : '')
+
+      if (diskFullSignal && isDiskFullErrorMessage(diskFullSignal)) {
+        notifyError(new Error(diskFullSignal), translateNow('notifications.errors.diskFull'))
+      }
 
       scheduleSessionsRefresh()
 

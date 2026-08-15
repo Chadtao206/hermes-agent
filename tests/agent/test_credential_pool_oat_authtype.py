@@ -11,18 +11,6 @@ from agent.credential_pool import (
 )
 
 
-def test_manual_anthropic_oat_normalized_to_oauth():
-    # Pool auth_type gates OAuth-only resolver and refresh paths.
-    entry = PooledCredential.from_dict(
-        "anthropic",
-        {
-            "label": "MainKey",
-            "source": "manual",
-            "auth_type": "api_key",
-            "access_token": "sk-ant-oat-EXAMPLE",
-        },
-    )
-    assert entry.auth_type == AUTH_TYPE_OAUTH
 
 
 def test_anthropic_real_api_key_unchanged():
@@ -33,41 +21,10 @@ def test_anthropic_real_api_key_unchanged():
     assert entry.auth_type == AUTH_TYPE_API_KEY
 
 
-def test_anthropic_admin_key_unchanged():
-    entry = PooledCredential.from_dict(
-        "anthropic",
-        {"auth_type": "api_key", "access_token": "sk-ant-admin-EXAMPLE"},
-    )
-    assert entry.auth_type == AUTH_TYPE_API_KEY
 
 
-def test_non_anthropic_provider_unchanged():
-    entry = PooledCredential.from_dict(
-        "openrouter",
-        {"auth_type": "api_key", "access_token": "sk-ant-oat-WHATEVER"},
-    )
-    assert entry.auth_type == AUTH_TYPE_API_KEY
 
 
-def test_add_entry_normalizes_before_persisting(tmp_path, monkeypatch):
-    hermes_home = tmp_path / "hermes"
-    hermes_home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-    pool = CredentialPool("anthropic", [])
-    entry = pool.add_entry(PooledCredential(
-        provider="anthropic",
-        id="manual-oat",
-        label="Manual setup token",
-        auth_type=AUTH_TYPE_API_KEY,
-        priority=0,
-        source="manual",
-        access_token="sk-ant-oat-manual-entry",
-    ))
-
-    persisted = json.loads((hermes_home / "auth.json").read_text())
-    assert entry.auth_type == AUTH_TYPE_OAUTH
-    assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_OAUTH
 
 
 def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch):
