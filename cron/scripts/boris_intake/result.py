@@ -543,12 +543,26 @@ def _model_incomplete(gaps: tuple[VerificationGap, ...]) -> Incomplete | None:
     )
 
 
+def _publishable_findings(result: StructuredResult) -> bool:
+    """Observations worth publishing that are not the gaps causing incompleteness."""
+    return any((
+        result.non_blocking_issues,
+        result.risk_hypotheses,
+        result.release_conditions,
+        result.nits,
+        result.blocking_gate_conditions,
+        tuple(gap for gap in result.verification_gaps if not gap.prevents_core_assessment),
+    ))
+
+
 def derive_terminal(result: StructuredResult) -> DerivedResult:
     if result.incomplete is not None and result.incomplete.origin == "system":
         return DerivedResult("REVIEW_INCOMPLETE", "INCOMPLETE")
     if result.blocking_issues:
         return DerivedResult("ISSUES_FOUND", "ISSUES")
     if result.incomplete is not None:
+        if _publishable_findings(result):
+            return DerivedResult("REVIEW_INCOMPLETE", "INCOMPLETE_WITH_FINDINGS")
         return DerivedResult("REVIEW_INCOMPLETE", "INCOMPLETE")
     if result.blocking_gate_conditions:
         return DerivedResult("ISSUES_FOUND", "GATE_BLOCKED")
@@ -717,7 +731,8 @@ def _render_issues(title: str, observations: tuple[Issue, ...]) -> list[str]:
 
 
 def render_github(result: StructuredResult) -> str:
-    if result.derived.outcome == "REVIEW_INCOMPLETE" and not result.blocking_issues:
+    incomplete = result.derived.outcome == "REVIEW_INCOMPLETE"
+    if incomplete and result.derived.presentation != "INCOMPLETE_WITH_FINDINGS":
         raise ValidationError("incomplete results without a substantiated issue are audit-only")
     flags = "--ignore-ci" if result.policy.ignore_ci else "none"
     lines = [
@@ -728,6 +743,13 @@ def render_github(result: StructuredResult) -> str:
         "",
         result.summary,
     ]
+    if incomplete and result.incomplete is not None:
+        lines.extend((
+            "> **Core assessment was prevented.** The observations below are real but "
+            "partial — treat this as an unfinished review, not a verdict.",
+            f"> Missing evidence: {result.incomplete.detail}",
+            f"> To finish: {result.incomplete.retry_guidance}",
+        ))
     lines.extend(_render_issues("Blocking Issues", result.blocking_issues))
     if result.blocking_gate_conditions:
         lines.append("## Blocking Gate Conditions")
@@ -813,14 +835,15 @@ def render_slack(result: StructuredResult, github_url: str | None) -> str:
             result.incomplete.detail,
             f"Retry: {result.incomplete.retry_guidance}",
         ]
-        observations = any((
+        if result.derived.presentation == "INCOMPLETE_WITH_FINDINGS":
+            lines.append("Partial observations were published in the GitHub review.")
+        elif any((
             result.non_blocking_issues,
             result.risk_hypotheses,
             result.verification_gaps,
             result.release_conditions,
             result.nits,
-        ))
-        if observations:
+        )):
             lines.append("Partial observations were retained in the audit record and were not published.")
     elif result.derived.outcome == "ISSUES_FOUND":
         lines = [f"ISSUES FOUND — {target}"]

@@ -518,7 +518,7 @@ def test_renderers_keep_gate_failure_hypothesis_and_release_condition_distinct(t
     assert "Required checks blocking: unit-tests" in slack
 
 
-def test_incomplete_partial_observations_are_audit_only(tmp_path):
+def test_incomplete_partial_observations_publish_to_github_but_not_into_slack(tmp_path):
     module = result_module()
     request = lifecycle_request(tmp_path)
     judgment = module.validate_judgment(valid_payload(
@@ -528,8 +528,106 @@ def test_incomplete_partial_observations_are_audit_only(tmp_path):
         request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
     )
 
-    with pytest.raises(module.ValidationError, match="incomplete"):
-        module.render_github(assembled)
+    assert "Minor defect" in module.render_github(assembled)
     slack = module.render_slack(assembled, None)
     assert "Minor defect" not in slack
-    assert "retained" in slack
+    assert "published in the GitHub review" in slack
+
+
+def test_incomplete_review_with_other_findings_still_publishes_to_github(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(valid_payload(
+        verification_gaps=[gap(core=True, reason="CROSS_REPO_STATUS_EVIDENCE_UNAVAILABLE")],
+        non_blocking_issues=[issue("Duplicate ledger row")],
+        nits=[nit()],
+    ))
+
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+    body = module.render_github(assembled)
+
+    assert assembled.derived.outcome == "REVIEW_INCOMPLETE"
+    assert assembled.derived.presentation == "INCOMPLETE_WITH_FINDINGS"
+    assert "Core assessment was prevented" in body
+    assert "Duplicate ledger row" in body
+    assert "Rename local variable" in body
+
+
+def test_incomplete_review_with_nothing_else_stays_audit_only(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(
+        valid_payload(verification_gaps=[gap(core=True)])
+    )
+
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+
+    assert assembled.derived.presentation == "INCOMPLETE"
+    with pytest.raises(module.ValidationError, match="audit-only"):
+        module.render_github(assembled)
+
+
+def test_system_failure_never_publishes_even_though_it_is_incomplete(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    failure = module.SystemFailure("LANE_NO_VALID_RESULT", "Lane died.", "Repost the link.")
+
+    assembled = module.assemble_result(
+        request, None, request.gate_snapshot, failure, "2026-08-14T12:01:00Z"
+    )
+
+    assert assembled.derived.presentation == "INCOMPLETE"
+    with pytest.raises(module.ValidationError, match="audit-only"):
+        module.render_github(assembled)
+
+
+def test_slack_reports_publication_instead_of_claiming_findings_were_withheld(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(valid_payload(
+        verification_gaps=[gap(core=True)],
+        non_blocking_issues=[issue("Duplicate ledger row")],
+    ))
+
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+    text = module.render_slack(assembled, "https://github.com/Ylopo/example/pull/42#r1")
+
+    assert "were not published" not in text
+    assert "published in the GitHub review" in text
+    assert "https://github.com/Ylopo/example/pull/42#r1" in text
+
+
+def test_a_core_gap_alone_does_not_count_as_a_publishable_finding(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(valid_payload(verification_gaps=[
+        gap("core one", core=True, reason="A"),
+        gap("core two", core=True, reason="B"),
+    ]))
+
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+
+    assert assembled.derived.presentation == "INCOMPLETE"
+
+
+def test_a_noncore_gap_alongside_a_core_gap_is_worth_publishing(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(valid_payload(verification_gaps=[
+        gap("core one", core=True, reason="A"),
+        gap("soft one", core=False),
+    ]))
+
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+
+    assert assembled.derived.presentation == "INCOMPLETE_WITH_FINDINGS"
