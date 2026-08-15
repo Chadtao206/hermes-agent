@@ -37,6 +37,7 @@ _OPERATIONS = frozenset({
     "pr_comments",
     "file_at_head",
 })
+_DIFF_PAGE_BUDGET = 60_000
 _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 
 _STRING_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 2_000}
@@ -311,6 +312,96 @@ def _ensure_current_head(request: LifecycleRequest) -> None:
     _metadata(request)
 
 
+def _diff_sections(diff: str) -> list[tuple[str, str]]:
+    if not diff:
+        return []
+    sections: list[tuple[str, str]] = []
+    current_path = ""
+    current: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                sections.append((current_path, "".join(current)))
+            current_path = line.rstrip("\n").split(" b/")[-1]
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append((current_path, "".join(current)))
+    return sections
+
+
+def _split_oversized(path: str, text: str, budget: int) -> list[tuple[str, str]]:
+    """Break one file's diff at hunk boundaries, marking any hunk still too large."""
+    pieces: list[tuple[str, str]] = []
+    header: list[str] = []
+    hunks: list[list[str]] = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("@@"):
+            hunks.append([line])
+        elif hunks:
+            hunks[-1].append(line)
+        else:
+            header.append(line)
+    if not hunks:
+        return [(path, text[:budget])]
+    prefix = "".join(header)
+    for hunk in hunks:
+        body = "".join(hunk)
+        room = budget - len(prefix)
+        if len(body) > room:
+            marker = (
+                f"[boris: {len(body)} lines of this hunk omitted — "
+                f"read {path} with file_at_head for full content]\n"
+            )
+            kept = body[: max(room - len(marker) - 1, 0)].rsplit("\n", 1)[0]
+            omitted = body[len(kept) :].count("\n")
+            body = (
+                f"{kept}\n[boris: {omitted} lines of this hunk omitted — "
+                f"read {path} with file_at_head for full content]\n"
+            )
+        pieces.append((path, prefix + body))
+        prefix = ""
+    return pieces
+
+
+def paginate_diff(diff: str, page: int, budget: int = _DIFF_PAGE_BUDGET) -> dict:
+    """Page a unified diff at file boundaries so nothing is silently truncated."""
+    units: list[tuple[str, str]] = []
+    for path, text in _diff_sections(diff):
+        if len(text) > budget:
+            units.extend(_split_oversized(path, text, budget))
+        else:
+            units.append((path, text))
+
+    pages: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    size = 0
+    for unit in units:
+        if current and size + len(unit[1]) > budget:
+            pages.append(current)
+            current, size = [], 0
+        current.append(unit)
+        size += len(unit[1])
+    if current:
+        pages.append(current)
+    if not pages:
+        pages = [[]]
+
+    total = len(pages)
+    if page < 1 or page > total:
+        raise ToolError(f"diff page {page} is out of range (1..{total})")
+    selected = pages[page - 1]
+    return {
+        "diff": "".join(text for _, text in selected),
+        "page": page,
+        "total_pages": total,
+        "files_on_page": sorted({path for path, _ in selected if path}),
+        "has_more": page < total,
+        "all_files": sorted({path for path, _ in units if path}),
+    }
+
+
 server = FastMCP("boris_review")
 
 
@@ -324,6 +415,7 @@ def read_github_evidence(
         "file_at_head",
     ],
     path: str | None = None,
+    page: int = 1,
 ) -> dict:
     if operation not in _OPERATIONS:
         raise ToolError("unknown GitHub evidence operation")
@@ -333,6 +425,10 @@ def read_github_evidence(
         raise ToolError("path is valid only for file_at_head")
     else:
         file_path = ""
+    if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+        raise ToolError("page must be a positive integer")
+    if page != 1 and operation != "pr_diff":
+        raise ToolError("page is valid only for pr_diff")
 
     store, request, _ = _bound_request()
     try:
@@ -342,11 +438,12 @@ def read_github_evidence(
             _ensure_current_head(request)
             repository = f"{request.owner}/{request.repo}"
             if operation == "pr_diff":
-                data = _github(
+                raw = _github(
                     request,
                     ["pr", "diff", str(request.pr_number), "-R", repository],
                     expect_json=False,
                 )
+                data = paginate_diff(raw, page)
             elif operation == "pr_checks":
                 data = _github(
                     request,

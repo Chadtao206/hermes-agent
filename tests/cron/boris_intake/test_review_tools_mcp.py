@@ -101,7 +101,7 @@ def test_public_handlers_accept_no_caller_selected_identity_or_destination():
     acceptance_params = tuple(inspect.signature(review_tools_mcp.read_acceptance_evidence).parameters)
     submission_params = tuple(inspect.signature(review_tools_mcp.submit_review_result).parameters)
 
-    assert github_params == ("operation", "path")
+    assert github_params == ("operation", "path", "page")
     assert acceptance_params == ("reference",)
     assert submission_params == ("payload",)
 
@@ -383,3 +383,74 @@ def test_identical_retry_completes_the_task_after_a_completion_failure(tmp_path,
     }
     assert store.judgment_for_request(request.request_id) == stored
     assert len(attempts) == 2
+
+
+def diff_for(*files):
+    parts = []
+    for name, lines in files:
+        body = "".join(f"+line {n} of {name}\n" for n in range(lines))
+        parts.append(f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -0,0 +1,{lines} @@\n{body}")
+    return "".join(parts)
+
+
+def test_paginate_diff_keeps_every_file_across_pages_without_silent_loss(tmp_path, monkeypatch):
+    from boris_intake import review_tools_mcp as module
+
+    diff = diff_for(("a.py", 40), ("b.py", 40), ("c.py", 40))
+    seen, page, guard = [], 1, 0
+    while guard < 20:
+        guard += 1
+        result = module.paginate_diff(diff, page, budget=900)
+        seen.append(result["diff"])
+        assert result["all_files"] == ["a.py", "b.py", "c.py"]
+        if not result["has_more"]:
+            assert result["page"] == result["total_pages"]
+            break
+        page += 1
+
+    assert result["total_pages"] > 1, "budget should force more than one page"
+    assert "".join(seen) == diff
+
+
+def test_paginate_diff_marks_a_hunk_it_had_to_shorten(tmp_path, monkeypatch):
+    from boris_intake import review_tools_mcp as module
+
+    diff = diff_for(("huge.py", 400))
+    pages = [module.paginate_diff(diff, n, budget=1_000) for n in (1,)]
+    text = pages[0]["diff"]
+
+    assert "lines of this hunk omitted" in text
+    assert "file_at_head" in text
+    assert pages[0]["files_on_page"] == ["huge.py"]
+
+
+def test_paginate_diff_rejects_a_page_beyond_the_end(tmp_path, monkeypatch):
+    from boris_intake import review_tools_mcp as module
+
+    with pytest.raises(module.ToolError, match="out of range"):
+        module.paginate_diff(diff_for(("a.py", 2)), 5, budget=900)
+
+
+def test_pr_diff_returns_first_page_and_advertises_the_rest(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    big = diff_for(("x.py", 4000), ("y.py", 4000))
+    runner, calls = github_runner(evidence=big)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_diff")
+
+    assert result["data"]["page"] == 1
+    assert result["data"]["has_more"] is True
+    assert result["data"]["all_files"] == ["x.py", "y.py"]
+    assert len(result["data"]["diff"]) <= module._DIFF_PAGE_BUDGET
+
+
+def test_pr_diff_rejects_page_on_other_operations(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = github_runner()
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    with pytest.raises(module.ToolError, match="page is valid only"):
+        module.read_github_evidence("pr_checks", None, 2)
+    with pytest.raises(module.ToolError, match="positive integer"):
+        module.read_github_evidence("pr_diff", None, 0)
