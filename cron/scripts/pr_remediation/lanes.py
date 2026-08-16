@@ -27,7 +27,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from pr_remediation.boris_source import Verdict
+from pr_remediation.boris_source import EvidenceAnchor, Issue, Verdict
 
 DISPATCH = "/Users/ctao/.hermes/scripts/pr/kanban_dispatch.sh"
 ANCHOR_ROOT = os.environ.get(
@@ -73,15 +73,127 @@ def _repo_is_excluded(verdict: Verdict) -> bool:
     return full in _excluded_repos() or full.endswith(_EXCLUDED_REPO_SUFFIXES)
 
 
-def build_brief(verdict: Verdict, round_number: int) -> str:
-    issues = "\n".join(f"- {title}" for title in verdict.blocking_issues) or "- (none listed)"
-    return (
+# The brief is passed as a literal `--body <text>` argv token (see the module
+# docstring above), never written to a file first, so its size is bounded by
+# more than good taste. `Issue`'s own fields can each run to 2,000 characters
+# and an issue can carry up to 50 of them (boris_intake/review_tools_mcp.py's
+# own schema caps), so an unbounded render of `verdict.blocking_issues` could
+# in principle reach the megabytes -- and long before any OS argv limit, a
+# brief that size would blow out the context of the very agent it exists to
+# brief. 20,000 characters is generous next to the three-issue live brief
+# this was built against (a few kilobytes) while still refusing to hand an
+# agent a novel. See `_bounded`: truncation only ever eats the issue detail,
+# never the acceptance criteria or the branch/push footer, and it always
+# says so rather than cutting silently.
+MAX_BRIEF_CHARS = 20_000
+
+_TRUNCATION_NOTICE = (
+    "\n[BRIEF TRUNCATED: the blocking-issue detail above was cut to stay "
+    f"under this brief's {MAX_BRIEF_CHARS}-character cap. This is a "
+    "shortened view, not the complete evidence Boris recorded -- treat any "
+    "issue cut off mid-way as incomplete and re-check the PR's review "
+    "thread for it before assuming it does not apply.]\n"
+)
+
+
+def _anchor_line(anchor: EvidenceAnchor) -> str:
+    """One evidence anchor. `diff` anchors are surfaced as the file paths
+    they are -- real repo-relative paths -- which is what lets the agent go
+    straight to the code instead of rediscovering where a finding lives."""
+    label = "file" if anchor.kind == "diff" else anchor.kind
+    line = f"     - {label}: {anchor.reference}"
+    return line + (f" ({anchor.detail})" if anchor.detail else "")
+
+
+def _issue_block(number: int, issue: Issue) -> str:
+    lines = [f"{number}. {issue.title or '(untitled)'}"]
+    if issue.expected_behavior:
+        lines.append(f"   - Expected behavior: {issue.expected_behavior}")
+    if issue.changed_mechanism:
+        lines.append(f"   - Changed mechanism: {issue.changed_mechanism}")
+    if issue.trigger:
+        lines.append(f"   - Trigger: {issue.trigger}")
+    if issue.consequence:
+        lines.append(f"   - Consequence: {issue.consequence}")
+    if issue.impact_scope:
+        lines.append(f"   - Impact scope: {issue.impact_scope}")
+    if issue.action:
+        lines.append(f"   - Suggested action: {issue.action}")
+    if issue.evidence_anchors:
+        lines.append("   - Evidence:")
+        lines.extend(_anchor_line(a) for a in issue.evidence_anchors)
+    return "\n".join(lines)
+
+
+def _issues_section(issues: tuple[Issue, ...]) -> str:
+    if not issues:
+        return "(none listed)\n"
+    return "\n".join(_issue_block(n, issue) for n, issue in enumerate(issues, 1)) + "\n"
+
+
+def _bounded(header: str, issues_text: str, footer: str) -> str:
+    """Assemble the brief, truncating only `issues_text` -- never `header` or
+    `footer`, which is where the branch names and the acceptance criteria
+    live -- and saying so when it happens rather than cutting silently. See
+    MAX_BRIEF_CHARS above for why a cap exists at all.
+    """
+    budget = max(MAX_BRIEF_CHARS - len(header) - len(footer) - len(_TRUNCATION_NOTICE), 0)
+    if len(issues_text) <= budget:
+        return header + issues_text + footer
+    return header + issues_text[:budget].rstrip() + _TRUNCATION_NOTICE + footer
+
+
+def build_brief(verdict: Verdict, round_number: int, *,
+                base_branch: str | None = None,
+                head_branch: str | None = None) -> str:
+    """The remediation brief, dispatched as the lane's `--body`.
+
+    Renders the full issue objects Boris produced -- title, expected
+    behavior, changed mechanism, trigger, consequence, impact scope,
+    suggested action, and evidence anchors, with `diff` anchors surfaced as
+    the file paths they are -- rather than the bare titles the old brief
+    carried, which left the engineer agent to rediscover where each finding
+    lives before it could fix anything. `Verdict.blocking_issues` (see
+    boris_source.py) is what makes this possible: the whole issue survives
+    from the reviewing service through to here now, not only its title.
+
+    Adds two things the old brief never had. An "Acceptance criteria"
+    section, shaped like the comparable fast-lane briefs this service is
+    benchmarked against (see ylopo_pr_readiness's generated fix briefs),
+    gives the agent an actual stopping condition -- the old brief said what
+    to fix and what not to do, but never what "done" means. And the base and
+    head branch name, read once via GitHubIO.branches() and threaded in from
+    `_open_lane`, remove a real ambiguity: the old brief said "push" without
+    saying where, and the worktree a lane runs in is checked out on a
+    kanban-generated branch that is not the PR's -- pushing that branch
+    instead would look like progress and fix nothing.
+
+    `base_branch`/`head_branch` default to None (unreadable, or not asked
+    for) and degrade to a visible placeholder rather than a guess: never
+    silently omitted, and never a name invented for a branch nobody
+    confirmed.
+    """
+    unknown_head = ("(unknown -- confirm with `gh pr view`; this is NOT the "
+                    "worktree's own branch)")
+    header = (
         f"Remediate {verdict.slug} at exact head {verdict.head_sha}.\n"
+        f"Base branch: {base_branch or '(unknown -- confirm with `gh pr view`)'}\n"
+        f"Head branch: {head_branch or unknown_head}\n"
         f"This is remediation round {round_number}, driven by the Boris review loop.\n\n"
-        f"Boris raised these blocking issues:\n{issues}\n\n"
-        f"Fix them at this head and push. Do not open a new PR, do not force-push, "
-        f"and do not change the PR's base branch.\n"
+        f"Boris raised these blocking issues:\n"
     )
+    push_target = (f"the PR's head branch, `{head_branch}`" if head_branch else
+                   "the PR's head branch named above (NOT the worktree's own branch)")
+    footer = (
+        "\n## Acceptance criteria\n\n"
+        f"- All {len(verdict.blocking_issues)} listed blocking issue(s) are "
+        "cleared at a pushed head, with tests covering them.\n"
+        "- Do not open a new PR.\n"
+        "- Do not force-push.\n"
+        "- Do not change the PR's base branch.\n\n"
+        f"Fix them at this head and push to {push_target}.\n"
+    )
+    return _bounded(header, _issues_section(verdict.blocking_issues), footer)
 
 
 def idempotency_key(verdict: Verdict, round_number: int) -> str:
@@ -93,7 +205,14 @@ class LaneIO:
         self._kanban_db = Path(kanban_db)
         self._runner = runner
 
-    def create(self, verdict: Verdict, round_number: int) -> str | None:
+    def create(self, verdict: Verdict, round_number: int, *,
+               base_branch: str | None = None,
+               head_branch: str | None = None) -> str | None:
+        # base_branch/head_branch: read by the caller (loop.py's _open_lane,
+        # via GitHubIO.branches()) and threaded straight into the brief.
+        # Optional and default None so a caller that cannot read them --  or
+        # a test that does not care -- still dispatches a valid, if less
+        # specific, brief; see build_brief for how a missing value degrades.
         # --- repo-name path safety ---------------------------------------
         # verdict.repo is the only field used to build a filesystem path
         # below (ANCHOR_ROOT/<repo>), so validate it before any path is
@@ -142,7 +261,8 @@ class LaneIO:
             "--idempotency-key", idempotency_key(verdict, round_number),
             "--created-by", "boris-remediation-loop",
             "--max-retries", "1",
-            "--body", build_brief(verdict, round_number),
+            "--body", build_brief(verdict, round_number,
+                                  base_branch=base_branch, head_branch=head_branch),
         ]
         try:
             proc = self._runner(

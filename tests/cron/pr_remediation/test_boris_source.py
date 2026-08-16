@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from pr_remediation.boris_source import BorisSource, Verdict
+from pr_remediation.boris_source import BorisSource, EvidenceAnchor, Issue, Verdict
 from pr_remediation.config import RemediationConfig
 
 SCHEMA = """
@@ -48,7 +48,11 @@ def test_a_pr_chad_posted_and_authored_qualifies(tmp_path):
     verdicts = source.new_verdicts()
     assert len(verdicts) == 1
     assert verdicts[0].outcome == "ISSUES_FOUND"
-    assert verdicts[0].blocking_issues == ("Null deref in handler",)
+    # blocking_issues carries full Issue objects now, not bare title strings
+    # (see boris_source.Issue's module docstring) -- the fixture's payload
+    # supplies only a title, so every other field defaults to its empty
+    # value and this equality still pins the title exactly.
+    assert verdicts[0].blocking_issues == (Issue(title="Null deref in handler"),)
 
 
 def test_status_message_ts_is_carried_onto_the_verdict(tmp_path):
@@ -144,7 +148,7 @@ def test_non_dict_items_inside_blocking_issues_are_skipped(tmp_path):
         "incomplete": None,
     }))
     verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
-    assert verdict.blocking_issues == ("real issue",)
+    assert verdict.blocking_issues == (Issue(title="real issue"),)
 
 
 def test_incomplete_that_is_not_a_dict_does_not_crash(tmp_path):
@@ -154,6 +158,109 @@ def test_incomplete_that_is_not_a_dict_does_not_crash(tmp_path):
     }))
     verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
     assert verdict.incomplete_origin is None
+
+
+def test_the_full_issue_structure_survives_onto_the_verdict(tmp_path):
+    """The whole point of widening Verdict.blocking_issues: everything Boris
+    produced for a finding -- not only its title -- has to reach the
+    remediation brief, and this is the boundary that must stop discarding
+    it. All eight fields boris_intake's Issue carries, round-tripped."""
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [{
+            "title": "Null deref in handler",
+            "expected_behavior": "Handler returns 400 on a missing field",
+            "changed_mechanism": "The new guard short-circuits before validation",
+            "trigger": "POST with a missing `id` field",
+            "consequence": "500 instead of 400, leaking a stack trace",
+            "impact_scope": "Every caller of /webhook",
+            "action": "Move the guard after validation",
+            "evidence_anchors": [
+                {"kind": "diff", "reference": "src/webhook.py", "detail": "line 42"},
+                {"kind": "test", "reference": "tests/test_webhook.py::test_missing_id"},
+            ],
+        }],
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert len(verdict.blocking_issues) == 1
+    issue = verdict.blocking_issues[0]
+    assert issue.title == "Null deref in handler"
+    assert issue.expected_behavior == "Handler returns 400 on a missing field"
+    assert issue.changed_mechanism == "The new guard short-circuits before validation"
+    assert issue.trigger == "POST with a missing `id` field"
+    assert issue.consequence == "500 instead of 400, leaking a stack trace"
+    assert issue.impact_scope == "Every caller of /webhook"
+    assert issue.action == "Move the guard after validation"
+    assert issue.evidence_anchors == (
+        EvidenceAnchor(kind="diff", reference="src/webhook.py", detail="line 42"),
+        EvidenceAnchor(kind="test", reference="tests/test_webhook.py::test_missing_id"),
+    )
+
+
+def test_an_issue_with_malformed_extra_fields_still_contributes_its_title(tmp_path):
+    """A payload boris_intake's own schema would never write (wrong types on
+    every non-title field), read anyway: the issue must still construct and
+    still carry its title, not raise and not vanish. This is the case the
+    defensive-parsing constraint names explicitly."""
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [{
+            "title": "Race in seed",
+            "expected_behavior": 123,
+            "changed_mechanism": None,
+            "trigger": ["not", "a", "string"],
+            "consequence": {"nested": "object"},
+            "impact_scope": 4.5,
+            "action": False,
+            "evidence_anchors": "not a list",
+        }],
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert len(verdict.blocking_issues) == 1
+    issue = verdict.blocking_issues[0]
+    assert issue.title == "Race in seed"
+    assert issue.expected_behavior == ""
+    assert issue.changed_mechanism == ""
+    assert issue.trigger == ""
+    assert issue.consequence == ""
+    assert issue.impact_scope == ""
+    assert issue.action == ""
+    assert issue.evidence_anchors == ()
+
+
+def test_an_issue_missing_every_extra_field_still_contributes_its_title(tmp_path):
+    """The minimal case: a dict with only a title, nothing else present at
+    all (not merely malformed) -- the same "still contributes its title"
+    guarantee from the other end."""
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [{"title": "Bare issue"}],
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.blocking_issues == (Issue(title="Bare issue"),)
+
+
+def test_malformed_evidence_anchor_entries_are_dropped_individually(tmp_path):
+    """One bad anchor must not cost the issue its other, good anchors, and
+    must not cost the issue itself."""
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [{
+            "title": "Race in seed",
+            "evidence_anchors": [
+                {"kind": "diff", "reference": "src/seed.py"},
+                {"kind": "diff"},                 # missing reference
+                {"reference": "src/x.py"},        # missing kind
+                "not a dict",
+                {"kind": 5, "reference": "y"},     # kind not a string
+                {"kind": "diff", "reference": ""},  # empty reference
+            ],
+        }],
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.blocking_issues[0].evidence_anchors == (
+        EvidenceAnchor(kind="diff", reference="src/seed.py"),
+    )
 
 
 def test_review_incomplete_with_unreadable_incomplete_never_defaults_to_system(tmp_path):

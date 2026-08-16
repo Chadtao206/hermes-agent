@@ -2,12 +2,12 @@ import re
 
 import pytest
 
-from pr_remediation.boris_source import Verdict
+from pr_remediation.boris_source import Issue, Verdict
 from pr_remediation.config import RemediationConfig
 from pr_remediation.slack_io import SlackIO
 
 VERDICT = Verdict("br_1", "Ylopo", "example", 42, "a" * 40, "1.0",
-                  "ISSUES_FOUND", None, ("Null deref",))
+                  "ISSUES_FOUND", None, (Issue(title="Null deref"),))
 
 # Used everywhere the test doesn't care which token is used, only that
 # something reasonable happens with it — kept equal so old assertions that

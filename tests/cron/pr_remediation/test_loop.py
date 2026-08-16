@@ -7,7 +7,7 @@ are checking.
 """
 import pytest
 
-from pr_remediation.boris_source import Verdict
+from pr_remediation.boris_source import Issue, Verdict
 from pr_remediation.config import RemediationConfig
 from pr_remediation.models import LoopState
 from pr_remediation.store import Store
@@ -37,11 +37,18 @@ class GitHubFake:
 
     def __init__(self, head="a" * 40, author="Chadtao206", hold=False,
                  claim_ok=True, release_ok=True, hold_raises=(),
-                 pr_state="OPEN", bot_threads=()):
+                 pr_state="OPEN", bot_threads=(),
+                 base_branch="main", head_branch="chad/example-branch"):
         self.head, self.author_login, self.hold = head, author, hold
         self.claim_ok, self.release_ok = claim_ok, release_ok
         self.hold_raises = set(hold_raises)
         self.claimed, self.released = [], []
+        # What branches() reports -- the (base, head) branch names a
+        # remediation brief needs (see lanes.build_brief). Defaulted to
+        # ordinary-looking names so the many tests that never mention
+        # branches at all still exercise a lane dispatch that has them.
+        self.base_branch, self.head_branch = base_branch, head_branch
+        self.branch_calls = []
         # What `gh pr view --json state` reports: OPEN / MERGED / CLOSED, or
         # None when GitHub could not be read.
         self.pr_state = pr_state
@@ -61,6 +68,10 @@ class GitHubFake:
 
     def state(self, o, r, p):
         return self.pr_state
+
+    def branches(self, o, r, p):
+        self.branch_calls.append((o, r, p))
+        return self.base_branch, self.head_branch
 
     def has_hold(self, o, r, p):
         if p in self.hold_raises:
@@ -158,9 +169,15 @@ class SlackFake:
 class LanesFake:
     def __init__(self, status="in_progress", lane_id=True):
         self.created, self._status, self._lane_id = [], status, lane_id
+        # What each create() call was handed for base_branch/head_branch --
+        # kept apart from `created` (every existing assertion already reads
+        # that as (slug, round) 2-tuples) so a test can pin what _open_lane
+        # passed through without touching those.
+        self.branches_seen = []
 
-    def create(self, verdict, round_number):
+    def create(self, verdict, round_number, *, base_branch=None, head_branch=None):
         self.created.append((verdict.slug, round_number))
+        self.branches_seen.append((base_branch, head_branch))
         if self._lane_id is None:
             return None
         return f"t_{len(self.created)}"
@@ -287,7 +304,7 @@ def verdict(outcome="ISSUES_FOUND", origin=None, head="a" * 40, rid="br_1",
     root_thread_ts). See pr_remediation/loop.py's _clear_running_signal.
     """
     return Verdict(rid, "Ylopo", "example", pr, head, thread, outcome, origin,
-                   ("Null deref",), status)
+                   (Issue(title="Null deref"),), status)
 
 
 def build(tmp_path, source, github=None, slack=None, lanes=None, clock=None,
@@ -332,6 +349,35 @@ def test_issues_found_opens_a_lane_and_reacts_with_thinkies(tmp_path):
     assert deps.lanes.created == [("Ylopo/example#42", 1)]
     assert deps.slack.thinkies_added, "no immediate visual feedback was given"
     assert deps.github.claimed == [("Ylopo", "example", 42)]
+
+
+def test_open_lane_reads_branches_once_and_threads_them_into_the_brief(tmp_path):
+    """GitHubIO.branches() answers both names from the one _view() call
+    (see github_io.py) -- _open_lane must call it exactly once per round and
+    hand both straight to lanes.create(), which is what lets build_brief say
+    where to push instead of leaving a real ambiguity open (see the module
+    docstring)."""
+    from pr_remediation.loop import tick
+
+    github = GitHubFake(base_branch="main", head_branch="chad/fix-things")
+    deps = build(tmp_path, SourceFake([verdict()]), github=github)
+    assert tick(deps) == 1
+    assert github.branch_calls == [("Ylopo", "example", 42)], \
+        "exactly one branches() read for the round, not one per field"
+    assert deps.lanes.branches_seen == [("main", "chad/fix-things")]
+
+
+def test_open_lane_still_dispatches_when_branches_cannot_be_read(tmp_path):
+    """None/None (an unreadable GitHub) must degrade the brief, not block
+    the round -- the round this verdict earned is not forfeit over a brief
+    that can only be slightly less specific."""
+    from pr_remediation.loop import tick
+
+    github = GitHubFake(base_branch=None, head_branch=None)
+    deps = build(tmp_path, SourceFake([verdict()]), github=github)
+    assert tick(deps) == 1
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    assert deps.lanes.branches_seen == [(None, None)]
 
 
 def test_ready_notifies_and_closes_without_a_lane(tmp_path):

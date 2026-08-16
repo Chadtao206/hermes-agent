@@ -3,13 +3,33 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from pr_remediation import lanes
-from pr_remediation.boris_source import Verdict
+from pr_remediation.boris_source import EvidenceAnchor, Issue, Verdict
 from pr_remediation.lanes import (
-    TERMINAL_LANE_STATUSES, LaneIO, build_brief, idempotency_key,
+    MAX_BRIEF_CHARS, TERMINAL_LANE_STATUSES, LaneIO, build_brief, idempotency_key,
 )
 
 VERDICT = Verdict("br_1", "Ylopo", "example", 42, "a" * 40, "1.0",
-                  "ISSUES_FOUND", None, ("Null deref in handler", "Race in seed"))
+                  "ISSUES_FOUND", None,
+                  (Issue(title="Null deref in handler"), Issue(title="Race in seed")))
+
+# An issue carrying the full structure boris_intake produces, used by the
+# tests below that check what build_brief does with fields beyond the
+# title -- VERDICT above deliberately stays title-only so the plain
+# "every blocking issue is named" tests aren't coupled to this shape.
+RICH_ISSUE = Issue(
+    title="Null deref in handler",
+    expected_behavior="Handler returns 400 on a missing field",
+    changed_mechanism="The new guard short-circuits before validation",
+    trigger="POST with a missing `id` field",
+    consequence="500 instead of 400, leaking a stack trace",
+    impact_scope="Every caller of /webhook",
+    action="Move the guard after validation",
+    evidence_anchors=(
+        EvidenceAnchor(kind="diff", reference="src/webhook.py", detail="line 42"),
+        EvidenceAnchor(kind="test", reference="tests/test_webhook.py::test_missing_id"),
+    ),
+)
+RICH_VERDICT = replace(VERDICT, blocking_issues=(RICH_ISSUE,))
 
 
 def _valid_anchor(tmp_path, monkeypatch, repo=VERDICT.repo):
@@ -37,6 +57,141 @@ def test_brief_pins_the_exact_head_so_andrej_cannot_drift():
 
 def test_brief_names_the_pr():
     assert "Ylopo/example#42" in build_brief(VERDICT, 1)
+
+
+# --- the full issue structure, not only the title --------------------------
+
+
+def test_brief_carries_the_full_issue_structure_not_only_the_title():
+    """The fix this whole change exists for: build_brief must stop
+    discarding everything Boris found except the title. Every field on
+    RICH_ISSUE has to reach the rendered brief."""
+    brief = build_brief(RICH_VERDICT, 1)
+    assert RICH_ISSUE.title in brief
+    assert RICH_ISSUE.expected_behavior in brief
+    assert RICH_ISSUE.changed_mechanism in brief
+    assert RICH_ISSUE.trigger in brief
+    assert RICH_ISSUE.consequence in brief
+    assert RICH_ISSUE.impact_scope in brief
+    assert RICH_ISSUE.action in brief
+
+
+def test_diff_anchors_are_surfaced_as_the_file_paths_they_are():
+    """The `diff` anchor's `reference` IS a real repo-relative file path
+    (see the module docstring) -- it must appear in the brief labelled as a
+    file, which is what lets the agent go straight to the code instead of
+    rediscovering where the finding lives."""
+    brief = build_brief(RICH_VERDICT, 1)
+    assert "file: src/webhook.py" in brief
+    assert "line 42" in brief, "the anchor's detail must not be dropped"
+
+
+def test_non_diff_anchors_are_labelled_by_their_own_kind_not_as_a_file():
+    """A `test` anchor's reference is a test id, not a path -- mislabelling
+    it as `file:` would send the agent looking for a file that does not
+    exist at that name."""
+    brief = build_brief(RICH_VERDICT, 1)
+    assert "test: tests/test_webhook.py::test_missing_id" in brief
+    assert "file: tests/test_webhook.py::test_missing_id" not in brief
+
+
+def test_an_issue_with_no_evidence_anchors_still_renders():
+    """RICH_ISSUE's siblings in VERDICT carry no evidence at all -- the
+    common case for a title-only issue -- and must not blow up or leave a
+    dangling 'Evidence:' header with nothing under it."""
+    brief = build_brief(VERDICT, 1)
+    assert "Null deref in handler" in brief and "Race in seed" in brief
+
+
+# --- acceptance criteria ----------------------------------------------------
+
+
+def test_brief_states_acceptance_criteria():
+    """The old brief said what to fix and what not to do, but never what
+    'done' means -- the agent had no stopping condition. This is the fix."""
+    brief = build_brief(RICH_VERDICT, 1)
+    assert "Acceptance criteria" in brief
+    assert "cleared at a pushed head" in brief
+    assert "tests covering them" in brief
+
+
+def test_acceptance_criteria_count_matches_the_number_of_blocking_issues():
+    brief = build_brief(VERDICT, 1)
+    assert "All 2 listed blocking issue" in brief
+
+
+def test_prohibitions_are_kept():
+    """No new PR, no force-push, no base-branch change -- unchanged
+    substance, now living inside the acceptance-criteria section."""
+    brief = build_brief(RICH_VERDICT, 1)
+    assert "Do not open a new PR" in brief
+    assert "Do not force-push" in brief
+    assert "Do not change the PR's base branch" in brief
+
+
+# --- base and head branch ---------------------------------------------------
+
+
+def test_brief_names_the_base_and_head_branch_when_known():
+    brief = build_brief(RICH_VERDICT, 1, base_branch="main",
+                        head_branch="chad/fix-webhook")
+    assert "main" in brief
+    assert "chad/fix-webhook" in brief
+
+
+def test_brief_tells_the_agent_to_push_the_actual_head_branch_not_the_worktree_s():
+    """The real ambiguity this closes: the old brief said 'push' without
+    saying where, and the worktree a lane runs in is checked out on a
+    kanban-generated branch that is NOT the PR's. The head branch name must
+    appear in the instruction that tells the agent where to push."""
+    brief = build_brief(RICH_VERDICT, 1, base_branch="main",
+                        head_branch="chad/fix-webhook")
+    lowered = brief.lower()
+    assert "push to" in lowered
+    assert "chad/fix-webhook" in lowered.split("push to", 1)[-1], \
+        "the head branch name must appear at or after the push instruction"
+
+
+def test_brief_degrades_visibly_when_branches_are_unknown():
+    """None (unreadable GitHub, or never asked) must render as a visible
+    placeholder -- never a guessed name, and never silently omitted."""
+    brief = build_brief(RICH_VERDICT, 1)
+    assert "unknown" in brief.lower()
+    assert "confirm" in brief.lower()
+
+
+# --- size cap and truncation -------------------------------------------------
+
+
+def test_an_ordinary_brief_is_nowhere_near_the_cap():
+    assert len(build_brief(RICH_VERDICT, 1)) < MAX_BRIEF_CHARS // 4
+
+
+def test_an_oversized_brief_is_truncated_and_says_so():
+    huge_issue = Issue(title="Huge issue",
+                       expected_behavior="x" * (MAX_BRIEF_CHARS * 2))
+    verdict = replace(VERDICT, blocking_issues=(huge_issue,))
+    brief = build_brief(verdict, 1)
+    assert len(brief) <= MAX_BRIEF_CHARS
+    assert "TRUNCATED" in brief
+
+
+def test_truncation_never_costs_the_acceptance_criteria_or_the_footer():
+    """The part of the brief that answers 'what does done mean' and 'where
+    do I push' must survive truncation intact -- only the issue detail may
+    be cut. A brief that looks complete but silently dropped its stopping
+    condition would be worse than a short one that admits it was cut."""
+    huge_issue = Issue(title="Huge issue",
+                       expected_behavior="x" * (MAX_BRIEF_CHARS * 3))
+    verdict = replace(VERDICT, blocking_issues=(huge_issue,))
+    brief = build_brief(verdict, 1, base_branch="main", head_branch="chad/fix")
+    assert "Acceptance criteria" in brief
+    assert "Do not force-push" in brief
+    assert "chad/fix" in brief
+
+
+def test_a_brief_within_the_cap_is_not_marked_truncated():
+    assert "TRUNCATED" not in build_brief(RICH_VERDICT, 1)
 
 
 def test_create_parses_the_lane_id_out_of_dispatch_output(tmp_path, monkeypatch):
@@ -77,6 +232,37 @@ def test_create_uses_the_dispatch_interface_the_script_actually_accepts(tmp_path
     assert not body_value.startswith("@"), "the real CLI never resolves @file references"
     assert "Null deref in handler" in body_value and "Race in seed" in body_value
     assert "--profile" not in argv and "--brief" not in argv
+
+
+def test_create_threads_base_and_head_branch_into_the_dispatched_body(tmp_path, monkeypatch):
+    """loop.py's _open_lane reads these off GitHubIO.branches() and hands
+    them to create() as keyword-only args (see LaneIO.create) -- they must
+    land in the actual --body text, not be silently dropped."""
+    _valid_anchor(tmp_path, monkeypatch)
+    seen = {}
+
+    def run(command, **kwargs):
+        seen["argv"] = command
+        return SimpleNamespace(returncode=0, stdout="t_abc123", stderr="")
+
+    LaneIO(tmp_path / "kanban.db", runner=run).create(
+        VERDICT, 1, base_branch="main", head_branch="chad/fix-webhook")
+    body_value = seen["argv"][seen["argv"].index("--body") + 1]
+    assert "main" in body_value
+    assert "chad/fix-webhook" in body_value
+
+
+def test_create_still_dispatches_without_branch_info(tmp_path, monkeypatch):
+    """base_branch/head_branch are keyword-only and optional -- a caller
+    that omits them (or a GitHub that could not answer) must still produce
+    a valid brief, not a TypeError."""
+    _valid_anchor(tmp_path, monkeypatch)
+
+    def run(command, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="t_abc123", stderr="")
+
+    result = LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1)
+    assert result == "t_abc123"
 
 
 def test_the_idempotency_key_pins_head_and_round(tmp_path):

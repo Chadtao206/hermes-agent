@@ -119,7 +119,13 @@ class GitHubIO:
             # verdict and the tick that acts on it, and the loop goes on to
             # label it, dispatch an engineer lane at "this head" and post a
             # re-review against a branch nobody can push to any more.
-            "--json", "labels,headRefOid,author,state",
+            #
+            # `baseRefName`/`headRefName` ride this same call so that
+            # `branches()` below -- which the remediation brief needs (see
+            # pr_remediation/lanes.py's build_brief) -- costs no second round
+            # trip. Every other accessor on this class already gets its field
+            # for free from this one `gh pr view`; these two are no different.
+            "--json", "labels,headRefOid,author,state,baseRefName,headRefName",
         ])
         if out is None:
             return None
@@ -179,6 +185,35 @@ class GitHubIO:
             return None
         value = data.get("state")
         return value.upper() if isinstance(value, str) and value else None
+
+    def branches(self, owner: str, repo: str, pr: int) -> tuple[str | None, str | None]:
+        """The PR's (base, head) branch names, in the one call `_view` already
+        makes -- not a second round trip.
+
+        Read together, deliberately, rather than as two accessors like
+        `head_sha`/`author`/`state` above: a remediation brief needs both at
+        once (pr_remediation/lanes.py's build_brief), and two separate calls
+        would each independently invoke `_view` -- exactly the second round
+        trip this method exists to avoid. The head branch removes a real
+        ambiguity the old brief left open ("push", without saying where,
+        against a worktree that lives on a kanban-generated branch that is
+        not the PR's); the base branch is context for whoever reviews next.
+
+        Shape-checked exactly like `author`, `state`, and `has_hold` above,
+        and for the same reason: a raise here would land inside
+        `_open_lane`, past the point the PR has already been claimed and the
+        ownership label already applied -- which is a worse state to fail
+        out of than simply saying less than the brief would have liked to.
+        None means "GitHub's answer cannot be trusted to name one" --
+        unreadable, missing, or the wrong type -- never an empty string
+        standing in for a real branch name.
+        """
+        data = self._view(owner, repo, pr)
+        if not isinstance(data, dict):
+            return None, None
+        base, head = data.get("baseRefName"), data.get("headRefName")
+        return (base if isinstance(base, str) and base else None,
+                head if isinstance(head, str) and head else None)
 
     def has_hold(self, owner: str, repo: str, pr: int) -> bool:
         """True also when GitHub could not be read, or the response's shape

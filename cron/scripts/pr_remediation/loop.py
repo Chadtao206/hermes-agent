@@ -1232,7 +1232,19 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
                                {"round": round_number}, deps.now())
         return _escalate(deps, loop, verdict, GITHUB_UNWRITABLE)
 
-    lane_id = deps.lanes.create(verdict, round_number)
+    # One more read before the write, same as the claim above: the brief
+    # needs the PR's base and head branch names (lanes.build_brief), and
+    # GitHubIO.branches() answers both from the single `_view()` call every
+    # other accessor on that adapter already makes -- not a second round
+    # trip. A GitHub that cannot answer this must not block the round: None
+    # degrades to the brief saying so (see build_brief), never to a raise or
+    # a refusal here -- the round this verdict earned is not forfeit over a
+    # brief that can only be slightly less specific.
+    base_branch, head_branch = deps.github.branches(
+        verdict.owner, verdict.repo, verdict.pr_number)
+
+    lane_id = deps.lanes.create(verdict, round_number,
+                                base_branch=base_branch, head_branch=head_branch)
     if lane_id is None:
         # Dispatch refused (no worktree anchor, an excluded infra repo, a
         # kanban failure). No lane means no remediation, so the round stays

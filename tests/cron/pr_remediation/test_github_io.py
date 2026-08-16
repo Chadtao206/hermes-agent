@@ -271,6 +271,71 @@ def test_state_is_upper_cased_so_one_comparison_serves(tmp_path):
     assert io_with(runner, tmp_path).state("Ylopo", "example", 42) == "OPEN"
 
 
+# --- branches(): base/head branch names for the remediation brief ----------
+#
+# GitHubIO.branches() feeds pr_remediation/lanes.py's build_brief, which
+# needs both names at once: the head branch removes a real ambiguity ("push",
+# without saying where, against a worktree that lives on a kanban-generated
+# branch that is not the PR's), and the base branch is context for whoever
+# reviews next. Both must come off the one `_view()` call every other
+# accessor here already makes -- not a second round trip.
+
+
+def test_the_view_asks_for_base_and_head_ref_names_so_branches_costs_no_second_call(tmp_path):
+    """Pinned on the argv for the same reason the `state` field is pinned
+    above: every driver-level test wires a fake and would never notice a
+    field silently dropped back out of `_view`'s request."""
+    runner, calls = runner_for({"view": json.dumps({"labels": []})})
+    io_with(runner, tmp_path).branches("Ylopo", "example", 42)
+    views = [c for c in calls if "view" in c]
+    assert views, "no gh pr view was issued"
+    fields = views[0][views[0].index("--json") + 1].split(",")
+    assert "baseRefName" in fields and "headRefName" in fields
+
+
+def test_branches_reads_both_names_from_the_live_pr(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "baseRefName": "main", "headRefName": "chad/fix-webhook"})})
+    assert io_with(runner, tmp_path).branches("Ylopo", "example", 42) == (
+        "main", "chad/fix-webhook")
+
+
+def test_branches_costs_exactly_one_gh_call(tmp_path):
+    """The whole point: both names from one _view() invocation, not two."""
+    runner, calls = runner_for({"view": json.dumps(
+        {"labels": [], "baseRefName": "main", "headRefName": "chad/fix"})})
+    io_with(runner, tmp_path).branches("Ylopo", "example", 42)
+    assert len([c for c in calls if "view" in c]) == 1
+
+
+def test_an_unreadable_pr_reads_branches_as_unknown_not_as_a_raise(tmp_path):
+    runner, _ = runner_for({})  # empty stdout: nothing to parse
+    assert io_with(runner, tmp_path).branches("Ylopo", "example", 42) == (None, None)
+
+
+def test_missing_ref_name_keys_read_as_unknown(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": []})})
+    assert io_with(runner, tmp_path).branches("Ylopo", "example", 42) == (None, None)
+
+
+def test_non_string_ref_names_read_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "baseRefName": 5, "headRefName": ["chad/fix"]})})
+    assert io_with(runner, tmp_path).branches("Ylopo", "example", 42) == (None, None)
+
+
+def test_empty_string_ref_names_read_as_unknown_not_as_a_real_branch(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "baseRefName": "", "headRefName": ""})})
+    assert io_with(runner, tmp_path).branches("Ylopo", "example", 42) == (None, None)
+
+
+def test_one_readable_ref_name_does_not_hide_the_other_being_unreadable(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "baseRefName": "main", "headRefName": None})})
+    assert io_with(runner, tmp_path).branches("Ylopo", "example", 42) == ("main", None)
+
+
 # --- unresolved_bot_threads(): the Codex/CodeQL review-thread check --------
 #
 # The blind spot this method closes: the first live run declared a PR ready

@@ -15,6 +15,39 @@ from pr_remediation.config import RemediationConfig
 
 
 @dataclass(frozen=True)
+class EvidenceAnchor:
+    kind: str
+    reference: str
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class Issue:
+    """One blocking issue as boris_intake's review produced it.
+
+    A local type, deliberately NOT boris_intake.result.Issue: this reader's
+    whole discipline is defending against a payload whose shape it does not
+    own (see the module docstring and `_verdict` below, and
+    `_issue`/`_anchor` immediately above it). Importing the writer's own
+    dataclass would blur that boundary -- a strict, non-optional field on
+    THAT type would let a malformed payload raise here as an unhandled
+    TypeError instead of degrading the way every other field in this file
+    does. Every field but `title` therefore defaults to an empty value, so a
+    partially-unusable issue (a non-string `expected_behavior`, an
+    unparsable `evidence_anchors`) still constructs and still carries its
+    title -- see `_issue`.
+    """
+    title: str
+    expected_behavior: str = ""
+    changed_mechanism: str = ""
+    trigger: str = ""
+    consequence: str = ""
+    impact_scope: str = ""
+    action: str = ""
+    evidence_anchors: tuple[EvidenceAnchor, ...] = ()
+
+
+@dataclass(frozen=True)
 class Verdict:
     request_id: str
     owner: str
@@ -24,7 +57,13 @@ class Verdict:
     root_thread_ts: str
     outcome: str
     incomplete_origin: str | None
-    blocking_issues: tuple[str, ...]
+    # Widened from tuple[str, ...] (title only) to tuple[Issue, ...] (the
+    # whole finding boris_intake produced) so pr_remediation/lanes.py's
+    # build_brief can render what breaks, how to trigger it, and where the
+    # evidence lives -- instead of a bare title the engineer agent has to
+    # rediscover the rest of on its own. See `_issue` for how a payload that
+    # cannot fill every field degrades rather than crashing this poller.
+    blocking_issues: tuple[Issue, ...]
     # boris_intake's status_message_ts: the message Boris posts and later
     # replaces with its verdict, distinct from both source_message_ts and
     # root_thread_ts. This is the reaction anchor (see pr_remediation/loop.py's
@@ -48,6 +87,62 @@ class BorisSource:
 
     def close(self) -> None:
         self._db.close()
+
+    @staticmethod
+    def _text(value: object) -> str:
+        """Coerce one Issue field to a string, degrading rather than raising.
+
+        boris_intake's own schema requires each of these to be a string, but
+        this reader does not own that enforcement -- the payload could have
+        been written by an older or a newer version of that service. A field
+        of the wrong type contributes an empty string, not an exception and
+        not a dropped issue.
+        """
+        return value if isinstance(value, str) else ""
+
+    @classmethod
+    def _anchor(cls, raw: object) -> EvidenceAnchor | None:
+        if not isinstance(raw, dict):
+            return None
+        kind, reference = raw.get("kind"), raw.get("reference")
+        if not isinstance(kind, str) or not isinstance(reference, str) or not reference:
+            # Both are required to make an anchor usable at all: a kind-less
+            # or reference-less anchor points nowhere. Dropped individually
+            # -- one bad anchor must not cost the issue its other, good ones.
+            return None
+        detail = raw.get("detail")
+        return EvidenceAnchor(kind=kind, reference=reference,
+                              detail=detail if isinstance(detail, str) else None)
+
+    @classmethod
+    def _anchors(cls, raw: object) -> tuple[EvidenceAnchor, ...]:
+        if not isinstance(raw, list):
+            return ()
+        return tuple(a for a in (cls._anchor(item) for item in raw) if a is not None)
+
+    @classmethod
+    def _issue(cls, raw: object) -> Issue | None:
+        """One blocking issue off the wire, or None when `raw` is not even a
+        dict (mirrors the old `isinstance(i, dict)` filter in `_verdict`).
+
+        Every field past `title` degrades independently via `_text`/
+        `_anchors`: a malformed `evidence_anchors` or a non-string
+        `changed_mechanism` must not cost the issue its title, which is the
+        one field this reader has always been able to surface and must go on
+        surfacing even from a payload it otherwise can't fully trust.
+        """
+        if not isinstance(raw, dict):
+            return None
+        return Issue(
+            title=str(raw.get("title", "")),
+            expected_behavior=cls._text(raw.get("expected_behavior")),
+            changed_mechanism=cls._text(raw.get("changed_mechanism")),
+            trigger=cls._text(raw.get("trigger")),
+            consequence=cls._text(raw.get("consequence")),
+            impact_scope=cls._text(raw.get("impact_scope")),
+            action=cls._text(raw.get("action")),
+            evidence_anchors=cls._anchors(raw.get("evidence_anchors")),
+        )
 
     def new_verdicts(self, limit: int = 50) -> tuple[Verdict, ...]:
         cur = self._db.execute(
@@ -93,7 +188,8 @@ class BorisSource:
             outcome=row["semantic_outcome"],
             incomplete_origin=incomplete.get("origin"),
             blocking_issues=tuple(
-                str(i.get("title", "")) for i in issues if isinstance(i, dict)
+                issue for issue in (self._issue(i) for i in issues)
+                if issue is not None
             ),
             status_message_ts=row["status_message_ts"],
         )

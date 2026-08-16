@@ -11,12 +11,12 @@ this touches the real config.yaml, .env, state databases or the network.
 from pathlib import Path
 
 from pr_remediation import daemon
-from pr_remediation.boris_source import Verdict
+from pr_remediation.boris_source import Issue, Verdict
 from pr_remediation.config import RemediationConfig
 from pr_remediation.loop import LoopDeps
 
 VERDICT = Verdict("br_1", "Ylopo", "example", 42, "a" * 40, "1.0",
-                  "ISSUES_FOUND", None, ("Null deref",))
+                  "ISSUES_FOUND", None, (Issue(title="Null deref"),))
 
 
 def _cfg(mode="live"):
