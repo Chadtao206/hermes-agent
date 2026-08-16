@@ -108,6 +108,12 @@ class SlackFake:
         # the same reason: a test should be able to pin what fired without
         # parsing message text or touching unrelated assertions.
         self.still_running = []
+        # The `lane_id` each notify_escalation call was actually handed --
+        # kept apart from `escalations` (every existing assertion already
+        # reads that as (slug, rounds, reason) 3-tuples) for the same reason
+        # `ready_threads` is kept apart from `ready`: a test should be able to
+        # pin what loop.py passed through without touching those.
+        self.escalation_lane_ids = []
         self._repost_ts = repost_ts
         self._ready_ts = ready_ts
         self._escalation_ts = escalation_ts
@@ -137,8 +143,9 @@ class SlackFake:
         self.ready_threads.append(unresolved_threads)
         return self._ready_ts
 
-    def notify_escalation(self, verdict, rounds, reason):
+    def notify_escalation(self, verdict, rounds, reason, lane_id=None):
         self.escalations.append((verdict.slug, rounds, reason))
+        self.escalation_lane_ids.append(lane_id)
         return self._escalation_ts
 
     def notify_still_running(self, verdict, elapsed_minutes, timeout_minutes,
@@ -159,6 +166,45 @@ class LanesFake:
         return f"t_{len(self.created)}"
 
     def status(self, lane_id):
+        return self._status
+
+
+class SequencedLanesFake(LanesFake):
+    """A lane whose status() answers a different value on each successive
+    call, so a test can put a different answer in front of the due pass's own
+    observation (`_observe_lane`'s read) than in front of the fresh re-check a
+    lane_timeout settle takes moments later in the same tick
+    (`_lane_still_running`'s read) -- simulating kanban's own account of the
+    lane changing in the gap between the two.
+    """
+
+    def __init__(self, statuses, lane_id=True):
+        super().__init__(status=statuses[0], lane_id=lane_id)
+        self._statuses = list(statuses)
+        self._calls = 0
+
+    def status(self, lane_id):
+        index = min(self._calls, len(self._statuses) - 1)
+        self._calls += 1
+        return self._statuses[index]
+
+
+class RaisesOnSecondReadLanesFake(LanesFake):
+    """status() answers normally the first time -- what the due pass's own
+    observation reads, and what must stay non-terminal for a lane_timeout
+    escalation to fire at all -- and raises every time after, simulating
+    kanban going unreachable exactly between that observation and the fresh
+    re-check `_lane_still_running` takes at settle time.
+    """
+
+    def __init__(self, first="running", lane_id=True):
+        super().__init__(status=first, lane_id=lane_id)
+        self._calls = 0
+
+    def status(self, lane_id):
+        self._calls += 1
+        if self._calls > 1:
+            raise RuntimeError("kanban unreachable")
         return self._status
 
 
@@ -2685,8 +2731,19 @@ def test_a_lane_that_never_finishes_is_given_up_on_and_escalated(tmp_path):
 
     boris_intake bounds the same shape at 90 minutes (REVIEW_WAIT_SECONDS),
     added after a real incident.
+
+    The loop still closes at the bound -- `active_for_pr` must eventually stop
+    finding it -- but a `running` card is kanban's own word that a worker may
+    still be pushing to this branch, so standing down here would be the
+    collision this service exists to prevent: a human sees the label gone and
+    reasonably takes that as permission to touch a branch a live worker still
+    owns. So the label and the reaction stay, and the notice names the lane
+    that is still going. See test_a_terminal_lane_at_settle_time_stands_down_
+    as_before for the case where kanban itself has since called the lane
+    finished.
     """
-    from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, tick
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_TIMEOUT_LANE_ALIVE, \
+        LANE_WAIT_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
     loop_id = only_loop(deps).loop_id
@@ -2695,14 +2752,107 @@ def test_a_lane_that_never_finishes_is_given_up_on_and_escalated(tmp_path):
     assert tick(deps) == 1
     assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [], \
+        "a lane kanban has not called finished may still push -- the label " \
+        "must stay, not be handed back while a worker can still commit to it"
+    assert deps.slack.thinkies_removed == [], \
+        "keep the reaction consistent with the label -- both signal the " \
+        "same thing, that work may still be in flight"
+    assert deps.slack.escalation_lane_ids == ["t_1"], \
+        "the escalation must name the still-running lane"
+    kept = [e["detail"] for e in deps.store.events(loop_id)
+            if e["kind"] == LANE_TIMEOUT_LANE_ALIVE]
+    assert kept and kept[0]["lane_id"] == "t_1"
+
+
+def test_a_terminal_lane_at_settle_time_stands_down_as_before(tmp_path):
+    """The due pass's own observation only ever requires "not yet terminal" to
+    reach the lane_timeout bound at all, so a settle re-checks kanban fresh
+    right before deciding whether to keep the ownership signals. If kanban's
+    account has moved on to a terminal status by then -- the card finished in
+    the gap between the due pass's read and this one -- today's behaviour
+    holds exactly as it did before this change: stand down like any other
+    escalation.
+    """
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_TIMEOUT_LANE_ALIVE, \
+        LANE_WAIT_SECONDS, tick
+
+    lanes = SequencedLanesFake(["running", "done"])
+    deps = drive_to_remediating(tmp_path, lanes=lanes)
+    loop_id = only_loop(deps).loop_id
+
+    deps.now.advance(LANE_WAIT_SECONDS)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
     assert deps.github.released == [("Ylopo", "example", 42)], \
-        "the pull request must be handed back, not left looking owned"
+        "a lane kanban now calls finished earns the ordinary stand-down"
+    assert deps.slack.thinkies_removed
+    assert deps.slack.escalation_lane_ids == [None], \
+        "a lane confirmed finished is not named as still running"
+    assert not [e for e in deps.store.events(loop_id)
+                if e["kind"] == LANE_TIMEOUT_LANE_ALIVE]
+
+
+def test_an_unreadable_lane_status_at_settle_time_is_treated_as_alive(tmp_path):
+    """A read that fails cannot tell "the worker just finished" from "kanban
+    is having a bad moment" -- those look identical from here. Reading the
+    failure as "finished" would release the label and the reaction over a
+    lane that, for all this settle knows, is still pushing to the branch; the
+    safe default treats an unreadable status the same as one this build
+    merely does not recognise as terminal, and keeps both signals.
+    """
+    from pr_remediation.loop import LANE_TIMEOUT_LANE_ALIVE, LANE_WAIT_SECONDS, tick
+
+    lanes = RaisesOnSecondReadLanesFake()
+    deps = drive_to_remediating(tmp_path, lanes=lanes)
+    loop_id = only_loop(deps).loop_id
+
+    deps.now.advance(LANE_WAIT_SECONDS)
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [], \
+        "an unreadable status must not be read as 'the lane is done'"
+    assert deps.slack.thinkies_removed == []
+    assert deps.slack.escalation_lane_ids == ["t_1"]
+    assert [e for e in deps.store.events(loop_id)
+            if e["kind"] == LANE_TIMEOUT_LANE_ALIVE]
+
+
+def test_other_escalation_reasons_still_release_ownership_with_a_lane_in_flight(
+        tmp_path):
+    """The lane_timeout exception is keyed on the reason string, not on
+    whether a lane happens to still be recorded on the row: a verdict that
+    escalates for an unrelated reason while a lane is genuinely still running
+    must keep releasing the ownership signals exactly as it always has."""
+    from pr_remediation.loop import NOT_CHAD_AUTHORED, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
+    loop_id = only_loop(deps).loop_id
+    deps.github.author_login = "someone-else"
+    deps.source.verdicts = [verdict(rid="br_2")]
+
+    assert tick(deps) == 1
+    assert deps.slack.escalations[-1][2] == NOT_CHAD_AUTHORED
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)]
+    assert deps.slack.thinkies_removed
+    assert deps.slack.escalation_lane_ids == [None], \
+        "notify_escalation must not be handed a lane_id for a reason that " \
+        "is not lane_timeout"
 
 
 def test_a_deleted_kanban_card_does_not_wedge_the_loop_forever(tmp_path):
     """`lane_status()` answers None for a card that is gone. Nothing else in
     this pass can ever move such a loop on: it is not finished, so no head is
-    read, no grace window opens and no head-read budget is spent."""
+    read, no grace window opens and no head-read budget is spent.
+
+    None is not evidence the lane is done, either -- it is kanban saying it
+    found no row for this id, which reads the same whether a human archived
+    the card or the read itself came back short. Releasing the label on that
+    basis would be exactly the "unknown read as dead" mistake this loop's
+    settle refuses to make -- see _lane_still_running.
+    """
     from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status=None))
@@ -2711,6 +2861,8 @@ def test_a_deleted_kanban_card_does_not_wedge_the_loop_forever(tmp_path):
     assert tick(deps) == 1
     assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
     assert only_loop(deps) is None
+    assert deps.github.released == [], \
+        "an unresolvable card is not evidence the lane is done"
 
 
 def test_a_running_lane_inside_the_bound_is_left_alone(tmp_path):
@@ -2905,4 +3057,7 @@ def test_the_escalation_timeout_still_fires_at_its_own_bound_regardless(
     assert tick(deps) == 1
     assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
-    assert deps.github.released == [("Ylopo", "example", 42)]
+    # The lane is still `running` by kanban's own account, so the ownership
+    # label stays -- see test_a_lane_that_never_finishes_is_given_up_on_and_
+    # escalated for why.
+    assert deps.github.released == []

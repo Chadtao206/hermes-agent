@@ -227,12 +227,36 @@ class SlackIO:
         # the module docstring.
         return self._post(self._notify_token, self._cfg.notify_channel, text)
 
-    def notify_escalation(self, verdict: Verdict, rounds: int, reason: str) -> str | None:
+    def notify_escalation(self, verdict: Verdict, rounds: int, reason: str,
+                          lane_id: str | None = None) -> str | None:
+        """Tell a human the loop stopped, and why.
+
+        `lane_id` is set by loop.py's `_settle_escalation` for exactly one
+        case: a `lane_timeout` escalation whose lane kanban has not (yet, or
+        ever) called finished. That lane may still be running and able to
+        push to this branch, and loop.py deliberately leaves `owner_label`
+        and the `:thinkies:` reaction in place rather than releasing them --
+        see that function's docstring. The notice has to carry that decision
+        explicitly, not just enact it: a human reading a label left on a PR
+        they were just told is "stopped" would otherwise reasonably read it
+        as a bug, or as permission to start editing a branch a worker might
+        still be pushing to. Every other reason leaves this None, and the
+        message is byte-identical to before this parameter existed.
+        """
         text = (
             f"⚠️ {verdict.slug} needs you — remediation stopped ({reason}).\n"
             f"{pr_url(verdict)}\n"
             f"Stopped at round {rounds} of {self._cfg.round_cap}."
         )
+        if lane_id:
+            text += (
+                f"\nLane {lane_id} has not reached a terminal kanban status "
+                f"— it may still be running and able to push to this branch. "
+                f"The `{self._cfg.owner_label}` label and the :thinkies: "
+                f"reaction are being left in place on purpose, not released "
+                f"with this escalation. Once the lane finishes, or you take "
+                f"over, remove them yourself — nothing else will."
+            )
         return self._post(self._notify_token, self._cfg.notify_channel, text)
 
     def notify_still_running(self, verdict: Verdict, elapsed_minutes: int,

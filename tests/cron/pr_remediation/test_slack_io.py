@@ -227,6 +227,36 @@ def test_escalation_notification_names_the_reason_and_round():
     assert calls[0][2]["channel"] == "C0BANB70BHR"
 
 
+def test_escalation_without_a_lane_id_carries_no_extra_text():
+    """The ordinary case, and every reason except lane_timeout-with-a-live-
+    lane: the message must stay byte-for-byte what it was before this
+    parameter existed."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_escalation(
+        VERDICT, rounds=3, reason="round_cap")
+    text = calls[0][2]["text"]
+    assert text == (
+        "⚠️ Ylopo/example#42 needs you — remediation stopped (round_cap).\n"
+        "https://github.com/Ylopo/example/pull/42\n"
+        "Stopped at round 3 of 3."
+    )
+
+
+def test_escalation_with_a_lane_id_names_it_and_what_to_clean_up():
+    call, calls = caller_for()
+    cfg = RemediationConfig()
+    SlackIO(cfg, TOK, TOK, call).notify_escalation(
+        VERDICT, rounds=1, reason="lane_timeout", lane_id="t_42")
+    text = calls[0][2]["text"]
+    assert "t_42" in text
+    assert "may still be running" in text or "still running" in text
+    assert "push" in text.lower()
+    assert cfg.owner_label in text
+    assert "thinkies" in text
+    assert "remove them yourself" in text.lower() or "clean" in text.lower() \
+        or "take over" in text.lower()
+
+
 def test_a_failed_post_returns_none_rather_than_raising():
     call, _ = caller_for(response={"ok": False, "error": "channel_not_found"})
     assert SlackIO(RemediationConfig(), TOK, TOK, call).post_rereview(

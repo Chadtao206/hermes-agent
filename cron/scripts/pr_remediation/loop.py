@@ -161,8 +161,9 @@ writes -- a reaction removed, a re-review posted, an escalation notice, the
 ownership label handed back. `has_hold` fails closed, so a GitHub this pass
 cannot read is a hold and the pass writes nothing at all. The escalation
 retry is the one due-pass route that does not read it, and deliberately: what
-it does is notify a human and stand down the signals this loop itself added,
-which is what a hold wants to happen anyway.
+it does is notify a human and (`lane_timeout` against a lane not confirmed
+finished excepted -- see below) stand down the signals this loop itself
+added, which is what a hold wants to happen anyway.
 
 A loop that closes while its lane is still running is the one thing neither
 pass can repair. Terminal states are absorbing and unclaimable, so that lane
@@ -199,6 +200,30 @@ Escalation reasons are free-form strings, not only `EscalationReason` members:
 the enum names the loop's *own* dead ends (round cap, no-op lane), while the
 driver also stops for reasons the enum does not model -- the PR changed hands,
 GitHub is unwritable, the re-review has no thread to land in.
+
+*A live lane keeps its claim.* `lane_timeout` is a bound on how long this loop
+will wait, not a bound on how long a lane may run -- kanban's own stale-lane
+reclaim (`dispatch_stale_timeout_seconds`) measures silence, a heartbeat gap,
+never duration, so a lane that keeps heartbeating can run past
+LANE_WAIT_SECONDS while genuinely healthy. Standing down in that case --
+releasing the ownership label, clearing the reaction -- would be exactly the
+collision this service exists to prevent: a human takes `hermes-owner-andrej`
+coming off as permission to touch the branch, while a worker in a worktree
+this loop cannot cancel is still able to commit and push to it. So a
+`lane_timeout` settle checks the lane fresh right before it would otherwise
+stand down (`_lane_still_running`), and a lane not confirmed finished --
+running, or a status the read could not resolve -- keeps both signals and
+says so in the notice, naming the lane. A status kanban itself calls terminal
+still stands down exactly as before; nothing about that path changes. Every
+other escalation reason is untouched by this -- the exception is keyed on the
+reason string, not on whether a lane happens to still be recorded on the row.
+
+The label a live-lane escalation leaves behind is never cleared by a later
+tick: the loop that would have cleared it is terminal, and closing it is the
+only lever this service has over a lane it cannot cancel. That is accepted on
+purpose -- a stale label a human was explicitly told about is a smaller harm
+than a missing one that lets a second agent start working a branch a live
+worker is still pushing to -- which is exactly why the notice has to say so.
 """
 from __future__ import annotations
 
@@ -320,6 +345,12 @@ HEAD_READ_EXHAUSTED = "head_read_exhausted"
 # GitHub); this says the lane never finished (look at the kanban card, which may
 # be wedged, or may simply be gone).
 LANE_TIMEOUT = "lane_timeout"
+
+# Written on a lane_timeout settle that finds the lane not confirmed finished
+# by kanban's own account and therefore, deliberately, releases neither the
+# ownership label nor the thinkies reaction. See _settle_escalation and
+# _lane_still_running.
+LANE_TIMEOUT_LANE_ALIVE = "lane_timeout_lane_alive"
 
 # Why a verdict was seen but deliberately not routed.
 LANE_IN_FLIGHT = "lane_in_flight"
@@ -748,6 +779,41 @@ def _escalation_debt(deps: LoopDeps, loop: LoopRequest) -> EscalationDebt | None
     return EscalationDebt(reason=reason, attempts=attempts, notified=notified)
 
 
+def _lane_still_running(deps: LoopDeps, lane_id: str) -> bool:
+    """Read the lane's status fresh, right here, for one settle and no other.
+
+    Only `_settle_escalation` calls this, and only when `debt.reason` is
+    `LANE_TIMEOUT`: it answers a question only that one escalation's
+    ownership decision and its wording need, not the routing decision
+    `_route_due` already took -- the same reason `_finish_ready` reads
+    `unresolved_bot_threads` in its own body rather than folding it into
+    `LaneFacts`. The read costs a kanban query only on the tick that actually
+    settles a lane_timeout escalation in live mode, since `_settle_escalation`
+    is reachable from nowhere else (`_rehearse` never calls it) -- not on
+    every due-pass visit the way `_observe_lane`'s read is.
+
+    A read that raises is answered the safe way, not the available way: a
+    kanban this call cannot reach and a lane genuinely still going are
+    indistinguishable from here, and reading "unreadable" as "finished" would
+    release the ownership label and the reaction over a worker that may still
+    be pushing to the branch -- the exact collision this service exists to
+    prevent. So an exception reads as "still running," the same answer a
+    status this build has never catalogued gets: only a status this module
+    recognises as terminal (`TERMINAL_LANE_STATUSES`) is ever read as "not
+    running" here. That also means this settle can disagree with the due
+    pass's own observation moments earlier in the same tick (which only
+    required "not yet terminal" to reach here at all) -- a lane that finishes
+    in the gap between the two reads is stood down exactly as it always was;
+    this function is what lets that still happen instead of freezing the
+    lane_timeout observation's answer in place.
+    """
+    try:
+        status = deps.lanes.status(lane_id)
+    except Exception:
+        return True
+    return status not in TERMINAL_LANE_STATUSES
+
+
 def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
                        debt: EscalationDebt) -> bool:
     """Tell the human if nobody has yet, and close the loop either way.
@@ -764,10 +830,30 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     it gates the *post* only, so a loop that has been heard but not closed
     comes back here and retries both of those, and neither is anything a human
     could see twice.
+
+    `lane_timeout` carries one more question no other reason asks: whether the
+    lane it gave up waiting on is actually done. Kanban's own stale-lane
+    reclaim only reaps silence, never duration, so a lane that keeps
+    heartbeating can still be genuinely working past LANE_WAIT_SECONDS, and a
+    worker in it can still commit and push to this branch. Standing down in
+    that case -- releasing `owner_label`, clearing the reaction -- would tell
+    a human the PR is free while it is not, which is the exact collision this
+    service exists to prevent. So this checks fresh (`_lane_still_running`,
+    scoped to this one reason and this one settle) rather than trusting the
+    due pass's own, now possibly stale, observation: a lane not confirmed
+    finished keeps both signals and is named in the notice; a lane kanban now
+    calls terminal stands down exactly as any other escalation does. Nothing
+    later ever revisits that "keep" -- the loop closes either way, and closing
+    is the only lever this service has over a lane it cannot cancel -- which
+    is deliberate: a stale label a human was told about beats a missing one
+    that invites a second agent onto a branch a live worker still owns.
     """
+    lane_alive = (debt.reason == LANE_TIMEOUT and loop.lane_id is not None
+                  and _lane_still_running(deps, loop.lane_id))
     if not debt.notified:
-        if deps.slack.notify_escalation(verdict, loop.round_count,
-                                        debt.reason) is None:
+        if deps.slack.notify_escalation(
+                verdict, loop.round_count, debt.reason,
+                lane_id=loop.lane_id if lane_alive else None) is None:
             attempt = debt.attempts + 1
             if attempt < NOTIFY_ATTEMPTS:
                 deps.store.record_note(loop.loop_id, EVENT_ESCALATION_PENDING,
@@ -788,7 +874,13 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         else:
             deps.store.record_note(loop.loop_id, EVENT_ESCALATION_DELIVERED,
                                    {"reason": debt.reason}, deps.now())
-    _stand_down(deps, loop, verdict)
+    if lane_alive:
+        # Deliberately NOT _stand_down: see the docstring above. The label and
+        # the reaction stay, and this note is the only record of why.
+        deps.store.record_note(loop.loop_id, LANE_TIMEOUT_LANE_ALIVE,
+                               {"lane_id": loop.lane_id}, deps.now())
+    else:
+        _stand_down(deps, loop, verdict)
     return _close(deps, loop, LoopState.ESCALATED,
                   escalation_reason=debt.reason)
 
