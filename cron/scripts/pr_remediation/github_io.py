@@ -57,8 +57,14 @@ class GitHubIO:
         ])
         if out is None:
             return None
+        if not out.strip():
+            # Empty stdout is nothing to parse, not an implicit "{}". Treat
+            # it the same as an unreadable response rather than manufacturing
+            # a fake empty object that downstream code would read as a known
+            # (label-free) state.
+            return None
         try:
-            data = json.loads(out or "{}")
+            data = json.loads(out)
         except ValueError:
             return None
         return data if isinstance(data, dict) else None
@@ -72,17 +78,40 @@ class GitHubIO:
         return ((data or {}).get("author") or {}).get("login") or None
 
     def has_hold(self, owner: str, repo: str, pr: int) -> bool:
-        """True also when GitHub could not be read: an unknown state is a hold."""
+        """True also when GitHub could not be read, or the response's shape
+        cannot be trusted to mean "no hold": an unknown state is a hold.
+
+        Only a `labels` value that is *exactly* a list of dicts, each with a
+        string `name`, is a recognised shape. Anything else -- missing key,
+        null, a scalar, a list of non-dicts, or a dict missing `name` -- is
+        unrecognised and must fail open (return True), the same as an
+        unreadable response. A `labels: []` list is a genuinely known,
+        label-free state and must still return False.
+        """
         data = self._view(owner, repo, pr)
         if data is None:
             return True
-        names = {str(l.get("name", "")) for l in data.get("labels") or []}
+        labels = data.get("labels")
+        if not isinstance(labels, list):
+            return True
+        names = set()
+        for label in labels:
+            if not isinstance(label, dict):
+                return True
+            name = label.get("name")
+            if not isinstance(name, str):
+                return True
+            names.add(name)
         return self._cfg.hold_label in names
 
-    def claim(self, owner: str, repo: str, pr: int) -> None:
-        self._run(["pr", "edit", str(pr), "-R", f"{owner}/{repo}",
-                   "--add-label", self._cfg.owner_label])
+    def claim(self, owner: str, repo: str, pr: int) -> bool:
+        """Add the ownership label. Returns True only if the write
+        succeeded; callers must treat False as "do not proceed as owner"."""
+        return self._run(["pr", "edit", str(pr), "-R", f"{owner}/{repo}",
+                           "--add-label", self._cfg.owner_label]) is not None
 
-    def release(self, owner: str, repo: str, pr: int) -> None:
-        self._run(["pr", "edit", str(pr), "-R", f"{owner}/{repo}",
-                   "--remove-label", self._cfg.owner_label])
+    def release(self, owner: str, repo: str, pr: int) -> bool:
+        """Remove the ownership label. Returns True only if the write
+        succeeded."""
+        return self._run(["pr", "edit", str(pr), "-R", f"{owner}/{repo}",
+                           "--remove-label", self._cfg.owner_label]) is not None

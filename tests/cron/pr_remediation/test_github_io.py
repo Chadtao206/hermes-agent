@@ -60,6 +60,88 @@ def test_head_sha_and_author_are_read_from_the_live_pr(tmp_path):
     assert io.author("Ylopo", "example", 42) == "Chadtao206"
 
 
+def test_empty_stdout_with_success_reads_as_unknown_not_as_false(tmp_path):
+    """returncode 0 with empty stdout is not a valid empty label set --
+    it's nothing to parse, and must fail open."""
+    runner, calls = runner_for({"view": ""})
+    io = io_with(runner, tmp_path)
+    assert io.has_hold("Ylopo", "example", 42) is True
+    assert any("view" in c for c in calls), "the runner must actually be invoked"
+
+
+def test_missing_labels_key_reads_as_unknown_not_as_false(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"headRefOid": "a" * 40})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_null_labels_reads_as_unknown_not_as_false(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": None})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_labels_as_bare_string_reads_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": "hermes-hold"})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_labels_as_dict_reads_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": {"a": 1}})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_labels_as_int_reads_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": 5})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_labels_list_of_strings_reads_as_unknown_not_as_raise(tmp_path):
+    """Entries in `labels` are expected to be dicts with a `name` field;
+    bare strings are an unrecognised shape, not something to coerce."""
+    runner, _ = runner_for({"view": json.dumps({"labels": ["hermes-hold"]})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_label_entry_missing_name_reads_as_unknown_not_as_false(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [{"color": "red"}]})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is True
+
+
+def test_empty_labels_list_is_a_known_state_and_reads_as_false(tmp_path):
+    """The one shape that must NOT fail open: [] is a genuinely known,
+    label-free PR, not an unknown one."""
+    runner, _ = runner_for({"view": json.dumps({"labels": []})})
+    assert io_with(runner, tmp_path).has_hold("Ylopo", "example", 42) is False
+
+
+def test_claim_returns_true_when_the_write_succeeds(tmp_path):
+    runner, calls = runner_for({})
+    assert io_with(runner, tmp_path).claim("Ylopo", "example", 42) is True
+    assert any("--add-label" in c for c in calls)
+
+
+def test_claim_returns_false_when_the_write_fails(tmp_path):
+    def run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    io = io_with(run, tmp_path)
+    assert io.claim("Ylopo", "example", 42) is False
+
+
+def test_release_returns_true_when_the_write_succeeds(tmp_path):
+    runner, calls = runner_for({})
+    assert io_with(runner, tmp_path).release("Ylopo", "example", 42) is True
+    assert any("--remove-label" in c for c in calls)
+
+
+def test_release_returns_false_when_the_write_fails(tmp_path):
+    def run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    io = io_with(run, tmp_path)
+    assert io.release("Ylopo", "example", 42) is False
+
+
 def test_a_failed_gh_call_reads_as_unknown_not_as_false(tmp_path):
     """Never let a transient failure look like 'no hold label'."""
     def run(command, **kwargs):
