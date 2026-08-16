@@ -2460,3 +2460,102 @@ def test_rescheduling_never_shortens_a_wait_a_route_chose(tmp_path):
     row = deps.store._db.execute(
         "SELECT next_attempt_at FROM loops WHERE loop_id=?", (loop_id,)).fetchone()
     assert row["next_attempt_at"] == deps.now() + HEAD_MOVE_GRACE_SECONDS
+
+
+# --- C2: a lane that never terminates must not wedge the pull request -------
+
+
+def test_a_lane_that_never_finishes_is_given_up_on_and_escalated(tmp_path):
+    """Every other bound in this module starts counting only once kanban has
+    already called the lane finished, so a lane that never says so outlived all
+    of them: the loop stayed in `remediating` forever, holding the ownership
+    label, and `active_for_pr` refused every later generation of that pull
+    request while this pass polled kanban every few seconds indefinitely.
+
+    boris_intake bounds the same shape at 90 minutes (REVIEW_WAIT_SECONDS),
+    added after a real incident.
+    """
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
+    loop_id = only_loop(deps).loop_id
+
+    deps.now.advance(LANE_WAIT_SECONDS)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)], \
+        "the pull request must be handed back, not left looking owned"
+
+
+def test_a_deleted_kanban_card_does_not_wedge_the_loop_forever(tmp_path):
+    """`lane_status()` answers None for a card that is gone. Nothing else in
+    this pass can ever move such a loop on: it is not finished, so no head is
+    read, no grace window opens and no head-read budget is spent."""
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status=None))
+    deps.now.advance(LANE_WAIT_SECONDS)
+
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
+    assert only_loop(deps) is None
+
+
+def test_a_running_lane_inside_the_bound_is_left_alone(tmp_path):
+    """The bound must not cut a lane that is simply taking a while: it is
+    dispatched with --max-retries 1, so kanban may legitimately run the work
+    twice inside one card's life."""
+    from pr_remediation.loop import LANE_WAIT_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
+    deps.now.advance(LANE_WAIT_SECONDS - 60)
+
+    assert tick(deps) == 0
+    assert deps.slack.escalations == []
+    assert only_loop(deps).state is LoopState.REMEDIATING
+
+
+def test_the_lane_timeout_reason_is_its_own_dead_end(tmp_path):
+    """Three different things to go and look at: `no_op_lane` means the lane
+    finished and pushed nothing (look at the branch), `head_read_exhausted`
+    means GitHub would not say what it pushed (look at GitHub), and this means
+    the lane never finished at all (look at the kanban card)."""
+    from pr_remediation.loop import HEAD_READ_EXHAUSTED, LANE_TIMEOUT
+    from pr_remediation.models import EscalationReason
+
+    assert LANE_TIMEOUT not in (HEAD_READ_EXHAUSTED,
+                                EscalationReason.NO_OP_LANE.value)
+
+
+def test_a_wedged_lane_that_is_escalated_is_reported_as_still_running(tmp_path):
+    """Nothing here can cancel a kanban lane, and a `running` card may well
+    still be pushing to the branch this loop has just handed back -- so the
+    human who is being told the PR is stuck is also told where the lane went."""
+    from pr_remediation.loop import EVENT_LANE_ABANDONED, LANE_WAIT_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(LANE_WAIT_SECONDS)
+    tick(deps)
+
+    abandoned = [e["detail"] for e in deps.store.events(loop_id)
+                 if e["kind"] == EVENT_LANE_ABANDONED]
+    assert abandoned and abandoned[0]["lane_id"] == "t_1"
+
+
+def test_a_paused_tick_records_the_lane_timeout_and_escalates_nothing(tmp_path):
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(LANE_WAIT_SECONDS)
+
+    shadow = in_mode(deps, "shadow")
+    assert tick(shadow) == 0
+    assert shadow.slack.escalations == []
+    assert shadow.store.get(loop_id).state is LoopState.REMEDIATING
+    decisions = [e["detail"] for e in shadow.store.events(loop_id)
+                 if e["kind"] == "shadow_decision"]
+    assert decisions[-1]["would"] == "escalate"
+    assert decisions[-1]["reason"] == LANE_TIMEOUT

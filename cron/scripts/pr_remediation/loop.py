@@ -133,6 +133,15 @@ all: only `remediating` (with a lane) and `awaiting_head_move` are waiting on
 one, so a row that still names the lane of a round already closed out is
 never read back as a second completion.
 
+All of that presupposes a lane kanban has already called finished, which is a
+thing a lane can simply never be. A wedged `running` card, or a card a human
+deleted (`lane_status()` then answers None), reaches none of the bounds below
+because none of them start counting until the lane is over. LANE_WAIT_SECONDS
+is the one bound that does not wait for that, measured from when the loop
+entered its current state, and it escalates as `lane_timeout` -- a third dead
+end, distinct from the two the next paragraph separates, and pointing a human
+at the kanban card rather than at the branch or at GitHub.
+
 That retry is bounded by HEAD_READ_ATTEMPTS, the same shape as NOTIFY_ATTEMPTS
 below and for the same reason: a blip is worth riding out, but a PR that was
 deleted, a repo that was renamed or transferred, or a token that lost its
@@ -228,6 +237,30 @@ HEAD_MOVE_GRACE_SECONDS = 60.0
 # (`active_for_pr`), open forever.
 HEAD_READ_ATTEMPTS = 5
 
+# How long a lane may sit without reaching a terminal kanban status before this
+# loop stops waiting for it. The one bound that does not presuppose a finished
+# lane: every other one here (the grace window, the head-read budget) only
+# starts counting once kanban has already said the lane is over, so a lane that
+# never says so -- a wedged `running` card, or a card a human deleted, which
+# `lane_status()` reports as None -- outlived all of them and wedged its pull
+# request permanently while this pass polled kanban every DUE_BACKOFF_SECONDS
+# forever.
+#
+# boris_intake bounds exactly this shape with REVIEW_WAIT_SECONDS = 90 minutes
+# (reconciler.py's REVIEW_LANE_TIMEOUT), added after a real incident. Three
+# hours here, deliberately twice that, for two reasons that both point the same
+# way: the sibling bounds a lane that *reads* a diff and returns a structured
+# judgement, while this one bounds a lane that writes code, runs a test suite
+# and pushes -- strictly more work at the same worker cadence -- and this lane
+# is dispatched with `--max-retries 1`, so kanban may legitimately run the work
+# twice inside one card's life. A bound tighter than twice the sibling's would
+# cut a legitimate second attempt off mid-flight and escalate a lane that was
+# about to succeed. It is measured from `updated_at`, which is when the loop
+# entered its current state -- the lane's dispatch, or the grace window's
+# opening -- and which nothing but a real transition moves (`store.defer`
+# deliberately leaves it alone).
+LANE_WAIT_SECONDS = 180 * 60
+
 # How many times a single escalation may be posted before the loop closes
 # unheard. Chosen high enough to ride out a Slack outage across several ticks,
 # low enough that a misconfigured channel cannot hold the PR's loop open (and
@@ -266,6 +299,13 @@ PR_OPEN = "OPEN"
 # push. Conflating them would send whoever is escalated to looking for a push
 # that was never the problem.
 HEAD_READ_EXHAUSTED = "head_read_exhausted"
+# The lane never reached a terminal kanban status at all -- a third dead end,
+# and a third thing to tell a human to go and look at. `no_op_lane` says the
+# lane finished and pushed nothing (look at the branch); `head_read_exhausted`
+# says the lane finished and GitHub would not say what it pushed (look at
+# GitHub); this says the lane never finished (look at the kanban card, which may
+# be wedged, or may simply be gone).
+LANE_TIMEOUT = "lane_timeout"
 
 # Why a verdict was seen but deliberately not routed.
 LANE_IN_FLIGHT = "lane_in_flight"
@@ -1174,9 +1214,28 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
         # routes past a stale claim rather than stopping to tidy it.
         return Route(ROUTE_DROP_ORPHAN, dict(orphan), standing=True)
 
-    if lane is None or not lane.finished:
-        # No lane to complete, or one still working. Either way there is
-        # nothing to decide and nothing to write.
+    if lane is None:
+        # This loop waits on no lane at all, so there is nothing to decide and
+        # nothing to write.
+        return None
+    if not lane.finished:
+        # A lane still working -- or one that will never say it has stopped.
+        # The bound below is the only one in this module that does not
+        # presuppose a finished lane, and without it a wedged `running` card or
+        # a card a human deleted (`status` None) held its pull request open for
+        # good: `active_for_pr` refuses every later generation while this loop
+        # lives, and no other route here can ever fire for it.
+        #
+        # No hold label is read first, and deliberately: like the escalation
+        # retry above, what this does is notify a human and stand down the
+        # signals this loop itself added, which is what a hold wants to happen
+        # anyway -- and a hold cannot be read on a tick where the lane read is
+        # the only thing that answered.
+        if deps.now() >= loop.updated_at + LANE_WAIT_SECONDS:
+            return Route(ROUTE_ESCALATE,
+                         {"reason": LANE_TIMEOUT, "lane_id": loop.lane_id,
+                          "status": lane.status},
+                         standing=True)
         return None
     if lane.held:
         # Everything below writes -- a reaction, a post, a label -- so Chad's
