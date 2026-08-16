@@ -1656,7 +1656,10 @@ def test_a_held_pr_stops_the_lane_pass_before_any_write(tmp_path):
 
 
 def test_an_unreadable_head_waits_instead_of_calling_the_lane_a_no_op(tmp_path):
-    """None is "GitHub could not be read", not "Andrej pushed nothing"."""
+    """None is "GitHub could not be read", not "Andrej pushed nothing". The
+    wait is bounded (HEAD_READ_ATTEMPTS), but three ticks is nowhere near it,
+    so each is still just a wait -- see the budget tests below for the bound
+    itself."""
     from pr_remediation.loop import tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
@@ -1668,12 +1671,144 @@ def test_an_unreadable_head_waits_instead_of_calling_the_lane_a_no_op(tmp_path):
     assert deps.slack.escalations == [], "a read blip must not burn the loop"
     assert deps.slack.reposts == []
     assert deps.store.get(loop_id).state is LoopState.REMEDIATING
-    assert kinds(deps, loop_id).count("head_unreadable") == 1
+    # Each attempt is its own note now, not one deduped sentence: the trail is
+    # the only durable place the count can live, and the append is bounded by
+    # the budget itself rather than growing without end.
+    assert [e["detail"]["attempt"] for e in deps.store.events(loop_id)
+            if e["kind"] == "head_unreadable"] == [1, 2, 3]
 
     deps.github.head = "b" * 40  # GitHub came back
     deps.now.advance()
     assert tick(deps) == 1
     assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+
+
+def test_the_head_read_budget_exhausting_escalates_with_a_reason_distinct_from_no_op_lane(
+        tmp_path):
+    """A permanently unreadable head is not a no-op lane. `no_op_lane` means
+    the read succeeded and the lane genuinely pushed nothing, which asks a
+    human to accept the round as spent; this reason means the read itself
+    never landed, which asks a human to go look at GitHub instead."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    for _ in range(HEAD_READ_ATTEMPTS):
+        deps.now.advance()
+        tick(deps)
+    assert deps.slack.escalations == \
+        [("Ylopo/example#42", 1, "head_read_exhausted")]
+    assert only_loop(deps) is None, "an escalated loop is finished"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)]
+    assert deps.slack.thinkies_removed == ["1.0"]
+    assert kinds(deps, loop_id).count("head_unreadable") == HEAD_READ_ATTEMPTS - 1, \
+        "the exhausting attempt escalates instead of recording one more wait"
+
+
+def test_a_head_read_escalation_retries_through_the_same_notify_budget(tmp_path):
+    """head_read_exhausted is an ordinary escalation once it exists: a failed
+    post leaves the loop non-terminal and owned, and retries through
+    NOTIFY_ATTEMPTS exactly like every other reason -- there is no bespoke
+    delivery path for this one to have its own bugs."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None), slack=slack)
+    loop_id = _loop_id(deps)
+    for _ in range(HEAD_READ_ATTEMPTS):
+        deps.now.advance()
+        tick(deps)
+    assert deps.store.get(loop_id).state is not LoopState.ESCALATED, \
+        "nobody has heard yet"
+    assert "escalation_pending" in kinds(deps, loop_id)
+    assert deps.github.released == [], "the PR stays owned until the notice lands"
+    assert len(slack.escalations) == 1, "the exhausting tick spent its first attempt"
+
+    slack._escalation_ts = "9.2"  # Slack recovers
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert [e[2] for e in deps.slack.escalations] == \
+        ["head_read_exhausted", "head_read_exhausted"], \
+        "the failed attempt and the delivered one, both against the same reason"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)]
+
+
+def test_a_recovered_read_does_not_carry_its_failure_count_into_the_next_round(
+        tmp_path):
+    """Scoped to the lane, not the loop: kanban hands every dispatch a fresh
+    id, so a round that opens after a recovery starts this budget at zero
+    rather than inheriting the round before it. Carrying the count over would
+    escalate a brand new round's very first blip."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, LANE_POLL_SECONDS, tick
+
+    github = GitHubFake(head=None)
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=github)
+    loop_id = _loop_id(deps)
+    for _ in range(HEAD_READ_ATTEMPTS - 1):
+        deps.now.advance()
+        assert tick(deps) == 0
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING, \
+        "one tick short of round 1's own budget"
+
+    github.head = "b" * 40  # round 1's push shows up
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).lane_id == "t_1"
+
+    # Round 2: a fresh verdict opens a new lane with its own id.
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    deps.now.advance()
+    assert tick(deps) == 1
+    loop = deps.store.get(loop_id)
+    assert (loop.round_count, loop.lane_id) == (2, "t_2")
+    deps.source.verdicts = []
+    deps.now.advance(LANE_POLL_SECONDS + 1)
+
+    github.head = None  # round 2's own blip -- not round 1's leftovers
+    deps.now.advance()
+    assert tick(deps) == 0
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING, \
+        "carrying round 1's four attempts over would escalate on this first one"
+    assert deps.slack.escalations == []
+    assert [e["detail"]["attempt"] for e in deps.store.events(loop_id)
+            if e["kind"] == "head_unreadable" and e["detail"]["lane_id"] == "t_2"] \
+        == [1]
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_tick_neither_escalates_nor_spends_the_head_read_budget(
+        tmp_path, mode):
+    """A pause must not quietly burn through HEAD_READ_ATTEMPTS while nobody is
+    driving: whatever ticks pass while paused must cost the live budget
+    nothing, or resuming live would escalate sooner than the budget promises."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+
+    paused = in_mode(deps, mode)
+    for _ in range(HEAD_READ_ATTEMPTS * 2):
+        paused.now.advance()
+        assert tick(paused) == 0
+    assert deps.slack.escalations == []
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    assert "head_unreadable" not in kinds(deps, loop_id), \
+        "a paused tick must not write the note a live tick spends its budget on"
+
+    # Resuming live still gets the full budget: nothing was spent while paused.
+    live = in_mode(deps, "live")
+    for _ in range(HEAD_READ_ATTEMPTS):
+        live.now.advance()
+        tick(live)
+    assert deps.slack.escalations == \
+        [("Ylopo/example#42", 1, "head_read_exhausted")]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
 def test_a_lane_pass_that_cannot_post_the_rereview_escalates(tmp_path):

@@ -125,6 +125,20 @@ all: only `remediating` (with a lane) and `awaiting_head_move` are waiting on
 one, so a row that still names the lane of a round already closed out is
 never read back as a second completion.
 
+That retry is bounded by HEAD_READ_ATTEMPTS, the same shape as NOTIFY_ATTEMPTS
+below and for the same reason: a blip is worth riding out, but a PR that was
+deleted, a repo that was renamed or transferred, or a token that lost its
+scope reads exactly like a blip on every single tick, and nothing else would
+ever end the wait -- leaving the loop non-terminal blocks every later
+generation of this PR (`active_for_pr`) behind a human who was never told.
+At the bound the loop escalates as `head_read_exhausted` rather than
+`no_op_lane`: the two are not the same dead end. `no_op_lane` means the read
+succeeded and the lane genuinely pushed nothing, which asks a human to accept
+the round as spent. `head_read_exhausted` means the read itself never landed,
+which asks a human to go look at GitHub rather than at the branch --
+conflating the two would send them looking for a push that was never the
+problem.
+
 The hold label is read before any of that is acted on, because all of it
 writes -- a reaction removed, a re-review posted, an escalation notice, the
 ownership label handed back. `has_hold` fails closed, so a GitHub this pass
@@ -193,6 +207,19 @@ LANE_POLL_SECONDS = 15
 # and taken exactly once, because `awaiting_head_move` has no self-edge.
 HEAD_MOVE_GRACE_SECONDS = 60.0
 
+# How many consecutive due-pass ticks a lane's head may come back unreadable
+# before this loop gives up waiting and escalates. A different problem from
+# the grace window above: that one assumes the read itself succeeds and only
+# the push is late, which its single one-shot wait is built to survive; this
+# is for when GitHub cannot even answer the question, which no fixed wait
+# survives on its own. Mirrors NOTIFY_ATTEMPTS below for the same reason and
+# at the same value: high enough to ride out a GitHub outage across several
+# ticks, low enough that a head that is unreadable for a real reason -- the
+# PR deleted, the repo renamed or transferred, a token that lost its scope --
+# cannot pin this PR's lane loop, and with it every later generation
+# (`active_for_pr`), open forever.
+HEAD_READ_ATTEMPTS = 5
+
 # How many times a single escalation may be posted before the loop closes
 # unheard. Chosen high enough to ride out a Slack outage across several ticks,
 # low enough that a misconfigured channel cannot hold the PR's loop open (and
@@ -206,6 +233,11 @@ DUE_LIMIT = 20
 NOT_CHAD_AUTHORED = "not_chad_authored"
 GITHUB_UNWRITABLE = "github_unwritable"
 REREVIEW_UNPOSTABLE = "rereview_unpostable"
+# The read, not the lane, is what gave up -- distinct from
+# EscalationReason.NO_OP_LANE, which means the read succeeded and found no
+# push. Conflating them would send whoever is escalated to looking for a push
+# that was never the problem.
+HEAD_READ_EXHAUSTED = "head_read_exhausted"
 
 # Why a verdict was seen but deliberately not routed.
 LANE_IN_FLIGHT = "lane_in_flight"
@@ -960,6 +992,26 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     return Route(ROUTE_OPEN_LANE, {"round": loop.round_count + 1})
 
 
+def _head_read_attempts(deps: LoopDeps, loop: LoopRequest, lane_id: str) -> int:
+    """How many times in a row this lane's head has come back unreadable.
+
+    Scoped to `lane_id`, not the loop: kanban hands every dispatch of a lane a
+    fresh id, so a loop that rides out a blip in one round and later opens
+    another lane starts this count at zero rather than inheriting the last
+    round's failures.
+
+    Counts the `head_unreadable` notes a live tick actually wrote, rather than
+    keeping a ledger of its own -- which is also what makes this budget
+    something only a live tick can spend. A paused tick's decisions go to
+    `_shadow` under a different kind (`shadow_decision`), so a pause, however
+    long, writes none of these and this always reads zero while one is on.
+    """
+    return sum(
+        1 for event in deps.store.events(loop.loop_id)
+        if event["kind"] == ROUTE_HEAD_UNREADABLE
+        and event["detail"].get("lane_id") == lane_id)
+
+
 def _route_due(deps: LoopDeps, loop: LoopRequest,
                lane: LaneFacts | None) -> Route | None:
     """Decide what a live tick owes a loop no verdict is going to arrive for.
@@ -1013,8 +1065,16 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
     if lane.head is None:
         # Read the hold but not the head: a blip between two calls. Waiting
         # costs a tick; guessing costs the loop, because "no head" read as "no
-        # push" escalates a round that may well have landed.
-        return Route(ROUTE_HEAD_UNREADABLE, {"lane_id": loop.lane_id},
+        # push" escalates a round that may well have landed. But the wait has
+        # to end somewhere: a deleted PR, a renamed or transferred repo, or a
+        # token that lost its scope reads exactly like a blip on every tick,
+        # and nothing else would ever tell this loop the difference.
+        attempt = _head_read_attempts(deps, loop, loop.lane_id) + 1
+        if attempt >= HEAD_READ_ATTEMPTS:
+            return Route(ROUTE_ESCALATE, {"reason": HEAD_READ_EXHAUSTED},
+                         standing=True)
+        return Route(ROUTE_HEAD_UNREADABLE,
+                     {"lane_id": loop.lane_id, "attempt": attempt},
                      standing=True)
     if lane.head != loop.head_sha:
         if not loop.root_thread_ts:
