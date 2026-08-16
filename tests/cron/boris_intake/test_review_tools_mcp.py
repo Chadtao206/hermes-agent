@@ -445,6 +445,125 @@ def test_pr_diff_returns_first_page_and_advertises_the_rest(tmp_path, monkeypatc
     assert len(result["data"]["diff"]) <= module._DIFF_PAGE_BUDGET
 
 
+TOO_LARGE = (
+    "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the "
+    "maximum number of lines (20000) (https://api.github.com/repos/o/r/pulls/42)\n"
+    "PullRequest.diff too_large"
+)
+
+
+def files_api_runner(pages, *, head="a" * 40, diff_stderr=TOO_LARGE):
+    """A gh runner whose `pr diff` is refused but whose changed-file pages answer."""
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if "view" in command:
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"headRefOid": head}), stderr=""
+            )
+        if "diff" in command:
+            return SimpleNamespace(returncode=1, stdout="", stderr=diff_stderr)
+        route = command[-1]
+        page = int(route.split("page=")[-1])
+        payload = pages[page - 1] if page <= len(pages) else []
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    return run, calls
+
+
+def test_pr_diff_falls_back_to_changed_files_when_github_refuses_the_diff(
+    tmp_path, monkeypatch
+):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    pages = [
+        [
+            {
+                "filename": "src/app.py",
+                "status": "modified",
+                "changes": 2,
+                "patch": "@@ -1,1 +1,2 @@\n-old\n+new",
+            }
+        ]
+    ]
+    runner, calls = files_api_runner(pages)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_diff")
+
+    assert result["data"]["all_files"] == ["src/app.py"]
+    assert result["data"]["source"] == "changed_files_api"
+    assert "diff --git a/src/app.py b/src/app.py" in result["data"]["diff"]
+    assert "+new" in result["data"]["diff"]
+    assert any("/pulls/42/files" in part for call in calls for part in call)
+
+
+def test_changed_file_fallback_names_files_whose_patch_github_withheld(
+    tmp_path, monkeypatch
+):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    pages = [
+        [
+            {"filename": "big.ts", "status": "modified", "changes": 9000},
+            {"filename": "gone.ts", "status": "removed", "changes": 3549},
+        ]
+    ]
+    runner, _calls = files_api_runner(pages)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    diff = module.read_github_evidence("pr_diff")["data"]["diff"]
+
+    assert "big.ts" in diff and "file_at_head" in diff
+    # A file deleted by the pull request cannot be re-read at head; say so rather
+    # than pointing the reviewer at a tool that will fail.
+    assert "gone.ts" in diff
+    gone = diff.split("diff --git a/gone.ts")[-1]
+    assert "file_at_head" not in gone
+
+
+def test_changed_file_fallback_walks_every_page(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    full = [
+        {"filename": f"f{n}.py", "status": "modified", "changes": 1, "patch": "@@ -1 +1 @@\n+x"}
+        for n in range(module._FILES_PER_PAGE)
+    ]
+    tail = [{"filename": "last.py", "status": "added", "changes": 1, "patch": "@@ -0,0 +1 @@\n+y"}]
+    runner, _calls = files_api_runner([full, tail])
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_diff")
+
+    assert "last.py" in result["data"]["all_files"]
+    assert len(result["data"]["all_files"]) == module._FILES_PER_PAGE + 1
+
+
+def test_pr_diff_does_not_fall_back_for_unrelated_github_failures(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, calls = files_api_runner([[]], diff_stderr="gh: authentication failed")
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    with pytest.raises(module.ToolError, match="authentication failed"):
+        module.read_github_evidence("pr_diff")
+    assert not any("files" in part for call in calls for part in call)
+
+
+def test_github_failures_report_why_github_refused(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+
+    def run(command, **kwargs):
+        if "view" in command and "headRefOid" in command[-1]:
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"headRefOid": "a" * 40}), stderr=""
+            )
+        return SimpleNamespace(returncode=4, stdout="", stderr="HTTP 502: upstream is unhappy")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    with pytest.raises(module.ToolError, match="upstream is unhappy") as caught:
+        module.read_github_evidence("file_at_head", "src/app.py")
+    assert caught.value.returncode == 4
+
+
 def test_pr_diff_rejects_page_on_other_operations(tmp_path, monkeypatch):
     module, _, _ = bind_request(tmp_path, monkeypatch)
     runner, _calls = github_runner()

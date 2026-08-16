@@ -22,9 +22,11 @@ ALLOWED_GH_VERBS = (
     ["pr", "diff", "1", "-R", "Ylopo/repo"],
     ["pr", "checks", "1", "-R", "Ylopo/repo"],
     ["api", "/repos/Ylopo/repo/contents/README.md?ref=" + "a" * 40],
+    ["api", "/repos/Ylopo/repo/pulls/1/files?per_page=50&page=1"],
 )
 
 REFUSED_GH_VERBS = (
+    ["api", "/repos/Ylopo/repo/pulls/9/files"],
     ["workflow", "list"],
     ["gist", "create", "x"],
     ["pr", "merge", "1", "-R", "Ylopo/repo"],

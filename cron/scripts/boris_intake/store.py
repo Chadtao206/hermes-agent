@@ -683,6 +683,17 @@ class Store:
         )
         self._db.commit()
 
+    def record_note(
+        self, request_id: str, kind: str, detail: dict[str, Any], now: float
+    ) -> None:
+        """Append a non-transitioning note to a request's audit trail."""
+        self._db.execute(
+            "INSERT INTO request_events "
+            "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+            (request_id, kind, json.dumps(detail, separators=(",", ":")), now),
+        )
+        self._db.commit()
+
     def renew_claim(
         self,
         request_id: str,

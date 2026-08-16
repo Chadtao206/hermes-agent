@@ -26,6 +26,15 @@ class ToolError(RuntimeError):
     pass
 
 
+class GitHubCommandError(ToolError):
+    """A refused `gh` invocation, carrying GitHub's own reason for refusing."""
+
+    def __init__(self, message: str, *, returncode: int, stderr: str) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 GHX_RO = "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"
 GITHUB_RUNNER = subprocess.run
 _PROFILE = "boris_on_demand"
@@ -39,6 +48,16 @@ _OPERATIONS = frozenset({
 })
 _DIFF_PAGE_BUDGET = 60_000
 _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+# GitHub refuses to render a pull request diff once it grows past roughly 20k
+# changed lines. The changed-file inventory still answers, so it is the only
+# changed-code evidence available on the largest pull requests. Ask for 50 files
+# a page rather than the 100 maximum: it keeps each response inside the 2 MiB
+# ceiling above, and GitHub withholds fewer patches on the smaller page (on a
+# 112-file pull request, 1 patch withheld at 50 against 3 at 100).
+_DIFF_REFUSED = re.compile(r"HTTP 406|exceeded the maximum number of lines|too_large")
+_FILES_PER_PAGE = 50
+_MAX_FILE_PAGES = 60
+_STDERR_EXCERPT = 300
 
 _STRING_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 2_000}
 _ANCHOR_SCHEMA = {
@@ -274,7 +293,13 @@ def _github(
     except Exception as error:
         raise ToolError("GitHub evidence read failed") from error
     if proc.returncode not in allowed_codes:
-        raise ToolError(f"GitHub evidence read failed with status {proc.returncode}")
+        detail = " ".join((proc.stderr or "").split())[:_STDERR_EXCERPT]
+        raise GitHubCommandError(
+            f"GitHub evidence read failed with status {proc.returncode}"
+            + (f": {detail}" if detail else ""),
+            returncode=proc.returncode,
+            stderr=proc.stderr or "",
+        )
     output = proc.stdout or ""
     if len(output.encode()) > 2 * 1024 * 1024:
         raise ToolError("GitHub evidence response exceeds 2 MiB")
@@ -402,6 +427,91 @@ def paginate_diff(diff: str, page: int, budget: int = _DIFF_PAGE_BUDGET) -> dict
     }
 
 
+def _changed_file_section(entry: object) -> str:
+    """Rebuild one file's diff section from its changed-file inventory entry."""
+    if not isinstance(entry, dict):
+        raise ToolError("GitHub changed-file entry is not an object")
+    filename = str(entry.get("filename") or "")
+    if not filename:
+        raise ToolError("GitHub changed-file entry has no filename")
+    previous = entry.get("previous_filename")
+    header = f"diff --git a/{previous or filename} b/{filename}\n"
+    patch = entry.get("patch")
+    if isinstance(patch, str) and patch:
+        return header + (patch if patch.endswith("\n") else patch + "\n")
+    status = str(entry.get("status") or "modified")
+    changes = entry.get("changes", 0)
+    if status == "removed":
+        # Deleted files are gone at head, so file_at_head cannot recover them.
+        note = (
+            f"[boris: GitHub withheld the patch for this deleted file "
+            f"({changes} lines removed); it is not readable at head]\n"
+        )
+    else:
+        note = (
+            f"[boris: GitHub withheld the patch for this file (status {status}, "
+            f"{changes} changed lines) — read {filename} with file_at_head "
+            f"for full content]\n"
+        )
+    return header + note
+
+
+def _changed_files_diff(request: LifecycleRequest) -> str:
+    """A unified diff rebuilt from the changed-file inventory."""
+    owner = quote(request.owner, safe="")
+    repo = quote(request.repo, safe="")
+    sections: list[str] = []
+    exhausted = True
+    for page in range(1, _MAX_FILE_PAGES + 1):
+        batch = _github(
+            request,
+            [
+                "api",
+                f"/repos/{owner}/{repo}/pulls/{request.pr_number}"
+                f"/files?per_page={_FILES_PER_PAGE}&page={page}",
+            ],
+            expect_json=True,
+        )
+        if not isinstance(batch, list):
+            raise ToolError("GitHub changed-file response is not a list")
+        sections.extend(_changed_file_section(entry) for entry in batch)
+        if len(batch) < _FILES_PER_PAGE:
+            exhausted = False
+            break
+    if not sections:
+        raise ToolError("GitHub reported no changed files for this pull request")
+    if exhausted:
+        # Never let a bounded walk read as complete coverage.
+        limit = _MAX_FILE_PAGES * _FILES_PER_PAGE
+        sections.append(
+            f"diff --git a/x b/[boris]-changed-file-inventory-truncated\n"
+            f"[boris: the changed-file inventory stopped at {limit} files; "
+            f"any file beyond that is absent from this diff]\n"
+        )
+    return "".join(sections)
+
+
+def _pr_diff(request: LifecycleRequest) -> tuple[str, str]:
+    """The exact-head diff, plus which evidence route produced it."""
+    try:
+        raw = _github(
+            request,
+            [
+                "pr",
+                "diff",
+                str(request.pr_number),
+                "-R",
+                f"{request.owner}/{request.repo}",
+            ],
+            expect_json=False,
+        )
+    except GitHubCommandError as error:
+        if not _DIFF_REFUSED.search(error.stderr):
+            raise
+        return _changed_files_diff(request), "changed_files_api"
+    return raw, "pr_diff"
+
+
 server = FastMCP("boris_review")
 
 
@@ -438,12 +548,9 @@ def read_github_evidence(
             _ensure_current_head(request)
             repository = f"{request.owner}/{request.repo}"
             if operation == "pr_diff":
-                raw = _github(
-                    request,
-                    ["pr", "diff", str(request.pr_number), "-R", repository],
-                    expect_json=False,
-                )
+                raw, source = _pr_diff(request)
                 data = paginate_diff(raw, page)
+                data["source"] = source
             elif operation == "pr_checks":
                 data = _github(
                     request,

@@ -37,7 +37,7 @@ def fetch_pr(
                 "-R",
                 f"{owner}/{repo}",
                 "--json",
-                "headRefOid,author,state",
+                "headRefOid,author,state,title,headRefName",
             ],
             capture_output=True,
             text=True,
@@ -63,6 +63,8 @@ def fetch_pr(
         head_sha=sha,
         author=str((data.get("author") or {}).get("login") or ""),
         state=str(data.get("state") or "").upper(),
+        title=str(data.get("title") or ""),
+        head_ref=str(data.get("headRefName") or ""),
     )
 
 

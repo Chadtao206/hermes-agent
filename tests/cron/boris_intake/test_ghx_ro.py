@@ -116,3 +116,24 @@ def test_file_content_api_rejects_traversal_alternate_hosts_and_body_flags():
     assert run(["api", "--hostname", "evil.test", route]).returncode == 3
     assert run(["api", "-F", "x=y", route]).returncode == 3
     assert run(["api", "--method=POST", route]).returncode == 3
+
+
+def test_allows_the_changed_file_inventory_for_the_pinned_pull_request():
+    assert run(["api", "/repos/Ylopo/repo/pulls/1/files"]).returncode == 0
+    assert run(["api", "/repos/Ylopo/repo/pulls/1/files?per_page=50"]).returncode == 0
+    assert run(["api", "/repos/Ylopo/repo/pulls/1/files?per_page=50&page=3"]).returncode == 0
+
+
+def test_changed_file_inventory_stays_inside_the_dispatched_scope():
+    # Another pull request, another repository, and neighbouring pull sub-resources
+    # are all outside the scope this lane was dispatched for.
+    assert run(["api", "/repos/Ylopo/repo/pulls/9/files"]).returncode == 3
+    assert run(["api", "/repos/Other/repo/pulls/1/files"]).returncode == 3
+    assert run(["api", "/repos/Ylopo/repo/pulls/1/reviews"]).returncode == 3
+    assert run(["api", "/repos/Ylopo/repo/pulls/1/files/../../secrets"]).returncode == 3
+
+
+def test_changed_file_inventory_accepts_only_pagination_query_parameters():
+    for query in ("ref=deadbeef", "per_page=50&evil=1", "page=1;rm", "per_page=abc", ""):
+        result = run(["api", f"/repos/Ylopo/repo/pulls/1/files?{query}"])
+        assert result.returncode == 3, query

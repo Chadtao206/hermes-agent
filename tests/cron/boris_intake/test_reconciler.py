@@ -1059,6 +1059,118 @@ def test_active_lane_without_submission_polls_then_terminal_lane_becomes_incompl
     assert github.publications == 0
 
 
+class AcceptanceFake:
+    def __init__(self, evidence=(), error=None):
+        self.evidence = evidence
+        self.error = error
+        self.calls = []
+
+    def fetch(self, title, head_ref):
+        self.calls.append((title, head_ref))
+        if self.error is not None:
+            raise self.error
+        return self.evidence
+
+
+def _drive_to_reviewing(store, admitted, deps, clock):
+    from boris_intake.reconciler import tick
+
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+
+
+def test_ticket_acceptance_evidence_is_authorized_before_the_reviewer_starts(tmp_path):
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    evidence = {"kind": "ticket", "reference": "PLAT-2345", "content": "Ship it."}
+    acceptance = AcceptanceFake(evidence=(("PLAT-2345", evidence),))
+    deps = ReconcilerDeps(
+        slack=SlackFake(),
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+        acceptance=acceptance,
+    )
+
+    _drive_to_reviewing(store, admitted, deps, clock)
+
+    assert acceptance.calls, "the dispatcher never looked for a ticket"
+    assert store.acceptance_evidence(admitted.request_id, "PLAT-2345") == evidence
+
+
+def test_a_failing_ticket_lookup_never_blocks_the_review(tmp_path):
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    acceptance = AcceptanceFake(error=RuntimeError("atlassian is down"))
+    deps = ReconcilerDeps(
+        slack=SlackFake(),
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+        acceptance=acceptance,
+    )
+
+    _drive_to_reviewing(store, admitted, deps, clock)
+
+    reviewing = store.get_request(admitted.request_id)
+    assert reviewing.workflow_state is WorkflowState.REVIEWING
+    assert store.acceptance_evidence(admitted.request_id, "PLAT-2345") is None
+    kinds = [event["kind"] for event in store.request_events(admitted.request_id)]
+    assert "acceptance_evidence_unavailable" in kinds
+
+
+def test_a_reviewer_lane_that_never_finishes_is_bounded(tmp_path):
+    """A wedged lane must fail honestly instead of polling for hours."""
+    from boris_intake.reconciler import REVIEW_WAIT_SECONDS, ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    github = GitHubFake(admitted.gate_snapshot)
+    kanban = KanbanFake()
+    kanban.status = "in_progress"  # never reaches a terminal status
+    deps = ReconcilerDeps(slack=slack, github=github, kanban=kanban, now=clock)
+
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+
+    # Inside the deadline a slow reviewer is left alone to keep working.
+    clock.advance(REVIEW_WAIT_SECONDS / 2)
+    tick(store, deps)
+    assert (
+        store.get_request(admitted.request_id).workflow_state
+        is WorkflowState.REVIEWING
+    )
+
+    clock.advance(REVIEW_WAIT_SECONDS)
+    for _ in range(4):
+        tick(store, deps)
+        if (
+            store.get_request(admitted.request_id).workflow_state
+            is WorkflowState.COMPLETE
+        ):
+            break
+        clock.advance()
+
+    completed = store.get_request(admitted.request_id)
+    assert completed.workflow_state is WorkflowState.COMPLETE
+    assert completed.semantic_outcome.value == "REVIEW_INCOMPLETE"
+    assert "REVIEW_LANE_TIMEOUT" in completed.validated_result_json
+    assert github.publications == 0
+
+
 def test_mechanically_invalid_submission_fails_closed_without_retries(tmp_path):
     from boris_intake.reconciler import ReconcilerDeps, tick
 

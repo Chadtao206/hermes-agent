@@ -73,6 +73,10 @@ class PRInfo:
     head_sha: str
     author: str
     state: str                 # "OPEN" | "CLOSED" | "MERGED"
+    # Only used to find the ticket a pull request claims to implement, so both
+    # stay optional: an older caller that omits them just finds no ticket.
+    title: str = ""
+    head_ref: str = ""
 
 
 @dataclass(frozen=True)

@@ -65,8 +65,20 @@ case "$verb" in
       *"/../"*|*"/./"*|*"%2e"*|*"%2E"*) refuse "api path traversal" ;;
     esac
     [[ "$_head" =~ ^[0-9a-f]{40}$ ]] || refuse "BORIS_PR_HEAD_SHA is invalid"
-    [[ "$_api_path" == "/repos/${_scope_repo}/contents/"*"?ref=${_head}" ]] ||
-      refuse "api path is outside the pinned repository head" ;;
+    # The changed-file inventory is the only way to learn which files a pull
+    # request touches when GitHub refuses to serve its diff (HTTP 406 above
+    # ~20k changed lines). It is read-only and pinned to the dispatched PR.
+    _files_route="/repos/${_scope_repo}/pulls/${_scope_num}/files"
+    _pagination='^(per_page=[0-9]{1,3}|page=[0-9]{1,4})(&(per_page=[0-9]{1,3}|page=[0-9]{1,4}))*$'
+    case "$_api_path" in
+      "/repos/${_scope_repo}/contents/"*"?ref=${_head}") ;;
+      "$_files_route") ;;
+      "$_files_route"\?*)
+        _query="${_api_path#*\?}"
+        [[ "$_query" =~ $_pagination ]] ||
+          refuse "api query is not an allowed pagination parameter" ;;
+      *) refuse "api path is outside the pinned repository head" ;;
+    esac ;;
   *) refuse "verb '$verb'" ;;
 esac
 

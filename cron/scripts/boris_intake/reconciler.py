@@ -16,6 +16,7 @@ sys.path.insert(0, "/Users/ctao/.hermes/scripts")
 
 from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
 
+from boris_intake.acceptance import JiraAcceptanceAdapter, helper_is_installed
 from boris_intake.config import Config, load_config
 from boris_intake.dispatch import KANBAN_DB, TERMINAL_STATUSES, KanbanIO
 from boris_intake.github import GitHubIO
@@ -47,6 +48,11 @@ from boris_intake.slack_io import (
 
 GATE_WAIT_SECONDS = 30 * 60
 GATE_POLL_SECONDS = 15
+# A reviewer lane that stops making progress otherwise polls forever: eight
+# requests once sat in REVIEWING for 162-330 minutes before a manual sweep.
+# Successful reviews have never taken longer than 32 minutes end to end, so 90
+# bounds the damage without cutting a slow-but-working reviewer short.
+REVIEW_WAIT_SECONDS = 90 * 60
 REVIEW_POLL_SECONDS = 15
 RETRY_BASE_SECONDS = 5
 RETRY_MAX_SECONDS = 5 * 60
@@ -93,6 +99,9 @@ class ReconcilerDeps:
     github: GitHubLifecycleAdapter
     kanban: KanbanAdapter
     now: Callable[[], float]
+    # Optional on purpose: with no adapter the reviewer simply sees no
+    # acceptance evidence, which is how every review ran before this existed.
+    acceptance: object | None = None
 
 
 def _timestamp(now: float) -> str:
@@ -301,6 +310,35 @@ def _reconcile_status_pending(
     )
 
 
+def _authorize_acceptance(
+    store: Store,
+    request: LifecycleRequest,
+    current: PRInfo,
+    deps: ReconcilerDeps,
+) -> None:
+    """Pre-authorize the ticket this pull request claims to implement.
+
+    Strictly best effort. Dispatch has already been decided by the time this
+    runs, so no failure here may change whether the review happens.
+    """
+    if deps.acceptance is None:
+        return
+    try:
+        for reference, evidence in deps.acceptance.fetch(
+            current.title, current.head_ref
+        ):
+            store.authorize_acceptance_evidence(
+                request.request_id, reference, evidence
+            )
+    except Exception as error:  # noqa: BLE001 - never fail a review over this
+        store.record_note(
+            request.request_id,
+            "acceptance_evidence_unavailable",
+            {"error": str(error)[:200]},
+            deps.now(),
+        )
+
+
 def _reconcile_starting(
     store: Store, request: LifecycleRequest, deps: ReconcilerDeps
 ) -> None:
@@ -317,6 +355,7 @@ def _reconcile_starting(
             deps,
         )
         return
+    _authorize_acceptance(store, request, current, deps)
     lane_id = deps.kanban.find_lane(request)
     if lane_id is None:
         lane_id = deps.kanban.create_lane(request)
@@ -388,11 +427,26 @@ def _reconcile_reviewing(
             return
         if status is None:
             raise RuntimeError("reviewer lane could not be found")
+        deadline = request.created_at + REVIEW_WAIT_SECONDS
+        if deps.now() >= deadline:
+            _transition_system_incomplete(
+                store,
+                request,
+                WorkflowState.REVIEWING,
+                request.gate_snapshot,
+                SystemFailure(
+                    "REVIEW_LANE_TIMEOUT",
+                    "The reviewer lane did not produce a result within 90 minutes.",
+                    "Repost the PR link to start a new review attempt.",
+                ),
+                deps,
+            )
+            return
         store.checkpoint(
             request.request_id,
             WorkflowState.REVIEWING,
             now=deps.now(),
-            next_attempt_at=deps.now() + REVIEW_POLL_SECONDS,
+            next_attempt_at=min(deps.now() + REVIEW_POLL_SECONDS, deadline),
             last_error=None,
         )
         return
@@ -806,6 +860,8 @@ def build_deps(
         github=GitHubIO(cfg.github_token_path),
         kanban=KanbanIO(kanban_db),
         now=now,
+        # Absent helper means absent acceptance evidence, not a broken daemon.
+        acceptance=JiraAcceptanceAdapter() if helper_is_installed() else None,
     )
 
 
