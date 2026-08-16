@@ -37,7 +37,7 @@ class GitHubFake:
 
     def __init__(self, head="a" * 40, author="Chadtao206", hold=False,
                  claim_ok=True, release_ok=True, hold_raises=(),
-                 pr_state="OPEN"):
+                 pr_state="OPEN", bot_threads=()):
         self.head, self.author_login, self.hold = head, author, hold
         self.claim_ok, self.release_ok = claim_ok, release_ok
         self.hold_raises = set(hold_raises)
@@ -45,6 +45,13 @@ class GitHubFake:
         # What `gh pr view --json state` reports: OPEN / MERGED / CLOSED, or
         # None when GitHub could not be read.
         self.pr_state = pr_state
+        # What unresolved_bot_threads() returns: () (the default) means "read
+        # succeeded, nothing outstanding" -- the ordinary, clean case every
+        # existing test exercises without knowing this parameter exists.
+        # None means the read itself failed. A non-empty sequence of dicts
+        # ({"path": ..., "outdated": ...}) means real bot threads are open.
+        self.bot_threads = bot_threads
+        self.bot_thread_calls = []
 
     def head_sha(self, o, r, p):
         return self.head
@@ -68,6 +75,10 @@ class GitHubFake:
         self.released.append((o, r, p))
         return self.release_ok
 
+    def unresolved_bot_threads(self, o, r, p):
+        self.bot_thread_calls.append((o, r, p))
+        return self.bot_threads
+
 
 class SlackFake:
     def __init__(self, repost_ts="9.0", ready_ts="9.1", escalation_ts="9.2"):
@@ -87,6 +98,11 @@ class SlackFake:
         # reading repost_retries sees nothing.
         self.repost_retries = []
         self.repost_retry_targets = []
+        # What notify_ready was actually handed for unresolved_threads on
+        # each call -- kept apart from `ready` (every existing assertion
+        # already reads that as (slug, rounds) 2-tuples) so a test can pin
+        # what the loop passed through without touching those.
+        self.ready_threads = []
         self._repost_ts = repost_ts
         self._ready_ts = ready_ts
         self._escalation_ts = escalation_ts
@@ -107,8 +123,9 @@ class SlackFake:
     def remove_thinkies(self, channel, ts):
         self.thinkies_removed.append(ts)
 
-    def notify_ready(self, verdict, rounds):
+    def notify_ready(self, verdict, rounds, unresolved_threads):
         self.ready.append((verdict.slug, rounds))
+        self.ready_threads.append(unresolved_threads)
         return self._ready_ts
 
     def notify_escalation(self, verdict, rounds, reason):
@@ -273,6 +290,78 @@ def test_ready_clears_the_thinkies_reaction(tmp_path):
     deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]))
     tick(deps)
     assert deps.slack.thinkies_removed == ["2.0"]
+
+
+# --- the ready notice reports unresolved bot review threads ----------------
+#
+# The blind spot the first live run exposed: the loop declared a PR ready
+# while three Codex threads sat open on the file it had just remediated.
+# `_finish_ready` now asks GitHubIO for open Codex/CodeQL threads before
+# telling Slack the loop is closing ready, and hands whatever it found
+# straight through to `notify_ready`'s new third parameter.
+
+def test_ready_asks_github_for_unresolved_bot_threads_on_the_right_pr(tmp_path):
+    from pr_remediation.loop import tick
+
+    github = GitHubFake(bot_threads=[
+        {"path": "scripts/lib/tag-vendors.ts", "outdated": False}])
+    deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]),
+                 github=github)
+    tick(deps)
+    assert github.bot_thread_calls == [("Ylopo", "example", 42)]
+
+
+def test_ready_passes_unresolved_bot_threads_through_to_the_notice(tmp_path):
+    from pr_remediation.loop import tick
+
+    found = [{"path": "scripts/lib/tag-vendors.ts", "outdated": False}]
+    deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]),
+                 github=GitHubFake(bot_threads=found))
+    tick(deps)
+    assert deps.slack.ready_threads == [found]
+
+
+def test_ready_with_no_unresolved_threads_passes_through_the_clean_answer(tmp_path):
+    """The ordinary case: GitHub was asked, nothing is outstanding. Not None
+    -- that would claim the check never ran."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]),
+                 github=GitHubFake(bot_threads=[]))
+    tick(deps)
+    assert deps.slack.ready_threads == [[]]
+
+
+def test_a_failed_thread_check_still_closes_the_loop_ready(tmp_path):
+    """The failure mode that matters most: a query that could not be
+    answered must not hold the loop open and must not turn into an
+    escalation either. It changes only what the notice says."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]),
+                 github=GitHubFake(bot_threads=None))
+    assert tick(deps) == 1
+    assert deps.slack.ready_threads == [None]
+    assert deps.store.get(_loop_id(deps)).state is LoopState.READY
+    assert deps.slack.escalations == [], \
+        "a failed thread check must not become an escalation"
+
+
+def test_off_mode_never_calls_unresolved_bot_threads(tmp_path):
+    """The kill switch stops the work, not only the writes: an off tick
+    never reaches `_finish_ready` at all (verdict.outcome is never even
+    consulted -- see test_the_off_switch_reads_no_github_at_all), so the new
+    GraphQL read must never fire either."""
+    from pr_remediation.loop import tick
+
+    github = GitHubFake(bot_threads=[{"path": "a.ts", "outdated": False}])
+    deps = in_mode(
+        build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]),
+              github=github),
+        "off")
+    assert tick(deps) == 0
+    assert github.bot_thread_calls == []
+    assert deps.slack.ready == []
 
 
 def test_thinkies_is_anchored_on_boris_status_message_not_root_thread_ts(tmp_path):

@@ -15,6 +15,43 @@ from pr_remediation.config import RemediationConfig
 _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 TIMEOUT = 30
 
+# The two review bots whose unresolved threads make a "ready" notice
+# overclaim. Fixed, like `RemediationConfig`'s other identity constants
+# (chad_github_login, hold_label) -- not something an operator tunes per
+# repo, so it lives beside the code that reads it rather than in config.py.
+REVIEW_BOT_LOGINS = frozenset({"chatgpt-codex-connector", "github-advanced-security"})
+
+# Thread resolution has no REST/`gh pr view --json` equivalent -- it is a
+# GraphQL-only field on `PullRequestReviewThread` -- so this is the one read
+# in this adapter that goes through `gh api graphql` instead of `_view`'s
+# `gh pr view`. `comments(first: 1)` is deliberate, not a pagination
+# shortcut taken for convenience: a thread's `path` is only exposed here as a
+# property of its comments (there is no thread-level `path` this query asks
+# for), and the first comment is the one that opened the thread and is what
+# "authored by a review bot" means below -- a human reply further down the
+# same thread must not launder a bot-opened thread out of this check, nor
+# manufacture one a bot never opened.
+_REVIEW_THREADS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          isOutdated
+          comments(first: 1) {
+            nodes {
+              path
+              author { login }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 class GitHubIO:
     def __init__(self, cfg: RemediationConfig, token_path: Path, runner=subprocess.run):
@@ -145,6 +182,91 @@ class GitHubIO:
                 return True
             names.add(name)
         return self._cfg.hold_label in names
+
+    def unresolved_bot_threads(self, owner: str, repo: str,
+                              pr: int) -> list[dict] | None:
+        """Unresolved review threads opened by Codex or CodeQL, or None when
+        that could not be determined.
+
+        Unlike `has_hold`, None here is deliberately NOT folded into either
+        answer a caller could act on -- there is no safe substitute for "we
+        don't know how many bot threads are still open" the way `True`
+        substitutes for "assume held". A transient GraphQL error must never
+        collapse into an empty list: that would read as a verified-clean PR,
+        recreating exactly the false all-clear this method exists to prevent.
+        The caller (`SlackIO.notify_ready`) is where that ambiguity gets
+        resolved -- None becomes its own sentence in the ready notice ("the
+        check could not be made"), never a silent clean bill of health, and
+        never a reason to hold the loop open or escalate it either: the loop
+        still closes ready, it just says less than it thinks it knows.
+
+        Every node is shape-checked before anything from it is trusted, the
+        same discipline `has_hold` and `author` use, and for the same
+        reason: a raise here would land inside `_finish_ready`, past the
+        point the verdict already routed to READY, so it must never happen.
+        Unlike `has_hold`, an unrecognised shape does not fail toward a safe
+        default per-thread -- there is none -- it fails the whole read (this
+        method returns None), rather than silently dropping the one
+        unresolved thread that happened to be malformed while reporting the
+        rest as if the picture were complete.
+        """
+        out = self._run([
+            "api", "graphql",
+            "-f", f"query={_REVIEW_THREADS_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"repo={repo}",
+            "-F", f"number={pr}",
+        ])
+        if out is None or not out.strip():
+            return None
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            pull_request = payload["data"]["repository"]["pullRequest"]
+            nodes = pull_request["reviewThreads"]["nodes"]
+        except (KeyError, TypeError):
+            return None
+        if not isinstance(nodes, list):
+            return None
+
+        threads: list[dict] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                return None
+            resolved = node.get("isResolved")
+            if not isinstance(resolved, bool):
+                return None
+            if resolved:
+                continue
+            outdated = node.get("isOutdated")
+            if not isinstance(outdated, bool):
+                return None
+            comments = node.get("comments")
+            if not isinstance(comments, dict):
+                return None
+            comment_nodes = comments.get("nodes")
+            if not isinstance(comment_nodes, list) or not comment_nodes:
+                return None
+            opener = comment_nodes[0]
+            if not isinstance(opener, dict):
+                return None
+            author = opener.get("author")
+            if not isinstance(author, dict):
+                return None
+            login = author.get("login")
+            if not isinstance(login, str) or not login:
+                return None
+            path = opener.get("path")
+            if not isinstance(path, str) or not path:
+                return None
+            if login not in REVIEW_BOT_LOGINS:
+                continue
+            threads.append({"path": path, "outdated": outdated})
+        return threads
 
     def claim(self, owner: str, repo: str, pr: int) -> bool:
         """Add the ownership label. Returns True only if the write

@@ -57,11 +57,102 @@ def test_thinkies_is_added_and_removed_by_name():
 
 def test_ready_notification_goes_to_pr_curator():
     call, calls = caller_for()
-    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(VERDICT, rounds=2)
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=2, unresolved_threads=[])
     token, method, params = calls[0]
     assert params["channel"] == "C0BANB70BHR"
     assert "ready for human review" in params["text"].lower()
     assert "https://github.com/Ylopo/example/pull/42" in params["text"]
+
+
+# --- notify_ready's third parameter: unresolved bot review threads --------
+#
+# The blind spot this fix closes: the first live run declared a PR "ready"
+# while three Codex threads sat open on the same file. `notify_ready` now
+# takes what GitHubIO.unresolved_bot_threads() found and says so -- but the
+# contract is asymmetric on purpose. `[]` (checked, nothing open) must
+# produce byte-for-byte the same notice this method always sent, so a clean
+# PR's message never changes. `None` (the check itself failed) must say so
+# explicitly rather than silently falling back to the clean notice --
+# collapsing the two would recreate the exact false all-clear this whole
+# change exists to remove, indistinguishable from a genuinely clean PR to
+# anyone reading Slack.
+
+def test_no_unresolved_threads_produces_the_unchanged_clean_notice():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=2, unresolved_threads=[])
+    text = calls[0][2]["text"]
+    assert text == (
+        "✅ Ylopo/example#42 is ready for human review.\n"
+        "https://github.com/Ylopo/example/pull/42\n"
+        "Cleared after 2 remediation round(s)."
+    )
+
+
+def test_unresolved_bot_threads_are_reported_with_count_and_paths():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=2, unresolved_threads=[
+            {"path": "scripts/lib/tag-vendors.ts", "outdated": False},
+            {"path": "scripts/lib/tag-vendors.ts", "outdated": False},
+            {"path": "scripts/lib/tag-vendors.ts", "outdated": False},
+        ])
+    text = calls[0][2]["text"]
+    assert "3 unresolved bot review thread" in text
+    assert "scripts/lib/tag-vendors.ts" in text
+    # The clean-notice lines must still be present verbatim -- this adds a
+    # line, it does not replace the notice.
+    assert "is ready for human review" in text
+    assert "Cleared after 2 remediation round(s)." in text
+
+
+def test_unresolved_bot_threads_across_multiple_files_names_each():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=1, unresolved_threads=[
+            {"path": "a.ts", "outdated": False},
+            {"path": "b.ts", "outdated": False},
+        ])
+    text = calls[0][2]["text"]
+    assert "2 unresolved bot review threads" in text
+    assert "a.ts" in text and "b.ts" in text
+
+
+def test_outdated_threads_are_counted_not_dropped():
+    """An outdated thread points at code that has since changed and is
+    usually less actionable -- but it is not resolved, so it must still be
+    counted and named, only distinguished from a current one."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=1, unresolved_threads=[
+            {"path": "a.ts", "outdated": True},
+        ])
+    text = calls[0][2]["text"]
+    assert "1 unresolved bot review thread" in text
+    assert "outdated" in text
+    assert "a.ts" in text
+
+
+def test_a_failed_thread_check_says_so_rather_than_staying_silent():
+    """The failure mode that matters most: None must never read as 'nothing
+    outstanding'. A transient GraphQL error must produce a notice that says
+    the check could not be made, not the clean notice a genuinely clear PR
+    would get."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=2, unresolved_threads=None)
+    text = calls[0][2]["text"]
+    assert "could not" in text.lower()
+    assert "is ready for human review" in text
+
+
+def test_a_failed_thread_check_does_not_prevent_the_notice_from_posting():
+    call, calls = caller_for()
+    ts = SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=2, unresolved_threads=None)
+    assert ts is not None
+    assert calls, "the ready notice must still post when the thread check failed"
 
 
 def test_escalation_notification_names_the_reason_and_round():
@@ -212,7 +303,7 @@ def test_thinkies_use_the_review_token():
 def test_notify_ready_uses_the_notify_token():
     call, calls = caller_for()
     SlackIO(RemediationConfig(), REVIEW_TOK, NOTIFY_TOK, call).notify_ready(
-        VERDICT, rounds=2)
+        VERDICT, rounds=2, unresolved_threads=[])
     assert calls[0][0] == NOTIFY_TOK
 
 
@@ -271,7 +362,8 @@ NON_SUCCESS_RESPONSES = [
 POSTING_METHODS = {
     "post_rereview": lambda io: io.post_rereview(VERDICT, "1.0", 1),
     "repost_rereview": lambda io: io.repost_rereview(VERDICT, "1.0"),
-    "notify_ready": lambda io: io.notify_ready(VERDICT, rounds=2),
+    "notify_ready": lambda io: io.notify_ready(
+        VERDICT, rounds=2, unresolved_threads=[]),
     "notify_escalation": lambda io: io.notify_escalation(
         VERDICT, rounds=3, reason="round_cap"),
 }

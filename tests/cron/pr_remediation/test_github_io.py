@@ -271,6 +271,227 @@ def test_state_is_upper_cased_so_one_comparison_serves(tmp_path):
     assert io_with(runner, tmp_path).state("Ylopo", "example", 42) == "OPEN"
 
 
+# --- unresolved_bot_threads(): the Codex/CodeQL review-thread check --------
+#
+# The blind spot this method closes: the first live run declared a PR ready
+# while three Codex threads sat open on the file it had just remediated.
+# Thread resolution has no `gh pr view --json` field, so this goes through
+# `gh api graphql` instead -- the same `_run`, the same fail-closed
+# discipline as `has_hold`, but a different safe default: there is no `True`
+# to substitute for "we don't know", so an unreadable or malformed response
+# returns None, and the caller (SlackIO.notify_ready) is the one place that
+# turns None into its own sentence rather than a silent clean bill of
+# health.
+
+
+def _thread(resolved, outdated, login, path):
+    return {
+        "isResolved": resolved,
+        "isOutdated": outdated,
+        "comments": {"nodes": [{"path": path, "author": {"login": login}}]},
+    }
+
+
+def _gql(nodes):
+    return json.dumps({
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": nodes}}}}})
+
+
+def test_the_call_goes_through_gh_api_graphql(tmp_path):
+    runner, calls = runner_for({"graphql": _gql([])})
+    io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42)
+    graphql_calls = [c for c in calls if "graphql" in c]
+    assert graphql_calls, "gh api graphql was never invoked"
+    assert "api" in graphql_calls[0]
+
+
+def test_an_unresolved_codex_thread_is_returned_with_its_path(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(False, False, "chatgpt-codex-connector", "scripts/lib/tag-vendors.ts"),
+    ])})
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 103)
+    assert threads == [{"path": "scripts/lib/tag-vendors.ts", "outdated": False}]
+
+
+def test_an_unresolved_codeql_thread_is_also_recognised(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(False, False, "github-advanced-security", "scripts/lib/tag-vendors.ts"),
+    ])})
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 103)
+    assert len(threads) == 1
+
+
+def test_multiple_unresolved_bot_threads_are_all_returned(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(False, False, "chatgpt-codex-connector", "scripts/lib/tag-vendors.ts"),
+        _thread(False, False, "chatgpt-codex-connector", "scripts/lib/tag-vendors.ts"),
+        _thread(False, False, "chatgpt-codex-connector", "scripts/lib/tag-vendors.ts"),
+    ])})
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 103)
+    assert len(threads) == 3
+
+
+def test_a_pr_with_no_unresolved_bot_threads_returns_an_empty_list(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([])})
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42)
+    assert threads == []
+
+
+def test_a_resolved_bot_thread_is_not_counted(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(True, False, "chatgpt-codex-connector", "a.ts"),
+    ])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) == []
+
+
+def test_a_resolved_threads_malformed_comments_do_not_poison_the_whole_read(tmp_path):
+    """Once a thread is known-resolved, this method never needs its comments
+    to answer the question this call exists for -- so a resolved thread with
+    garbage comments must not turn an otherwise-clean read into None."""
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": True, "isOutdated": False, "comments": "not even a dict"},
+    ])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) == []
+
+
+def test_a_thread_from_a_non_bot_author_is_not_counted(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(False, False, "some-human-reviewer", "a.ts"),
+    ])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) == []
+
+
+def test_bot_and_human_threads_together_only_the_bot_one_is_counted(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(False, False, "some-human-reviewer", "human.ts"),
+        _thread(False, False, "chatgpt-codex-connector", "bot.ts"),
+    ])})
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42)
+    assert threads == [{"path": "bot.ts", "outdated": False}]
+
+
+def test_an_outdated_unresolved_thread_is_still_returned_with_the_flag_set(tmp_path):
+    """isOutdated does not mean resolved -- it must still be reported, only
+    distinguishable from a current thread."""
+    runner, _ = runner_for({"graphql": _gql([
+        _thread(False, True, "chatgpt-codex-connector", "a.ts"),
+    ])})
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42)
+    assert threads == [{"path": "a.ts", "outdated": True}]
+
+
+# --- unresolved_bot_threads(): fails closed to None, never to [] -----------
+#
+# [] means "GitHub was asked and nothing is outstanding". None means "GitHub
+# could not be trusted to answer at all". A test here that got these two
+# backwards would be exactly the false all-clear this whole change exists to
+# prevent, so every failure and shape mismatch below is pinned to None, not
+# to the empty list a lazy fallback would produce.
+
+
+def test_a_failed_gh_call_returns_none_not_an_empty_list(tmp_path):
+    def run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    io = io_with(run, tmp_path)
+    assert io.unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_empty_stdout_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": ""})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_unparseable_json_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": "{not json"})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_a_json_scalar_payload_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": json.dumps(42)})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_missing_data_key_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": json.dumps({"errors": ["boom"]})})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_a_null_repository_returns_none_not_a_raise(tmp_path):
+    """gh api graphql can return HTTP 200 with `data.repository: null` for a
+    repo the token cannot see or that was renamed -- that must fail closed
+    like any other unreadable answer, not raise past this method."""
+    runner, _ = runner_for({"graphql": json.dumps({"data": {"repository": None}})})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_review_threads_nodes_not_a_list_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": json.dumps({
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": "not-a-list"}}}}})})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_a_node_that_is_not_a_dict_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql(["not-a-dict"])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_isresolved_missing_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isOutdated": False, "comments": {"nodes": []}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_isresolved_wrong_type_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": "no", "isOutdated": False, "comments": {"nodes": []}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_isoutdated_wrong_type_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": False, "isOutdated": "no", "comments": {"nodes": []}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_comments_not_a_dict_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": False, "isOutdated": False, "comments": ["nope"]}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_empty_comments_returns_none(tmp_path):
+    """A thread with zero comments cannot answer who opened it -- unknown,
+    not silently skipped."""
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": False, "isOutdated": False, "comments": {"nodes": []}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_author_not_a_dict_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": False, "isOutdated": False,
+         "comments": {"nodes": [{"path": "a.ts", "author": "bot"}]}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_login_not_a_string_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": False, "isOutdated": False,
+         "comments": {"nodes": [{"path": "a.ts", "author": {"login": 7}}]}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
+def test_missing_path_returns_none(tmp_path):
+    runner, _ = runner_for({"graphql": _gql([
+        {"isResolved": False, "isOutdated": False,
+         "comments": {"nodes": [
+             {"author": {"login": "chatgpt-codex-connector"}}]}}])})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
+
+
 def test_a_missing_or_unreadable_state_reads_as_unknown_not_as_closed(tmp_path):
     """Unknown must never be read as "not open": that answer closes the loop,
     and terminal states are absorbing."""

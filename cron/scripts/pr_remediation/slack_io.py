@@ -43,6 +43,49 @@ def pr_url(verdict: Verdict) -> str:
     return f"https://github.com/{verdict.owner}/{verdict.repo}/pull/{verdict.pr_number}"
 
 
+def _thread_notice(unresolved_threads: list[dict] | None) -> str | None:
+    """The line to append to a ready notice about open bot review threads,
+    or None when nothing should be added.
+
+    Three cases, and they must stay visibly distinct in the notice itself
+    (not just in this function's return type), because a human reading Slack
+    sees only the text: `None` in means the GraphQL read failed or came back
+    in a shape this build does not trust, and that is reported as its own
+    sentence -- never silence, which would be indistinguishable from a
+    verified-clean PR and would recreate the false all-clear this whole
+    change exists to remove. `[]` in means the read succeeded and nothing is
+    outstanding, and returns `None` out (no line added) so a clean PR's
+    notice reads exactly as it did before this change. A non-empty list
+    names the count and the files, because that is what lets a human decide
+    whether to act without opening the PR.
+
+    `isOutdated` threads are counted, not dropped. Codex and CodeQL mark a
+    thread outdated when the code it points at has since changed, which
+    makes it *usually* less actionable than a current one -- but "usually"
+    is doing real work in that sentence: outdated does not mean resolved,
+    nobody has dismissed it, and an outdated comment can still be pointing at
+    a real problem the diff moved rather than fixed. Dropping it silently
+    would repeat this exact incident's shape (a real, still-open concern the
+    notice doesn't mention) for the sake of tidiness. Surfacing the split
+    instead -- the total, and how many of those are outdated -- gives a human
+    the same triage signal without discarding anything: current threads are
+    presumptively the ones to check first, and a nonzero outdated count is
+    itself informative (it says some of this PR's history moved past a
+    review comment, which is worth knowing even if that comment no longer
+    applies verbatim).
+    """
+    if unresolved_threads is None:
+        return "⚠️ Could not check for unresolved bot review threads — verify manually."
+    if not unresolved_threads:
+        return None
+    outdated = sum(1 for t in unresolved_threads if t.get("outdated"))
+    paths = ", ".join(sorted({str(t.get("path")) for t in unresolved_threads}))
+    plural = "" if len(unresolved_threads) == 1 else "s"
+    outdated_note = f" ({outdated} outdated)" if outdated else ""
+    return (f"⚠️ {len(unresolved_threads)} unresolved bot review thread{plural}"
+            f"{outdated_note} on: {paths}")
+
+
 class SlackIO:
     def __init__(self, cfg: RemediationConfig, review_token: str,
                 notify_token: str, caller):
@@ -135,12 +178,33 @@ class SlackIO:
         except Exception:
             pass
 
-    def notify_ready(self, verdict: Verdict, rounds: int) -> str | None:
+    def notify_ready(self, verdict: Verdict, rounds: int,
+                     unresolved_threads: list[dict] | None) -> str | None:
+        """Tell a human the loop closed ready, and what GitHub said about
+        open bot review threads while it did.
+
+        `unresolved_threads` carries GitHubIO.unresolved_bot_threads()'s own
+        contract verbatim, unmodified by anything in between: None means the
+        GraphQL read could not be trusted (a query failure, or a shape this
+        build does not recognise), and an empty list means the read
+        succeeded and found nothing outstanding. The two must never be
+        conflated -- folding None into "nothing to report" is exactly the
+        false all-clear this parameter exists to prevent, indistinguishable
+        from a genuinely clean PR to anyone reading the notice. So None gets
+        its own sentence saying the check did not run, an empty list adds no
+        line at all (the notice this replaces said nothing here either, and
+        a clean PR should read exactly as it always has), and a non-empty
+        list names the count and the files. None of the three ever change
+        whether this posts or what channel it posts to.
+        """
         text = (
             f"✅ {verdict.slug} is ready for human review.\n"
             f"{pr_url(verdict)}\n"
             f"Cleared after {rounds} remediation round(s)."
         )
+        thread_line = _thread_notice(unresolved_threads)
+        if thread_line:
+            text += f"\n{thread_line}"
         # The main Hermes bot's token: it is the identity already a member of
         # notify_channel. Son of Chad cannot reach that channel at all — see
         # the module docstring.

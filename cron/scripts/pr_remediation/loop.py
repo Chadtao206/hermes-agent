@@ -828,7 +828,28 @@ def _close_stale(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
 
 
 def _finish_ready(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
-    if deps.slack.notify_ready(verdict, loop.round_count) is None:
+    """Close a loop ready, and tell Slack what GitHub says about open bot
+    review threads while doing it.
+
+    The Codex/CodeQL thread check is read *here*, not folded into `_route`'s
+    `PrFacts`: it answers a question only the ready notice's wording needs,
+    not the routing decision -- a live tick reaches this function only after
+    `_route` has already decided READY_FOR_HUMAN_REVIEW, and reading it
+    earlier would spend a GraphQL call on every verdict this loop ever sees,
+    not only the one that closes it. `unresolved_bot_threads` already turns
+    a failed or malformed query into `None` rather than raising or guessing
+    (see its docstring), so nothing here needs to guard it a second time --
+    and by design that `None` changes only what `notify_ready` says, never
+    whether this closes: a stuck GraphQL query must not hold a clean PR's
+    loop open, and must not read as an escalation either. Reached only from
+    `_perform`, which `_consumer` hands out in live mode alone (see the
+    module docstring's `_consumer` paragraph) -- so, like every other GitHub
+    write in this module, this call happens only when a live tick performs
+    the route a paused one only recorded.
+    """
+    threads = deps.github.unresolved_bot_threads(verdict.owner, verdict.repo,
+                                                  verdict.pr_number)
+    if deps.slack.notify_ready(verdict, loop.round_count, threads) is None:
         deps.store.record_note(loop.loop_id, "notify_failed",
                                {"kind": "ready"}, deps.now())
     _stand_down(deps, loop, verdict)

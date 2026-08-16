@@ -231,7 +231,7 @@ def test_build_deps_wires_the_review_token_to_review_calls_and_the_notify_token_
 
     deps.slack.post_rereview(VERDICT, "1.0", 1)
     deps.slack.add_thinkies("C1", "5.0")
-    deps.slack.notify_ready(VERDICT, rounds=1)
+    deps.slack.notify_ready(VERDICT, rounds=1, unresolved_threads=[])
     deps.slack.notify_escalation(VERDICT, rounds=1, reason="round_cap")
 
     assert calls == [
