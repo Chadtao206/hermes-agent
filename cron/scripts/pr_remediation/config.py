@@ -27,10 +27,17 @@ class RemediationConfig:
 
 
 def load_config(path: Path | None = None) -> RemediationConfig:
+    # Only `mode` and `round_cap` are YAML-configurable. The remaining
+    # fields (marker, chad_slack_id, chad_github_login, boris_channel,
+    # notify_channel, owner_label, hold_label, poll_seconds) are
+    # deliberately fixed defaults, even if someone writes them into the
+    # YAML — do not add parsing for them here.
     path = path or DEFAULT_CONFIG
     try:
         data = yaml.safe_load(path.read_text()) or {}
     except (OSError, yaml.YAMLError):
+        return RemediationConfig()
+    if not isinstance(data, dict):
         return RemediationConfig()
     block = data.get("pr_remediation")
     if not isinstance(block, dict):
@@ -40,6 +47,10 @@ def load_config(path: Path | None = None) -> RemediationConfig:
     if mode not in VALID_MODES:
         mode = "shadow"
     round_cap = block.get("round_cap", 3)
-    if not isinstance(round_cap, int) or not 1 <= round_cap <= 10:
+    if (
+        not isinstance(round_cap, int)
+        or isinstance(round_cap, bool)
+        or not 1 <= round_cap <= 10
+    ):
         round_cap = 3
     return RemediationConfig(mode=mode, round_cap=round_cap)
