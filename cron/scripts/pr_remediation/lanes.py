@@ -32,10 +32,28 @@ from pr_remediation.boris_source import Verdict
 DISPATCH = "/Users/ctao/.hermes/scripts/pr/kanban_dispatch.sh"
 ANCHOR_ROOT = os.environ.get(
     "PR_FIX_ANCHOR_ROOT", "/Users/ctao/.hermes/state/pr-review-anchors")
+EXPECTED_OWNER = os.environ.get("PR_REVIEW_EXPECTED_OWNER", "Ylopo")
 ASSIGNEE = "engineer"  # SOUL.md: Andrej = engineer
 TIMEOUT = 120
 TERMINAL_LANE_STATUSES = frozenset({"done", "blocked", "failed", "cancelled"})
 _TASK_ID = re.compile(r"\bt_[0-9a-z]+")
+_SAFE_REPO_NAME = re.compile(r"[A-Za-z0-9._-]+")
+_DEFAULT_EXCLUDED_REPOS = "Ylopo/ylopo-infra Ylopo/ylopo-github-actions-workflows"
+_EXCLUDED_REPO_SUFFIXES = ("-infra", "-infrastructure")
+
+
+def _excluded_repos() -> frozenset[str]:
+    """Space-separated `owner/name` entries. Read live off the environment
+    (not cached at import) so a live override -- or a test's monkeypatch.setenv
+    -- takes effect without a module reload, matching how ANCHOR_ROOT below is
+    read live off the module global."""
+    raw = os.environ.get("PR_REVIEW_EXCLUDED_REPOS") or _DEFAULT_EXCLUDED_REPOS
+    return frozenset(raw.split())
+
+
+def _repo_is_excluded(verdict: Verdict) -> bool:
+    full = f"{verdict.owner}/{verdict.repo}"
+    return full in _excluded_repos() or full.endswith(_EXCLUDED_REPO_SUFFIXES)
 
 
 def build_brief(verdict: Verdict, round_number: int) -> str:
@@ -59,6 +77,31 @@ class LaneIO:
         self._runner = runner
 
     def create(self, verdict: Verdict, round_number: int) -> str | None:
+        # --- repo-name path safety ---------------------------------------
+        # verdict.repo is the only field used to build a filesystem path
+        # below (ANCHOR_ROOT/<repo>), so validate it before any path is
+        # touched. Mirrors kanban_dispatch.sh's owner + character-class
+        # checks (that script's `prfix:*:fix` block, ~lines 181-187): the PR
+        # must be under the expected owner, and the repo name must contain
+        # nothing outside A-Za-z0-9._- (rules out embedded path separators
+        # and URL-shaped values). A bare "." or ".." is composed entirely of
+        # otherwise-allowed characters, so the character class alone would
+        # not catch a literal traversal segment -- reject those explicitly.
+        if verdict.owner != EXPECTED_OWNER:
+            return None
+        if verdict.repo in (".", "..") or not _SAFE_REPO_NAME.fullmatch(verdict.repo):
+            return None
+
+        # --- infra-repo ban -----------------------------------------------
+        # Infra repos are OFF-LIMITS for automated fixes: devops (jbankes)
+        # rejected pr-bot backend/CI workarounds on ylopo-infra three times
+        # (#252/#255/#249). The SAME policy also lives in
+        # kanban_dispatch.sh's `prfix:*:fix` gate (~lines 188-206) and in
+        # pr_review_gather.py's `repo_excluded` -- keep all three in sync if
+        # you change this policy. infra PRs stay minimal + human-driven.
+        if _repo_is_excluded(verdict):
+            return None
+
         # kanban_dispatch.sh's clone-on-miss is gated on `prfix:*:fix`
         # idempotency keys (see the `case` around line 168 of that script);
         # this loop deliberately uses `borisloop:` keys instead, because

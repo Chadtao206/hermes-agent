@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 from pr_remediation import lanes
@@ -143,3 +144,163 @@ def test_create_dispatches_when_the_anchor_is_a_valid_git_repo(tmp_path, monkeyp
     result = LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1)
     assert result == "t_abc123"
     assert len(calls) == 1, "a valid anchor must still dispatch through the runner"
+
+
+def _tracking_runner(calls):
+    """A fake runner that records every invocation and always succeeds --
+    so a refusal in these tests can only be explained by create() itself
+    returning early, never by a fake raising and being swallowed."""
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="Created t_abc123 (engineer)\n", stderr="")
+
+    return run
+
+
+# --- Gap 1: infra-repo ban -------------------------------------------------
+
+
+def test_create_refuses_the_explicitly_excluded_ylopo_infra_repo(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="ylopo-infra")
+    _valid_anchor(tmp_path, monkeypatch, repo="ylopo-infra")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the runner must never be invoked for an excluded repo"
+
+
+def test_create_refuses_the_explicitly_excluded_workflows_repo(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="ylopo-github-actions-workflows")
+    _valid_anchor(tmp_path, monkeypatch, repo="ylopo-github-actions-workflows")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the runner must never be invoked for an excluded repo"
+
+
+def test_create_refuses_a_repo_ending_in_infra_by_suffix(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="some-other-infra")
+    _valid_anchor(tmp_path, monkeypatch, repo="some-other-infra")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the -infra suffix rule must refuse even outside the explicit list"
+
+
+def test_create_refuses_a_repo_ending_in_infrastructure_by_suffix(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="platform-infrastructure")
+    _valid_anchor(tmp_path, monkeypatch, repo="platform-infrastructure")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the -infrastructure suffix rule must refuse even outside the explicit list"
+
+
+def test_create_honours_the_excluded_repos_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_REVIEW_EXCLUDED_REPOS", "Ylopo/custom-banned")
+    verdict = replace(VERDICT, repo="custom-banned")
+    _valid_anchor(tmp_path, monkeypatch, repo="custom-banned")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "an override-listed repo must be refused"
+
+
+def test_create_env_override_replaces_rather_than_appends_the_default_list(tmp_path, monkeypatch):
+    """PR_REVIEW_EXCLUDED_REPOS REPLACES the default explicit list (matching
+    kanban_dispatch.sh's `${VAR:-default}` bash semantics), so a repo that is
+    excluded by default only via the explicit list -- not the suffix rule --
+    must dispatch normally once a different override is set.
+    """
+    monkeypatch.setenv("PR_REVIEW_EXCLUDED_REPOS", "Ylopo/some-other-repo")
+    verdict = replace(VERDICT, repo="ylopo-github-actions-workflows")
+    _valid_anchor(tmp_path, monkeypatch, repo="ylopo-github-actions-workflows")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result == "t_abc123"
+    assert len(calls) == 1
+
+
+def test_create_env_override_does_not_disable_the_suffix_rule(tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_REVIEW_EXCLUDED_REPOS", "Ylopo/custom-banned")
+    verdict = replace(VERDICT, repo="something-infra")
+    _valid_anchor(tmp_path, monkeypatch, repo="something-infra")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the suffix rule must still apply even with an env override set"
+
+
+# --- Gap 2: repo-name path safety ------------------------------------------
+
+
+def test_create_refuses_when_owner_is_not_the_expected_owner(tmp_path, monkeypatch):
+    _valid_anchor(tmp_path, monkeypatch)
+    verdict = replace(VERDICT, owner="NotYlopo")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "a PR outside the expected owner must never reach the runner"
+
+
+def test_create_refuses_a_repo_name_containing_a_path_separator(tmp_path, monkeypatch):
+    """Proves this is a real gap, not just theoretical: plant a real anchor
+    two levels deep and show the pre-fix code would find and dispatch
+    against it via a repo name shaped like `sibling/evil`.
+    """
+    anchor_root = tmp_path / "anchors"
+    (anchor_root / "sibling" / "evil" / ".git").mkdir(parents=True)
+    monkeypatch.setattr(lanes, "ANCHOR_ROOT", str(anchor_root))
+    verdict = replace(VERDICT, repo="sibling/evil")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "a repo name with a path separator must never reach the runner"
+
+
+def test_create_refuses_a_bare_dotdot_traversal_segment(tmp_path, monkeypatch):
+    """A bare '..' is composed entirely of otherwise-allowed characters, so
+    the character class alone would not catch it. Proves this is a real
+    gap: plant a real anchor one level ABOVE ANCHOR_ROOT and show the
+    pre-fix code would find and dispatch against it.
+    """
+    anchor_root = tmp_path / "anchors"
+    anchor_root.mkdir()
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(lanes, "ANCHOR_ROOT", str(anchor_root))
+    verdict = replace(VERDICT, repo="..")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "a bare '..' repo name must never reach the runner"
+
+
+def test_create_refuses_a_repo_name_with_a_disallowed_character(tmp_path, monkeypatch):
+    repo = "evil;payload"
+    _valid_anchor(tmp_path, monkeypatch, repo=repo)
+    verdict = replace(VERDICT, repo=repo)
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "a repo name outside A-Za-z0-9._- must never reach the runner"
+
+
+def test_create_still_dispatches_an_ordinary_repo(tmp_path, monkeypatch):
+    _valid_anchor(tmp_path, monkeypatch)
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(VERDICT, 1)
+    assert result == "t_abc123"
+    assert len(calls) == 1
