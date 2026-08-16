@@ -104,6 +104,44 @@ row's lane is cleared. Adoption is refused outright while a lane is in flight
 as well, and can never lower `round_count` -- otherwise a loop that had spent
 its whole budget would have rounds handed back to it.
 
+*A round ends when the head moves, not when the lane exits.* The lane in
+flight is what drives a `remediating` loop, and the due pass is what watches
+it: kanban is polled for that lane's status, and once it is terminal the pull
+request itself is read to see whether anything was actually pushed. A moved
+head earns a re-review post and, with it, the next verdict; an unmoved one
+does not, because re-reviewing an unchanged pull request reproduces the same
+verdict and spends another round arriving at it.
+
+"Unmoved" is a judgement about a race, though, so it is not taken on the
+first look. Kanban marks a lane terminal when its worker exits, which can be
+moments before GitHub serves the pushed head. `awaiting_head_move` is that
+one grace window, and the store's transition table gives the state no
+self-edge on purpose: a loop enters it once, and the next look either finds
+the push or gives up as `no_op_lane`. A head GitHub could not read at all is
+neither answer -- like an unreadable author it is recorded and retried,
+because escalating a network blip would burn the loop permanently. Which
+state the loop is in is also what says whether there is a lane to complete at
+all: only `remediating` (with a lane) and `awaiting_head_move` are waiting on
+one, so a row that still names the lane of a round already closed out is
+never read back as a second completion.
+
+The hold label is read before any of that is acted on, because all of it
+writes -- a reaction removed, a re-review posted, an escalation notice, the
+ownership label handed back. `has_hold` fails closed, so a GitHub this pass
+cannot read is a hold and the pass writes nothing at all. The escalation
+retry is the one due-pass route that does not read it, and deliberately: what
+it does is notify a human and stand down the signals this loop itself added,
+which is what a hold wants to happen anyway.
+
+A loop that closes while its lane is still running is the one thing neither
+pass can repair. Terminal states are absorbing and unclaimable, so that lane
+will finish, push to a pull request this service has just handed back, and be
+polled by nobody -- and there is no cancel to call for it from here. Both
+shapes of it (the lane the row records, and the lane whose recording write
+was lost) are therefore logged and written to the trail as `lane_abandoned`,
+so the human who has just been told the PR is ready, or stuck, can find the
+lane still moving underneath them.
+
 *An escalation is not finished until a human has it.* Escalation exists
 because a person has to intervene, so a notification that failed does NOT close
 the loop. The loop stays non-terminal with an `escalation_pending` note, and a
@@ -139,12 +177,21 @@ from typing import Any, Callable
 
 from pr_remediation.boris_source import Verdict
 from pr_remediation.config import RemediationConfig
+from pr_remediation.lanes import TERMINAL_LANE_STATUSES
 from pr_remediation.models import EscalationReason, LoopRequest, LoopState
 from pr_remediation.store import CorruptLoopRow
 
 # A freshly created lane must not be inspected on the same tick that created it:
 # claim_due would find it, see a not-yet-started lane, and escalate it as a no-op.
 LANE_POLL_SECONDS = 15
+
+# The single grace window a finished lane gets for its push to become visible.
+# Kanban marks a lane terminal when its worker exits, which can be moments
+# before GitHub serves the pushed head, so the first unchanged read is not yet
+# evidence that the lane did nothing. Long enough to ride out that gap, short
+# enough that a genuinely empty round is not left looking live for minutes --
+# and taken exactly once, because `awaiting_head_move` has no self-edge.
+HEAD_MOVE_GRACE_SECONDS = 60.0
 
 # How many times a single escalation may be posted before the loop closes
 # unheard. Chosen high enough to ride out a Slack outage across several ticks,
@@ -181,6 +228,10 @@ EVENT_ORPHANED_LANE = "orphaned_lane"
 # cannot reach that case: the note lands *after* the transition that overtook
 # it, so nothing in trail order ever clears it.
 EVENT_ORPHAN_SUPERSEDED = "orphan_superseded"
+# A lane left running by a loop that has just closed. Nothing polls it, nothing
+# can cancel it from here, and it is about to push to a pull request this
+# service has handed back -- so the only thing left is to say where it went.
+EVENT_LANE_ABANDONED = "lane_abandoned"
 # Written by store.transition() itself, and only when the swap landed.
 EVENT_TRANSITION = "transition"
 
@@ -194,18 +245,21 @@ EVENT_TRANSITION = "transition"
 ROUTE_SETTLE_ESCALATION = "settle_escalation"
 ROUTE_HELD = "held"
 ROUTE_AUTHOR_UNREADABLE = "author_unreadable"
+ROUTE_HEAD_UNREADABLE = "head_unreadable"
 ROUTE_UNKNOWN_OUTCOME = "unknown_outcome"
 ROUTE_UNOBSERVED = "unobserved"
 ROUTE_ESCALATE = "escalate"
 ROUTE_NOTIFY_READY = "notify_ready"
 ROUTE_REPOST_REREVIEW = "repost_rereview"
+ROUTE_LANE_PUSHED = "lane_pushed"
+ROUTE_AWAIT_HEAD_MOVE = "await_head_move"
 ROUTE_ADOPT_LANE = "adopt_lane"
 ROUTE_DROP_ORPHAN = "drop_orphan"
 ROUTE_OPEN_LANE = "open_lane"
 ROUTE_DEFER = "defer_verdict"
 
-_OBSERVATIONS = (ROUTE_HELD, ROUTE_AUTHOR_UNREADABLE, ROUTE_UNKNOWN_OUTCOME,
-                 ROUTE_UNOBSERVED)
+_OBSERVATIONS = (ROUTE_HELD, ROUTE_AUTHOR_UNREADABLE, ROUTE_HEAD_UNREADABLE,
+                 ROUTE_UNKNOWN_OUTCOME, ROUTE_UNOBSERVED)
 
 _LOG = logging.getLogger(__name__)
 
@@ -279,6 +333,30 @@ class PrFacts:
     author: str | None
 
 
+@dataclass(frozen=True)
+class LaneFacts:
+    """What kanban and GitHub say about the lane a loop is waiting on.
+
+    Hoisted out of the routing for the same reason as `PrFacts`: whether this
+    tick looks at the outside world at all is a question about the operating
+    mode, and the mode is asked outside the routing.
+
+    `held` and `head` are read only once the lane has finished, because that is
+    the only point at which this pass writes anything -- so a hold that was
+    never asked about is None here, and never False. A `status` this build does
+    not recognise (kanban unreachable, the lane deleted) is not finished: like
+    an unreadable author it leaves the loop where it is rather than escalating
+    on a blip.
+    """
+    status: str | None
+    held: bool | None = None
+    head: str | None = None
+
+    @property
+    def finished(self) -> bool:
+        return self.status in TERMINAL_LANE_STATUSES
+
+
 def _observe(deps: LoopDeps, verdict: Verdict) -> PrFacts:
     """Read the PR's hold label and author. The only network in a routing pass."""
     if deps.github.has_hold(verdict.owner, verdict.repo, verdict.pr_number):
@@ -288,22 +366,63 @@ def _observe(deps: LoopDeps, verdict: Verdict) -> PrFacts:
                                              verdict.pr_number))
 
 
-def _shadow(deps: LoopDeps, loop: LoopRequest, route: Route) -> None:
-    """Write to the trail the decision a live tick would have acted on.
+def _observe_lane(deps: LoopDeps, loop: LoopRequest) -> LaneFacts | None:
+    """Read the lane this loop waits on, and the PR once that lane has finished.
 
-    A `standing` decision is recorded once, because repeating it adds no fact:
-    the due pass retakes it every tick until the debt is paid or the mode
-    changes. "Once" lasts only as long as nothing else happens to the loop --
-    any event appended after the note (a lost transition, say) makes the next
-    rehearsal a new fact again, so a rehearsal that failed at its one permitted
-    act is never mistaken for one already recorded.
+    None means the loop is not waiting on a lane at all, which is most of them:
+    the due pass revisits every unsettled loop on every tick, so the cheap local
+    kanban read is taken only for the loops a lane could still be running for,
+    and the two GitHub reads only once one has actually finished. That ordering
+    is also what makes the hold label a read-before-write: the lane's status is
+    the last question that can be answered without writing anything.
     """
+    if not _lane_pending(loop):
+        return None
+    status = deps.lanes.status(loop.lane_id)
+    if status not in TERMINAL_LANE_STATUSES:
+        return LaneFacts(status=status)
+    if deps.github.has_hold(loop.owner, loop.repo, loop.pr_number):
+        return LaneFacts(status=status, held=True)
+    return LaneFacts(status=status, held=False,
+                     head=deps.github.head_sha(loop.owner, loop.repo,
+                                               loop.pr_number))
+
+
+def _repeats_last_note(deps: LoopDeps, loop: LoopRequest, kind: str,
+                       detail: dict) -> bool:
+    """Has this exact note just been written, with nothing since?
+
+    A `standing` decision is retaken every tick until whatever prompted it is
+    settled, so recording it every time appends the same sentence to a trail
+    that every later tick reads back in full. "Just been written" lasts only as
+    long as nothing else happens to the loop -- any event appended after the
+    note makes the next recording a new fact again, so a pass that failed at
+    its one permitted act is never mistaken for one already recorded.
+    """
+    trail = deps.store.events(loop.loop_id)
+    return bool(trail) and trail[-1]["kind"] == kind and trail[-1]["detail"] == detail
+
+
+def _note_standing(deps: LoopDeps, loop: LoopRequest, kind: str,
+                   detail: dict) -> None:
+    """Record a note unless it is already the last thing this loop said.
+
+    For the facts the due pass rediscovers on every tick: a hold nobody has
+    lifted, a GitHub still unreadable, a Slack still refusing the re-review.
+    Recorded once each, because the trail is read back in full on every tick
+    and an outage that lasts an hour must not leave 240 identical sentences in
+    it.
+    """
+    if not _repeats_last_note(deps, loop, kind, detail):
+        deps.store.record_note(loop.loop_id, kind, detail, deps.now())
+
+
+def _shadow(deps: LoopDeps, loop: LoopRequest, route: Route) -> None:
+    """Write to the trail the decision a live tick would have acted on."""
     decision = {"would": route.action, **route.detail}
-    if route.standing:
-        trail = deps.store.events(loop.loop_id)
-        if (trail and trail[-1]["kind"] == "shadow_decision"
-                and trail[-1]["detail"] == decision):
-            return
+    if route.standing and _repeats_last_note(deps, loop, "shadow_decision",
+                                             decision):
+        return
     deps.store.record_note(loop.loop_id, "shadow_decision", decision, deps.now())
 
 
@@ -325,6 +444,63 @@ def _transition(deps: LoopDeps, loop: LoopRequest, target: LoopState,
     return ok
 
 
+def _lane_left_running(deps: LoopDeps, loop: LoopRequest) -> str | None:
+    """The lane that would go on running if this loop closed now, if any.
+
+    Both of the module's own accounts of "a lane is really working this branch"
+    -- the one the row records while it is `remediating`, and the one whose
+    recording write was lost -- and neither one of a lane already completed: a
+    row that still names the lane of a finished round is not stranding it.
+    """
+    if _lane_in_flight(loop):
+        return loop.lane_id
+    orphan = _adoptable_orphan(deps, loop)
+    return str(orphan["lane_id"]) if orphan else None
+
+
+def _close(deps: LoopDeps, loop: LoopRequest, target: LoopState,
+           **fields: Any) -> bool:
+    """Drive the loop terminal, reporting any lane it leaves running.
+
+    Terminal states are absorbing and unclaimable, so a lane still in flight
+    when the loop closes is polled by nobody ever again: it finishes, it pushes
+    to a pull request this service has just handed back to a human, and no
+    re-review follows it. Nothing here can prevent that -- the dispatch surface
+    this service holds creates lanes and cannot cancel them, and refusing to
+    close the loop instead would pin the pull request open for good (which is
+    the failure `active_for_pr` punishes hardest). So it is reported: a
+    `lane_abandoned` note beside the notice the human is being sent anyway, and
+    a WARNING in the log, both naming the lane to go and look at.
+
+    The lane is identified before the swap, not after: a successful transition
+    appends to the trail the orphan replay reads, and only a landed swap is
+    worth reporting -- a lost one leaves the loop open and the lane still ours.
+    """
+    lane_id = _lane_left_running(deps, loop)
+    if not _transition(deps, loop, target, **fields):
+        return False
+    if lane_id:
+        _LOG.warning("loop %s closed as %s with lane %s still running on %s",
+                     loop.loop_id, target.value, lane_id, loop.slug)
+        deps.store.record_note(loop.loop_id, EVENT_LANE_ABANDONED,
+                               {"lane_id": lane_id, "round": loop.round_count,
+                                "state": target.value}, deps.now())
+    return True
+
+
+def _clear_running_signal(deps: LoopDeps, loop: LoopRequest) -> None:
+    """Take off the reaction that says a round is running, because none is.
+
+    Anchored on the *loop's* thread, not on any verdict's: a later verdict can
+    carry a different root, and a reaction added on one message can only ever be
+    removed from that same message. Idempotent by construction -- removing a
+    reaction that is gone is a no-op -- which is what lets every path that ends
+    a round run it without checking whether another already did.
+    """
+    if loop.root_thread_ts:
+        deps.slack.remove_thinkies(deps.cfg.boris_channel, loop.root_thread_ts)
+
+
 def _stand_down(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> None:
     """Hand the PR back: no remediation round is running any more.
 
@@ -337,13 +513,8 @@ def _stand_down(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> None:
     run them: removing a reaction that is gone and releasing a label that is
     already released are no-ops, and a settle interrupted midway would
     otherwise leave the PR looking owned with nothing left to clear it.
-
-    The reaction is anchored on the *loop's* thread, not this verdict's: a
-    later verdict can carry a different root, and a reaction added on one
-    message can only ever be removed from that same message.
     """
-    if loop.root_thread_ts:
-        deps.slack.remove_thinkies(deps.cfg.boris_channel, loop.root_thread_ts)
+    _clear_running_signal(deps, loop)
     if not deps.github.release(verdict.owner, verdict.repo, verdict.pr_number):
         deps.store.record_note(loop.loop_id, "release_failed",
                                {"label": deps.cfg.owner_label}, deps.now())
@@ -440,8 +611,8 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
             deps.store.record_note(loop.loop_id, EVENT_ESCALATION_DELIVERED,
                                    {"reason": debt.reason}, deps.now())
     _stand_down(deps, loop, verdict)
-    return _transition(deps, loop, LoopState.ESCALATED,
-                       escalation_reason=debt.reason)
+    return _close(deps, loop, LoopState.ESCALATED,
+                  escalation_reason=debt.reason)
 
 
 def _escalate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
@@ -459,7 +630,7 @@ def _finish_ready(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
         deps.store.record_note(loop.loop_id, "notify_failed",
                                {"kind": "ready"}, deps.now())
     _stand_down(deps, loop, verdict)
-    return _transition(deps, loop, LoopState.READY)
+    return _close(deps, loop, LoopState.READY)
 
 
 def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
@@ -476,6 +647,66 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
                                {"round": loop.round_count + 1}, deps.now())
         return False
     return _transition(deps, loop, LoopState.REREVIEW_POSTED)
+
+
+def _lane_pushed(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+                 head: str) -> bool:
+    """The lane finished and moved the head: ask Boris to look again.
+
+    The round is not spent here -- it was spent when the lane was dispatched --
+    so the post names the round that has just finished, and the row keeps its
+    count. What it does record is the head the lane pushed, because that is what
+    the next verdict will be about and what the round after this one would be
+    dispatched against.
+
+    Posted before the row is moved on, in that order for the same reason
+    `_repost` uses it: a post that failed leaves the loop exactly where it was,
+    unspent and immediately due, so the next sweep tries again rather than
+    parking it in `rereview_posted` to wait for a verdict nobody will send. The
+    price is the narrow reverse: a swap lost after the post lands (our lease
+    lapsed) leaves a re-review requested that the row does not know about, which
+    is recorded as a lost transition and costs one duplicate review at worst.
+    """
+    _clear_running_signal(deps, loop)
+    if deps.slack.post_rereview(verdict, loop.root_thread_ts,
+                                loop.round_count) is None:
+        # Unlike `_repost`'s, this failure is retried by the due pass on every
+        # tick rather than by the next verdict, so the note is standing.
+        _note_standing(deps, loop, "rereview_post_failed",
+                       {"round": loop.round_count})
+        return False
+    return _transition(deps, loop, LoopState.REREVIEW_POSTED, head_sha=head)
+
+
+def _await_head_move(deps: LoopDeps, loop: LoopRequest) -> bool:
+    """The lane exited without a visible push. Give that push one window.
+
+    Not a round and not a verdict: the row is parked in `awaiting_head_move`
+    until the grace window elapses, and the next look either finds the push or
+    calls the round a no-op. The reaction comes off now, though -- the lane has
+    exited, so nothing is running whichever way the next look goes.
+
+    Exactly one such window is possible by construction: the store's transition
+    table gives `awaiting_head_move` no self-edge, so a second attempt to enter
+    it would raise rather than quietly park the loop again forever.
+    """
+    _clear_running_signal(deps, loop)
+    return _transition(deps, loop, LoopState.AWAITING_HEAD_MOVE,
+                       next_attempt_at=deps.now() + HEAD_MOVE_GRACE_SECONDS)
+
+
+def _lane_pending(loop: LoopRequest) -> bool:
+    """Is this loop waiting on the outcome of a lane?
+
+    Only two states are: `remediating` with a lane recorded (it is running) and
+    `awaiting_head_move` (it has exited and the push has not shown up yet). The
+    state, not the lane_id, is what answers -- `lane_id` outlives the round it
+    ran, so a `rereview_posted` row still names the lane whose completion put it
+    there, and reading that back as a fresh completion would post the re-review
+    a second time and then call the unmoved head a no-op.
+    """
+    return loop.lane_id is not None and loop.state in (
+        LoopState.REMEDIATING, LoopState.AWAITING_HEAD_MOVE)
 
 
 def _lane_in_flight(loop: LoopRequest) -> bool:
@@ -719,15 +950,19 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     return Route(ROUTE_OPEN_LANE, {"round": loop.round_count + 1})
 
 
-def _route_due(deps: LoopDeps, loop: LoopRequest) -> Route | None:
+def _route_due(deps: LoopDeps, loop: LoopRequest,
+               lane: LaneFacts | None) -> Route | None:
     """Decide what a live tick owes a loop no verdict is going to arrive for.
 
-    `_route`'s counterpart for the retry pass, under the same discipline: it
-    decides, writes nothing, and reads nothing outside the store -- both debts
-    it can find are answered by the loop's own trail. None means the loop owes
-    nothing, which is the ordinary case and is deliberately silent: this pass
-    revisits every unsettled loop on every tick, and a note for a healthy one
-    would grow its trail without end.
+    `_route`'s counterpart for the due pass, under the same discipline: it
+    decides and performs none of it. What kanban and GitHub say arrives as
+    `lane`, already read, for the reason `_route` takes `facts` that way --
+    whether to read at all is a question about the operating mode, and `None`
+    is both "this loop waits on no lane" and "this tick looked at nothing".
+
+    None means the loop owes nothing, which is the ordinary case and is
+    deliberately silent: this pass revisits every unsettled loop on every tick,
+    and a note for a healthy one would grow its trail without end.
 
     Every route it names is `standing`: a debt is still owed on the next tick,
     unlike a verdict, which arrives once and is consumed.
@@ -740,17 +975,57 @@ def _route_due(deps: LoopDeps, loop: LoopRequest) -> Route | None:
                      {"reason": debt.reason, "notified": debt.notified},
                      debt=debt, standing=True)
     orphan = _orphaned_lane(deps, loop)
-    if orphan is None:
+    if orphan is not None:
+        # Settled before the row's own lane is completed, and it costs at most
+        # one tick to do so: completing a lane writes the state a stale claim
+        # would later be adopted over, so the claim goes first.
+        if loop.lane_id is None:
+            return Route(ROUTE_ADOPT_LANE, dict(orphan), standing=True)
+        # The row records a lane of its own, so this claim can never be adopted
+        # -- and nothing in the trail will ever supersede it, so it would come
+        # back the moment that lane is cleared. Deleting it is this pass's job
+        # precisely because this is the pass with nothing else to spend: a
+        # verdict is consumed whatever is done with it, so the verdict path
+        # routes past a stale claim rather than stopping to tidy it.
+        return Route(ROUTE_DROP_ORPHAN, dict(orphan), standing=True)
+
+    if lane is None or not lane.finished:
+        # No lane to complete, or one still working. Either way there is
+        # nothing to decide and nothing to write.
         return None
-    if loop.lane_id is None:
-        return Route(ROUTE_ADOPT_LANE, dict(orphan), standing=True)
-    # The row records a lane of its own, so this claim can never be adopted --
-    # and nothing in the trail will ever supersede it, so it would come back
-    # the moment that lane is cleared. Deleting it is this pass's job precisely
-    # because this is the pass with nothing else to spend: a verdict is
-    # consumed whatever is done with it, so the verdict path routes past a
-    # stale claim rather than stopping to tidy it.
-    return Route(ROUTE_DROP_ORPHAN, dict(orphan), standing=True)
+    if lane.held:
+        # Everything below writes -- a reaction, a post, a label -- so Chad's
+        # kill switch is answered here, and `has_hold` fails closed so a GitHub
+        # this pass could not read lands in this branch too.
+        return Route(ROUTE_HELD,
+                     {"label": deps.cfg.hold_label, "lane_id": loop.lane_id},
+                     standing=True)
+    if lane.head is None:
+        # Read the hold but not the head: a blip between two calls. Waiting
+        # costs a tick; guessing costs the loop, because "no head" read as "no
+        # push" escalates a round that may well have landed.
+        return Route(ROUTE_HEAD_UNREADABLE, {"lane_id": loop.lane_id},
+                     standing=True)
+    if lane.head != loop.head_sha:
+        if not loop.root_thread_ts:
+            # SlackIO refuses to post outside a thread because the intake gate
+            # silently drops such a message, so the remediation is real and
+            # there is no route back into review for it. Permanent: escalate.
+            return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNPOSTABLE},
+                         standing=True)
+        return Route(ROUTE_LANE_PUSHED,
+                     {"round": loop.round_count, "head_sha": lane.head},
+                     standing=True)
+    if loop.state is LoopState.AWAITING_HEAD_MOVE:
+        # The grace window has been spent and the head still has not moved.
+        # Re-reviewing an unchanged pull request would reproduce this verdict
+        # and spend another round arriving back here.
+        return Route(ROUTE_ESCALATE,
+                     {"reason": EscalationReason.NO_OP_LANE.value},
+                     standing=True)
+    return Route(ROUTE_AWAIT_HEAD_MOVE,
+                 {"lane_id": loop.lane_id, "status": lane.status},
+                 standing=True)
 
 
 def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
@@ -765,8 +1040,15 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
             raise ValueError("settle_escalation route carries no debt")
         return _settle_escalation(deps, loop, verdict, route.debt)
     if route.action in _OBSERVATIONS:
-        deps.store.record_note(loop.loop_id, route.action, route.detail,
-                               deps.now())
+        # A standing observation -- a hold that has not been lifted, a GitHub
+        # still unreadable -- is retaken every tick, and recording it every
+        # time appends the same sentence to a trail every later tick reads back
+        # in full. Recorded once, until something else happens to the loop.
+        if route.standing:
+            _note_standing(deps, loop, route.action, route.detail)
+        else:
+            deps.store.record_note(loop.loop_id, route.action, route.detail,
+                                   deps.now())
         return False
     if route.action == ROUTE_ESCALATE:
         return _escalate(deps, loop, verdict, str(route.detail["reason"]))
@@ -774,6 +1056,10 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         return _finish_ready(deps, loop, verdict)
     if route.action == ROUTE_REPOST_REREVIEW:
         return _repost(deps, loop, verdict)
+    if route.action == ROUTE_LANE_PUSHED:
+        return _lane_pushed(deps, loop, verdict, str(route.detail["head_sha"]))
+    if route.action == ROUTE_AWAIT_HEAD_MOVE:
+        return _await_head_move(deps, loop)
     if route.action == ROUTE_ADOPT_LANE:
         return _adopt_lane(deps, loop, route.detail)
     if route.action == ROUTE_DROP_ORPHAN:
@@ -818,14 +1104,24 @@ def _consumer(deps: LoopDeps) -> Callable[
     return _perform if deps.cfg.mode == "live" else _rehearse
 
 
-def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
-    """Route one verdict against a loop we hold the lease on.
+def _observes(deps: LoopDeps) -> bool:
+    """Whether this tick looks at the outside world at all.
 
-    The mode is asked here and nowhere below, and it answers two questions:
-    whether this tick looks at GitHub at all -- `off` is the hard kill switch,
-    so it stops the reads too -- and which consumer takes the decision.
+    `_consumer`'s counterpart on the read side, and the only other place the
+    mode is asked. `off` is the hard kill switch, so it stops the work and not
+    merely the writes: no lane is polled and no GitHub is read. `shadow` keeps
+    reading, because rehearsing a decision taken without the facts would not be
+    rehearsing the decision a live tick takes.
+
+    Named and shared for the same reason `_consumer` is: both passes ask
+    through it, so neither can grow a mode test of its own.
     """
-    facts = None if deps.cfg.mode == "off" else _observe(deps, verdict)
+    return deps.cfg.mode != "off"
+
+
+def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
+    """Route one verdict against a loop we hold the lease on."""
+    facts = _observe(deps, verdict) if _observes(deps) else None
     return _consumer(deps)(deps, loop, verdict,
                            _route(deps, loop, verdict, facts))
 
@@ -915,24 +1211,34 @@ def _verdict_for(loop: LoopRequest) -> Verdict:
 
 
 def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
-    """Retry the writes that cannot wait for a verdict to carry them.
+    """Carry every step no verdict is going to arrive to carry.
 
-    Two debts qualify, and neither can count on a verdict arriving. An
-    escalated PR gets no further verdicts at all -- that is what escalating
-    means -- and an orphaned lane need not produce one either, since a lane
-    that changes nothing triggers no re-review.
+    Three things qualify, and none of them can count on a verdict. An escalated
+    PR gets no further verdicts at all -- that is what escalating means. An
+    orphaned lane need not produce one either, since a lane that changes
+    nothing triggers no re-review. And a lane that *has* changed something
+    produces one only once this pass has asked for it: the whole round hinges
+    on a re-review nobody else will post.
 
-    The pass leases each loop exactly as the verdict path does, and only ever
-    retries a write: it opens no lane, spends no round, reads nothing from
-    GitHub, and says nothing to a human who has already been told. A loop can
-    therefore pass through it many times without accumulating side effects.
+    It is one pass and one batch on purpose. A second `claim_due` would lease
+    loops this one is still working, so lane completion joins the retries here
+    rather than sweeping for itself.
 
-    It decides and acts through the same two consumers the verdict path uses --
-    `_route_due` names what a live tick owes, `_perform` pays it, `_rehearse`
-    records it -- so there is no mode gate of its own here to forget, and none
-    that a mutation can delete. The one thing it does not share is a verdict:
-    the one that stopped this loop was consumed ticks ago, so it addresses
-    Slack and GitHub from the row (`_verdict_for`).
+    The lease is renewed per loop, not taken once for the batch: LEASE_SECONDS
+    is short next to DUE_LIMIT loops with a kanban poll and two GitHub reads
+    each, and a tick whose lease lapses partway learns it from a `transition()`
+    returning False *after* it has already posted. Renewing first turns that
+    into a refusal before any side effect, and a renewal we cannot have means
+    somebody else owns the loop: leave it entirely, do not merely skip the
+    write.
+
+    It decides and acts through the same helpers the verdict path uses --
+    `_route_due` names what a live tick owes, `_observes` says whether it looks
+    at anything to name it, `_perform` pays it and `_rehearse` records it -- so
+    there is no mode gate of its own here to forget, and none that a mutation
+    can delete. The one thing it does not share is a verdict: the one that
+    stopped this loop was consumed ticks ago, so it addresses Slack and GitHub
+    from the row (`_verdict_for`).
     """
     try:
         due = deps.store.claim_due(now=deps.now(), limit=DUE_LIMIT)
@@ -942,11 +1248,17 @@ def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
 
     advanced = 0
     consume = _consumer(deps)
+    observes = _observes(deps)
     for loop in due:
         try:
             if loop.loop_id in driven:
                 continue
-            route = _route_due(deps, loop)
+            if not deps.store.renew_claim(loop.loop_id, now=deps.now()):
+                _LOG.warning("the lease on loop %s lapsed mid-batch; "
+                             "leaving it to whoever holds it now", loop.loop_id)
+                continue
+            route = _route_due(deps, loop,
+                               _observe_lane(deps, loop) if observes else None)
             if route is None:
                 continue
             if consume(deps, loop, _verdict_for(loop), route):
@@ -984,9 +1296,9 @@ def tick(deps: LoopDeps) -> int:
     generation once `active_for_pr` stops finding it.
 
     The verdict pass is followed by a due pass over leased due loops, which
-    exists so that a write nobody will send another verdict for -- an
-    escalation nobody received, a lane nobody recorded -- is tried again
-    anyway.
+    exists so that a step nobody will send another verdict for -- an escalation
+    nobody received, a lane nobody recorded, a finished lane whose re-review
+    nobody has asked for -- is taken anyway.
     """
     advanced = 0
     driven: set[str] = set()

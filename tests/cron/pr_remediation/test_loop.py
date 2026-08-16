@@ -614,12 +614,13 @@ def test_the_same_verdict_is_never_consumed_twice(tmp_path):
 
 
 def rereview_posted(deps):
-    """Force the loop past its in-flight lane, the way the lane path will.
+    """Force the loop past its in-flight lane, the way the lane pass does.
 
     A verdict is refused while a lane is still in flight (that lane, not a
     second one, drives the next step), so driving round accounting from the
-    verdict path alone means standing in for the lane-completion pass Task 9
-    adds: the lane finished, the head moved, the re-review went out.
+    verdict path alone means standing in for the due pass's lane completion:
+    the lane finished, the head moved, the re-review went out. The lane pass
+    itself is exercised further down, from the due pass it really runs in.
     """
     deps.store._db.execute(
         "UPDATE loops SET state=? WHERE loop_id=?",
@@ -1477,3 +1478,405 @@ def _loop_id(deps):
     row = deps.store._db.execute(
         "SELECT loop_id FROM loops ORDER BY created_at DESC LIMIT 1").fetchone()
     return row["loop_id"]
+
+
+# --- lane completion: the head must actually have moved --------------------
+
+
+class CountingStore:
+    """A real store that counts how many due batches a tick leases."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.due_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def claim_due(self, *, now, limit):
+        self.due_calls += 1
+        return self._inner.claim_due(now=now, limit=limit)
+
+
+class LeaseLapses:
+    """A real store that reports our lease gone for whichever loops are named.
+
+    LEASE_SECONDS is short relative to a due batch that makes network calls per
+    loop, so a long batch loses ownership partway through -- which the driver
+    must notice at the loop it happens to, and not by watching a later
+    compare-and-swap fail after the side effects already fired.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.lapsed = set()
+        self.renewed = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def renew_claim(self, loop_id, *, now):
+        self.renewed.append(loop_id)
+        if loop_id in self.lapsed:
+            return False
+        return self._inner.renew_claim(loop_id, now=now)
+
+
+class ReadRecordingLanes(LanesFake):
+    """A kanban that remembers being polled. `off` must poll it nothing."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.polled = []
+
+    def status(self, lane_id):
+        self.polled.append(lane_id)
+        return super().status(lane_id)
+
+
+def drive_to_remediating(tmp_path, lanes=None, github=None, slack=None,
+                         store=None, thread="1.0"):
+    """A live tick that opened a lane, with its verdict consumed.
+
+    What the next sweep finds: a `remediating` row with a lane to poll, a
+    thinkies reaction on the thread, and no verdict left to route -- so the due
+    pass, not the verdict pass, is what drives everything below.
+    """
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    deps = build(tmp_path, SourceFake([verdict(thread=thread)]), lanes=lanes,
+                 github=github, slack=slack, store=store)
+    assert tick(deps) == 1
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    deps.source.verdicts = []
+    deps.now.advance(LANE_POLL_SECONDS + 1)
+    return deps
+
+
+def test_a_finished_lane_that_moved_the_head_asks_for_a_rereview(tmp_path):
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    deps.github.head = "b" * 40  # Andrej pushed
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "the round that just finished, not the one about to start"
+    assert deps.slack.thinkies_removed == ["1.0"], \
+        "the running signal must be cleared"
+    loop = only_loop(deps)
+    assert loop.state is LoopState.REREVIEW_POSTED
+    assert loop.head_sha == "b" * 40, "the head the next verdict will be about"
+    assert loop.round_count == 1, "asking for a re-review spends no round"
+    assert deps.slack.escalations == []
+
+    # ...and the pass is finished with this loop: a terminal lane still named
+    # by the row must not be read back as a second completion, which would
+    # re-post the re-review and then call the unmoved head a no-op.
+    deps.now.advance()
+    assert tick(deps) == 0
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    assert deps.slack.escalations == []
+
+
+def test_a_still_running_lane_is_left_alone_and_silent(tmp_path):
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path)  # LanesFake defaults to in_progress
+    loop_id = _loop_id(deps)
+    before = kinds(deps, loop_id)
+    deps.github.head = "b" * 40  # a push mid-round settles nothing
+    assert tick(deps) == 0
+    assert deps.slack.reposts == [] and deps.slack.escalations == []
+    assert deps.slack.thinkies_removed == []
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.head_sha == "a" * 40
+    assert kinds(deps, loop_id) == before, \
+        "a healthy loop must not grow its trail on every tick"
+
+
+def test_a_lane_that_pushed_nothing_gets_one_grace_window_then_escalates(tmp_path):
+    """kanban marks a lane terminal when its worker exits, which can be moments
+    before GitHub serves the pushed head. Calling that a no-op on the first
+    look escalates a race; never calling it one re-reviews an unchanged PR
+    forever."""
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    assert tick(deps) == 1
+    loop = only_loop(deps)
+    assert loop.state is LoopState.AWAITING_HEAD_MOVE
+    assert deps.slack.escalations == [], "a push can land just behind its lane"
+    assert deps.slack.reposts == []
+    assert deps.slack.thinkies_removed == ["1.0"], "no round is running now"
+
+    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    assert tick(deps) == 1
+    assert deps.slack.escalations[0][2] == "no_op_lane"
+    assert deps.slack.reposts == [], "an unchanged PR must never be re-reviewed"
+    assert only_loop(deps) is None, "an escalated loop is finished"
+    assert deps.github.released == [("Ylopo", "example", 42)]
+
+
+def test_the_grace_window_catches_a_push_that_landed_late(tmp_path):
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    assert tick(deps) == 1
+    assert only_loop(deps).state is LoopState.AWAITING_HEAD_MOVE
+
+    deps.github.head = "b" * 40  # GitHub was simply behind the lane
+    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    assert deps.slack.escalations == []
+    loop = only_loop(deps)
+    assert loop.state is LoopState.REREVIEW_POSTED
+    assert loop.head_sha == "b" * 40
+
+
+def test_a_held_pr_stops_the_lane_pass_before_any_write(tmp_path):
+    """The lane pass writes -- a reaction, a post, a label -- so it reads Chad's
+    kill switch first, and `has_hold` fails closed on an unreadable GitHub."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    deps.github.hold = True
+    deps.github.head = "b" * 40
+    loop_id = _loop_id(deps)
+    for _ in range(3):
+        deps.now.advance()
+        assert tick(deps) == 0
+    assert deps.slack.reposts == [] and deps.slack.escalations == []
+    assert deps.slack.thinkies_removed == []
+    assert deps.github.released == []
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    assert kinds(deps, loop_id).count("held") == 1, \
+        "a standing observation is recorded once, not once a tick"
+
+
+def test_an_unreadable_head_waits_instead_of_calling_the_lane_a_no_op(tmp_path):
+    """None is "GitHub could not be read", not "Andrej pushed nothing"."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    for _ in range(3):
+        deps.now.advance()
+        assert tick(deps) == 0
+    assert deps.slack.escalations == [], "a read blip must not burn the loop"
+    assert deps.slack.reposts == []
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    assert kinds(deps, loop_id).count("head_unreadable") == 1
+
+    deps.github.head = "b" * 40  # GitHub came back
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+
+
+def test_a_lane_pass_that_cannot_post_the_rereview_escalates(tmp_path):
+    """No thread means the gate silently drops the post, so the loop would
+    stall waiting for a verdict that can never come."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                thread="")
+    deps.github.head = "b" * 40
+    assert tick(deps) == 1
+    assert deps.slack.reposts == []
+    assert deps.slack.escalations[0][2] == "rereview_unpostable"
+    assert only_loop(deps) is None
+
+
+def test_a_failed_rereview_post_leaves_the_lane_pass_to_retry(tmp_path):
+    """A Slack blip is transient: do not burn the round over it."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                slack=SlackFake(repost_ts=None))
+    deps.github.head = "b" * 40
+    loop_id = _loop_id(deps)
+    for _ in range(3):
+        deps.now.advance()
+        assert tick(deps) == 0
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    assert deps.slack.escalations == []
+    assert kinds(deps, loop_id).count("rereview_post_failed") == 1, \
+        "a standing failure is recorded once, not once a tick: the trail is " \
+        "read back in full on every tick, so an outage must not grow it"
+
+    deps.slack._repost_ts = "9.0"  # Slack is back
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+
+
+def test_the_lane_pass_leases_no_batch_of_its_own(tmp_path):
+    """Lane completion joins the existing due pass rather than adding a third
+    claim: a second batch would lease loops the first one is still working."""
+    from pr_remediation.loop import tick
+
+    store = CountingStore(Store(tmp_path / "r.db"))
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                store=store)
+    store.due_calls = 0
+    deps.github.head = "b" * 40
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    assert store.due_calls == 1, "a second due batch is a third claim pass"
+
+
+def test_a_lease_lost_mid_batch_stops_that_loop_and_no_other(tmp_path):
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    store = LeaseLapses(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1", pr=42),
+                                       verdict(rid="br_2", pr=43)]),
+                 lanes=LanesFake(status="done"), store=store)
+    assert tick(deps) == 2
+    lost = only_loop(deps, 42).loop_id
+    kept = only_loop(deps, 43).loop_id
+    store.lapsed.add(lost)
+
+    deps.source.verdicts = []
+    deps.github.head = "b" * 40
+    deps.now.advance(LANE_POLL_SECONDS + 1)
+    assert tick(deps) == 1
+    assert set(store.renewed) == {lost, kept}, \
+        "every loop the batch works must renew the lease it works under"
+    assert deps.slack.reposts == [("Ylopo/example#43", 1)]
+    assert deps.store.get(lost).state is LoopState.REMEDIATING, \
+        "a loop we no longer own must not be driven"
+    assert deps.store.get(kept).state is LoopState.REREVIEW_POSTED
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_lane_pass_completes_nothing_a_live_run_started(tmp_path, mode):
+    """The pause procedure arriving mid-round: a live tick opened the lane, and
+    a paused one must neither post the re-review nor move the loop."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = _loop_id(deps)
+    deps.github.head = "b" * 40
+
+    paused = in_mode(deps, mode)
+    for _ in range(3):
+        paused.now.advance()
+        assert tick(paused) == 0
+    assert deps.slack.reposts == [], "a paused run posted a re-review"
+    assert deps.slack.thinkies_removed == []
+    assert deps.slack.escalations == []
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.head_sha == "a" * 40
+
+    if mode == "shadow":
+        assert [event["detail"]["would"] for event in deps.store.events(loop_id)
+                if event["kind"] == "shadow_decision"] == ["lane_pushed"], \
+            "a standing decision is rehearsed once, however long the pause"
+
+    # ...and the round is still there for whoever turns the service back on.
+    live = in_mode(deps, "live")
+    live.now.advance()
+    assert tick(live) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+
+
+def test_the_off_switch_polls_no_lane_and_reads_no_github(tmp_path):
+    """`off` stops the work, not merely the writes -- in the due pass too,
+    where a lane poll and two API reads per open loop per tick is rate budget
+    spent on decisions nobody will act on."""
+    from pr_remediation.loop import tick
+
+    github = ReadRecordingGitHub()
+    lanes = ReadRecordingLanes(status="done")
+    deps = drive_to_remediating(tmp_path, lanes=lanes, github=github)
+    github.reads.clear()
+    lanes.polled.clear()
+
+    off = in_mode(deps, "off")
+    off.now.advance()
+    assert tick(off) == 0
+    assert lanes.polled == [], "the kill switch still went looking at the lane"
+    assert github.reads == [], "the kill switch still called GitHub"
+
+    shadow = in_mode(deps, "shadow")
+    shadow.now.advance()
+    assert tick(shadow) == 0
+    assert lanes.polled == ["t_1"], "shadow rehearses the live decision, so it reads"
+    assert github.reads == [("has_hold", 42), ("head_sha", 42)]
+
+
+def test_a_lane_still_running_when_the_loop_closes_is_recorded(tmp_path):
+    """A ready verdict arriving mid-round closes the loop, and terminal states
+    are absorbing and unclaimable -- so that lane is polled by nobody, finishes,
+    and pushes to a PR this service has just handed back."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path)  # a lane still in progress
+    loop_id = _loop_id(deps)
+    deps.source.verdicts = [verdict(rid="br_2", outcome="READY_FOR_HUMAN_REVIEW")]
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.READY
+    abandoned = [event["detail"] for event in deps.store.events(loop_id)
+                 if event["kind"] == "lane_abandoned"]
+    assert [d["lane_id"] for d in abandoned] == ["t_1"], \
+        "nothing will ever poll that lane again, so say so"
+
+
+def test_an_escalation_over_an_outstanding_orphan_records_the_lane_it_strands(
+        tmp_path):
+    """The other shape of the same leak: the row never recorded the lane, so
+    only the trail knows one is still running when the loop closes."""
+    from pr_remediation.loop import LoopDeps, tick
+
+    store = LosingStore(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]), store=store)
+    assert tick(deps) == 0
+    loop_id = _loop_id(deps)
+    assert "orphaned_lane" in kinds(deps, loop_id)
+
+    healed = LoopDeps(**{**deps.__dict__, "store": store._inner})
+    healed.source.verdicts = [model_incomplete(rid="br_2")]
+    healed.now.advance()
+    assert tick(healed) == 1
+    assert healed.store.get(loop_id).state is LoopState.ESCALATED
+    abandoned = [event["detail"] for event in healed.store.events(loop_id)
+                 if event["kind"] == "lane_abandoned"]
+    assert [d["lane_id"] for d in abandoned] == ["t_1"]
+
+
+def test_a_closed_loop_that_stranded_nothing_records_nothing(tmp_path):
+    """The note is a leak report, not a footer on every close."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]))
+    assert tick(deps) == 1
+    assert "lane_abandoned" not in kinds(deps, _loop_id(deps))
+
+
+def test_a_finished_lane_hands_the_loop_to_the_next_verdict(tmp_path):
+    """The circle this pass closes, walked end to end: a verdict opens round 1,
+    the lane pushes, the due pass asks for a re-review, and the verdict that
+    comes back opens round 2 against the head the lane really pushed to."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = _loop_id(deps)
+    deps.github.head = "b" * 40
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    deps.now.advance()
+    assert tick(deps) == 1
+    loop = deps.store.get(loop_id)
+    assert loop.round_count == 2, "the re-review's verdict starts the next round"
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.lane_id == "t_2"
+    assert deps.lanes.created == [("Ylopo/example#42", 1), ("Ylopo/example#42", 2)]
+    assert deps.slack.thinkies_added == ["1.0", "1.0"]
