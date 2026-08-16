@@ -11,20 +11,29 @@ this touches the real config.yaml, .env, state databases or the network.
 from pathlib import Path
 
 from pr_remediation import daemon
+from pr_remediation.boris_source import Verdict
 from pr_remediation.config import RemediationConfig
 from pr_remediation.loop import LoopDeps
+
+VERDICT = Verdict("br_1", "Ylopo", "example", 42, "a" * 40, "1.0",
+                  "ISSUES_FOUND", None, ("Null deref",))
 
 
 def _cfg(mode="live"):
     return RemediationConfig(mode=mode)
 
 
+def _both_tokens(review="xoxb-review", notify="xoxb-notify"):
+    return {"TICKET_HUB_SLACK_BOT_TOKEN": review, "SLACK_BOT_TOKEN": notify}
+
+
 def test_main_exits_zero_without_building_deps_when_mode_is_off(monkeypatch):
     built = []
     monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="off"))
-    monkeypatch.setattr(daemon, "run_selftest", lambda cfg: (_ for _ in ()).throw(
+    monkeypatch.setattr(daemon, "run_selftest", lambda cfg, **kw: (_ for _ in ()).throw(
         AssertionError("selftest must not run when mode is off")))
-    monkeypatch.setattr(daemon, "build_deps", lambda cfg, token: built.append(1))
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda cfg, review_token, notify_token: built.append(1))
 
     assert daemon.main() == 0
     assert built == []
@@ -35,41 +44,63 @@ def test_main_fails_closed_and_builds_nothing_when_selftest_reports_failures(
 ):
     built = []
     monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="live"))
+    monkeypatch.setattr(daemon, "parse_env", lambda path: _both_tokens())
     monkeypatch.setattr(daemon, "run_selftest",
-                        lambda cfg: ["the write token is missing"])
-    monkeypatch.setattr(daemon, "build_deps", lambda cfg, token: built.append(1))
+                        lambda cfg, **kw: ["the write token is missing"])
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda cfg, review_token, notify_token: built.append(1))
 
     assert daemon.main() == 1
     assert built == []
     assert "the write token is missing" in capsys.readouterr().err
 
 
-def test_main_fails_closed_when_the_slack_bot_token_is_missing(monkeypatch):
+def test_main_fails_closed_when_the_review_slack_token_is_missing(monkeypatch):
     built = []
     monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="live"))
-    monkeypatch.setattr(daemon, "run_selftest", lambda cfg: [])
-    monkeypatch.setattr(daemon, "parse_env", lambda path: {})
-    monkeypatch.setattr(daemon, "build_deps", lambda cfg, token: built.append(1))
+    monkeypatch.setattr(daemon, "run_selftest", lambda cfg, **kw: [])
+    monkeypatch.setattr(daemon, "parse_env",
+                        lambda path: {"SLACK_BOT_TOKEN": "xoxb-notify"})
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda cfg, review_token, notify_token: built.append(1))
+
+    assert daemon.main() == 1
+    assert built == []
+
+
+def test_main_fails_closed_when_the_notify_slack_token_is_missing(monkeypatch):
+    """SLACK_BOT_TOKEN (the main Hermes bot) is a distinct requirement from
+    TICKET_HUB_SLACK_BOT_TOKEN now that SlackIO needs both -- missing either
+    one must fail closed, not just the one the daemon already checked before
+    this fix."""
+    built = []
+    monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="live"))
+    monkeypatch.setattr(daemon, "run_selftest", lambda cfg, **kw: [])
+    monkeypatch.setattr(daemon, "parse_env",
+                        lambda path: {"TICKET_HUB_SLACK_BOT_TOKEN": "xoxb-review"})
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda cfg, review_token, notify_token: built.append(1))
 
     assert daemon.main() == 1
     assert built == []
 
 
 def test_main_builds_deps_and_enters_the_poll_loop_once_healthy(monkeypatch):
-    """A healthy startup must reach build_deps with the loaded config and the
-    resolved token, and must hand off to the poll loop -- not run it inline
-    forever, and not skip it either."""
+    """A healthy startup must reach build_deps with the loaded config and
+    both resolved tokens, and must hand off to the poll loop -- not run it
+    inline forever, and not skip it either."""
     calls = {}
     cfg = _cfg(mode="live")
     sentinel_deps = object()
 
     monkeypatch.setattr(daemon, "load_config", lambda: cfg)
-    monkeypatch.setattr(daemon, "run_selftest", lambda passed_cfg: calls.setdefault(
-        "selftest_cfg", passed_cfg) and [])
+    monkeypatch.setattr(daemon, "run_selftest", lambda passed_cfg, **kw: calls.setdefault(
+        "selftest_cfg", passed_cfg) and calls.setdefault("selftest_kwargs", kw) and [])
     monkeypatch.setattr(daemon, "parse_env",
-                        lambda path: {"TICKET_HUB_SLACK_BOT_TOKEN": "xoxb-test"})
-    monkeypatch.setattr(daemon, "build_deps", lambda passed_cfg, token: (
-        calls.__setitem__("build_deps", (passed_cfg, token)), sentinel_deps)[1])
+                        lambda path: _both_tokens("xoxb-review-test", "xoxb-notify-test"))
+    monkeypatch.setattr(daemon, "build_deps", lambda passed_cfg, review_token, notify_token: (
+        calls.__setitem__("build_deps", (passed_cfg, review_token, notify_token)),
+        sentinel_deps)[1])
     monkeypatch.setattr(daemon.signal, "signal", lambda *a, **k: None)
 
     def fake_run(deps, *, should_stop, **kw):
@@ -78,8 +109,34 @@ def test_main_builds_deps_and_enters_the_poll_loop_once_healthy(monkeypatch):
     monkeypatch.setattr(daemon, "_run", fake_run)
 
     assert daemon.main() == 0
-    assert calls["build_deps"] == (cfg, "xoxb-test")
+    assert calls["build_deps"] == (cfg, "xoxb-review-test", "xoxb-notify-test")
     assert calls["run_deps"] is sentinel_deps
+
+
+def test_main_passes_both_tokens_and_the_real_slack_caller_into_run_selftest(monkeypatch):
+    """The reachability check can only do its job if it is handed the exact
+    tokens build_deps is about to wire into SlackIO, and a real caller to
+    probe with -- not a value read separately that could drift, and not a
+    None that would silently skip the check (see selftest.py's guard for
+    that case)."""
+    seen = {}
+    monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="live"))
+    monkeypatch.setattr(daemon, "parse_env",
+                        lambda path: _both_tokens("xoxb-review-test", "xoxb-notify-test"))
+
+    def fake_selftest(cfg, **kw):
+        seen.update(kw)
+        return []
+    monkeypatch.setattr(daemon, "run_selftest", fake_selftest)
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda cfg, review_token, notify_token: object())
+    monkeypatch.setattr(daemon.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_run", lambda deps, **kw: None)
+
+    assert daemon.main() == 0
+    assert seen["review_token"] == "xoxb-review-test"
+    assert seen["notify_token"] == "xoxb-notify-test"
+    assert seen["slack_caller"] is daemon.slack_caller
 
 
 def test_main_fails_closed_when_selftest_itself_raises(monkeypatch, capsys):
@@ -93,11 +150,13 @@ def test_main_fails_closed_when_selftest_itself_raises(monkeypatch, capsys):
     failure instead."""
     built = []
     monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="live"))
+    monkeypatch.setattr(daemon, "parse_env", lambda path: _both_tokens())
 
-    def boom(cfg):
+    def boom(cfg, **kw):
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
     monkeypatch.setattr(daemon, "run_selftest", boom)
-    monkeypatch.setattr(daemon, "build_deps", lambda cfg, token: built.append(1))
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda cfg, review_token, notify_token: built.append(1))
 
     assert daemon.main() == 1
     assert built == []
@@ -118,11 +177,10 @@ def test_sigterm_handler_installed_by_main_actually_stops_the_poll_loop(monkeypa
     sentinel_deps = object()
 
     monkeypatch.setattr(daemon, "load_config", lambda: cfg)
-    monkeypatch.setattr(daemon, "run_selftest", lambda passed_cfg: [])
-    monkeypatch.setattr(daemon, "parse_env",
-                        lambda path: {"TICKET_HUB_SLACK_BOT_TOKEN": "xoxb-test"})
+    monkeypatch.setattr(daemon, "run_selftest", lambda passed_cfg, **kw: [])
+    monkeypatch.setattr(daemon, "parse_env", lambda path: _both_tokens())
     monkeypatch.setattr(daemon, "build_deps",
-                        lambda passed_cfg, token: sentinel_deps)
+                        lambda passed_cfg, review_token, notify_token: sentinel_deps)
 
     def fake_signal(signum, handler):
         handlers[signum] = handler
@@ -139,6 +197,49 @@ def test_sigterm_handler_installed_by_main_actually_stops_the_poll_loop(monkeypa
     assert daemon.main() == 0
     assert calls["should_stop_before"] is False
     assert calls["should_stop_after"] is True
+
+
+# --- build_deps: the two-token contract -------------------------------------
+#
+# SlackIO now takes review_token and notify_token separately (see
+# slack_io.py's module docstring), and build_deps is the one place that
+# wires the real values into it. A swap here -- the review token handed to
+# notify calls, or vice versa -- is exactly the regression this fix exists
+# to prevent: it would either make every re-review invisible to Boris's
+# gate (wrong identity posting) or make every notification fail with
+# not_in_channel (an identity that cannot reach that workspace's channel).
+# BorisSource/GitHubIO/LaneIO/Store are stubbed out because build_deps wires
+# them against the real, deployed database and token paths -- exercising
+# those here would touch the live daemon's own state.
+
+def test_build_deps_wires_the_review_token_to_review_calls_and_the_notify_token_to_notifications(
+    monkeypatch,
+):
+    monkeypatch.setattr(daemon, "BorisSource", lambda *a, **k: object())
+    monkeypatch.setattr(daemon, "GitHubIO", lambda *a, **k: object())
+    monkeypatch.setattr(daemon, "LaneIO", lambda *a, **k: object())
+    monkeypatch.setattr(daemon, "Store", lambda *a, **k: object())
+
+    calls = []
+
+    def fake_caller(token, method, **params):
+        calls.append((token, method))
+        return {"ok": True, "ts": "1.0"}
+    monkeypatch.setattr(daemon, "slack_caller", fake_caller)
+
+    deps = daemon.build_deps(_cfg(mode="live"), "review-tok", "notify-tok")
+
+    deps.slack.post_rereview(VERDICT, "1.0", 1)
+    deps.slack.add_thinkies("C1", "5.0")
+    deps.slack.notify_ready(VERDICT, rounds=1)
+    deps.slack.notify_escalation(VERDICT, rounds=1, reason="round_cap")
+
+    assert calls == [
+        ("review-tok", "chat.postMessage"),
+        ("review-tok", "reactions.add"),
+        ("notify-tok", "chat.postMessage"),
+        ("notify-tok", "chat.postMessage"),
+    ]
 
 
 def test_run_survives_a_bad_tick_and_keeps_polling(tmp_path, monkeypatch):

@@ -2,9 +2,11 @@
 """Remediation loop daemon. Polls Boris verdicts and advances loops.
 
 Runs under a launchd KeepAlive supervisor, which sets the shape of both
-failure paths here. Startup failures (a missing write token, a marker gone
-out of sync with boris_intake, a missing autofix gate in live mode) must fail
-closed: `main` refuses to build any dependency and exits nonzero rather than
+failure paths here. Startup failures (a missing write token, a missing Slack
+token for either identity, a marker gone out of sync with boris_intake, a
+missing autofix gate in live mode, a Slack token/channel pairing that
+`run_selftest` can prove is unreachable in live mode) must fail closed:
+`main` refuses to build any dependency and exits nonzero rather than
 starting degraded, because a daemon that starts anyway would sit there
 posting nothing, dispatching nothing, and telling nobody why. That includes a
 precondition check that itself raises (an exotic config error the checked
@@ -100,14 +102,36 @@ def parse_env(path: Path | None = None) -> dict[str, str]:
     return _parse_env(SLACK_READ_ENV_PATH if path is None else path)
 
 
-def build_deps(cfg: RemediationConfig, slack_token: str) -> LoopDeps:
-    """Wire the real adapters. A seam so tests can wire fakes instead."""
-    from slack_read import slack_call
+def slack_caller(token: str, method: str, **params):
+    """The deployed `slack_call`, used both for `run_selftest`'s reachability
+    check and, via `build_deps`, for every real post and reaction once the
+    daemon is up.
 
+    A wrapper for the same reason `parse_env` is one: `slack_read` lives only
+    under DEPLOYED_SCRIPTS, so importing it at module scope is exactly what
+    forced this module's sys.path mutation out of import time. Keeping the
+    name at module scope keeps the seam tests can patch.
+    """
+    from slack_read import slack_call as _slack_call
+
+    return _slack_call(token, method, **params)
+
+
+def build_deps(cfg: RemediationConfig, review_token: str,
+               notify_token: str) -> LoopDeps:
+    """Wire the real adapters. A seam so tests can wire fakes instead.
+
+    Two tokens, not one: `review_token` (Son of Chad,
+    TICKET_HUB_SLACK_BOT_TOKEN) owns the review-thread work SlackIO performs,
+    `notify_token` (the main Hermes bot, SLACK_BOT_TOKEN) owns the
+    notifications -- the two channels live in different Slack workspaces, so
+    one identity cannot cover both. See slack_io.py's module docstring for
+    why the split has to be by call, not by config.
+    """
     return LoopDeps(
         source=BorisSource(DEFAULT_BORIS_DB, cfg),
         github=GitHubIO(cfg, DEFAULT_TOKEN),
-        slack=SlackIO(cfg, slack_token, slack_call),
+        slack=SlackIO(cfg, review_token, notify_token, slack_caller),
         lanes=LaneIO(KANBAN_DB),
         store=Store(STATE_DB),
         cfg=cfg,
@@ -138,8 +162,18 @@ def main() -> int:
         sys.stderr.write("pr_remediation: mode=off, exiting\n")
         return 0
 
+    # Both Slack identities come from the same `.env`, read once here so the
+    # selftest's reachability check (live mode only) can probe the exact
+    # tokens the daemon is about to build SlackIO with -- not a value it
+    # reads separately and could drift from.
+    env = parse_env(ENV_PATH)
+    review_token = env.get("TICKET_HUB_SLACK_BOT_TOKEN", "")
+    notify_token = env.get("SLACK_BOT_TOKEN", "")
+
     try:
-        failures = run_selftest(cfg)
+        failures = run_selftest(cfg, review_token=review_token,
+                                notify_token=notify_token,
+                                slack_caller=slack_caller)
     except Exception as error:  # noqa: BLE001 - a selftest crash must still fail closed
         # load_boris_intake_config only catches OSError/yaml.YAMLError; something
         # like a UnicodeDecodeError from a non-UTF-8 config file would otherwise
@@ -153,13 +187,14 @@ def main() -> int:
             sys.stderr.write(f"pr_remediation: selftest: {failure}\n")
         return 1
 
-    env = parse_env(ENV_PATH)
-    token = env.get("TICKET_HUB_SLACK_BOT_TOKEN", "")
-    if not token:
+    if not review_token:
         sys.stderr.write("pr_remediation: TICKET_HUB_SLACK_BOT_TOKEN is missing\n")
         return 1
+    if not notify_token:
+        sys.stderr.write("pr_remediation: SLACK_BOT_TOKEN is missing\n")
+        return 1
 
-    deps = build_deps(cfg, token)
+    deps = build_deps(cfg, review_token, notify_token)
     sys.stderr.write(f"pr_remediation: started, mode={cfg.mode}\n")
     sys.stderr.flush()
 
