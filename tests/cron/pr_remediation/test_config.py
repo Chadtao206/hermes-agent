@@ -29,10 +29,19 @@ def test_live_mode_is_honoured(tmp_path):
 
 
 def test_states_cover_the_whole_loop():
+    # `stale` joined the vocabulary with I2: a pull request merged or closed
+    # under the loop is terminal, but it is neither `ready` (which notifies a
+    # human) nor `escalated` (which claims one must intervene).
     assert {s.value for s in LoopState} == {
         "observed", "remediating", "awaiting_head_move",
-        "rereview_posted", "ready", "escalated",
+        "rereview_posted", "ready", "escalated", "stale",
     }
+
+
+def test_stale_is_terminal_so_a_merged_pr_is_never_re_driven():
+    from pr_remediation.models import TERMINAL_STATES
+
+    assert LoopState.STALE in TERMINAL_STATES
 
 
 def test_load_config_defaults_when_file_is_missing(tmp_path):

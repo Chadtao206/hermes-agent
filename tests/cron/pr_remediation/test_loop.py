@@ -36,17 +36,24 @@ class GitHubFake:
     """claim/release return bool, as GitHubIO now does."""
 
     def __init__(self, head="a" * 40, author="Chadtao206", hold=False,
-                 claim_ok=True, release_ok=True, hold_raises=()):
+                 claim_ok=True, release_ok=True, hold_raises=(),
+                 pr_state="OPEN"):
         self.head, self.author_login, self.hold = head, author, hold
         self.claim_ok, self.release_ok = claim_ok, release_ok
         self.hold_raises = set(hold_raises)
         self.claimed, self.released = [], []
+        # What `gh pr view --json state` reports: OPEN / MERGED / CLOSED, or
+        # None when GitHub could not be read.
+        self.pr_state = pr_state
 
     def head_sha(self, o, r, p):
         return self.head
 
     def author(self, o, r, p):
         return self.author_login
+
+    def state(self, o, r, p):
+        return self.pr_state
 
     def has_hold(self, o, r, p):
         if p in self.hold_raises:
@@ -2253,3 +2260,104 @@ def test_an_archived_lane_is_read_as_finished_and_the_loop_moves_on(tmp_path):
     assert tick(deps) == 1
     assert deps.slack.reposts == [("Ylopo/example#42", 1)]
     assert only_loop(deps).state is LoopState.REREVIEW_POSTED
+
+
+# --- I2: the loop must not write to a merged or closed pull request ---------
+
+
+def test_a_merged_pr_is_closed_as_stale_instead_of_remediated(tmp_path):
+    """The commonest thing in today's backlog: 9 of the 11 distinct pull
+    requests this loop would pick up are already MERGED.
+
+    Before I2, `gh pr view` deliberately did not ask for `state`, so a PR
+    merged between the verdict and the tick was labelled as owned, handed an
+    engineer lane told to "fix them at this head and push", and had a re-review
+    posted about it.
+    """
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict()]),
+                 github=GitHubFake(pr_state="MERGED"))
+    assert tick(deps) == 1
+    assert deps.lanes.created == [], "no lane may be dispatched at a merged PR"
+    assert deps.github.claimed == [], "the ownership label must not be applied"
+    assert deps.slack.reposts == []
+    assert only_loop(deps) is None, "the loop is closed"
+
+
+def test_closing_stale_notifies_nobody_but_still_hands_the_pr_back(tmp_path):
+    """Silent, not absent. A merge is a human's own act and the ordinary end of
+    a pull request, so a Slack notice would page whoever merged it about their
+    own merge on the commonest path there is. The signals this loop added are
+    still cleared -- a stuck ownership label is what makes a PR look owned
+    forever."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict()]),
+                 github=GitHubFake(pr_state="CLOSED"))
+    tick(deps)
+    assert deps.slack.escalations == [], "a closed PR is not an escalation"
+    assert deps.slack.ready == []
+    assert deps.github.released == [("Ylopo", "example", 42)]
+    assert deps.slack.thinkies_removed == ["1.0"]
+
+
+def test_a_stale_close_is_recorded_as_stale_not_as_an_escalation(tmp_path):
+    from pr_remediation.loop import PR_NOT_OPEN, tick
+
+    store = Store(tmp_path / "r.db")
+    deps = build(tmp_path, SourceFake([verdict()]), store=store,
+                 github=GitHubFake(pr_state="MERGED"))
+    tick(deps)
+    loop_id = [e for e in store._db.execute("SELECT loop_id, state, "
+                                            "escalation_reason FROM loops")][0]
+    assert loop_id[1] == LoopState.STALE.value
+    assert loop_id[2] == PR_NOT_OPEN
+    assert PR_NOT_OPEN in kinds(deps, loop_id[0])
+
+
+def test_an_unreadable_state_is_not_read_as_a_merged_pr(tmp_path):
+    """None means unknown, never "not open". Closing a loop is irreversible --
+    terminal states are absorbing and active_for_pr then refuses every later
+    generation for the PR -- so a blip must leave the loop where it was."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict()]),
+                 github=GitHubFake(pr_state=None))
+    assert tick(deps) == 1
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    assert only_loop(deps).state is LoopState.REMEDIATING
+
+
+def test_the_due_pass_does_not_post_a_rereview_into_a_merged_pr(tmp_path):
+    """The other half of I2. The lane ran, pushed, and by the time it finished
+    the PR had been merged -- so the head moved, which is exactly the condition
+    that earns a re-review. Posting one asks Boris to review a merged PR and
+    then waits forever for a verdict about it."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    deps.github.head = "b" * 40           # the lane really did push
+    deps.github.pr_state = "MERGED"       # ...and then it was merged
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [], "no re-review may be posted at a merged PR"
+    assert deps.slack.escalations == []
+    assert only_loop(deps) is None
+    assert deps.github.released == [("Ylopo", "example", 42)]
+
+
+def test_a_paused_tick_records_the_stale_decision_and_closes_nothing(tmp_path):
+    """The mode invariant holds for the new route like every other: shadow
+    decides and writes no loop state."""
+    from pr_remediation.loop import ROUTE_CLOSE_STALE, tick
+
+    deps = build(tmp_path, SourceFake([verdict()]),
+                 github=GitHubFake(pr_state="MERGED"))
+    shadow = in_mode(deps, "shadow")
+    assert tick(shadow) == 0
+    loop = only_loop(shadow)
+    assert loop is not None and loop.state is LoopState.OBSERVED
+    assert shadow.github.released == []
+    decisions = [e["detail"] for e in shadow.store.events(loop.loop_id)
+                 if e["kind"] == "shadow_decision"]
+    assert decisions == [{"would": ROUTE_CLOSE_STALE, "pr_state": "MERGED"}]

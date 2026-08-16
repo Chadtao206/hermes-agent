@@ -53,7 +53,12 @@ class GitHubIO:
     def _view(self, owner: str, repo: str, pr: int) -> dict | None:
         out = self._run([
             "pr", "view", str(pr), "-R", f"{owner}/{repo}",
-            "--json", "labels,headRefOid,author",
+            # `state` is not optional here: without it this adapter cannot tell
+            # an open pull request from one that was merged or closed between a
+            # verdict and the tick that acts on it, and the loop goes on to
+            # label it, dispatch an engineer lane at "this head" and post a
+            # re-review against a branch nobody can push to any more.
+            "--json", "labels,headRefOid,author,state",
         ])
         if out is None:
             return None
@@ -97,6 +102,22 @@ class GitHubIO:
             return None
         login = author.get("login")
         return login if isinstance(login, str) and login else None
+
+    def state(self, owner: str, repo: str, pr: int) -> str | None:
+        """`OPEN`, `MERGED` or `CLOSED` -- upper-cased, as `gh` reports it --
+        or None when GitHub's answer cannot be trusted to name one.
+
+        Shape-checked like `author` and `has_hold`, and None means *unknown*,
+        never "not open". The driver only writes a loop off as stale on a state
+        it positively read, because guessing the other way would abandon a live
+        pull request on a network blip -- and a loop driven terminal is one
+        `active_for_pr` will never let a later generation recover.
+        """
+        data = self._view(owner, repo, pr)
+        if not isinstance(data, dict):
+            return None
+        value = data.get("state")
+        return value.upper() if isinstance(value, str) and value else None
 
     def has_hold(self, owner: str, repo: str, pr: int) -> bool:
         """True also when GitHub could not be read, or the response's shape

@@ -12,6 +12,12 @@ class LoopState(str, Enum):
     REREVIEW_POSTED = "rereview_posted"
     READY = "ready"
     ESCALATED = "escalated"
+    # The pull request stopped being open -- merged or closed by a human --
+    # so there is nothing left to remediate and nobody to tell. Terminal, and
+    # deliberately neither READY (which notifies) nor ESCALATED (which claims a
+    # human must intervene); a merge is the ordinary end of a pull request, not
+    # an incident.
+    STALE = "stale"
 
 
 class EscalationReason(str, Enum):
@@ -22,7 +28,8 @@ class EscalationReason(str, Enum):
     LANE_FAILED = "lane_failed"
 
 
-TERMINAL_STATES = frozenset({LoopState.READY, LoopState.ESCALATED})
+TERMINAL_STATES = frozenset({LoopState.READY, LoopState.ESCALATED,
+                             LoopState.STALE})
 
 
 @dataclass(frozen=True)

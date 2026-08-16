@@ -93,6 +93,7 @@ _ALLOWED_TRANSITIONS: dict[LoopState, frozenset[LoopState]] = {
         LoopState.REREVIEW_POSTED,
         LoopState.READY,
         LoopState.ESCALATED,
+        LoopState.STALE,
     }),
     LoopState.REMEDIATING: frozenset({
         LoopState.REMEDIATING,
@@ -100,12 +101,14 @@ _ALLOWED_TRANSITIONS: dict[LoopState, frozenset[LoopState]] = {
         LoopState.REREVIEW_POSTED,
         LoopState.READY,
         LoopState.ESCALATED,
+        LoopState.STALE,
     }),
     LoopState.AWAITING_HEAD_MOVE: frozenset({
         LoopState.REMEDIATING,
         LoopState.REREVIEW_POSTED,
         LoopState.READY,
         LoopState.ESCALATED,
+        LoopState.STALE,
     }),
     LoopState.REREVIEW_POSTED: frozenset({
         LoopState.REMEDIATING,
@@ -113,9 +116,13 @@ _ALLOWED_TRANSITIONS: dict[LoopState, frozenset[LoopState]] = {
         LoopState.REREVIEW_POSTED,
         LoopState.READY,
         LoopState.ESCALATED,
+        LoopState.STALE,
     }),
     LoopState.READY: frozenset(),
     LoopState.ESCALATED: frozenset(),
+    # A pull request that stopped being open can be reached from anywhere the
+    # loop is still running, and is absorbing like the other two terminals.
+    LoopState.STALE: frozenset(),
 }
 
 # Positive whitelist for the batch claim path. Selecting the states we know how

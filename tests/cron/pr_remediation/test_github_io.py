@@ -238,3 +238,47 @@ def test_missing_author_key_reads_as_unknown(tmp_path):
 def test_an_unreadable_pr_reads_as_an_unknown_author(tmp_path):
     runner, _ = runner_for({})  # empty stdout: nothing to parse
     assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
+
+
+# --- I2: the view must actually ask GitHub for the PR's state --------------
+
+
+def test_the_view_asks_for_state_so_a_merged_pr_can_be_recognised(tmp_path):
+    """The field list is the contract with `gh`, and it is the thing that was
+    wrong: `_view` requested labels,headRefOid,author and deliberately not
+    `state`, so nothing downstream could tell an open pull request from one
+    merged between the verdict and the tick. Pinned on the argv, because every
+    driver-level test wires a fake and would never notice the field going
+    missing again."""
+    runner, calls = runner_for({"view": json.dumps({"labels": []})})
+    io_with(runner, tmp_path).state("Ylopo", "example", 42)
+    views = [c for c in calls if "view" in c]
+    assert views, "no gh pr view was issued"
+    fields = views[0][views[0].index("--json") + 1].split(",")
+    assert "state" in fields, f"gh was asked for {fields}, which cannot answer "\
+        "whether the pull request is still open"
+
+
+def test_state_is_read_from_the_live_pr(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "headRefOid": "b" * 40,
+         "author": {"login": "Chadtao206"}, "state": "MERGED"})})
+    assert io_with(runner, tmp_path).state("Ylopo", "example", 42) == "MERGED"
+
+
+def test_state_is_upper_cased_so_one_comparison_serves(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": [], "state": "open"})})
+    assert io_with(runner, tmp_path).state("Ylopo", "example", 42) == "OPEN"
+
+
+def test_a_missing_or_unreadable_state_reads_as_unknown_not_as_closed(tmp_path):
+    """Unknown must never be read as "not open": that answer closes the loop,
+    and terminal states are absorbing."""
+    missing, _ = runner_for({"view": json.dumps({"labels": []})})
+    assert io_with(missing, tmp_path).state("Ylopo", "example", 42) is None
+
+    unreadable, _ = runner_for({})  # empty stdout
+    assert io_with(unreadable, tmp_path).state("Ylopo", "example", 42) is None
+
+    scalar, _ = runner_for({"view": json.dumps({"labels": [], "state": 7})})
+    assert io_with(scalar, tmp_path).state("Ylopo", "example", 42) is None

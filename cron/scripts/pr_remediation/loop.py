@@ -6,7 +6,12 @@ Two orderings carry the whole design.
 anything is written, so a PR Chad has taken back is never touched. `has_hold`
 fails closed (an unreadable GitHub is a hold), and an unreadable author is
 treated as "unknown", not as "reassigned" -- escalating a transient read blip
-would burn the loop permanently on a network hiccup.
+would burn the loop permanently on a network hiccup. The pull request's own
+state is read in that same breath, because a PR merged or closed between the
+verdict and the tick is one every act below would aim at a branch nobody can
+push to any more: it is closed as `stale` -- silently, since a merge is a
+human's own act and not an incident -- with the ownership label and the
+reaction handed back all the same.
 
 *Lease before side effects.* Every irreversible act -- labelling the PR,
 dispatching a remediation lane, posting to Slack -- happens only after
@@ -236,6 +241,14 @@ DUE_LIMIT = 20
 NOT_CHAD_AUTHORED = "not_chad_authored"
 GITHUB_UNWRITABLE = "github_unwritable"
 REREVIEW_UNPOSTABLE = "rereview_unpostable"
+# The pull request stopped being open. Serves as both the trail's note kind and
+# the reason stamped on the closed row, because here they say the same thing --
+# unlike the defer/event vocabularies below, which read alike but are matched by
+# different code.
+PR_NOT_OPEN = "pr_not_open"
+# The one `gh pr view --json state` value that means there is still something to
+# remediate. MERGED and CLOSED are both ends of the road.
+PR_OPEN = "OPEN"
 # The read, not the lane, is what gave up -- distinct from
 # EscalationReason.NO_OP_LANE, which means the read succeeded and found no
 # push. Conflating them would send whoever is escalated to looking for a push
@@ -284,6 +297,7 @@ ROUTE_HEAD_UNREADABLE = "head_unreadable"
 ROUTE_UNKNOWN_OUTCOME = "unknown_outcome"
 ROUTE_UNOBSERVED = "unobserved"
 ROUTE_ESCALATE = "escalate"
+ROUTE_CLOSE_STALE = "close_stale"
 ROUTE_NOTIFY_READY = "notify_ready"
 ROUTE_REPOST_REREVIEW = "repost_rereview"
 ROUTE_LANE_PUSHED = "lane_pushed"
@@ -363,9 +377,17 @@ class PrFacts:
     nowhere else. `author` is None both when GitHub could not be read and when
     the PR is held -- a held PR's author is moot and is deliberately not
     fetched -- so `held` must be consulted first.
+
+    `pr_state` is what `gh` calls the pull request -- OPEN, MERGED or CLOSED --
+    and None when it could not be read, or was not asked for because the PR is
+    held. It is read before any write for the same reason the hold and the
+    author are: a pull request merged between a verdict and the tick that acts
+    on it is one every act below would aim at a branch nobody can push to any
+    more.
     """
     held: bool
     author: str | None
+    pr_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -386,6 +408,7 @@ class LaneFacts:
     status: str | None
     held: bool | None = None
     head: str | None = None
+    pr_state: str | None = None
 
     @property
     def finished(self) -> bool:
@@ -397,6 +420,8 @@ def _observe(deps: LoopDeps, verdict: Verdict) -> PrFacts:
     if deps.github.has_hold(verdict.owner, verdict.repo, verdict.pr_number):
         return PrFacts(held=True, author=None)
     return PrFacts(held=False,
+                   pr_state=deps.github.state(verdict.owner, verdict.repo,
+                                              verdict.pr_number),
                    author=deps.github.author(verdict.owner, verdict.repo,
                                              verdict.pr_number))
 
@@ -419,6 +444,8 @@ def _observe_lane(deps: LoopDeps, loop: LoopRequest) -> LaneFacts | None:
     if deps.github.has_hold(loop.owner, loop.repo, loop.pr_number):
         return LaneFacts(status=status, held=True)
     return LaneFacts(status=status, held=False,
+                     pr_state=deps.github.state(loop.owner, loop.repo,
+                                                loop.pr_number),
                      head=deps.github.head_sha(loop.owner, loop.repo,
                                                loop.pr_number))
 
@@ -681,6 +708,49 @@ def _escalate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     return _settle_escalation(deps, loop, verdict,
                               EscalationDebt(reason=reason, attempts=0,
                                              notified=False))
+
+
+def _not_open(pr_state: str | None) -> bool:
+    """Is the pull request positively known not to be open?
+
+    None -- unreadable, or never asked for -- is deliberately NOT "not open".
+    Closing a loop is irreversible (terminal states are absorbing, and
+    `active_for_pr` then refuses every later generation for that PR), so it is
+    taken only on a state GitHub actually reported. A blip leaves the loop
+    exactly where it was.
+    """
+    return pr_state is not None and pr_state != PR_OPEN
+
+
+def _close_stale(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+                 pr_state: str) -> bool:
+    """The pull request is not open any more. Close the loop, and tell nobody.
+
+    Silent on purpose. Merging or closing a pull request is a human's own act
+    and the ordinary end of one -- of the eleven distinct pull requests today's
+    backlog would drive, nine are already MERGED -- so a Slack notice here would
+    page the person who merged it about their own merge, on the commonest path
+    there is. That is how a notification channel stops being read, and it would
+    be bought for nothing: there is no remediation left to do and no decision
+    for anyone to take.
+
+    Standing down is *not* skipped, though, and that is the difference between
+    silent and absent. The ownership label and the thinkies reaction are signals
+    this loop put on a pull request it no longer owns; a label left behind on a
+    merged PR is exactly the "looks owned forever" failure this service exists
+    to avoid. Both acts are idempotent, so a close lost to a lapsed lease simply
+    runs them again.
+
+    The trail carries the record Slack does not: a `pr_not_open` note naming the
+    state GitHub reported, and the transition into `stale`. `stale` rather than
+    `escalated` because the row's state is read as a claim about what happened,
+    and "a human must intervene" would be a false one; rather than `ready`
+    because that one notifies and means the opposite thing.
+    """
+    _note_standing(deps, loop, PR_NOT_OPEN,
+                   {"pr_state": pr_state, "round": loop.round_count})
+    _stand_down(deps, loop, verdict)
+    return _close(deps, loop, LoopState.STALE, escalation_reason=PR_NOT_OPEN)
 
 
 def _finish_ready(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
@@ -966,6 +1036,13 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         # Chad's kill switch, and also the fail-closed answer when GitHub
         # cannot be read at all.
         return Route(ROUTE_HELD, {"label": cfg.hold_label})
+    if _not_open(facts.pr_state):
+        # Merged or closed while this verdict was in flight. Everything below
+        # writes to the pull request -- the ownership label, a lane told to
+        # "fix them at this head and push", a re-review -- and none of it means
+        # anything now. Checked ahead of the author, because who wrote a merged
+        # pull request is not a question worth escalating over.
+        return Route(ROUTE_CLOSE_STALE, {"pr_state": facts.pr_state})
     author = facts.author
     if author is None:
         return Route(ROUTE_AUTHOR_UNREADABLE, {})
@@ -1096,6 +1173,15 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
         return Route(ROUTE_HELD,
                      {"label": deps.cfg.hold_label, "lane_id": loop.lane_id},
                      standing=True)
+    if _not_open(lane.pr_state):
+        # The lane ran, and by the time it finished the pull request was merged
+        # or closed. Everything below this line writes to it -- a re-review
+        # post, an escalation, a released label -- so the same answer the
+        # verdict path gives applies here, and ahead of the head comparison: a
+        # head that moved into a merged pull request still earns no re-review.
+        return Route(ROUTE_CLOSE_STALE,
+                     {"pr_state": lane.pr_state, "lane_id": loop.lane_id},
+                     standing=True)
     if lane.head is None:
         # Read the hold but not the head: a blip between two calls. Waiting
         # costs a tick; guessing costs the loop, because "no head" read as "no
@@ -1154,6 +1240,8 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
             deps.store.record_note(loop.loop_id, route.action, route.detail,
                                    deps.now())
         return False
+    if route.action == ROUTE_CLOSE_STALE:
+        return _close_stale(deps, loop, verdict, str(route.detail["pr_state"]))
     if route.action == ROUTE_ESCALATE:
         return _escalate(deps, loop, verdict, str(route.detail["reason"]))
     if route.action == ROUTE_NOTIFY_READY:
