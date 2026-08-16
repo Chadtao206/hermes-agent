@@ -25,7 +25,19 @@ class GitHubIO:
     def _run(self, args: list[str]) -> str | None:
         try:
             token = self._token_path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except Exception:
+            # Any failure to obtain a usable token (missing file, permission
+            # error, non-UTF-8 bytes, etc.) must fail closed by returning
+            # None here rather than raising. Callers like has_hold() rely on
+            # None propagating up as "unreadable" -> "assume hold", so this
+            # must never escape as an exception.
+            return None
+        if not token:
+            # An empty (or whitespace-only, after strip()) token file is a
+            # locally-detectable unusable-token case. Short-circuit here
+            # instead of handing "" to gh: it avoids a pointless network
+            # call and does not make the fail-closed guarantee depend on
+            # gh's behavior toward an empty GH_TOKEN.
             return None
         try:
             proc = self._runner(
