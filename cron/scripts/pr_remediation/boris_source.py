@@ -56,14 +56,32 @@ class BorisSource:
             payload = json.loads(row["validated_result_json"] or "{}")
         except ValueError:
             payload = {}
-        incomplete = payload.get("incomplete") or None
-        issues = payload.get("blocking_issues") or []
+        # boris_intake owns this payload's shape and evolves it independently
+        # of this reader. Malformed JSON *syntax* is handled above; here we
+        # additionally guard against JSON that parses fine but into a shape
+        # we don't expect (wrong top-level type, wrong field types). Coerce
+        # to the empty/absent form rather than raising — one unrecognised
+        # row must never take the polling loop down.
+        if not isinstance(payload, dict):
+            payload = {}
+        incomplete = payload.get("incomplete")
+        if not isinstance(incomplete, dict):
+            # An unreadable `incomplete` payload must never be mistaken for
+            # origin="system" (which tells the remediation loop the failure
+            # was transient and safe to retry without spending a round).
+            # Falling back to {} here means incomplete.get("origin") below
+            # naturally yields None, which escalates to a human instead of
+            # silently retrying forever on a payload we can't interpret.
+            incomplete = {}
+        issues = payload.get("blocking_issues")
+        if not isinstance(issues, list):
+            issues = []
         return Verdict(
             request_id=row["request_id"], owner=row["owner"], repo=row["repo"],
             pr_number=row["pr_number"], head_sha=row["head_sha"],
             root_thread_ts=row["root_thread_ts"],
             outcome=row["semantic_outcome"],
-            incomplete_origin=(incomplete or {}).get("origin"),
+            incomplete_origin=incomplete.get("origin"),
             blocking_issues=tuple(
                 str(i.get("title", "")) for i in issues if isinstance(i, dict)
             ),

@@ -84,3 +84,72 @@ def test_the_source_never_writes_to_the_boris_database(tmp_path):
     db = sqlite3.connect(str(path))
     # A read-only connection would have failed already; assert the row is untouched.
     assert db.execute("SELECT COUNT(*) FROM review_requests").fetchone()[0] == 1
+
+
+# --- defensive parsing: boris_intake owns validated_result_json's shape and
+# evolves it independently of this reader, so a row whose JSON parses fine
+# but into an unexpected shape must degrade, not take the poller down. ---
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [json.dumps([1, 2, 3]), json.dumps("not an object"), json.dumps(42)],
+    ids=["list", "string", "number"],
+)
+def test_non_dict_top_level_payload_does_not_crash(tmp_path, bad_payload):
+    path = boris_db(tmp_path, validated_result_json=bad_payload)
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.blocking_issues == ()
+    assert verdict.incomplete_origin is None
+    # Identity fields come from real columns, not the payload, so they stay trustworthy.
+    assert verdict.outcome == "ISSUES_FOUND"
+    assert verdict.head_sha == "a" * 40
+
+
+def test_blocking_issues_that_is_not_a_list_becomes_an_empty_tuple(tmp_path):
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": 5,
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.blocking_issues == ()
+
+
+def test_non_dict_items_inside_blocking_issues_are_skipped(tmp_path):
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [
+            {"title": "real issue"}, "not a dict", 42, None, ["nested"],
+        ],
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.blocking_issues == ("real issue",)
+
+
+def test_incomplete_that_is_not_a_dict_does_not_crash(tmp_path):
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [],
+        "incomplete": "not an object",
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.incomplete_origin is None
+
+
+def test_review_incomplete_with_unreadable_incomplete_never_defaults_to_system(tmp_path):
+    """origin="system" tells the remediation loop a REVIEW_INCOMPLETE failure
+    was transient and safe to retry automatically, without spending one of
+    the loop's limited remediation rounds. An `incomplete` payload we can't
+    interpret is NOT known to be transient — guessing "system" for it would
+    make the loop retry forever on a row it never actually understood. None
+    is the fail-safe answer: it routes to human escalation instead. Do not
+    "helpfully" default this to "system".
+    """
+    path = boris_db(
+        tmp_path, semantic_outcome="REVIEW_INCOMPLETE",
+        validated_result_json=json.dumps({
+            "blocking_issues": [],
+            "incomplete": [1, 2, 3],
+        }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert verdict.outcome == "REVIEW_INCOMPLETE"
+    assert verdict.incomplete_origin is None
