@@ -315,6 +315,13 @@ def test_marker_outside_a_thread_is_rejected():
     assert reasons(evaluate(top_level, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
 
 
+def test_marker_on_thread_root_is_rejected():
+    """A marked message posted as a thread root (thread_ts == ts) is not a reply."""
+    root = ev(user_id=BOT, is_bot=True, ts="0.9", thread_ts="0.9",
+             text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(root, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
 def test_marker_does_nothing_when_the_loop_is_not_configured():
     """Unconfigured deployments must behave exactly as before."""
     repost = ev(user_id=BOT, is_bot=True, thread_ts="0.9",
