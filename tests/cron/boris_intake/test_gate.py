@@ -267,3 +267,63 @@ def test_real_world_24_pr_batch_is_admitted_by_default():
     r = evaluate(ev(text=text), CFG, deps())
     assert len(r.commands) == 24
     assert not [x for x in r.rejections if x.reason is ReasonCode.RATE_LIMITED]
+
+
+# --- remediation loop's marked re-review (Task 1) ----------------------------
+
+MARKER = "[fixed it. probably. v1]"
+LOOP_CFG = Config(mode="live", channels=("C1", "C2"), passive_channels=("C1",),
+                  bot_user_id=BOT, loop_bot_user_id=BOT, loop_marker=MARKER,
+                  loop_attributed_user_id="U07E3AHV686")
+CHAD = Identity("U07E3AHV686", "ctao@ylopo.com", "T02PND103", False, False, False, False)
+
+
+def test_boris_own_verdict_post_is_still_rejected():
+    """THE regression test: Boris's verdict carries a real PR URL (result.py:869).
+
+    If this ever passes admission, Boris re-admits its own output on every review.
+    """
+    verdict = ev(
+        user_id=BOT, is_bot=True, thread_ts="0.9",
+        text="READY — Ylopo/repo#5 @ fffffff\n"
+             "GitHub review: https://github.com/Ylopo/repo/pull/5#pullrequestreview-1",
+    )
+    result = evaluate(verdict, LOOP_CFG, deps())
+    assert reasons(result) == {ReasonCode.NOT_HUMAN}
+
+
+def test_marked_loop_repost_is_admitted_and_attributed_to_chad():
+    repost = ev(
+        user_id=BOT, is_bot=True, thread_ts="0.9",
+        text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5",
+    )
+    result = evaluate(repost, LOOP_CFG, deps(identity=CHAD))
+    assert not result.rejections
+    assert result.commands[0].requester_user_id == "U07E3AHV686"
+    assert result.commands[0].requester_email == "ctao@ylopo.com"
+
+
+def test_marker_from_any_other_bot_is_rejected():
+    other = ev(user_id="UOTHERBOT", is_bot=True, thread_ts="0.9",
+               text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(other, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_marker_outside_a_thread_is_rejected():
+    top_level = ev(user_id=BOT, is_bot=True, thread_ts=None,
+                   text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(top_level, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_marker_does_nothing_when_the_loop_is_not_configured():
+    """Unconfigured deployments must behave exactly as before."""
+    repost = ev(user_id=BOT, is_bot=True, thread_ts="0.9",
+                text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(repost, CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_loop_repost_with_a_subtype_is_rejected():
+    """message_changed and friends are never a fresh request."""
+    edited = ev(user_id=BOT, is_bot=True, thread_ts="0.9", subtype="message_changed",
+                text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(edited, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}

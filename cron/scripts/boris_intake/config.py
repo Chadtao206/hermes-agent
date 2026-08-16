@@ -44,6 +44,11 @@ class Config:
     orgs: tuple[str, ...] = ("Ylopo",)
     github_token_path: Path = DEFAULT_TOKEN_PATH
     rubric_version: str = "2"
+    # The remediation loop's re-review identity. All three default to "" so a
+    # deployment that has not configured the loop behaves exactly as before.
+    loop_bot_user_id: str = ""
+    loop_marker: str = ""
+    loop_attributed_user_id: str = ""
     limits: Limits = field(default_factory=Limits)
 
 
@@ -80,6 +85,9 @@ def load_config(path: Path | None = None) -> Config:
 
     token_path = block.get("github_token_path")
     rubric_version = str(block.get("rubric_version") or "2").strip() or "2"
+    loop_bot_user_id = str(block.get("loop_bot_user_id", "") or "").strip()
+    loop_marker = str(block.get("loop_marker", "") or "").strip()
+    loop_attributed_user_id = str(block.get("loop_attributed_user_id", "") or "").strip()
     return Config(
         mode=mode,
         team_id=str(block.get("team_id", "T02PND103")),
@@ -91,5 +99,8 @@ def load_config(path: Path | None = None) -> Config:
         github_token_path=(Path(str(token_path)).expanduser() if token_path
                            else DEFAULT_TOKEN_PATH),
         rubric_version=rubric_version,
+        loop_bot_user_id=loop_bot_user_id,
+        loop_marker=loop_marker,
+        loop_attributed_user_id=loop_attributed_user_id,
         limits=limits,
     )

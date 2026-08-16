@@ -37,13 +37,34 @@ def _reject(reason: ReasonCode, detail: str = "") -> GateResult:
     return GateResult(rejections=(Rejection(reason, detail),))
 
 
+def _is_loop_repost(event: NormalizedEvent, cfg: Config) -> bool:
+    """The remediation loop's own re-review request — the one admitted bot message.
+
+    Boris posts its verdict as this same bot user, and that verdict contains a
+    parseable PR URL, so identity alone cannot separate the two. The marker is
+    what does: the loop emits it, Boris never does. Requiring a thread reply and
+    no subtype keeps a stray top-level or edited message from qualifying.
+    """
+    if not (cfg.loop_marker and cfg.loop_bot_user_id and cfg.loop_attributed_user_id):
+        return False
+    return (
+        event.is_bot
+        and event.user_id == cfg.loop_bot_user_id
+        and not event.subtype
+        and cfg.loop_marker in (event.text or "")
+        and bool(event.thread_ts)
+        and event.thread_ts != event.ts
+    )
+
+
 def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
     # Mode gate first — cheapest possible check.
     if cfg.mode == "off":
         return _reject(ReasonCode.MODE_OFF)
 
-    # 1: real human message
-    if event.is_bot or not event.user_id or event.subtype:
+    # 1: real human message, or the remediation loop's own marked re-review
+    loop_repost = _is_loop_repost(event, cfg)
+    if not loop_repost and (event.is_bot or not event.user_id or event.subtype):
         return _reject(ReasonCode.NOT_HUMAN, event.subtype or "no user id")
 
     # 2: channel allowlist (also excludes DMs — no im channel is ever listed)
@@ -78,15 +99,19 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
             "Supported flags: --ignore-ci",
         )
 
-    # 3: identity. Fail closed on lookup failure.
-    identity = deps.identity(event.user_id)
+    # 3: identity. Fail closed on lookup failure. A loop repost resolves as Chad
+    #    so every downstream predicate, quota and audit row reads as his request.
+    requester_user_id = (
+        cfg.loop_attributed_user_id if loop_repost else event.user_id
+    )
+    identity = deps.identity(requester_user_id)
     if identity is None:
-        return _reject(ReasonCode.IDENTITY_LOOKUP_FAILED, event.user_id)
+        return _reject(ReasonCode.IDENTITY_LOOKUP_FAILED, requester_user_id)
     if not is_trusted(identity, cfg):
-        return _reject(ReasonCode.IDENTITY_NOT_TRUSTED, identity.email or event.user_id)
+        return _reject(ReasonCode.IDENTITY_NOT_TRUSTED, identity.email or requester_user_id)
 
     # 8: rate limits, evaluated once per message
-    verdict = deps.rate_verdict(event.user_id)
+    verdict = deps.rate_verdict(requester_user_id)
     if verdict != "ok":
         return _reject(ReasonCode.RATE_LIMITED, verdict)
 
@@ -118,7 +143,7 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
         cmd = ReviewCommand(
             owner=ref.owner, repo=ref.repo, pr_number=ref.number,
             head_sha=info.head_sha, pr_author=info.author,
-            requester_user_id=event.user_id, requester_email=identity.email,
+            requester_user_id=requester_user_id, requester_email=identity.email,
             channel_id=event.channel_id, message_ts=event.ts,
             root_thread_ts=event.thread_ts or event.ts,
             permalink=_permalink(event.channel_id, event.ts),
