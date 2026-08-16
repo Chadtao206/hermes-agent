@@ -306,6 +306,20 @@ def test_the_same_verdict_is_never_consumed_twice(tmp_path):
 # --- round accounting ------------------------------------------------------
 
 
+def rereview_posted(deps):
+    """Force the loop past its in-flight lane, the way the lane path will.
+
+    A verdict is refused while a lane is still in flight (that lane, not a
+    second one, drives the next step), so driving round accounting from the
+    verdict path alone means standing in for the lane-completion pass Task 9
+    adds: the lane finished, the head moved, the re-review went out.
+    """
+    deps.store._db.execute(
+        "UPDATE loops SET state=? WHERE loop_id=?",
+        (LoopState.REREVIEW_POSTED.value, _loop_id(deps)))
+    deps.store._db.commit()
+
+
 def test_the_round_cap_escalates_on_the_fourth_verdict(tmp_path):
     from pr_remediation.loop import tick
 
@@ -313,6 +327,7 @@ def test_the_round_cap_escalates_on_the_fourth_verdict(tmp_path):
     for n in range(1, 4):
         deps.source.verdicts = [verdict(rid=f"br_{n}")]
         tick(deps)
+        rereview_posted(deps)
     assert len(deps.lanes.created) == 3
     assert only_loop(deps).round_count == 3
 
@@ -328,9 +343,154 @@ def test_a_new_round_records_the_head_it_dispatched_against(tmp_path):
 
     deps = build(tmp_path, SourceFake([verdict()]))
     tick(deps)
+    rereview_posted(deps)
     deps.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
     tick(deps)
     assert only_loop(deps).head_sha == "b" * 40
+
+
+# --- one lane per loop -----------------------------------------------------
+
+
+def test_two_verdicts_for_one_pr_in_one_sweep_open_exactly_one_lane(tmp_path):
+    """A re-review landing just behind its review is still one branch."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1"), verdict(rid="br_2")]))
+    assert tick(deps) == 1
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    assert deps.github.claimed == [("Ylopo", "example", 42)]
+    loop = only_loop(deps)
+    assert loop.round_count == 1
+
+    deferred = [event["detail"] for event in deps.store.events(loop.loop_id)
+                if event["kind"] == "verdict_deferred"]
+    assert [d["request_id"] for d in deferred] == ["br_2"], \
+        "the verdict we refused must be in the trail, not silently dropped"
+    assert deferred[0]["reason"] == "lane_in_flight"
+
+
+def test_a_verdict_while_a_lane_is_in_flight_starts_no_second_round(tmp_path):
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]))
+    tick(deps)
+    deps.now.advance()
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    assert tick(deps) == 0
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    loop = only_loop(deps)
+    assert loop.round_count == 1
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.head_sha == "a" * 40, "the head the lane runs against must stand"
+
+
+def test_a_deferred_verdict_leaves_the_loop_due_for_the_lane_sweep(tmp_path):
+    """Refusing a verdict must not park the loop out of anyone's reach."""
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1"), verdict(rid="br_2")]))
+    tick(deps)
+    due = deps.store.claim_due(now=deps.now() + LANE_POLL_SECONDS + 1, limit=5)
+    assert [loop.loop_id for loop in due] == [only_loop(deps).loop_id]
+
+
+# --- an escalation is not finished until a human has it --------------------
+
+
+def model_incomplete(rid="br_1"):
+    return verdict(rid=rid, outcome="REVIEW_INCOMPLETE", origin="model")
+
+
+def test_an_undelivered_escalation_does_not_close_the_loop(tmp_path):
+    """Terminal means "a human was told". Nobody was told."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([model_incomplete()]),
+                 slack=SlackFake(escalation_ts=None))
+    assert tick(deps) == 0
+    assert len(deps.slack.escalations) == 1, \
+        "the retry pass must not re-post what this tick just tried"
+    loop = only_loop(deps)
+    assert loop is not None, "a silent escalation must not look like success"
+    assert loop.state is not LoopState.ESCALATED
+    assert "escalation_pending" in kinds(deps, loop.loop_id)
+    assert deps.github.released == [], "the PR stays owned until the human has it"
+
+
+def test_a_pending_escalation_is_retried_until_it_lands(tmp_path):
+    """No further verdict will ever come for an escalated PR, so the retry
+    cannot depend on one."""
+    from pr_remediation.loop import tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    tick(deps)
+    assert len(slack.escalations) == 1
+
+    deps.source.verdicts = []
+    slack._escalation_ts = "9.2"
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert len(slack.escalations) == 2
+    assert deps.lanes.created == [], "a retry is a post, not a round"
+    loop = deps.store.get(_loop_id(deps))
+    assert loop.state is LoopState.ESCALATED
+    assert loop.round_count == 0
+    assert deps.github.released == [("Ylopo", "example", 42)]
+
+
+def test_a_delivered_escalation_is_never_notified_twice(tmp_path):
+    from pr_remediation.loop import tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    tick(deps)
+    deps.source.verdicts = []
+    slack._escalation_ts = "9.2"
+    deps.now.advance()
+    tick(deps)
+    deps.now.advance()
+    assert tick(deps) == 0
+    assert len(slack.escalations) == 2
+    assert deps.store.get(_loop_id(deps)).state is LoopState.ESCALATED
+
+
+def test_a_verdict_during_a_pending_escalation_retries_instead_of_remediating(tmp_path):
+    """A stopped loop stays stopped: the verdict pays for the post, not a lane."""
+    from pr_remediation.loop import tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    tick(deps)
+    slack._escalation_ts = "9.2"
+    deps.source.verdicts = [verdict(rid="br_2")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.lanes.created == []
+    assert len(slack.escalations) == 2
+    loop = deps.store.get(_loop_id(deps))
+    assert loop.round_count == 0
+    assert loop.state is LoopState.ESCALATED
+    assert "verdict_deferred" in kinds(deps, loop.loop_id)
+
+
+def test_a_permanently_unreachable_channel_stops_retrying(tmp_path):
+    """Retrying forever would pin the PR's loop open and never notify anyone."""
+    from pr_remediation.loop import NOTIFY_ATTEMPTS, tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    tick(deps)
+    deps.source.verdicts = []
+    for _ in range(NOTIFY_ATTEMPTS):
+        deps.now.advance()
+        tick(deps)
+    assert len(slack.escalations) == NOTIFY_ATTEMPTS
+    loop_id = _loop_id(deps)
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED, \
+        "a loop held open forever blocks every later loop on this PR"
+    assert "escalation_unreachable" in kinds(deps, loop_id)
 
 
 # --- the claim discipline --------------------------------------------------
@@ -520,6 +680,12 @@ def test_every_edge_the_driver_takes_is_legal(tmp_path, prior, outcome, origin, 
     store._db.commit()
 
     deps.source.verdicts = [verdict(rid="br_1", outcome=outcome, origin=origin)]
+    if prior is LoopState.REMEDIATING and outcome == "ISSUES_FOUND":
+        # The one cell where the driver deliberately takes no edge at all: the
+        # lane opened by the first tick is still in flight.
+        assert tick(deps) == 0
+        assert store.get(loop_id).state is LoopState.REMEDIATING
+        return
     assert tick(deps) == 1
     assert store.get(loop_id).state is target
 

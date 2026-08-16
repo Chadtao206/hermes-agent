@@ -18,6 +18,27 @@ the only surviving failure is a lease that lapses mid-batch, which shows up as
 a False from `transition()` and is recorded as `orphaned_lane` rather than
 counted as progress.
 
+Two invariants sit on top of those orderings.
+
+*One lane per loop.* A round may start only while no lane is in flight -- from
+`observed`, `awaiting_head_move` or `rereview_posted`, never from
+`remediating` with a lane recorded. Two verdicts for one PR can both be unseen
+in a single sweep (a re-review completing just behind its review), and without
+this rule the second one opens a second lane against the same branch: exactly
+the collision this service exists to remove. The in-flight lane, not a new
+verdict, is what drives the loop's next step; the refused verdict is written to
+the trail as `verdict_deferred` rather than silently dropped.
+
+*An escalation is not finished until a human has it.* Escalation exists
+because a person has to intervene, so a notification that failed does NOT close
+the loop. The loop stays non-terminal with an `escalation_pending` note, and a
+later tick re-posts -- only the post, never the remediation side effects and
+never another round. Retries are bounded by NOTIFY_ATTEMPTS: a permanently
+misconfigured channel would otherwise pin the loop open forever, and a loop
+that never goes terminal blocks every later loop on that PR
+(`active_for_pr`). At the bound the loop closes with `escalation_unreachable`
+in the trail and an ERROR in the log.
+
 Escalation reasons are free-form strings, not only `EscalationReason` members:
 the enum names the loop's *own* dead ends (round cap, no-op lane), while the
 driver also stops for reasons the enum does not model -- the PR changed hands,
@@ -38,10 +59,23 @@ from pr_remediation.store import CorruptLoopRow
 # claim_due would find it, see a not-yet-started lane, and escalate it as a no-op.
 LANE_POLL_SECONDS = 15
 
+# How many times a single escalation may be posted before the loop closes
+# unheard. Chosen high enough to ride out a Slack outage across several ticks,
+# low enough that a misconfigured channel cannot hold the PR's loop open (and
+# with it every later loop for that PR) indefinitely.
+NOTIFY_ATTEMPTS = 5
+
+# Loops the retry pass leases per tick.
+DUE_LIMIT = 20
+
 # Stop reasons outside EscalationReason's vocabulary. See the module docstring.
 NOT_CHAD_AUTHORED = "not_chad_authored"
 GITHUB_UNWRITABLE = "github_unwritable"
 REREVIEW_UNPOSTABLE = "rereview_unpostable"
+
+# Why a verdict was seen but deliberately not routed.
+LANE_IN_FLIGHT = "lane_in_flight"
+ESCALATION_PENDING = "escalation_pending"
 
 _LOG = logging.getLogger(__name__)
 
@@ -99,20 +133,90 @@ def _stand_down(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> None:
                                {"label": deps.cfg.owner_label}, deps.now())
 
 
+def _defer_verdict(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+                   reason: str) -> None:
+    """Record a verdict the driver saw and deliberately did not route.
+
+    `tick` marks a verdict seen before handling it, so it is never replayed:
+    this note is the only surviving trace that it existed. It carries enough to
+    reconstruct what was refused (which review, what it said, against which
+    head) so a human reading the trail can tell a deliberate refusal from a
+    verdict the loop simply never received.
+    """
+    deps.store.record_note(loop.loop_id, "verdict_deferred", {
+        "reason": reason,
+        "request_id": verdict.request_id,
+        "outcome": verdict.outcome,
+        "head_sha": verdict.head_sha,
+        "lane_id": loop.lane_id,
+        "round": loop.round_count,
+    }, deps.now())
+
+
+def _pending_escalation(deps: LoopDeps, loop: LoopRequest) -> tuple[str, int] | None:
+    """(reason, failed attempts) if this loop still owes a human a notice.
+
+    The event trail is the record, because there is no room for one in the row:
+    `transition()` writes a fixed set of columns and the state machine has no
+    "escalating" state. Replaying the trail in order also settles the
+    orderings for free -- an `escalation_delivered` or `escalation_unreachable`
+    after the failures means the debt is closed, not outstanding.
+    """
+    reason: str | None = None
+    attempts = 0
+    for event in deps.store.events(loop.loop_id):
+        kind = event["kind"]
+        if kind == "escalation_pending":
+            reason = str(event["detail"].get("reason") or "")
+            attempts += 1
+        elif kind in ("escalation_delivered", "escalation_unreachable"):
+            reason, attempts = None, 0
+    return (reason, attempts) if reason is not None else None
+
+
+def _deliver_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+                        reason: str, attempts: int) -> bool:
+    """Tell the human, and only then close the loop.
+
+    A failed post leaves the loop non-terminal on purpose. Closing it anyway
+    would be the worst outcome this system can produce -- it looks exactly like
+    a handled escalation, while the person who was supposed to take over never
+    heard anything, and the only trace would be an event nobody watches.
+
+    A delivery is recorded *before* the stand-down and the compare-and-swap, so
+    a crash in between cannot make a later tick post the same notice twice.
+    """
+    if deps.slack.notify_escalation(verdict, loop.round_count, reason) is None:
+        attempt = attempts + 1
+        if attempt < NOTIFY_ATTEMPTS:
+            deps.store.record_note(loop.loop_id, "escalation_pending",
+                                   {"reason": reason, "attempt": attempt},
+                                   deps.now())
+            return False
+        # Out of attempts. Holding the loop open past this point buys nothing
+        # (the channel is not coming back on its own) and costs the PR every
+        # future loop, since active_for_pr would keep finding this one.
+        _LOG.error("escalation for loop %s (%s) never reached a human in %d attempts",
+                   loop.loop_id, reason, attempt)
+        deps.store.record_note(loop.loop_id, "escalation_unreachable",
+                               {"reason": reason, "attempts": attempt}, deps.now())
+    else:
+        deps.store.record_note(loop.loop_id, "escalation_delivered",
+                               {"reason": reason}, deps.now())
+    _stand_down(deps, loop, verdict)
+    return _transition(deps, loop, LoopState.ESCALATED, escalation_reason=reason)
+
+
 def _escalate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
               reason: str) -> bool:
-    if deps.cfg.mode == "live":
-        if deps.slack.notify_escalation(verdict, loop.round_count, reason) is None:
-            # The human was not told. Still close the loop -- leaving it open
-            # would re-run every side effect on the next sweep -- but leave the
-            # silence in the trail, because nothing else will report it.
-            deps.store.record_note(loop.loop_id, "notify_failed",
-                                   {"kind": "escalation", "reason": reason},
-                                   deps.now())
-        _stand_down(deps, loop, verdict)
-    else:
+    if deps.cfg.mode != "live":
         _shadow(deps, loop.loop_id, "escalate", {"reason": reason})
-    return _transition(deps, loop, LoopState.ESCALATED, escalation_reason=reason)
+        return _transition(deps, loop, LoopState.ESCALATED,
+                           escalation_reason=reason)
+    # attempts=0: a loop that already owes a notice is intercepted before it
+    # can reach here, on both the verdict path and the retry pass, so this is
+    # always the first attempt at this escalation.
+    return _deliver_escalation(deps, loop, verdict, reason, attempts=0)
 
 
 def _finish_ready(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
@@ -150,8 +254,29 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     return _transition(deps, loop, LoopState.REREVIEW_POSTED)
 
 
+def _lane_in_flight(loop: LoopRequest) -> bool:
+    """Is a remediation lane already working this branch?
+
+    State alone is the rule -- `remediating` means a round is running -- with
+    one qualification: a `remediating` row carrying no lane_id has nothing
+    running (a shadow-mode round, or a live flip on top of one). Treating that
+    as in-flight would strand it forever, because the lane pass has no lane to
+    poll and would never move it on.
+    """
+    return loop.state is LoopState.REMEDIATING and loop.lane_id is not None
+
+
 def _remediate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     cfg = deps.cfg
+    if _lane_in_flight(loop):
+        # A second lane on this branch is the collision this service exists to
+        # remove, and here we would be causing it ourselves. The lane already
+        # running drives the next step: it finishes, the head moves, the
+        # re-review goes out, and *that* verdict starts the next round. Checked
+        # before the round cap, because the round this verdict would spend has
+        # already been spent by the lane in flight.
+        _defer_verdict(deps, loop, verdict, LANE_IN_FLIGHT)
+        return False
     if loop.round_count >= cfg.round_cap:
         return _escalate(deps, loop, verdict, EscalationReason.ROUND_CAP.value)
     round_number = loop.round_count + 1
@@ -196,6 +321,19 @@ def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     """Route one verdict against a loop we hold the lease on."""
     store, cfg = deps.store, deps.cfg
 
+    pending = _pending_escalation(deps, loop)
+    if pending is not None:
+        # This loop has already given up; all it is waiting for is the human to
+        # hear about it. Routing the verdict would restart a loop we stopped,
+        # so retry the notice instead: no lane, no round, no round-cap
+        # accounting. Ahead of the hold check on purpose -- what follows is a
+        # Slack post plus the stand-down of signals this loop itself added,
+        # which is what a hold wants to happen anyway -- and ahead of the
+        # author check, which would otherwise escalate an escalated loop again.
+        reason, attempts = pending
+        _defer_verdict(deps, loop, verdict, ESCALATION_PENDING)
+        return _deliver_escalation(deps, loop, verdict, reason, attempts)
+
     if deps.github.has_hold(verdict.owner, verdict.repo, verdict.pr_number):
         # Chad's kill switch, and also the fail-closed answer when GitHub
         # cannot be read at all.
@@ -223,7 +361,7 @@ def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     return _remediate(deps, loop, verdict)
 
 
-def _handle(deps: LoopDeps, verdict: Verdict) -> bool:
+def _handle(deps: LoopDeps, verdict: Verdict, driven: set[str]) -> bool:
     store = deps.store
     loop = store.active_for_pr(verdict.owner, verdict.repo, verdict.pr_number)
     if loop is None:
@@ -237,6 +375,10 @@ def _handle(deps: LoopDeps, verdict: Verdict) -> bool:
         # It owns the verdict routing for this PR; we must not double-drive it.
         return False
 
+    # Recorded whatever happens below, including a refused claim: the retry
+    # pass must not touch a loop this pass has already worked on this tick, or
+    # a single tick would post two notifications for one escalation.
+    driven.add(loop.loop_id)
     if not store.claim(loop.loop_id, now=deps.now()):
         # Leased elsewhere, or already terminal. Either way, not ours to drive.
         return False
@@ -260,6 +402,56 @@ def _note_quietly(deps: LoopDeps, loop_id: str, kind: str, detail: dict) -> None
         _LOG.exception("could not record %s for loop %s", kind, loop_id)
 
 
+def _verdict_for(loop: LoopRequest) -> Verdict:
+    """Enough of a Verdict to address Slack and GitHub for a loop we hold.
+
+    The retry pass has no verdict in hand: the one that caused the escalation
+    was consumed ticks ago, and a notice only needs the PR's coordinates.
+    """
+    return Verdict(
+        request_id=loop.boris_request_id, owner=loop.owner, repo=loop.repo,
+        pr_number=loop.pr_number, head_sha=loop.head_sha,
+        root_thread_ts=loop.root_thread_ts, outcome="",
+        incomplete_origin=None, blocking_issues=(),
+    )
+
+
+def _retry_undelivered(deps: LoopDeps, driven: set[str]) -> int:
+    """Re-post escalation notices that never reached anyone.
+
+    An escalated PR gets no further verdicts -- that is what escalating means
+    -- so the verdict pass can never be the only way back to one of these. The
+    pass leases each loop exactly as the verdict path does, and does only one
+    thing: post the notice again. It opens no lane, spends no round, and reads
+    nothing from GitHub, so a loop can pass through it many times without
+    accumulating side effects.
+    """
+    if deps.cfg.mode != "live":
+        return 0
+    try:
+        due = deps.store.claim_due(now=deps.now(), limit=DUE_LIMIT)
+    except Exception:
+        _LOG.exception("the retry pass could not lease its batch")
+        return 0
+
+    advanced = 0
+    for loop in due:
+        try:
+            if loop.loop_id in driven:
+                continue
+            pending = _pending_escalation(deps, loop)
+            if pending is None:
+                continue
+            reason, attempts = pending
+            if _deliver_escalation(deps, loop, _verdict_for(loop), reason, attempts):
+                advanced += 1
+        except Exception:
+            _LOG.exception("loop %s could not be renotified", loop.loop_id)
+        finally:
+            deps.store.release(loop.loop_id)
+    return advanced
+
+
 def tick(deps: LoopDeps) -> int:
     """Route every unseen verdict. Returns the number of loops advanced.
 
@@ -271,13 +463,18 @@ def tick(deps: LoopDeps) -> int:
     here (a dispatched lane, a Slack post, a label) are not idempotent, and a
     stalled loop the daemon's due-sweep can pick up is a far cheaper failure
     than a duplicate remediation lane.
+
+    The verdict pass is followed by a retry pass over leased due loops, which
+    exists so that an escalation nobody received is tried again even though no
+    further verdict will ever arrive for that PR.
     """
     advanced = 0
+    driven: set[str] = set()
     for verdict in deps.source.new_verdicts():
         try:
             if not deps.store.mark_verdict_seen(verdict.request_id, deps.now()):
                 continue
-            if _handle(deps, verdict):
+            if _handle(deps, verdict, driven):
                 advanced += 1
         except CorruptLoopRow as exc:
             _LOG.exception("loop %s carries an unreadable state", exc.loop_id)
@@ -285,4 +482,4 @@ def tick(deps: LoopDeps) -> int:
                           {"state": str(exc.state)})
         except Exception:
             _LOG.exception("verdict %s could not be routed", verdict.request_id)
-    return advanced
+    return advanced + _retry_undelivered(deps, driven)
