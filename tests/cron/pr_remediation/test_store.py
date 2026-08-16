@@ -4,7 +4,7 @@ import threading
 import pytest
 
 from pr_remediation.models import LoopState
-from pr_remediation.store import Store
+from pr_remediation.store import _USER_VERSION, CorruptLoopRow, Store
 
 
 def open_one(store, *, pr=42, head="a" * 40, now=1_000_000.0):
@@ -180,8 +180,6 @@ def test_a_row_with_an_unknown_state_cannot_wedge_a_claim_batch(tmp_path):
     been issued but before the commit -- means a single bad row raises
     mid-batch and leaves a write transaction holding the database lock, so
     every other loop then fails with 'database is locked'."""
-    from pr_remediation.store import CorruptLoopRow
-
     store = Store(tmp_path / "r.db")
     _insert_raw(store, loop_id="lp_corrupt", state="not_a_state", created_at=999_999.0)
     healthy = open_one(store)
@@ -355,6 +353,28 @@ def test_a_store_opens_on_a_fresh_directory_in_wal_mode(tmp_path):
     assert open_one(store).generation == 1
 
 
+def test_a_store_waits_on_a_busy_writer_instead_of_failing_the_tick(tmp_path):
+    """WAL still serialises writers, and every mutator takes the write lock up
+    front with BEGIN IMMEDIATE. Without an explicit busy timeout a tick that
+    collides with an in-flight write raises 'database is locked' immediately
+    and drops the loop, rather than waiting the other writer out."""
+    store = Store(tmp_path / "r.db")
+    assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 10_000
+
+
+def test_a_store_stamps_the_schema_version_it_wrote(tmp_path):
+    """The stamp is how a future migration tells an old file from a current
+    one; an unstamped database reads as version 0 and is indistinguishable
+    from one written before the column layout it assumes."""
+    db = tmp_path / "r.db"
+    store = Store(db)
+    assert _USER_VERSION != 0, "0 is the unstamped default and cannot be a version"
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == _USER_VERSION
+    store.close()
+    # Reopening an existing database re-stamps rather than leaving it stale.
+    assert Store(db)._db.execute("PRAGMA user_version").fetchone()[0] == _USER_VERSION
+
+
 # --- I7: only the intended UNIQUE conflict is swallowed -------------------
 
 def test_open_loop_does_not_report_a_programming_error_as_already_active(tmp_path):
@@ -415,3 +435,239 @@ def test_concurrent_ticks_yield_exactly_one_winner_and_no_errors(tmp_path):
     observer = Store(db)
     assert observer.claim_due(now=1_000_020.0, limit=10) == (), \
         "the losing ticks' releases must not have freed the winner's lease"
+
+
+# --- claim(): leasing one specific loop ------------------------------------
+
+def test_claim_leases_the_one_loop_the_verdict_path_is_about_to_drive(tmp_path):
+    """The verdict path finds its loop with active_for_pr, not claim_due, so
+    without a single-loop claim it must either race a concurrent tick or skip
+    leasing altogether -- and then its closing transition() returns False after
+    the irreversible work (opening a remediation lane, posting to Slack) has
+    already happened, orphaning the lane and losing the round."""
+    db = tmp_path / "r.db"
+    driver = Store(db)
+    rival = Store(db)
+    loop = open_one(driver)
+
+    assert driver.claim(loop.loop_id, now=1_000_010.0) is True
+    # A real lease, not a bookkeeping flag: no other tick can take the row.
+    assert rival.claim(loop.loop_id, now=1_000_011.0) is False
+    assert rival.claim_due(now=1_000_012.0, limit=10) == ()
+    # And the holder can finish the round it started.
+    assert driver.transition(loop.loop_id, LoopState.OBSERVED,
+                             LoopState.REMEDIATING, now=1_000_013.0) is True
+    assert driver._db.in_transaction is False
+
+
+def test_claiming_a_lease_we_already_hold_succeeds_and_extends_it(tmp_path):
+    """Idempotent on purpose: a driver that already claimed the loop (here via
+    the batch path) must be able to call claim() again without tracking
+    whether it holds one, and the re-claim has to push the expiry out or a
+    long round still lapses mid-flight."""
+    db = tmp_path / "r.db"
+    driver = Store(db)
+    rival = Store(db)
+    loop = open_one(driver)
+    assert len(driver.claim_due(now=1_000_010.0, limit=10)) == 1
+
+    assert driver.claim(loop.loop_id, now=1_000_200.0) is True
+    # LEASE_SECONDS is 300: the original lease expired at 1_000_310, the
+    # re-claim's at 1_000_500, so a rival at 1_000_400 must still be refused.
+    assert rival.claim(loop.loop_id, now=1_000_400.0) is False
+    assert rival.claim_due(now=1_000_400.0, limit=10) == ()
+
+
+def test_claim_refuses_a_missing_terminal_or_unparseable_loop(tmp_path):
+    """A finished loop must never be re-driven -- every side effect it
+    performed would run again -- and a row whose state this build cannot parse
+    is not something to drive either. Both are the caller's cue to stop, not an
+    exception to handle."""
+    store = Store(tmp_path / "r.db")
+    finished = open_one(store)
+    store.transition(finished.loop_id, LoopState.OBSERVED, LoopState.READY,
+                     now=1_000_100.0)
+    _insert_raw(store, loop_id="lp_corrupt", state="not_a_state", created_at=999_999.0)
+
+    assert store.claim(finished.loop_id, now=1_000_200.0) is False
+    assert store.claim("lp_nonexistent", now=1_000_200.0) is False
+    assert store.claim("lp_corrupt", now=1_000_200.0) is False
+    assert store._db.in_transaction is False, "a refused claim writes nothing and rolls back"
+
+
+# --- renew_claim(): leases that outlive a long batch ------------------------
+
+def test_renew_claim_keeps_a_long_batch_from_losing_its_row_mid_flight(tmp_path):
+    """LEASE_SECONDS is 300 while one drive batch can walk many loops with a
+    network call each. Without renewal the tick's own lease lapses part-way
+    through, a later tick takes the row over, and the first tick's remaining
+    transition() calls silently return False after its side effects fired."""
+    db = tmp_path / "r.db"
+    long_tick = Store(db)
+    next_tick = Store(db)
+    loop = open_one(long_tick)
+    assert len(long_tick.claim_due(now=1_000_010.0, limit=10)) == 1
+
+    assert long_tick.renew_claim(loop.loop_id, now=1_000_200.0) is True
+    # Past the original 1_000_310 expiry, inside the renewed 1_000_500 one.
+    assert next_tick.claim_due(now=1_000_400.0, limit=10) == ()
+    assert next_tick.claim(loop.loop_id, now=1_000_400.0) is False
+    assert long_tick.transition(loop.loop_id, LoopState.OBSERVED,
+                                LoopState.REMEDIATING, now=1_000_401.0) is True
+
+
+def test_renew_claim_reports_lost_ownership_instead_of_taking_the_row_back(tmp_path):
+    """False is the signal to stop. Renewing unconditionally would let a tick
+    that already lost the row to a successor keep driving it, which is the
+    double-drive the leases exist to prevent."""
+    db = tmp_path / "r.db"
+    slow_tick = Store(db)
+    next_tick = Store(db)
+    loop = open_one(slow_tick)
+    assert slow_tick.claim(loop.loop_id, now=1_000_010.0) is True
+    # The lease lapses and the successor takes over.
+    assert next_tick.claim(loop.loop_id, now=1_000_400.0) is True
+
+    assert slow_tick.renew_claim(loop.loop_id, now=1_000_401.0) is False
+    assert next_tick.renew_claim(loop.loop_id, now=1_000_402.0) is True
+    assert slow_tick.transition(loop.loop_id, LoopState.OBSERVED,
+                                LoopState.REMEDIATING, now=1_000_403.0) is False
+    assert slow_tick._db.in_transaction is False
+
+
+def test_renew_claim_will_not_resurrect_a_lease_that_already_lapsed(tmp_path):
+    """A lapsed lease is not ours to extend even when nobody took it yet: we
+    cannot tell from here whether a successor is mid-round. Re-claiming is the
+    way back, and it refuses if one is."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+
+    assert store.renew_claim(loop.loop_id, now=1_000_010.0) is False, "never claimed"
+    assert store.claim(loop.loop_id, now=1_000_010.0) is True
+    assert store.renew_claim(loop.loop_id, now=1_000_400.0) is False, "lapsed"
+    assert store.claim(loop.loop_id, now=1_000_401.0) is True
+    assert store.renew_claim(loop.loop_id, now=1_000_402.0) is True
+
+
+# --- M3: a corrupt row does surface inside a write transaction -------------
+
+def test_a_corrupt_row_surfaces_inside_open_loops_own_transaction(tmp_path):
+    """CorruptLoopRow used to claim it was never raised while a write
+    transaction is open. open_loop reads through active_for_pr *inside* its
+    BEGIN IMMEDIATE, so it is. The guarantee that actually holds is the weaker
+    one: the mutator rolls back before the raise propagates, so a corrupt row
+    fails loudly without leaving the database lock held or wedging the store."""
+    store = Store(tmp_path / "r.db")
+    _insert_raw(store, loop_id="lp_corrupt", state="not_a_state",
+                created_at=999_999.0, pr_number=42)
+    at_raise: dict[str, bool] = {}
+    parse = store._row
+
+    def spy(row):
+        try:
+            return parse(row)
+        except CorruptLoopRow:
+            at_raise["in_transaction"] = store._db.in_transaction
+            raise
+
+    store._row = spy
+    with pytest.raises(CorruptLoopRow):
+        open_one(store, pr=42)
+    del store._row
+
+    assert at_raise["in_transaction"] is True, "raised with the write lock held"
+    assert store._db.in_transaction is False, "but unwound before it escaped"
+    assert open_one(store, pr=43) is not None, "and the store is not wedged"
+
+
+# --- M4: a failed BEGIN must not wedge the connection forever --------------
+
+@pytest.mark.parametrize("mutate", [
+    pytest.param(lambda s, lid: s.record_note(lid, "note", {}, 1_000_050.0),
+                 id="record_note"),
+    pytest.param(lambda s, lid: s.transition(lid, LoopState.OBSERVED,
+                                             LoopState.REMEDIATING, now=1_000_050.0),
+                 id="transition"),
+    pytest.param(lambda s, lid: s.claim_due(now=1_000_050.0, limit=10),
+                 id="claim_due"),
+    pytest.param(lambda s, lid: s.claim(lid, now=1_000_050.0), id="claim"),
+    pytest.param(lambda s, lid: s.renew_claim(lid, now=1_000_050.0), id="renew_claim"),
+    pytest.param(lambda s, lid: s.release(lid), id="release"),
+    pytest.param(lambda s, lid: s.mark_verdict_seen("br_new", 1_000_050.0),
+                 id="mark_verdict_seen"),
+    pytest.param(lambda s, lid: s.open_loop(
+        owner="Ylopo", repo="example", pr_number=99, head_sha="e" * 40,
+        boris_request_id="br_99", root_thread_ts="1.0", now=1_000_050.0),
+        id="open_loop"),
+])
+def test_a_stray_open_transaction_cannot_wedge_a_mutator_forever(tmp_path, mutate):
+    """Every mutator opens BEGIN IMMEDIATE. Run it while this long-lived
+    connection is already in a transaction and SQLite raises 'cannot start a
+    transaction within a transaction' -- with the BEGIN outside the try there
+    is no rollback, the connection stays in that transaction, and every
+    subsequent mutator raises the same way forever. Nothing in the public API
+    reaches this today, which is exactly why it must be closed now: it is one
+    statement away, and the failure mode is permanent."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    store._db.execute("BEGIN IMMEDIATE")
+
+    with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
+        mutate(store, loop.loop_id)
+    assert store._db.in_transaction is False, "the failed BEGIN must be rolled back"
+
+    # Recovered: the next write on this connection goes through.
+    store.record_note(loop.loop_id, "after", {}, 1_000_060.0)
+    assert [e["kind"] for e in store.events(loop.loop_id)] == ["opened", "after"]
+
+
+# --- M5: a refused CAS rolls back, it does not commit ----------------------
+
+class _PendingWriteConnection:
+    """Slips one extra write into the store's transaction immediately after
+    the statement matching `after`, standing in for anything left pending on
+    this long-lived connection. A commit flushes it; a rollback discards it --
+    which is how a test tells the two apart, since both leave `in_transaction`
+    False."""
+
+    def __init__(self, real, after, sql, params):
+        self._real = real
+        self._after = after
+        self._sql = sql
+        self._params = params
+        self._armed = True
+
+    def execute(self, sql, params=()):
+        result = self._real.execute(sql, params)
+        if self._armed and sql.startswith(self._after):
+            self._armed = False
+            self._real.execute(self._sql, self._params)
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_a_refused_cas_rolls_back_rather_than_committing_an_empty_transaction(tmp_path):
+    """A refused CAS writes nothing of its own, so committing looks harmless.
+    It is not: commit is not scoped to the method that calls it, and flushes
+    whatever else is pending in the same transaction on this connection -- the
+    silent half-write the BEGIN IMMEDIATE discipline exists to prevent.
+    Asserting `in_transaction is False` cannot catch that, because a commit
+    leaves it False too."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    store._db = _PendingWriteConnection(
+        store._db, "SELECT state, lease_owner",
+        "INSERT INTO loop_events (loop_id, kind, detail_json, at) VALUES (?,?,?,?)",
+        (loop.loop_id, "pending", "{}", 1_000_050.0),
+    )
+
+    # Stale expectation: the loop is observed, not remediating.
+    assert store.transition(loop.loop_id, LoopState.REMEDIATING,
+                            LoopState.READY, now=1_000_050.0) is False
+    store._db = store._db._real
+
+    assert [e["kind"] for e in store.events(loop.loop_id)] == ["opened"], \
+        "an empty commit would have flushed the pending write"
+    assert store._db.in_transaction is False

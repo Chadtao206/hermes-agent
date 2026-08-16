@@ -4,12 +4,16 @@ Mirrors boris_intake/store.py: compare-and-swap transitions, an append-only
 event trail, and short owner-stamped leases so two ticks can never drive the
 same loop.
 
-Every mutator runs inside an explicit `BEGIN IMMEDIATE` and rolls back on any
-exception. That makes a whole bug class unrepresentable: a raise between a
-write and its commit can no longer leave a write applied-but-uncommitted on
-this long-lived connection, where a later unrelated commit would flush a state
-change with no matching event (breaking the append-only trail) and where the
-open write transaction would hold the database lock against every other loop.
+Every mutator opens an explicit `BEGIN IMMEDIATE` *inside* its `try` and rolls
+back on any exception, the `BEGIN` included. That makes a whole bug class
+unrepresentable: a raise between a write and its commit can no longer leave a
+write applied-but-uncommitted on this long-lived connection, where a later
+unrelated commit would flush a state change with no matching event (breaking
+the append-only trail) and where the open write transaction would hold the
+database lock against every other loop. Keeping the `BEGIN` itself under the
+guard closes the same hole one level up: were the connection ever already in a
+transaction, `cannot start a transaction within a transaction` would otherwise
+escape unrolled-back and wedge every later mutator on this connection forever.
 """
 from __future__ import annotations
 
@@ -127,7 +131,10 @@ class CorruptLoopRow(ValueError):
     """A persisted row carries a state string this build does not recognise.
 
     Raised in place of the enum's anonymous ValueError so the bad row is
-    attributable. It is never raised while a write transaction is open.
+    attributable. It can surface while a write transaction is open --
+    `open_loop` reads through `active_for_pr` inside its own BEGIN IMMEDIATE --
+    but never escapes one: every mutator rolls back before it propagates, so a
+    corrupt row fails loudly without leaving the database lock held.
     """
 
     def __init__(self, loop_id: str, state: Any):
@@ -162,8 +169,8 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             columns = {
                 str(row["name"]) for row in self._db.execute("PRAGMA table_info(loops)")
             }
@@ -209,8 +216,8 @@ class Store:
     def open_loop(self, *, owner: str, repo: str, pr_number: int, head_sha: str,
                   boris_request_id: str, root_thread_ts: str,
                   now: float) -> LoopRequest | None:
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             if self.active_for_pr(owner, repo, pr_number) is not None:
                 self._db.rollback()
                 return None
@@ -257,8 +264,8 @@ class Store:
         unknown = set(fields) - _TRANSITION_FIELDS
         if unknown:
             raise ValueError(f"unsupported transition fields: {sorted(unknown)}")
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             row = self._db.execute(
                 "SELECT state, lease_owner, lease_expires_at FROM loops WHERE loop_id=?",
                 (loop_id,),
@@ -299,8 +306,8 @@ class Store:
             raise
 
     def record_note(self, loop_id: str, kind: str, detail: dict, now: float) -> None:
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             self._append(loop_id, kind, detail, now)
             self._db.commit()
         except Exception:
@@ -328,8 +335,8 @@ class Store:
 
     def claim_due(self, *, now: float, limit: int) -> tuple[LoopRequest, ...]:
         states = ",".join("?" for _ in _CLAIMABLE_STATES)
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             ids = [
                 str(row["loop_id"])
                 for row in self._db.execute(
@@ -367,14 +374,82 @@ class Store:
             self._db.rollback()
             raise
 
+    def claim(self, loop_id: str, *, now: float) -> bool:
+        """Take the lease on exactly this loop. False if we cannot have it.
+
+        `claim_due` leases a whole due batch, which is no use to the verdict
+        path: that one finds its loop by `active_for_pr` and must lease *that*
+        row before it starts doing irreversible work (opening a remediation
+        lane, posting to Slack). Without this the driver either races a
+        concurrent tick or skips leasing entirely, and its closing
+        `transition()` silently returns False after the side effects fired --
+        orphaning the lane and losing the round.
+
+        False means: no such loop, a terminal (or unrecognised) state that must
+        never be driven again, or an unexpired lease held by someone else.
+        Re-taking a lease we already hold succeeds and extends it, so a driver
+        can call this without tracking whether it already owns one.
+        """
+        states = ",".join("?" for _ in _CLAIMABLE_STATES)
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            cur = self._db.execute(
+                f"UPDATE loops SET lease_owner=?, lease_expires_at=? "
+                f"WHERE loop_id=? AND state IN ({states}) "
+                "AND (lease_owner IS NULL OR lease_owner=? OR lease_expires_at<=?)",
+                (self._lease_owner, now + LEASE_SECONDS, loop_id,
+                 *_CLAIMABLE_STATES, self._lease_owner, now),
+            )
+            if cur.rowcount != 1:
+                # Nothing was written, so roll back rather than commit an empty
+                # transaction: an empty commit would flush anything else left
+                # pending on this long-lived connection.
+                self._db.rollback()
+                return False
+            self._db.commit()
+            return True
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def renew_claim(self, loop_id: str, *, now: float) -> bool:
+        """Extend our own lease. False if we no longer hold it.
+
+        LEASE_SECONDS is short relative to a drive batch, which can walk many
+        loops with a network call each. A tick whose lease lapses mid-batch
+        finds its later `transition()` calls returning False after the side
+        effects have already fired, so a long-running driver renews between
+        steps and stops on False rather than continuing unsafely.
+
+        Owner- and expiry-guarded like the sibling store's `renew_claim`: a
+        lease that already lapsed cannot be renewed, because a later tick may
+        have taken the row over in the meantime. Re-acquire with `claim` (which
+        will refuse if that happened) instead.
+        """
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            cur = self._db.execute(
+                "UPDATE loops SET lease_expires_at=? "
+                "WHERE loop_id=? AND lease_owner=? AND lease_expires_at>?",
+                (now + LEASE_SECONDS, loop_id, self._lease_owner, now),
+            )
+            if cur.rowcount != 1:
+                self._db.rollback()
+                return False
+            self._db.commit()
+            return True
+        except Exception:
+            self._db.rollback()
+            raise
+
     def release(self, loop_id: str) -> bool:
         """Drop our own lease. False if we no longer hold it.
 
         Owner-guarded on purpose: a slow tick finishing after its lease lapsed
         must not hand the current owner's row to a third tick.
         """
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             cur = self._db.execute(
                 "UPDATE loops SET lease_owner=NULL, lease_expires_at=0 "
                 "WHERE loop_id=? AND lease_owner=?",
@@ -388,8 +463,8 @@ class Store:
 
     def mark_verdict_seen(self, boris_request_id: str, now: float) -> bool:
         """False if this verdict was already consumed."""
-        self._db.execute("BEGIN IMMEDIATE")
         try:
+            self._db.execute("BEGIN IMMEDIATE")
             self._db.execute(
                 "INSERT INTO seen_verdicts (boris_request_id, at) VALUES (?,?)",
                 (boris_request_id, now))
