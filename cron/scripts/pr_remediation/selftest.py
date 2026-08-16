@@ -43,14 +43,21 @@ DEFAULT_ENV = Path("/Users/ctao/.hermes/.env")
 
 
 def _autofix_open(env_path: Path) -> bool:
-    """kanban_dispatch.sh reads this same line to decide whether to allow create."""
+    """kanban_dispatch.sh reads this same line to decide whether to allow create,
+    via `grep ... | tail -1` -- last match wins, so the operator's current .env
+    value (not an earlier stale duplicate) is authoritative. The sibling parser
+    in ylopo_pr_readiness/gather.py::mode_live mirrors the same rule. Do not
+    return on the first match here: that would silently disagree with the gate
+    this check exists to reflect."""
     try:
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("PR_REVIEW_AUTOFIX="):
-                return line.split("=", 1)[1].strip().strip('"\'') == "1"
+        lines = env_path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return False
-    return False
+    value = None
+    for line in lines:
+        if line.startswith("PR_REVIEW_AUTOFIX="):
+            value = line.split("=", 1)[1].strip().strip('"\'')
+    return value == "1"
 
 
 def run_selftest(cfg: RemediationConfig, *, token_path: Path = DEFAULT_TOKEN,

@@ -51,6 +51,16 @@ def _env(tmp_path, autofix="1"):
     return env
 
 
+def _env_duplicated(tmp_path, *values):
+    """An .env with PR_REVIEW_AUTOFIX repeated, in the given order -- e.g. an
+    operator appending a fresh line below a stale one rather than editing it
+    in place, which is exactly what kanban_dispatch.sh's `tail -1` is there to
+    handle correctly."""
+    env = tmp_path / ".env"
+    env.write_text("".join(f"PR_REVIEW_AUTOFIX={v}\n" for v in values))
+    return env
+
+
 def test_selftest_fails_closed_on_a_missing_github_token(tmp_path):
     failures = run_selftest(
         RemediationConfig(), token_path=tmp_path / "absent",
@@ -83,6 +93,33 @@ def test_live_mode_requires_the_autofix_gate_to_be_open(tmp_path):
         boris_db=_boris_db(tmp_path), env_path=_env(tmp_path, autofix="0"),
         boris_intake_config_path=_boris_intake_config(tmp_path))
     assert any("autofix" in f.lower() for f in failures)
+
+
+def test_autofix_gate_last_duplicate_wins_when_the_last_value_closes_it(tmp_path):
+    """kanban_dispatch.sh reads PR_REVIEW_AUTOFIX with `grep ... | tail -1` --
+    last match in the file wins, so a stale `=1` earlier in .env followed by
+    the operator's current `=0` must read as CLOSED here too. A selftest that
+    stopped at the first match would report the gate open while
+    kanban_dispatch.sh refuses every lane -- the exact divergence this check
+    exists to prevent."""
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path),
+        env_path=_env_duplicated(tmp_path, "1", "0"),
+        boris_intake_config_path=_boris_intake_config(tmp_path))
+    assert any("autofix" in f.lower() for f in failures)
+
+
+def test_autofix_gate_last_duplicate_wins_when_the_last_value_opens_it(tmp_path):
+    """Same duplicate-key file, opposite order: last value `=1` must read as
+    OPEN, not just "not the first value". Together with the test above, this
+    pins last-wins rather than merely not-first-wins."""
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path),
+        env_path=_env_duplicated(tmp_path, "0", "1"),
+        boris_intake_config_path=_boris_intake_config(tmp_path))
+    assert failures == []
 
 
 def test_shadow_mode_does_not_need_the_autofix_gate(tmp_path):

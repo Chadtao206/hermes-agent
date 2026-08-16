@@ -80,6 +80,65 @@ def test_main_builds_deps_and_enters_the_poll_loop_once_healthy(monkeypatch):
     assert calls["run_deps"] is sentinel_deps
 
 
+def test_main_fails_closed_when_selftest_itself_raises(monkeypatch, capsys):
+    """run_selftest's call to load_boris_intake_config() is not itself a
+    checked failure mode everywhere: boris_intake.config.load_config only
+    catches OSError and yaml.YAMLError, so something exotic -- e.g. a
+    UnicodeDecodeError from a non-UTF-8 config file -- would otherwise
+    propagate out of run_selftest and crash main() with a raw traceback.
+    Under a KeepAlive supervisor that just loops the same crash forever;
+    main() must report it the same clean way as any other precondition
+    failure instead."""
+    built = []
+    monkeypatch.setattr(daemon, "load_config", lambda: _cfg(mode="live"))
+
+    def boom(cfg):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    monkeypatch.setattr(daemon, "run_selftest", boom)
+    monkeypatch.setattr(daemon, "build_deps", lambda cfg, token: built.append(1))
+
+    assert daemon.main() == 1
+    assert built == []
+    assert "selftest" in capsys.readouterr().err.lower()
+
+
+def test_sigterm_handler_installed_by_main_actually_stops_the_poll_loop(monkeypatch):
+    """Covers the real signal wiring end to end: capture the handler main()
+    actually registers with signal.signal (rather than neutering signal.signal
+    to a no-op, and rather than injecting should_stop directly), invoke it the
+    way a real SIGTERM delivery would, and assert the should_stop() closure
+    `_run` receives reflects the flip. If `stop()` were neutered to never set
+    the flag, should_stop() would stay False after the handler fires and this
+    test would fail."""
+    calls = {}
+    handlers = {}
+    cfg = _cfg(mode="live")
+    sentinel_deps = object()
+
+    monkeypatch.setattr(daemon, "load_config", lambda: cfg)
+    monkeypatch.setattr(daemon, "run_selftest", lambda passed_cfg: [])
+    monkeypatch.setattr(daemon, "parse_env",
+                        lambda path: {"TICKET_HUB_SLACK_BOT_TOKEN": "xoxb-test"})
+    monkeypatch.setattr(daemon, "build_deps",
+                        lambda passed_cfg, token: sentinel_deps)
+
+    def fake_signal(signum, handler):
+        handlers[signum] = handler
+    monkeypatch.setattr(daemon.signal, "signal", fake_signal)
+
+    def fake_run(deps, *, should_stop, **kw):
+        calls["should_stop_before"] = should_stop()
+        # Invoke the real handler main() installed, exactly as the signal
+        # module would call it on delivery: (signum, frame).
+        handlers[daemon.signal.SIGTERM](daemon.signal.SIGTERM, None)
+        calls["should_stop_after"] = should_stop()
+    monkeypatch.setattr(daemon, "_run", fake_run)
+
+    assert daemon.main() == 0
+    assert calls["should_stop_before"] is False
+    assert calls["should_stop_after"] is True
+
+
 def test_run_survives_a_bad_tick_and_keeps_polling(tmp_path, monkeypatch):
     """The one thing neither startup path guards: a tick that raises once
     the daemon is already up. `_run` must log it and go on to the next tick

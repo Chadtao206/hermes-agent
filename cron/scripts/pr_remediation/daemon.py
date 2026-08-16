@@ -6,7 +6,11 @@ failure paths here. Startup failures (a missing write token, a marker gone
 out of sync with boris_intake, a missing autofix gate in live mode) must fail
 closed: `main` refuses to build any dependency and exits nonzero rather than
 starting degraded, because a daemon that starts anyway would sit there
-posting nothing, dispatching nothing, and telling nobody why. Once running,
+posting nothing, dispatching nothing, and telling nobody why. That includes a
+precondition check that itself raises (an exotic config error the checked
+loaders don't catch, e.g. a non-UTF-8 byte) -- `main` reports it the same way
+as any other precondition failure rather than letting it escape as a raw
+traceback for KeepAlive to loop on. Once running,
 the opposite must hold: a single bad tick -- one exploding adapter, one
 malformed row -- must not take the whole process down, because KeepAlive
 would just restart it into the same failure a moment later. `_run` is the
@@ -74,7 +78,16 @@ def main() -> int:
         sys.stderr.write("pr_remediation: mode=off, exiting\n")
         return 0
 
-    failures = run_selftest(cfg)
+    try:
+        failures = run_selftest(cfg)
+    except Exception as error:  # noqa: BLE001 - a selftest crash must still fail closed
+        # load_boris_intake_config only catches OSError/yaml.YAMLError; something
+        # like a UnicodeDecodeError from a non-UTF-8 config file would otherwise
+        # propagate straight out of main() as a raw traceback. Under a KeepAlive
+        # supervisor that just loops the same crash forever with no clean signal
+        # -- report it the same way every other precondition failure is reported.
+        sys.stderr.write(f"pr_remediation: selftest crashed: {error}\n")
+        return 1
     if failures:
         for failure in failures:
             sys.stderr.write(f"pr_remediation: selftest: {failure}\n")
