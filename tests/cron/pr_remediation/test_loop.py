@@ -336,11 +336,22 @@ def test_shadow_mode_never_posts_or_labels_on_any_route(tmp_path):
     ]
     deps = build(tmp_path, SourceFake(outcomes))
     deps = LoopDeps(**{**deps.__dict__, "cfg": RemediationConfig(mode="shadow")})
-    assert tick(deps) == 4
+    # Zero, not four: a paused tick advances no loop at all. It decides, and
+    # every decision is recorded -- which is what the four routes below check.
+    assert tick(deps) == 0
     assert deps.lanes.created == []
     assert deps.github.claimed == deps.github.released == []
     assert deps.slack.reposts == deps.slack.ready == deps.slack.escalations == []
     assert deps.slack.thinkies_added == deps.slack.thinkies_removed == []
+
+    decided = []
+    for pr in (1, 2, 3, 4):
+        loop = only_loop(deps, pr)
+        assert loop.state is LoopState.OBSERVED, "a paused tick moved a loop"
+        decided += [event["detail"]["would"]
+                    for event in deps.store.events(loop.loop_id)
+                    if event["kind"] == "shadow_decision"]
+    assert decided == ["open_lane", "notify_ready", "repost_rereview", "escalate"]
 
 
 @pytest.mark.parametrize("mode", ["shadow", "off"])
@@ -380,6 +391,87 @@ def test_a_paused_run_never_settles_an_escalation_a_live_run_left_pending(tmp_pa
     assert tick(live) == 1
     assert len(slack.escalations) == 2
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+@pytest.mark.parametrize("outcome,origin,target", [
+    ("READY_FOR_HUMAN_REVIEW", None, LoopState.READY),
+    ("REVIEW_INCOMPLETE", "model", LoopState.ESCALATED),
+])
+def test_a_paused_run_never_closes_a_loop_a_live_run_created(
+        tmp_path, mode, outcome, origin, target):
+    """Gating single branches on the mode missed the two that go *terminal*.
+
+    A pure paused run cannot create the precondition, which is why walking
+    every route in shadow never caught it: a live tick is what claims the PR,
+    dispatches the lane and adds the reaction, and the pause procedure is
+    exactly what arrives next. Closing such a loop is unrecoverable -- terminal
+    means `active_for_pr` returns None, so no later live tick can pick it up,
+    the ownership label other agents read stays on the PR forever, and nobody
+    is ever told the PR is ready.
+    """
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]))
+    assert tick(deps) == 1
+    loop_id = _loop_id(deps)
+    assert deps.github.claimed == [("Ylopo", "example", 42)]
+    assert deps.slack.thinkies_added == ["1.0"]
+    rereview_posted(deps)  # the lane finished, the head moved, the re-review went
+
+    paused = in_mode(deps, mode)
+    paused.source.verdicts = [verdict(rid="br_2", outcome=outcome, origin=origin)]
+    paused.now.advance()
+    assert tick(paused) == 0
+
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED, \
+        "a paused run drove the loop terminal"
+    assert only_loop(deps) is not None, "no later live tick could ever recover it"
+    assert deps.slack.ready == deps.slack.escalations == []
+    assert deps.github.released == [], "a paused run handed the label back"
+    assert deps.slack.thinkies_removed == []
+    assert "shadow_decision" in kinds(deps, loop_id), \
+        "a paused run must still record the route it would have taken"
+
+    # ...and everything is exactly as a later live tick expects to find it.
+    live = in_mode(deps, "live")
+    live.source.verdicts = [verdict(rid="br_3", outcome=outcome, origin=origin)]
+    live.now.advance()
+    assert tick(live) == 1
+    assert deps.store.get(loop_id).state is target
+    assert deps.github.released == [("Ylopo", "example", 42)]
+    assert deps.slack.thinkies_removed == ["1.0"]
+
+
+def test_the_newest_verdict_wins_and_a_stale_one_never_reopens_the_pr(tmp_path):
+    """`new_verdicts` is newest-first, so within one sweep the *older* verdict
+    is routed second. Once the newer one has closed the loop, `active_for_pr`
+    reports no loop at all and a second generation opens: in a single tick the
+    service announced the PR ready, handed the ownership label back, then
+    re-claimed it and dispatched a lane -- from a stale verdict.
+    """
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([
+        verdict(rid="br_new", outcome="READY_FOR_HUMAN_REVIEW"),
+        verdict(rid="br_old"),
+    ]))
+    assert tick(deps) == 1
+    assert deps.slack.ready == [("Ylopo/example#42", 0)]
+    assert deps.github.released == [("Ylopo", "example", 42)]
+    assert deps.github.claimed == [], "the PR was re-claimed after being handed back"
+    assert deps.lanes.created == []
+    assert only_loop(deps) is None
+    rows = deps.store._db.execute("SELECT COUNT(*) AS c FROM loops").fetchone()
+    assert rows["c"] == 1, "a stale verdict opened a second generation"
+
+    loop_id = _loop_id(deps)
+    deferred = deferrals(deps, loop_id)
+    assert [d["request_id"] for d in deferred] == ["br_old"], \
+        "the verdict we skipped must be in the trail, not silently dropped"
+    assert deferred[0]["reason"] == "superseded_verdict"
+    assert deps.store.mark_verdict_seen("br_old", deps.now()) is False, \
+        "a skipped verdict is consumed, not left to be replayed"
 
 
 def test_the_same_verdict_is_never_consumed_twice(tmp_path):
@@ -455,7 +547,10 @@ def test_two_verdicts_for_one_pr_in_one_sweep_open_exactly_one_lane(tmp_path):
                 if event["kind"] == "verdict_deferred"]
     assert [d["request_id"] for d in deferred] == ["br_2"], \
         "the verdict we refused must be in the trail, not silently dropped"
-    assert deferred[0]["reason"] == "lane_in_flight"
+    # br_2 is the *older* of the two (new_verdicts is newest-first), so it is
+    # now refused a step earlier than it used to be -- before it is routed at
+    # all, rather than by the in-flight lane br_1 opened.
+    assert deferred[0]["reason"] == "superseded_verdict"
 
 
 def test_a_verdict_while_a_lane_is_in_flight_starts_no_second_round(tmp_path):
@@ -471,6 +566,7 @@ def test_a_verdict_while_a_lane_is_in_flight_starts_no_second_round(tmp_path):
     assert loop.round_count == 1
     assert loop.state is LoopState.REMEDIATING
     assert loop.head_sha == "a" * 40, "the head the lane runs against must stand"
+    assert deferrals(deps, loop.loop_id)[-1]["reason"] == "lane_in_flight"
 
 
 def test_a_deferred_verdict_leaves_the_loop_due_for_the_lane_sweep(tmp_path):
@@ -545,6 +641,80 @@ def test_an_orphaned_lane_is_adopted_with_no_verdict_at_all(tmp_path):
     due = healed.store.claim_due(now=healed.now() + LANE_POLL_SECONDS + 1, limit=5)
     assert [claimed.loop_id for claimed in due] == [loop.loop_id], \
         "an adopted lane is due for the lane pass like any other"
+
+
+def _orphan_note(deps, loop_id, lane_id="t_1", round_number=1):
+    """The recording write a lapsed lease lost, landing *after* the rival's.
+
+    This ordering is the only one an orphan can arise in -- the lease lapsed
+    because a rival took the row over, so the rival's lane-carrying transition
+    is already in the trail when our note lands -- and it is precisely the
+    ordering `_orphaned_lane`'s superseding rule cannot see.
+    """
+    deps.store.record_note(loop_id, "orphaned_lane",
+                           {"lane_id": lane_id, "round": round_number,
+                            "head_sha": "a" * 40}, deps.now())
+
+
+def _three_rounds(deps):
+    """Drive the loop to its round cap, one real lane per round."""
+    from pr_remediation.loop import tick
+
+    for n in range(1, 4):
+        deps.source.verdicts = [verdict(rid=f"br_{n}")]
+        deps.now.advance()
+        tick(deps)
+        if n < 3:
+            rereview_posted(deps)
+    return only_loop(deps)
+
+
+def test_the_due_pass_never_adopts_an_orphan_over_a_live_lane(tmp_path):
+    """`_remediate` guards adoption with the in-flight rule and the due pass
+    did not, so the pass rewrote a loop at round 3 with a stale round-1 orphan:
+    two rounds of budget handed back to a loop that had exhausted its cap, and
+    the lane the row actually recorded stranded."""
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    deps = build(tmp_path, SourceFake([]))
+    loop = _three_rounds(deps)
+    assert (loop.round_count, loop.lane_id) == (3, "t_3")
+    assert loop.state is LoopState.REMEDIATING, "a lane is in flight"
+    _orphan_note(deps, loop.loop_id)
+
+    deps.source.verdicts = []
+    deps.now.advance(LANE_POLL_SECONDS + 1)
+    assert tick(deps) == 0, "nothing was owed and nothing should have moved"
+    loop = only_loop(deps)
+    assert loop.lane_id == "t_3", "the lane the row records was stranded"
+    assert loop.round_count == 3, "a capped loop had two rounds handed back"
+
+
+def test_adopting_an_orphan_never_rewinds_the_round_cap(tmp_path):
+    """Adoption is a correction, not a rewind. It records the lane that is
+    really running; it must not restore budget the loop has already spent."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([]))
+    loop = _three_rounds(deps)
+    rereview_posted(deps)  # that lane finished, so nothing is in flight now
+    _orphan_note(deps, loop.loop_id)
+
+    deps.source.verdicts = [verdict(rid="br_4")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    loop = only_loop(deps)
+    assert loop.lane_id == "t_1", "the lane that is really running is adopted"
+    assert loop.round_count == 3, "a capped loop had two rounds handed back"
+    assert len(deps.lanes.created) == 3, "adoption dispatches nothing"
+
+    # ...so the cap still bites, which is the whole point of not rewinding it.
+    rereview_posted(deps)
+    deps.source.verdicts = [verdict(rid="br_5")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert len(deps.lanes.created) == 3, "the cap must stop a fourth lane"
+    assert deps.slack.escalations[-1][2] == "round_cap"
 
 
 # --- an escalation is not finished until a human has it --------------------
@@ -647,7 +817,13 @@ def test_a_permanently_unreachable_channel_stops_retrying(tmp_path):
 
 def test_one_sweep_spends_at_most_one_notification_attempt(tmp_path):
     """NOTIFY_ATTEMPTS is a budget for riding out an outage across ticks. Spent
-    inside one tick it closes the loop unheard over a momentary blip."""
+    inside one tick it closes the loop unheard over a momentary blip.
+
+    What bounds it is the newest-verdict rule: one verdict per pull request per
+    sweep means one trip through the escalation path per sweep, so a second
+    verdict for the same PR cannot spend a second attempt seconds after the
+    first.
+    """
     from pr_remediation.loop import tick
 
     slack = SlackFake(escalation_ts=None)
@@ -659,7 +835,7 @@ def test_one_sweep_spends_at_most_one_notification_attempt(tmp_path):
     assert kinds(deps, loop_id).count("escalation_pending") == 1
     deferred = deferrals(deps, loop_id)
     assert [d["request_id"] for d in deferred] == ["br_2"]
-    assert deferred[0]["reason"] == "escalation_attempt_spent"
+    assert deferred[0]["reason"] == "superseded_verdict"
 
 
 def test_a_delivered_escalation_whose_close_was_lost_is_closed_later_in_silence(tmp_path):
@@ -680,8 +856,54 @@ def test_a_delivered_escalation_whose_close_was_lost_is_closed_later_in_silence(
     assert tick(deps) == 1, "nothing else will ever come back for this loop"
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
     assert len(deps.slack.escalations) == 1, "the human already has it"
+    # The retry re-attempts every write still owed, the stand-down included.
+    # Both its acts are idempotent, and gating them on `notified` (as this once
+    # did) is what leaves a label stranded when a settle dies between the
+    # delivery note and the stand-down -- see the test below.
+    assert deps.github.released == [("Ylopo", "example", 42)] * 2
+
+
+class ReactionRemovalDies(SlackFake):
+    """A Slack whose reaction removal explodes exactly once.
+
+    Lands the settle in the one window that strands the PR: the delivery note
+    is written, so no later tick will ever post again, and the stand-down that
+    should follow it never runs.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.explode = True
+
+    def remove_thinkies(self, channel, ts):
+        if self.explode:
+            self.explode = False
+            raise RuntimeError("slack ate the reaction removal")
+        return super().remove_thinkies(channel, ts)
+
+
+def test_a_stand_down_that_died_after_delivery_is_retried(tmp_path):
+    """Gating the whole notify-and-stand-down half on `notified` means a settle
+    that throws between the delivery note and the stand-down leaves the
+    ownership label and the reaction applied, with no later tick that would
+    ever clear them. Only the notification may be gated."""
+    from pr_remediation.loop import tick
+
+    slack = ReactionRemovalDies()
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    assert tick(deps) == 0
+    loop_id = _loop_id(deps)
+    assert "escalation_delivered" in kinds(deps, loop_id), "the human has it"
+    assert deps.github.released == [], "the label is stranded on the PR"
+
+    deps.source.verdicts = []
+    deps.now.advance()
+    assert tick(deps) == 1
     assert deps.github.released == [("Ylopo", "example", 42)], \
-        "the retry re-attempts the write, not the stand-down"
+        "no later tick would ever hand the PR back"
+    assert deps.slack.thinkies_removed == ["1.0"]
+    assert len(slack.escalations) == 1, "the human already has the notice"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
 def test_a_delivered_escalation_never_lets_a_later_verdict_restart_remediation(tmp_path):
@@ -926,8 +1148,9 @@ def test_every_edge_the_driver_takes_is_legal(tmp_path, prior, outcome, origin, 
 def test_a_remediating_loop_with_no_lane_takes_the_remediating_edge(tmp_path):
     """The cell the matrix above now skips, and the only path that still
     reaches `remediating -> remediating`: a row in that state with no lane to
-    poll (a shadow round, or a live flip on top of one) has nothing in flight,
-    so a verdict starts a real round from there."""
+    poll (a hand-edit, or a round an older build's shadow mode wrote before a
+    paused tick stopped writing state) has nothing in flight, so a verdict
+    starts a real round from there."""
     from pr_remediation.loop import tick
 
     store = Store(tmp_path / "r.db")

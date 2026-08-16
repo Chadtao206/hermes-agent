@@ -18,21 +18,66 @@ the only surviving failure is a lease that lapses mid-batch, which shows up as
 a False from `transition()` and is recorded as `orphaned_lane` rather than
 counted as progress.
 
-Three invariants sit on top of those orderings.
+Four invariants sit on top of those orderings.
+
+*A paused tick decides; only a live tick acts.* Shadow (and off) is the kill
+switch an operator reaches for to stop this service, and gating each routing
+branch on `cfg.mode` failed twice: the ready and escalate routes went on
+driving loops to a *terminal* state from the mode that exists to write nothing.
+A loop a live tick had already claimed the PR for was then closed without
+notifying anyone, without releasing the ownership label and without removing
+the reaction -- and, being terminal, `active_for_pr` refused every later live
+tick the chance to recover it.
+
+So the mode is not asked inside the routing at all. `_route` decides what a
+live tick would do and performs none of it; exactly one of two consumers
+follows, `_perform` (live) or `_rehearse` (paused, which writes the decision to
+the trail and stops). A branch added to `_perform` cannot leak into a paused
+tick, because a paused tick never reaches `_perform`. What a shadow soak shows
+is therefore one recorded decision per verdict rather than a simulated
+multi-round progression: shadow exists to validate routing, not to rehearse
+state.
+
+Opening the loop row is not a state change but the record itself: without one
+there is nowhere to write the decision, and the `observed` row a paused tick
+leaves behind is exactly the row a later live tick would have opened for the
+same verdict.
+
+Adopting an orphaned lane is the one deliberate exception, and it is consistent
+with the invariant rather than a hole in it: it is a store-only correction that
+dispatches nothing, posts nothing and claims nothing, recording a lane that is
+already running in the real world. Suppressing it would make a paused tick file
+a round with no lane against a PR that has one -- a less truthful record than
+the correction itself.
+
+*One verdict per pull request per sweep, and the newest.* `new_verdicts` is
+ordered newest-first, so within one sweep the *older* verdict for a PR would be
+routed second -- against a loop the newer one may already have closed, which
+`active_for_pr` then reports as no loop at all, opening a second generation
+that re-claims a PR this service has just handed back. Only the first verdict a
+sweep sees for a pull request drives its loop. The rest are marked seen and
+written to the trail as `superseded_verdict`, and nothing stalls: the loop's own
+`next_attempt_at` is untouched, so the due pass finds it exactly as it would
+have.
 
 *One lane per loop.* A round may start only while no lane is in flight -- from
 `observed`, `awaiting_head_move` or `rereview_posted`, never from
 `remediating` with a lane recorded, and never while a lane this loop opened but
-failed to record is still outstanding. Two verdicts for one PR can both be
-unseen in a single sweep (a re-review completing just behind its review), and
-without this rule the second one opens a second lane against the same branch:
-exactly the collision this service exists to remove. Kanban's idempotency key
-does not cover the orphaned case, because that key embeds the head sha and the
-orphan's own push is what moves the head -- so the trail, not the row, has to
-answer for it, and the orphan is *adopted* (the lost write retried, nothing
-else) rather than replaced. The in-flight lane, not a new verdict, is what
-drives the loop's next step; the refused verdict is written to the trail as
-`verdict_deferred` rather than silently dropped.
+failed to record is still outstanding. Kanban's idempotency key does not cover
+the orphaned case, because that key embeds the head sha and the orphan's own
+push is what moves the head -- so the trail, not the row, has to answer for it,
+and the orphan is *adopted* (the lost write retried, nothing else) rather than
+replaced. The in-flight lane, not a new verdict, is what drives the loop's next
+step; the refused verdict is written to the trail as `verdict_deferred` rather
+than silently dropped.
+
+Adoption is a correction, never a rewind. The rule that a recorded lane
+supersedes an orphan is order-dependent, and the ordering is inverted in the
+only way an orphan arises: a lapsed lease means the rival records *its* lane
+first and our orphan note lands after it, unsuperseded. So adoption is refused
+outright while a lane is in flight (on the verdict path and in the due pass
+alike), and can never lower `round_count` -- otherwise a loop that had spent
+its whole budget would have rounds handed back to it.
 
 *An escalation is not finished until a human has it.* Escalation exists
 because a person has to intervene, so a notification that failed does NOT close
@@ -43,20 +88,18 @@ misconfigured channel would otherwise pin the loop open forever, and a loop
 that never goes terminal blocks every later loop on that PR
 (`active_for_pr`). At the bound the loop closes with `escalation_unreachable`
 in the trail and an ERROR in the log. That budget is spread across ticks by
-design, so one sweep spends at most one attempt on a loop.
+design, so one sweep spends at most one attempt on a loop -- which the
+newest-verdict rule above is what guarantees.
 
 "Notified" and "closed" are two debts, not one: the notice is recorded before
 the closing compare-and-swap (so a crash cannot double-post), which means the
 close can be lost after a human already has the notice. Such a loop must keep
-being retried -- silently, the write only -- or it never reaches a terminal
-state and `active_for_pr` blocks every future generation for that PR.
-
-*Shadow writes nothing outside the store.* Shadow (and off) is the kill switch
-an operator reaches for to stop this service, so every routing branch is gated
-on `cfg.mode` -- the pending-escalation intercept included, which a live run is
-what creates. A shadow tick records what it would have done and leaves the
-escalation debt, the ownership label and the human channel exactly as a later
-live tick will find them.
+being retried -- the write, and the stand-down, never the post -- or it never
+reaches a terminal state and `active_for_pr` blocks every future generation for
+that PR. Only the *notification* is gated on `notified`: both stand-down acts
+are idempotent by construction, and a settle that died between the delivery
+note and the stand-down would otherwise strand the ownership label on the PR
+with no tick left that would ever clear it.
 
 Escalation reasons are free-form strings, not only `EscalationReason` members:
 the enum names the loop's *own* dead ends (round cap, no-op lane), while the
@@ -66,7 +109,7 @@ GitHub is unwritable, the re-review has no thread to land in.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from pr_remediation.boris_source import Verdict
@@ -96,7 +139,7 @@ REREVIEW_UNPOSTABLE = "rereview_unpostable"
 LANE_IN_FLIGHT = "lane_in_flight"
 LANE_ORPHANED = "lane_orphaned"
 ESCALATION_OWED = "escalation_owed"
-ESCALATION_ATTEMPT_SPENT = "escalation_attempt_spent"
+SUPERSEDED_VERDICT = "superseded_verdict"
 
 # Event kinds the driver replays to reconstruct what the row cannot hold: the
 # escalation debt, and a lane whose write was lost. Kept apart from the defer
@@ -110,6 +153,24 @@ EVENT_ESCALATION_UNREACHABLE = "escalation_unreachable"
 EVENT_ORPHANED_LANE = "orphaned_lane"
 # Written by store.transition() itself, and only when the swap landed.
 EVENT_TRANSITION = "transition"
+
+# The routes a verdict can take. `_route` names one, `_perform` performs it and
+# `_rehearse` records it -- so the name is both the dispatch key and the word a
+# shadow soak reads back. Three of them (held, author_unreadable,
+# unknown_outcome) are observations rather than acts: they are their own note
+# kind, and a live tick does no more with them than record it.
+ROUTE_SETTLE_ESCALATION = "settle_escalation"
+ROUTE_HELD = "held"
+ROUTE_AUTHOR_UNREADABLE = "author_unreadable"
+ROUTE_UNKNOWN_OUTCOME = "unknown_outcome"
+ROUTE_ESCALATE = "escalate"
+ROUTE_NOTIFY_READY = "notify_ready"
+ROUTE_REPOST_REREVIEW = "repost_rereview"
+ROUTE_ADOPT_LANE = "adopt_lane"
+ROUTE_OPEN_LANE = "open_lane"
+ROUTE_DEFER = "defer_verdict"
+
+_OBSERVATIONS = (ROUTE_HELD, ROUTE_AUTHOR_UNREADABLE, ROUTE_UNKNOWN_OUTCOME)
 
 _LOG = logging.getLogger(__name__)
 
@@ -139,6 +200,27 @@ class EscalationDebt:
     reason: str
     attempts: int
     notified: bool
+
+
+@dataclass(frozen=True)
+class Route:
+    """What a live tick would do with one verdict, decided before it is done.
+
+    Deciding and doing are split so that the operating mode is asked exactly
+    once, outside the routing: a live tick performs the route, a paused one
+    records it. `detail` is written to the trail verbatim, so it must stay
+    JSON-shaped; `debt` is the replayed trail the escalation actor would
+    otherwise have to read a second time, and is deliberately not recorded.
+
+    `defer`, when set, is why this verdict is not itself driving the loop --
+    the in-flight lane is, or a debt the loop already owes is. It is recorded
+    in both modes, because the verdict is marked seen either way and this note
+    is the only surviving trace that it existed.
+    """
+    action: str
+    detail: dict = field(default_factory=dict)
+    defer: str | None = None
+    debt: EscalationDebt | None = None
 
 
 def _shadow(deps: LoopDeps, loop_id: str, action: str, detail: dict) -> None:
@@ -171,6 +253,11 @@ def _stand_down(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> None:
     (the ownership label, the thinkies reaction). Failing to clear either is
     worth recording -- a stuck label makes the PR look owned forever -- but
     must not stop the loop from reaching its terminal state.
+
+    Both are also idempotent by construction, which is what lets every settle
+    run them: removing a reaction that is gone and releasing a label that is
+    already released are no-ops, and a settle interrupted midway would
+    otherwise leave the PR looking owned with nothing left to clear it.
 
     The reaction is anchored on the *loop's* thread, not this verdict's: a
     later verdict can carry a different root, and a reaction added on one
@@ -244,11 +331,11 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
 
     A delivery is recorded *before* the stand-down and the compare-and-swap, so
     a crash in between cannot make a later tick post the same notice twice.
-    The price of that ordering is a close that can be lost after the notice
-    landed, which is what `notified` is for: it gates the whole notify-and-
-    stand-down half, so a loop that has been heard but not closed comes back
-    here and retries the one write still missing -- no post, no label, no
-    reaction, nothing a human could see twice.
+    The price of that ordering is two writes that can be lost after the notice
+    landed -- the stand-down and the close -- which is what `notified` is for:
+    it gates the *post* only, so a loop that has been heard but not closed
+    comes back here and retries both of those, and neither is anything a human
+    could see twice.
     """
     if not debt.notified:
         if deps.slack.notify_escalation(verdict, loop.round_count,
@@ -258,6 +345,8 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
                 deps.store.record_note(loop.loop_id, EVENT_ESCALATION_PENDING,
                                        {"reason": debt.reason, "attempt": attempt},
                                        deps.now())
+                # Nobody has the notice, so the PR stays owned and the reaction
+                # stays on: the loop is still open and will be retried.
                 return False
             # Out of attempts. Holding the loop open past this point buys
             # nothing (the channel is not coming back on its own) and costs the
@@ -271,17 +360,13 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         else:
             deps.store.record_note(loop.loop_id, EVENT_ESCALATION_DELIVERED,
                                    {"reason": debt.reason}, deps.now())
-        _stand_down(deps, loop, verdict)
+    _stand_down(deps, loop, verdict)
     return _transition(deps, loop, LoopState.ESCALATED,
                        escalation_reason=debt.reason)
 
 
 def _escalate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
               reason: str) -> bool:
-    if deps.cfg.mode != "live":
-        _shadow(deps, loop.loop_id, "escalate", {"reason": reason})
-        return _transition(deps, loop, LoopState.ESCALATED,
-                           escalation_reason=reason)
     # A debt with nothing paid on it yet: a loop that already owes one is
     # intercepted before it can reach here, on the verdict path and in the due
     # pass alike, so this is always the first attempt at this escalation.
@@ -291,13 +376,10 @@ def _escalate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
 
 
 def _finish_ready(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
-    if deps.cfg.mode == "live":
-        if deps.slack.notify_ready(verdict, loop.round_count) is None:
-            deps.store.record_note(loop.loop_id, "notify_failed",
-                                   {"kind": "ready"}, deps.now())
-        _stand_down(deps, loop, verdict)
-    else:
-        _shadow(deps, loop.loop_id, "notify_ready", {"rounds": loop.round_count})
+    if deps.slack.notify_ready(verdict, loop.round_count) is None:
+        deps.store.record_note(loop.loop_id, "notify_failed",
+                               {"kind": "ready"}, deps.now())
+    _stand_down(deps, loop, verdict)
     return _transition(deps, loop, LoopState.READY)
 
 
@@ -306,14 +388,6 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
 
     Retrying the review costs no remediation round: nothing was remediated.
     """
-    if deps.cfg.mode != "live":
-        _shadow(deps, loop.loop_id, "repost_rereview", {"transient": True})
-        return _transition(deps, loop, LoopState.REREVIEW_POSTED)
-    if not loop.root_thread_ts:
-        # SlackIO refuses to post outside a thread because the intake gate
-        # silently drops such a message. No thread means no route back into
-        # review, ever -- that is permanent, so escalate rather than retry.
-        return _escalate(deps, loop, verdict, REREVIEW_UNPOSTABLE)
     if deps.slack.post_rereview(verdict, loop.root_thread_ts,
                                 loop.round_count + 1) is None:
         # A post that failed with a thread present is a Slack blip. Leave the
@@ -330,9 +404,9 @@ def _lane_in_flight(loop: LoopRequest) -> bool:
 
     State alone is the rule -- `remediating` means a round is running -- with
     one qualification: a `remediating` row carrying no lane_id has nothing
-    running (a shadow-mode round, or a live flip on top of one). Treating that
-    as in-flight would strand it forever, because the lane pass has no lane to
-    poll and would never move it on.
+    running (a hand-edited row, or one an older build's shadow round left
+    behind). Treating that as in-flight would strand it forever, because the
+    lane pass has no lane to poll and would never move it on.
 
     The row is not the whole account. A lane whose recording write was lost
     leaves no trace here at all -- `_orphaned_lane` answers for that one.
@@ -350,7 +424,10 @@ def _orphaned_lane(deps: LoopDeps, loop: LoopRequest) -> dict | None:
     generation of the same pull request.
 
     A transition that did record a lane supersedes the orphan: whatever the row
-    points at now is what is running.
+    points at now is what is running. That rule reads the trail in order and is
+    therefore only half the answer -- an orphan written *after* a rival's
+    transition is never superseded by it -- so callers must additionally refuse
+    to adopt while a lane is in flight, and `_adopt_lane` refuses to rewind.
     """
     orphan: dict | None = None
     for event in deps.store.events(loop.loop_id):
@@ -376,49 +453,25 @@ def _adopt_lane(deps: LoopDeps, loop: LoopRequest, orphan: dict) -> bool:
     poll, so the loop goes on from that lane's completion like any other round;
     until the write lands, every verdict and every due sweep tries it again.
 
-    The round the orphan spent is the round recorded. It cannot double-count:
-    any later dispatch that did land its write would have superseded the
-    orphan, and this path never reaches a row that already carries a lane.
+    The round the orphan spent is the round recorded, but never a *lower* one
+    than the row already carries. An orphan note can outlive the round it
+    describes (it is written after the rival transition that supersedes it in
+    trail order, so nothing ever clears it), and adopting it at face value
+    would hand a loop that had exhausted its round cap its whole budget back.
+    Callers must also refuse to adopt while a lane is in flight; this floor is
+    the second half of that guard, not a substitute for it.
     """
+    spent = int(orphan.get("round") or loop.round_count + 1)
     return _transition(
         deps, loop, LoopState.REMEDIATING,
-        round_count=int(orphan.get("round") or loop.round_count + 1),
+        round_count=max(spent, loop.round_count),
         lane_id=str(orphan["lane_id"]),
         head_sha=str(orphan.get("head_sha") or loop.head_sha),
         next_attempt_at=deps.now() + LANE_POLL_SECONDS)
 
 
-def _remediate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
-    cfg = deps.cfg
-    if _lane_in_flight(loop):
-        # A second lane on this branch is the collision this service exists to
-        # remove, and here we would be causing it ourselves. The lane already
-        # running drives the next step: it finishes, the head moves, the
-        # re-review goes out, and *that* verdict starts the next round. Checked
-        # before the round cap, because the round this verdict would spend has
-        # already been spent by the lane in flight.
-        _defer_verdict(deps, loop, verdict, LANE_IN_FLIGHT)
-        return False
-    orphan = _orphaned_lane(deps, loop)
-    if orphan is not None:
-        # The row says no lane, the trail says otherwise, and the trail is
-        # right: this loop's own dispatch lost its recording write. Adopt that
-        # lane rather than open a second one against the same branch. In
-        # shadow too, deliberately: adoption dispatches nothing and posts
-        # nothing, it only corrects the store's record of a lane that is
-        # already running, and the shadow branch below would otherwise write a
-        # round with no lane at all -- a worse account of the same PR.
-        _defer_verdict(deps, loop, verdict, LANE_ORPHANED)
-        return _adopt_lane(deps, loop, orphan)
-    if loop.round_count >= cfg.round_cap:
-        return _escalate(deps, loop, verdict, EscalationReason.ROUND_CAP.value)
-    round_number = loop.round_count + 1
-
-    if cfg.mode != "live":
-        _shadow(deps, loop.loop_id, "open_lane", {"round": round_number})
-        return _transition(deps, loop, LoopState.REMEDIATING,
-                           round_count=round_number, head_sha=verdict.head_sha)
-
+def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+               round_number: int) -> bool:
     if not deps.github.claim(verdict.owner, verdict.repo, verdict.pr_number):
         # The ownership label is how every other agent learns this PR is taken.
         # Without it we would push commits to a PR nobody knows we own -- and a
@@ -448,18 +501,19 @@ def _remediate(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
                                 "head_sha": verdict.head_sha}, deps.now())
         return False
     if loop.root_thread_ts:
-        deps.slack.add_thinkies(cfg.boris_channel, loop.root_thread_ts)
+        deps.slack.add_thinkies(deps.cfg.boris_channel, loop.root_thread_ts)
     return True
 
 
-def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
-           already_driven: bool) -> bool:
-    """Route one verdict against a loop we hold the lease on.
+def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> Route:
+    """Decide what a live tick would do with this verdict, and do none of it.
 
-    `already_driven` says this sweep has worked this loop before, for an
-    earlier verdict on the same pull request.
+    The whole routing decision lives here, and nothing here writes loop state,
+    posts, labels or dispatches. Only GitHub *reads* happen -- the hold label
+    and the author -- because a decision taken without them would not be the
+    decision a live tick takes, and a shadow soak exists to check exactly that.
     """
-    store, cfg = deps.store, deps.cfg
+    cfg = deps.cfg
 
     debt = _escalation_debt(deps, loop)
     if debt is not None:
@@ -471,55 +525,124 @@ def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         # itself added, which is what a hold wants to happen anyway -- and
         # ahead of the author check, which would otherwise escalate an
         # escalated loop again.
-        if cfg.mode != "live":
-            # The one routing branch a shadow run can reach without having
-            # created the state itself: a live run left the debt, an operator
-            # then flipped the switch to stop the service. Settling here would
-            # post to a human channel, hand the ownership label back and drive
-            # the loop terminal, from the mode that exists to write nothing.
-            # Left untouched, the debt is still there for a later live tick.
-            _shadow(deps, loop.loop_id, "settle_escalation",
-                    {"reason": debt.reason, "notified": debt.notified})
-            _defer_verdict(deps, loop, verdict, ESCALATION_OWED)
-            return False
-        if already_driven:
-            # NOTIFY_ATTEMPTS is a budget for riding out a Slack outage across
-            # several ticks. A second verdict for this loop in this sweep would
-            # spend a second attempt on the same outage seconds later, and
-            # enough of them would close the loop unheard inside one tick.
-            _defer_verdict(deps, loop, verdict, ESCALATION_ATTEMPT_SPENT)
-            return False
-        _defer_verdict(deps, loop, verdict, ESCALATION_OWED)
-        return _settle_escalation(deps, loop, verdict, debt)
+        return Route(ROUTE_SETTLE_ESCALATION,
+                     {"reason": debt.reason, "notified": debt.notified},
+                     defer=ESCALATION_OWED, debt=debt)
 
     if deps.github.has_hold(verdict.owner, verdict.repo, verdict.pr_number):
         # Chad's kill switch, and also the fail-closed answer when GitHub
         # cannot be read at all.
-        store.record_note(loop.loop_id, "held", {"label": cfg.hold_label},
-                          deps.now())
-        return False
+        return Route(ROUTE_HELD, {"label": cfg.hold_label})
     author = deps.github.author(verdict.owner, verdict.repo, verdict.pr_number)
     if author is None:
-        store.record_note(loop.loop_id, "author_unreadable", {}, deps.now())
-        return False
+        return Route(ROUTE_AUTHOR_UNREADABLE, {})
     if author != cfg.chad_github_login:
-        return _escalate(deps, loop, verdict, NOT_CHAD_AUTHORED)
+        return Route(ROUTE_ESCALATE, {"reason": NOT_CHAD_AUTHORED})
 
     if verdict.outcome == "READY_FOR_HUMAN_REVIEW":
-        return _finish_ready(deps, loop, verdict)
+        return Route(ROUTE_NOTIFY_READY, {"rounds": loop.round_count})
     if verdict.outcome == "REVIEW_INCOMPLETE":
-        if verdict.incomplete_origin == "system":
-            return _repost(deps, loop, verdict)
-        return _escalate(deps, loop, verdict,
-                         EscalationReason.MODEL_INCOMPLETE.value)
+        if verdict.incomplete_origin != "system":
+            return Route(ROUTE_ESCALATE,
+                         {"reason": EscalationReason.MODEL_INCOMPLETE.value})
+        if not loop.root_thread_ts:
+            # SlackIO refuses to post outside a thread because the intake gate
+            # silently drops such a message. No thread means no route back into
+            # review, ever -- that is permanent, so escalate rather than retry.
+            return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNPOSTABLE})
+        return Route(ROUTE_REPOST_REREVIEW, {"round": loop.round_count + 1})
     if verdict.outcome != "ISSUES_FOUND":
-        store.record_note(loop.loop_id, "unknown_outcome",
-                          {"outcome": verdict.outcome}, deps.now())
+        return Route(ROUTE_UNKNOWN_OUTCOME, {"outcome": verdict.outcome})
+
+    if _lane_in_flight(loop):
+        # A second lane on this branch is the collision this service exists to
+        # remove, and here we would be causing it ourselves. The lane already
+        # running drives the next step: it finishes, the head moves, the
+        # re-review goes out, and *that* verdict starts the next round. Checked
+        # before the round cap, because the round this verdict would spend has
+        # already been spent by the lane in flight.
+        return Route(ROUTE_DEFER, {"lane_id": loop.lane_id},
+                     defer=LANE_IN_FLIGHT)
+    orphan = _orphaned_lane(deps, loop)
+    if orphan is not None:
+        # The row says no lane, the trail says otherwise, and the trail is
+        # right: this loop's own dispatch lost its recording write. Adopt that
+        # lane rather than open a second one against the same branch.
+        return Route(ROUTE_ADOPT_LANE, dict(orphan), defer=LANE_ORPHANED)
+    if loop.round_count >= cfg.round_cap:
+        return Route(ROUTE_ESCALATE,
+                     {"reason": EscalationReason.ROUND_CAP.value})
+    return Route(ROUTE_OPEN_LANE, {"round": loop.round_count + 1})
+
+
+def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+             route: Route) -> bool:
+    """Do what `_route` decided. Reached only in live mode."""
+    if route.defer is not None:
+        _defer_verdict(deps, loop, verdict, route.defer)
+    if route.action == ROUTE_SETTLE_ESCALATION:
+        if route.debt is None:
+            # Unreachable via `_route`, and a silent `return False` here would
+            # look exactly like a loop with nothing owing.
+            raise ValueError("settle_escalation route carries no debt")
+        return _settle_escalation(deps, loop, verdict, route.debt)
+    if route.action in _OBSERVATIONS:
+        deps.store.record_note(loop.loop_id, route.action, route.detail,
+                               deps.now())
         return False
-    return _remediate(deps, loop, verdict)
+    if route.action == ROUTE_ESCALATE:
+        return _escalate(deps, loop, verdict, str(route.detail["reason"]))
+    if route.action == ROUTE_NOTIFY_READY:
+        return _finish_ready(deps, loop, verdict)
+    if route.action == ROUTE_REPOST_REREVIEW:
+        return _repost(deps, loop, verdict)
+    if route.action == ROUTE_ADOPT_LANE:
+        return _adopt_lane(deps, loop, route.detail)
+    if route.action == ROUTE_OPEN_LANE:
+        return _open_lane(deps, loop, verdict, int(route.detail["round"]))
+    # ROUTE_DEFER: the in-flight lane drives the loop, not this verdict, and
+    # the note above is the whole of what we owe it.
+    return False
 
 
-def _handle(deps: LoopDeps, verdict: Verdict, driven: set[str]) -> bool:
+def _rehearse(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+              route: Route) -> bool:
+    """Record what a live tick would have done, and change no loop state.
+
+    The kill switch, honoured structurally: a paused tick decides and stops,
+    so no routing branch can leak a post, a label or a terminal state past it.
+    Adoption is the one exception, for the reason the module docstring gives --
+    it is a store-only correction recording a lane that is already running, and
+    refusing it would file a round with no lane instead.
+    """
+    _shadow(deps, loop.loop_id, route.action, route.detail)
+    if route.defer is not None:
+        _defer_verdict(deps, loop, verdict, route.defer)
+    if route.action == ROUTE_ADOPT_LANE:
+        return _adopt_lane(deps, loop, route.detail)
+    return False
+
+
+def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
+    """Route one verdict against a loop we hold the lease on.
+
+    The operating mode is asked here and nowhere below: one of two consumers
+    takes the decision, and only one of them can act.
+    """
+    route = _route(deps, loop, verdict)
+    if deps.cfg.mode != "live":
+        return _rehearse(deps, loop, verdict, route)
+    return _perform(deps, loop, verdict, route)
+
+
+def _handle(deps: LoopDeps, verdict: Verdict,
+            driven: set[str]) -> tuple[bool, str | None]:
+    """Drive one verdict, returning whether it advanced its loop and which one.
+
+    The loop id goes back to `tick` so that an older verdict for the same pull
+    request has somewhere to be recorded even after the newest one has closed
+    the loop -- by which point `active_for_pr` can no longer find it.
+    """
     store = deps.store
     loop = store.active_for_pr(verdict.owner, verdict.repo, verdict.pr_number)
     if loop is None:
@@ -531,29 +654,47 @@ def _handle(deps: LoopDeps, verdict: Verdict, driven: set[str]) -> bool:
     if loop is None:
         # Another tick opened this PR's loop between our read and our insert.
         # It owns the verdict routing for this PR; we must not double-drive it.
-        return False
+        return False, None
 
-    # `driven` guards both passes, and is read before it is written. The due
-    # pass must not touch a loop this pass has already worked on this tick, and
-    # neither must a second verdict for the same pull request: either way a
-    # single tick would spend two of one escalation's notification attempts.
-    # Recorded whatever happens below, a refused claim included -- that loop is
-    # being driven, just not by us.
-    already_driven = loop.loop_id in driven
+    # The due pass must not touch a loop this pass has already worked on this
+    # tick. Recorded whatever happens below, a refused claim included -- that
+    # loop is being driven, just not by us.
     driven.add(loop.loop_id)
     if not store.claim(loop.loop_id, now=deps.now()):
         # Leased elsewhere, or already terminal. Either way, not ours to drive.
-        return False
+        return False, loop.loop_id
     try:
         # Re-read under the lease: the snapshot above was taken unleased, so
         # its state and round_count may already be stale, and driving from a
         # stale round_count is how a round gets spent twice.
         leased = store.get(loop.loop_id)
         if leased is None:
-            return False
-        return _drive(deps, leased, verdict, already_driven)
+            return False, loop.loop_id
+        return _drive(deps, leased, verdict), loop.loop_id
     finally:
         store.release(loop.loop_id)
+
+
+def _record_superseded(deps: LoopDeps, verdict: Verdict,
+                       loop_id: str | None) -> None:
+    """Note an older verdict for a pull request this sweep has already driven.
+
+    It is marked seen like any other, so this note is the only trace it leaves;
+    it drives nothing, and it stalls nothing either, because the loop's own
+    `next_attempt_at` is untouched by a note.
+    """
+    loop = deps.store.get(loop_id) if loop_id else None
+    if loop is None:
+        # The driving verdict never got as far as a loop (a lost open_loop
+        # race, or a throw before it had one). Whatever row it would have found
+        # is still the right place for this, if there is one at all.
+        loop = deps.store.active_for_pr(verdict.owner, verdict.repo,
+                                        verdict.pr_number)
+    if loop is None:
+        _LOG.warning("superseded verdict %s has no loop to record it against",
+                     verdict.request_id)
+        return
+    _defer_verdict(deps, loop, verdict, SUPERSEDED_VERDICT)
 
 
 def _note_quietly(deps: LoopDeps, loop_id: str, kind: str, detail: dict) -> None:
@@ -611,6 +752,14 @@ def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
                 if _settle_escalation(deps, loop, _verdict_for(loop), debt):
                     advanced += 1
                 continue
+            if _lane_in_flight(loop):
+                # The same guard the verdict path applies, and for the same
+                # reason: an orphan note that trails a rival's transition is
+                # never superseded, so without this the pass would rewrite a
+                # live lane (and its round) with a stale one. Deliberately
+                # silent -- this pass runs every tick, and a note here would
+                # grow the trail forever for a loop that is perfectly healthy.
+                continue
             orphan = _orphaned_lane(deps, loop)
             if orphan is not None and _adopt_lane(deps, loop, orphan):
                 advanced += 1
@@ -640,6 +789,12 @@ def tick(deps: LoopDeps) -> int:
     stalled loop the daemon's due-sweep can pick up is a far cheaper failure
     than a duplicate remediation lane.
 
+    At most one verdict per pull request is routed, the newest -- `sweep`
+    remembers which pull requests this tick has driven, and which loop each of
+    them belongs to. See the module docstring: an older verdict routed second
+    would drive a loop the newer one has already closed, and open a second
+    generation once `active_for_pr` stops finding it.
+
     The verdict pass is followed by a due pass over leased due loops, which
     exists so that a write nobody will send another verdict for -- an
     escalation nobody received, a lane nobody recorded -- is tried again
@@ -647,11 +802,21 @@ def tick(deps: LoopDeps) -> int:
     """
     advanced = 0
     driven: set[str] = set()
+    sweep: dict[tuple[str, str, int], str | None] = {}
     for verdict in deps.source.new_verdicts():
+        pr = (verdict.owner, verdict.repo, verdict.pr_number)
         try:
             if not deps.store.mark_verdict_seen(verdict.request_id, deps.now()):
                 continue
-            if _handle(deps, verdict, driven):
+            if pr in sweep:
+                _record_superseded(deps, verdict, sweep[pr])
+                continue
+            # Claimed before it is driven, so a verdict that throws mid-handle
+            # still bars an older one for the same PR from driving the loop.
+            sweep[pr] = None
+            handled, loop_id = _handle(deps, verdict, driven)
+            sweep[pr] = loop_id
+            if handled:
                 advanced += 1
         except CorruptLoopRow as exc:
             _LOG.exception("loop %s carries an unreadable state", exc.loop_id)
