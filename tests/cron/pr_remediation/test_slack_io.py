@@ -155,6 +155,69 @@ def test_a_failed_thread_check_does_not_prevent_the_notice_from_posting():
     assert calls, "the ready notice must still post when the thread check failed"
 
 
+# --- notify_still_running: the progress notice, and its one hard rule ------
+#
+# Posted by the due pass once a round has run past
+# loop.STILL_RUNNING_THRESHOLD_SECONDS with nothing to show for it but the
+# ownership label and the thinkies reaction. It must land in the review
+# thread, under Son of Chad's identity, exactly like a re-review post -- and
+# it must NEVER carry cfg.marker: boris_intake's gate
+# (gate.py::_is_loop_repost) admits a thread reply from this bot as a
+# re-review *request* precisely when that marker is present, and a progress
+# notice that carried it would be admitted as one, spawning a spurious review
+# mid-remediation.
+
+def test_still_running_notice_reports_elapsed_and_timeout_minutes():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_still_running(
+        VERDICT, elapsed_minutes=45, timeout_minutes=180, thread_ts="1.0")
+    text = calls[0][2]["text"]
+    assert "45" in text
+    assert "180" in text
+    assert "escalate" in text.lower()
+
+
+def test_still_running_notice_posts_as_a_reply_in_the_review_thread():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_still_running(
+        VERDICT, elapsed_minutes=45, timeout_minutes=180, thread_ts="1.0")
+    token, method, params = calls[0]
+    assert token == TOK
+    assert method == "chat.postMessage"
+    assert params["thread_ts"] == "1.0"
+    assert params["channel"] == "C0BPCKPEFCG"
+
+
+def test_still_running_notice_uses_the_review_token():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), REVIEW_TOK, NOTIFY_TOK, call).notify_still_running(
+        VERDICT, elapsed_minutes=45, timeout_minutes=180, thread_ts="1.0")
+    assert calls[0][0] == REVIEW_TOK
+
+
+def test_still_running_notice_refuses_to_post_without_a_thread():
+    """Same gate, same guard as post_rereview/repost_rereview: a top-level
+    post is silently dropped by the intake gate as NOT_HUMAN."""
+    call, calls = caller_for()
+    io = SlackIO(RemediationConfig(), TOK, TOK, call)
+    assert io.notify_still_running(VERDICT, 45, 180, "") is None
+    assert io.notify_still_running(VERDICT, 45, 180, None) is None
+    assert calls == []
+
+
+def test_still_running_notice_never_carries_the_loop_marker():
+    """The one hard rule: this message must be admitted by boris_intake's
+    gate as NOT_HUMAN, never as a loop repost -- see
+    boris_intake/gate.py::_is_loop_repost, which keys on cfg.loop_marker
+    being present verbatim. A regression here would spawn a spurious
+    re-review mid-remediation."""
+    call, calls = caller_for()
+    cfg = RemediationConfig()
+    SlackIO(cfg, TOK, TOK, call).notify_still_running(
+        VERDICT, elapsed_minutes=45, timeout_minutes=180, thread_ts="1.0")
+    assert cfg.marker not in calls[0][2]["text"]
+
+
 def test_escalation_notification_names_the_reason_and_round():
     call, calls = caller_for()
     SlackIO(RemediationConfig(), TOK, TOK, call).notify_escalation(
@@ -366,6 +429,8 @@ POSTING_METHODS = {
         VERDICT, rounds=2, unresolved_threads=[]),
     "notify_escalation": lambda io: io.notify_escalation(
         VERDICT, rounds=3, reason="round_cap"),
+    "notify_still_running": lambda io: io.notify_still_running(
+        VERDICT, elapsed_minutes=45, timeout_minutes=180, thread_ts="1.0"),
 }
 
 REACTION_METHODS = {

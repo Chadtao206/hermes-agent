@@ -30,6 +30,16 @@ cfg.marker verbatim: boris_intake's gate admits this bot's messages only
 when that literal string is present (see
 boris_intake/gate.py::_is_loop_repost). Change it in either one and that
 path's re-reviews stop being admitted.
+
+`notify_still_running` is review-thread work too -- same identity, same
+thread, same `_post_thread_reply` gate guard -- but it is the one message
+here that must NEVER carry cfg.marker. That marker is what tells
+boris_intake's gate a thread reply from this bot is a re-review *request*
+rather than an ordinary bot message; a progress notice that carried it would
+be admitted as one and spawn a spurious review mid-remediation, which is
+exactly the collision the loop's round sequencing exists to prevent. Without
+the marker the gate rejects it as NOT_HUMAN, which is the correct outcome for
+a message that is not asking for anything.
 """
 from __future__ import annotations
 
@@ -224,3 +234,37 @@ class SlackIO:
             f"Stopped at round {rounds} of {self._cfg.round_cap}."
         )
         return self._post(self._notify_token, self._cfg.notify_channel, text)
+
+    def notify_still_running(self, verdict: Verdict, elapsed_minutes: int,
+                             timeout_minutes: int,
+                             thread_ts: str | None) -> str | None:
+        """Say once, as a reply in the review thread, that a round is still
+        going -- posted by the due pass after it has run longer than
+        STILL_RUNNING_THRESHOLD_SECONDS (loop.py) with no terminal lane
+        status.
+
+        This is the fix for the blind spot the first live ISSUES_FOUND run
+        exposed: a round ran for twenty minutes with only the ownership label
+        and the thinkies reaction to show for it, which look identical
+        whether the round is working normally or wedged. This notice gives a
+        human the other half of that picture -- how long it has been running,
+        and when silence would start meaning something -- without claiming
+        anything has gone wrong. `timeout_minutes` names LANE_WAIT_SECONDS
+        (loop.py) so the notice and the escalation it warns about stay
+        anchored to the same bound; loop.py computes it, not this method,
+        because that constant is not part of this class's own contract.
+
+        Deliberately does NOT carry cfg.marker -- see the module docstring.
+        Posted under Son of Chad's identity, into the review thread, exactly
+        like `post_rereview` and `repost_rereview`: it is review-thread work,
+        not a notification, so it goes nowhere near notify_channel, which
+        carries only terminal outcomes (ready, escalation) and would have
+        this progress chatter dilute the signal a human actually acts on.
+        """
+        text = (
+            f"⏳ Still working on {pr_url(verdict)} — this remediation round "
+            f"has been running for {elapsed_minutes} minute(s). "
+            f"It will escalate to a human at {timeout_minutes} minutes if it "
+            f"hasn't finished by then."
+        )
+        return self._post_thread_reply(text, thread_ts)

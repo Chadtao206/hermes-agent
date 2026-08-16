@@ -261,6 +261,20 @@ HEAD_READ_ATTEMPTS = 5
 # deliberately leaves it alone).
 LANE_WAIT_SECONDS = 180 * 60
 
+# How long a round may run with no terminal lane status before the due pass
+# says, once, that it is still going. Not a bound like LANE_WAIT_SECONDS
+# above -- it escalates nothing, closes nothing, and changes no loop state --
+# it exists because the loop's own signals while a round runs (the ownership
+# label, the thinkies reaction) look identical whether that round is working
+# normally or wedged. The first live ISSUES_FOUND run sat silent behind
+# exactly those two signals for twenty minutes with nothing to tell them
+# apart. Thirty minutes, well under LANE_WAIT_SECONDS (three hours): a human
+# who has learned to expect this notice and then hears nothing further still
+# has more than two hours of genuine headroom before the loop gives up on its
+# own, so the silence past this notice stays informative rather than another
+# instance of the same ambiguity this notice exists to remove.
+STILL_RUNNING_THRESHOLD_SECONDS = 30 * 60
+
 # How many times a single escalation may be posted before the loop closes
 # unheard. Chosen high enough to ride out a Slack outage across several ticks,
 # low enough that a misconfigured channel cannot hold the PR's loop open (and
@@ -354,6 +368,11 @@ ROUTE_NOTIFY_READY = "notify_ready"
 ROUTE_REPOST_REREVIEW = "repost_rereview"
 ROUTE_LANE_PUSHED = "lane_pushed"
 ROUTE_AWAIT_HEAD_MOVE = "await_head_move"
+# A round still in flight, well past STILL_RUNNING_THRESHOLD_SECONDS. Not an
+# observation (_OBSERVATIONS below): unlike those, a live tick does something
+# with it beyond recording -- it posts once to the review thread -- so it
+# gets its own branch in `_perform` rather than folding into that tuple.
+ROUTE_STILL_RUNNING = "still_running"
 ROUTE_ADOPT_LANE = "adopt_lane"
 ROUTE_DROP_ORPHAN = "drop_orphan"
 ROUTE_OPEN_LANE = "open_lane"
@@ -929,6 +948,50 @@ def _await_head_move(deps: LoopDeps, loop: LoopRequest) -> bool:
                        next_attempt_at=deps.now() + HEAD_MOVE_GRACE_SECONDS)
 
 
+def _notify_still_running(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+                          detail: dict) -> bool:
+    """Say once, in the review thread, that this round is still in flight.
+
+    Fires from the due pass once a round has run past
+    STILL_RUNNING_THRESHOLD_SECONDS with no terminal lane status -- the gap
+    the module constant's comment describes, where the ownership label and
+    the thinkies reaction look the same whether the round is working normally
+    or wedged.
+
+    Once per round, not once a tick: `_route_due` recomputes this route on
+    every due-pass visit for as long as the round keeps running past the
+    threshold, and it is the standing-note dedup here (`_repeats_last_note`)
+    that stops the repeat -- the same mechanism that already keeps a hold
+    nobody has lifted, or a GitHub still unreadable, from growing the trail
+    without end. Checked before the post is attempted, and the note that
+    prevents the next repeat is written whether or not the post itself
+    landed: a Slack outage is not a reason to retry this every tick the way
+    `_lane_pushed`'s post is, because nothing downstream depends on this one
+    arriving -- the human still gets the escalation at LANE_WAIT_SECONDS if
+    the round is genuinely wedged, notice or no notice.
+
+    `elapsed_minutes` is measured from `loop.updated_at`, not from a value
+    that moves on every due-pass visit: `store.defer` (what reschedules a
+    loop the due pass has just looked at) deliberately leaves `updated_at`
+    alone, and only a real transition -- the lane's own dispatch into
+    REMEDIATING -- sets it while this round is in flight. That is the same
+    basis LANE_WAIT_SECONDS is measured from, so the "will escalate at
+    `timeout_minutes`" the notice states stays true against the bound that
+    actually fires it.
+
+    Always returns False: nothing here is a round, a state or a verdict --
+    only a best-effort post that changes no loop state and consumes nothing.
+    """
+    if _repeats_last_note(deps, loop, ROUTE_STILL_RUNNING, detail):
+        return False
+    elapsed_minutes = int((deps.now() - loop.updated_at) // 60)
+    timeout_minutes = int(LANE_WAIT_SECONDS // 60)
+    deps.slack.notify_still_running(verdict, elapsed_minutes, timeout_minutes,
+                                    loop.root_thread_ts)
+    deps.store.record_note(loop.loop_id, ROUTE_STILL_RUNNING, detail, deps.now())
+    return False
+
+
 def _lane_pending(loop: LoopRequest) -> bool:
     """Is this loop waiting on the outcome of a lane?
 
@@ -1302,6 +1365,14 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
                          {"reason": LANE_TIMEOUT, "lane_id": loop.lane_id,
                           "status": lane.status},
                          standing=True)
+        if deps.now() >= loop.updated_at + STILL_RUNNING_THRESHOLD_SECONDS:
+            # Ahead of LANE_WAIT_SECONDS only in the sense that this bound is
+            # smaller; the check above already returned for anything that has
+            # crossed the timeout, so a round is never told it is "still
+            # running" on the same tick it escalates.
+            return Route(ROUTE_STILL_RUNNING,
+                         {"lane_id": loop.lane_id, "round": loop.round_count},
+                         standing=True)
         return None
     if lane.held:
         # Everything below writes -- a reaction, a post, a label -- so Chad's
@@ -1389,6 +1460,8 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         return _lane_pushed(deps, loop, verdict, str(route.detail["head_sha"]))
     if route.action == ROUTE_AWAIT_HEAD_MOVE:
         return _await_head_move(deps, loop)
+    if route.action == ROUTE_STILL_RUNNING:
+        return _notify_still_running(deps, loop, verdict, route.detail)
     if route.action == ROUTE_ADOPT_LANE:
         return _adopt_lane(deps, loop, route.detail)
     if route.action == ROUTE_DROP_ORPHAN:

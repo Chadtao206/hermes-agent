@@ -103,9 +103,18 @@ class SlackFake:
         # already reads that as (slug, rounds) 2-tuples) so a test can pin
         # what the loop passed through without touching those.
         self.ready_threads = []
+        # Calls to notify_still_running, as (slug, elapsed_minutes,
+        # timeout_minutes, thread_ts) -- kept apart from the other lists for
+        # the same reason: a test should be able to pin what fired without
+        # parsing message text or touching unrelated assertions.
+        self.still_running = []
         self._repost_ts = repost_ts
         self._ready_ts = ready_ts
         self._escalation_ts = escalation_ts
+        # None (the default) means "post succeeds"; set to True to make
+        # notify_still_running behave like a failed Slack call, mirroring
+        # the real SlackIO's contract of returning None on failure.
+        self.still_running_fails = False
 
     def post_rereview(self, verdict, thread_ts, round_number):
         self.reposts.append((verdict.slug, round_number))
@@ -131,6 +140,12 @@ class SlackFake:
     def notify_escalation(self, verdict, rounds, reason):
         self.escalations.append((verdict.slug, rounds, reason))
         return self._escalation_ts
+
+    def notify_still_running(self, verdict, elapsed_minutes, timeout_minutes,
+                             thread_ts):
+        self.still_running.append(
+            (verdict.slug, elapsed_minutes, timeout_minutes, thread_ts))
+        return None if self.still_running_fails else "9.3"
 
 
 class LanesFake:
@@ -2755,3 +2770,139 @@ def test_a_paused_tick_records_the_lane_timeout_and_escalates_nothing(tmp_path):
                  if e["kind"] == "shadow_decision"]
     assert decisions[-1]["would"] == "escalate"
     assert decisions[-1]["reason"] == LANE_TIMEOUT
+
+
+# --- the still-running progress notice --------------------------------------
+#
+# The gap the first live ISSUES_FOUND run exposed: a round ran for twenty
+# minutes with only the ownership label and the thinkies reaction to show for
+# it, and those look identical whether the round is healthy or wedged. The due
+# pass now says, once, that a round is still going once it has run past
+# STILL_RUNNING_THRESHOLD_SECONDS -- well under LANE_WAIT_SECONDS, which stays
+# exactly as it was.
+
+def test_a_round_under_the_threshold_posts_nothing(tmp_path):
+    from pr_remediation.loop import STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path)  # LanesFake defaults to in_progress
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS - 60)
+    assert tick(deps) == 0
+    assert deps.slack.still_running == []
+
+
+def test_a_round_over_the_threshold_posts_the_notice_once(tmp_path):
+    from pr_remediation.loop import STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, thread="1.0")
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS)
+    assert tick(deps) == 0, "a progress notice advances nothing"
+    assert len(deps.slack.still_running) == 1
+    slug, elapsed_minutes, timeout_minutes, thread_ts = deps.slack.still_running[0]
+    assert slug == "Ylopo/example#42"
+    assert elapsed_minutes >= 30
+    assert timeout_minutes == 180
+    assert thread_ts == "1.0", "posted to the review thread, not the reaction anchor"
+    loop_id = only_loop(deps).loop_id
+    assert only_loop(deps).state is LoopState.REMEDIATING, \
+        "a progress notice changes no loop state"
+    assert kinds(deps, loop_id).count("still_running") == 1
+
+
+def test_a_further_tick_does_not_post_the_notice_again(tmp_path):
+    from pr_remediation.loop import STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path)
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS)
+    assert tick(deps) == 0
+    assert len(deps.slack.still_running) == 1
+
+    for _ in range(3):
+        deps.now.advance(30.0)
+        assert tick(deps) == 0
+    assert len(deps.slack.still_running) == 1, \
+        "a standing notice is posted once per round, not once a tick"
+    loop_id = only_loop(deps).loop_id
+    assert kinds(deps, loop_id).count("still_running") == 1
+
+
+def test_the_notice_carries_no_state_change_and_is_not_counted_as_progress(
+        tmp_path):
+    from pr_remediation.loop import STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    before = deps.store.get(loop_id)
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS)
+    assert tick(deps) == 0
+    after = deps.store.get(loop_id)
+    assert after.state == before.state
+    assert after.round_count == before.round_count
+    assert after.lane_id == before.lane_id
+    assert after.head_sha == before.head_sha
+
+
+def test_a_paused_tick_posts_no_still_running_notice(tmp_path):
+    """The kill switch, structurally: `_rehearse` never reaches
+    `_notify_still_running`, so a paused tick must post nothing at all --
+    only the shadow decision is recorded."""
+    from pr_remediation.loop import STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS)
+
+    shadow = in_mode(deps, "shadow")
+    assert tick(shadow) == 0
+    assert shadow.slack.still_running == []
+    assert shadow.store.get(loop_id).state is LoopState.REMEDIATING
+    decisions = [e["detail"] for e in shadow.store.events(loop_id)
+                 if e["kind"] == "shadow_decision"]
+    assert decisions[-1]["would"] == "still_running"
+
+
+def test_a_failed_notice_post_does_not_disturb_the_loop(tmp_path):
+    """Handled the way every other Slack call here is: no raise, no block,
+    nothing consumed. The notice is best-effort and is not retried forever --
+    it is marked said for this round whether or not it actually landed."""
+    from pr_remediation.loop import STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path)
+    deps.slack.still_running_fails = True
+    loop_id = only_loop(deps).loop_id
+    before = deps.store.get(loop_id)
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS)
+
+    assert tick(deps) == 0  # must not raise
+    after = deps.store.get(loop_id)
+    assert after.state == before.state
+    assert after.round_count == before.round_count
+    assert after.lane_id == before.lane_id
+    assert len(deps.slack.still_running) == 1, "the attempt still happened"
+
+    # And it does not retry forever: a further tick posts nothing more.
+    deps.now.advance(30.0)
+    assert tick(deps) == 0
+    assert len(deps.slack.still_running) == 1
+
+
+def test_the_escalation_timeout_still_fires_at_its_own_bound_regardless(
+        tmp_path):
+    """The still-running notice must not delay, replace, or otherwise touch
+    LANE_WAIT_SECONDS: a round that keeps not finishing still escalates at
+    exactly the same bound as before this notice existed."""
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, \
+        STILL_RUNNING_THRESHOLD_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="running"))
+    loop_id = only_loop(deps).loop_id
+
+    deps.now.advance(STILL_RUNNING_THRESHOLD_SECONDS)
+    assert tick(deps) == 0
+    assert len(deps.slack.still_running) == 1
+    assert deps.slack.escalations == []
+
+    deps.now.advance(LANE_WAIT_SECONDS - STILL_RUNNING_THRESHOLD_SECONDS)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)]
