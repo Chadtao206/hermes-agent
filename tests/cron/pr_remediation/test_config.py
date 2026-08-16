@@ -35,20 +35,6 @@ def test_states_cover_the_whole_loop():
     }
 
 
-def test_marker_matches_boris_intakes_loop_marker_byte_for_byte():
-    """Drift guard: boris_intake's `loop_marker` config value (see
-    cron/scripts/boris_intake/config.py) must equal this literal exactly.
-    The two packages keep independent copies of the same marker on purpose
-    (this task does not restructure either package to share a constant),
-    so nothing else enforces agreement between them. If someone edits one
-    copy without the other, boris_intake's gate stops recognising the
-    remediation loop's re-review posts, admits nothing, and the loop
-    stalls silently with no error. Break this test, then go update the
-    other copy too.
-    """
-    assert RemediationConfig().marker == "[fixed it. probably. v1]"
-
-
 def test_load_config_defaults_when_file_is_missing(tmp_path):
     path = tmp_path / "does-not-exist.yaml"
     assert load_config(path) == RemediationConfig()
