@@ -74,8 +74,29 @@ class GitHubIO:
         return (data or {}).get("headRefOid") or None
 
     def author(self, owner: str, repo: str, pr: int) -> str | None:
+        """The PR's author login, or None when GitHub's answer cannot be
+        trusted to name one.
+
+        Shape-checked exactly like `has_hold` below, and for the same reason.
+        The chained-`.get` form this replaced -- `(data.get("author") or {})
+        .get("login")` -- raises AttributeError the moment `author` is a scalar
+        rather than a dict (a `"author": "Chadtao206"` payload, a truncated
+        response, a schema change). That raise lands inside `tick`'s per-verdict
+        handler *after* the verdict has already been marked seen, so the verdict
+        is spent, the loop is left in `observed`, and nothing routes it.
+
+        None is a safe answer here where an exception is not: the driver reads
+        it as "unknown author" and records a `author_unreadable` observation,
+        which is exactly what a transient GitHub is meant to produce.
+        """
         data = self._view(owner, repo, pr)
-        return ((data or {}).get("author") or {}).get("login") or None
+        if not isinstance(data, dict):
+            return None
+        author = data.get("author")
+        if not isinstance(author, dict):
+            return None
+        login = author.get("login")
+        return login if isinstance(login, str) and login else None
 
     def has_hold(self, owner: str, repo: str, pr: int) -> bool:
         """True also when GitHub could not be read, or the response's shape

@@ -192,3 +192,49 @@ def test_empty_token_file_fails_closed_without_calling_gh(tmp_path):
         io = GitHubIO(RemediationConfig(), token, runner=run)
         assert io.has_hold("Ylopo", "example", 42) is True, "fail closed: assume hold"
         assert calls == [], "runner must not be invoked for an unusable token"
+
+
+# --- I6: author() is shape-checked, exactly as has_hold is ------------------
+#
+# Task 5 declared this class of defect Critical for has_hold and hardened only
+# that method, leaving author() on the chained-.get form. The consequence is
+# worse here than a wrong answer: the raise lands in tick()'s per-verdict
+# handler AFTER the verdict is marked seen, so the verdict is spent and the
+# loop is stranded in `observed`, where the due pass has nothing to do for it.
+
+
+def test_author_as_a_bare_string_reads_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "headRefOid": "b" * 40, "author": "Chadtao206"})})
+    assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
+
+
+def test_author_as_a_list_reads_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "headRefOid": "b" * 40, "author": [{"login": "x"}]})})
+    assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
+
+
+def test_author_as_an_int_reads_as_unknown_not_as_raise(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "headRefOid": "b" * 40, "author": 7})})
+    assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
+
+
+def test_a_non_string_login_reads_as_unknown_not_as_a_login(tmp_path):
+    """A login that is not a string can never equal cfg.chad_github_login, but
+    returning it would hand the driver a value it compares and logs as one."""
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "headRefOid": "b" * 40, "author": {"login": 42}})})
+    assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
+
+
+def test_missing_author_key_reads_as_unknown(tmp_path):
+    runner, _ = runner_for({"view": json.dumps(
+        {"labels": [], "headRefOid": "b" * 40})})
+    assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
+
+
+def test_an_unreadable_pr_reads_as_an_unknown_author(tmp_path):
+    runner, _ = runner_for({})  # empty stdout: nothing to parse
+    assert io_with(runner, tmp_path).author("Ylopo", "example", 42) is None
