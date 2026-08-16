@@ -844,8 +844,13 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     # (status_message_ts). SlackIO's gate admits a re-review only as a reply
     # in an existing thread; the thinkies reaction anchor is a different
     # concern (see _clear_running_signal) and must stay separate from this.
-    if deps.slack.post_rereview(verdict, loop.root_thread_ts,
-                                loop.round_count + 1) is None:
+    #
+    # repost_rereview, deliberately -- NOT post_rereview. This path spends no
+    # round and pushed nothing, so it must not carry post_rereview's "Round N
+    # of M -- remediation pushed" claim; that mismatch (a round number and a
+    # push that never happened) is the bug this split exists to prevent. See
+    # slack_io.py's docstrings on both methods.
+    if deps.slack.repost_rereview(verdict, loop.root_thread_ts) is None:
         # A post that failed with a thread present is a Slack blip. Leave the
         # loop in its current state, unspent and immediately due, so the
         # daemon's sweep retries it instead of burning it.

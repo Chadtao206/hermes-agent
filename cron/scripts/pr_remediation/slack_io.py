@@ -25,10 +25,11 @@ scope or invite changes that.
   catches it and returns `None`, so nothing anywhere records that the
   notice never went out. That is the outcome this split exists to prevent.
 
-The re-review post must carry cfg.marker verbatim: boris_intake's gate
-admits this bot's messages only when that literal string is present (see
-boris_intake/gate.py::_is_loop_repost). Change it here and re-reviews stop
-being admitted.
+Both re-review posts (`post_rereview` and `repost_rereview`) must carry
+cfg.marker verbatim: boris_intake's gate admits this bot's messages only
+when that literal string is present (see
+boris_intake/gate.py::_is_loop_repost). Change it in either one and that
+path's re-reviews stop being admitted.
 """
 from __future__ import annotations
 
@@ -63,8 +64,13 @@ class SlackIO:
             return None
         return response.get("ts") if response.get("ok") else None
 
-    def post_rereview(self, verdict: Verdict, thread_ts: str | None,
-                      round_number: int) -> str | None:
+    def _post_thread_reply(self, text: str, thread_ts: str | None) -> str | None:
+        """Post `text` as a reply in the review thread, under Son of Chad's identity.
+
+        Shared by post_rereview and repost_rereview: both are re-review posts
+        and both must satisfy the same gate, so the guard and the identity
+        live here once rather than being kept in sync by hand in two places.
+        """
         # The gate (boris_intake/gate.py::_is_loop_repost) admits this bot's
         # message ONLY as a reply in an existing thread. Posting at top level
         # when thread_ts is falsy would land a message the gate silently
@@ -73,17 +79,47 @@ class SlackIO:
         # caller can see None and escalate.
         if not thread_ts:
             return None
+        # Son of Chad's token: this post's authorization gate keys on that
+        # identity's user id, not on which token happens to be able to reach
+        # the channel. See the module docstring.
+        return self._post(self._review_token, self._cfg.boris_channel, text,
+                          thread_ts)
+
+    def post_rereview(self, verdict: Verdict, thread_ts: str | None,
+                      round_number: int) -> str | None:
+        """Ask Boris to look again after a remediation lane pushed a fix.
+
+        `round_number` is the round that just finished: a lane genuinely ran
+        and moved the head, so "remediation pushed" is a true claim here.
+        Contrast `repost_rereview`, which posts for a path where neither is
+        true -- the two messages must stay distinct, or a human scanning the
+        thread cannot tell which of the two actually happened.
+        """
         text = (
             f"{self._cfg.marker}\n"
             f"{pr_url(verdict)}\n"
             f"Round {round_number} of {self._cfg.round_cap} — remediation pushed, "
             f"requesting re-review."
         )
-        # Son of Chad's token: this post's authorization gate keys on that
-        # identity's user id, not on which token happens to be able to reach
-        # the channel. See the module docstring.
-        return self._post(self._review_token, self._cfg.boris_channel, text,
-                          thread_ts)
+        return self._post_thread_reply(text, thread_ts)
+
+    def repost_rereview(self, verdict: Verdict, thread_ts: str | None) -> str | None:
+        """Ask Boris to look again after a system-origin incomplete verdict.
+
+        Nothing was remediated and no round was spent here -- the previous
+        review simply never reached a verdict on this head (it was
+        superseded, or the head could not be read). The text says exactly
+        that: no round number (there is none to truthfully report) and no
+        claim that anything was pushed. See `post_rereview` for the sibling
+        that reports a genuine push.
+        """
+        text = (
+            f"{self._cfg.marker}\n"
+            f"{pr_url(verdict)}\n"
+            f"Previous review didn't reach a verdict on this head — "
+            f"re-requesting review. No remediation round was spent."
+        )
+        return self._post_thread_reply(text, thread_ts)
 
     def add_thinkies(self, channel: str, ts: str) -> None:
         try:

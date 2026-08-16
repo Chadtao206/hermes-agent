@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from pr_remediation.boris_source import Verdict
@@ -91,6 +93,74 @@ def test_caller_is_invoked_with_token_first_and_never_inside_params():
     assert token == "super-secret-tok"
     assert method == "chat.postMessage"
     assert "token" not in params
+
+
+def test_repost_rereview_carries_the_marker_and_the_pr_url():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).repost_rereview(VERDICT, "1.0")
+    token, method, params = calls[0]
+    assert token == TOK
+    assert method == "chat.postMessage"
+    assert params["thread_ts"] == "1.0"
+    assert params["channel"] == "C0BPCKPEFCG"
+    assert "[fixed it. probably. v1]" in params["text"]
+    assert "https://github.com/Ylopo/example/pull/42" in params["text"]
+
+
+def test_repost_rereview_does_not_claim_remediation_was_pushed():
+    """The bug this fix closes: a system-origin repost (nothing remediated,
+    no lane ran) must never say "remediation pushed"."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).repost_rereview(VERDICT, "1.0")
+    text = calls[0][2]["text"].lower()
+    assert "pushed" not in text
+    assert "no remediation round was spent" in text
+
+
+def test_repost_rereview_prints_no_misleading_round_number():
+    """No "Round N of M" -- that phrasing claims a round was spent, and here
+    none was."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).repost_rereview(VERDICT, "1.0")
+    text = calls[0][2]["text"]
+    assert not re.search(r"[Rr]ound\s+\d+\s+of\s+\d+", text)
+
+
+def test_repost_rereview_refuses_to_post_without_a_thread_and_returns_none():
+    """Same gate, same guard as post_rereview -- see the Defect 2 test below."""
+    call, calls = caller_for()
+    io = SlackIO(RemediationConfig(), TOK, TOK, call)
+    assert io.repost_rereview(VERDICT, "") is None
+    assert io.repost_rereview(VERDICT, None) is None
+    assert calls == []
+
+
+def test_repost_rereview_uses_the_review_token():
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), "review-tok", "notify-tok",
+           call).repost_rereview(VERDICT, "1.0")
+    assert calls[0][0] == "review-tok"
+
+
+def test_the_two_rereview_messages_stay_distinct():
+    """Regression coverage for the bug this fix closes: `_repost` in loop.py
+    used to call `post_rereview` with `round_count + 1`, claiming a round was
+    spent and a fix was pushed when neither had happened. If the two paths
+    were ever collapsed back into sharing one message -- whether by making
+    repost_rereview call post_rereview, or by making the two produce
+    identical text -- this must fail."""
+    call, calls = caller_for()
+    io = SlackIO(RemediationConfig(), TOK, TOK, call)
+    io.post_rereview(VERDICT, "1.0", 1)
+    io.repost_rereview(VERDICT, "1.0")
+    lane_pushed_text = calls[0][2]["text"]
+    repost_text = calls[1][2]["text"]
+
+    assert lane_pushed_text != repost_text
+    assert "remediation pushed" in lane_pushed_text
+    assert "remediation pushed" not in repost_text
+    assert re.search(r"Round\s+1\s+of\s+3", lane_pushed_text)
+    assert not re.search(r"[Rr]ound\s+\d+\s+of\s+\d+", repost_text)
 
 
 def test_post_rereview_refuses_to_post_without_a_thread_and_returns_none():
@@ -200,6 +270,7 @@ NON_SUCCESS_RESPONSES = [
 
 POSTING_METHODS = {
     "post_rereview": lambda io: io.post_rereview(VERDICT, "1.0", 1),
+    "repost_rereview": lambda io: io.repost_rereview(VERDICT, "1.0"),
     "notify_ready": lambda io: io.notify_ready(VERDICT, rounds=2),
     "notify_escalation": lambda io: io.notify_escalation(
         VERDICT, rounds=3, reason="round_cap"),

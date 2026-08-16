@@ -78,6 +78,15 @@ class SlackFake:
         # as (slug, round) tuples) so a test can pin the target without
         # touching every one of those.
         self.repost_targets = []
+        # `_lane_pushed` calls post_rereview; `_repost` (the system-origin
+        # incomplete path) calls repost_rereview. Tracked in separate lists,
+        # deliberately, so a test can tell which of loop.py's two call sites
+        # actually fired without parsing message text -- and so that if
+        # `_repost` ever regresses back to calling post_rereview (the bug
+        # this fix closes), the call lands in the wrong list and the test
+        # reading repost_retries sees nothing.
+        self.repost_retries = []
+        self.repost_retry_targets = []
         self._repost_ts = repost_ts
         self._ready_ts = ready_ts
         self._escalation_ts = escalation_ts
@@ -85,6 +94,11 @@ class SlackFake:
     def post_rereview(self, verdict, thread_ts, round_number):
         self.reposts.append((verdict.slug, round_number))
         self.repost_targets.append(thread_ts)
+        return self._repost_ts
+
+    def repost_rereview(self, verdict, thread_ts):
+        self.repost_retries.append(verdict.slug)
+        self.repost_retry_targets.append(thread_ts)
         return self._repost_ts
 
     def add_thinkies(self, channel, ts):
@@ -303,7 +317,7 @@ def test_rereview_still_posts_to_the_thread_not_the_status_message(tmp_path):
         [verdict(outcome="REVIEW_INCOMPLETE", origin="system",
                  thread="1.0", status="2.0")]))
     tick(deps)
-    assert deps.slack.repost_targets == ["1.0"], \
+    assert deps.slack.repost_retry_targets == ["1.0"], \
         "the system-incomplete repost must target root_thread_ts, not the anchor"
 
 
@@ -391,7 +405,9 @@ def test_system_incomplete_reposts_without_burning_a_round(tmp_path):
     deps = build(tmp_path, SourceFake(
         [verdict(outcome="REVIEW_INCOMPLETE", origin="system")]))
     tick(deps)
-    assert deps.slack.reposts, "a transient incomplete should be retried"
+    assert deps.slack.repost_retries, "a transient incomplete should be retried"
+    assert deps.slack.reposts == [], \
+        "must call repost_rereview, not post_rereview -- see slack_io.py"
     assert deps.lanes.created == []
     loop = only_loop(deps)
     assert loop.round_count == 0
@@ -1444,7 +1460,7 @@ def test_a_rereview_with_no_thread_escalates(tmp_path):
     deps = build(tmp_path, SourceFake(
         [verdict(outcome="REVIEW_INCOMPLETE", origin="system", thread="")]))
     tick(deps)
-    assert deps.slack.reposts == []
+    assert deps.slack.repost_retries == []
     assert deps.slack.escalations[0][2] == "rereview_unpostable"
 
 
