@@ -31,11 +31,27 @@ REVIEW_BOT_LOGINS = frozenset({"chatgpt-codex-connector", "github-advanced-secur
 # "authored by a review bot" means below -- a human reply further down the
 # same thread must not launder a bot-opened thread out of this check, nor
 # manufacture one a bot never opened.
+#
+# `reviewThreads(first: 100)` alone -- no `pageInfo`, no `$after` -- was the
+# bug: GitHub answers a request for the first hundred threads with a clean
+# HTTP 200 and a `nodes` array that looks exactly like a complete one, so a
+# PR with a 101st unresolved thread reads as fully checked when it was not.
+# The PR this feature was built for reached 97 threads after its first live
+# run -- comfortably inside one page today, but "comfortably inside one page
+# today" is exactly the condition that made the shortcut invisible until it
+# wasn't. `pageInfo { hasNextPage endCursor }` and the `$after` variable let
+# `unresolved_bot_threads` walk every page instead of trusting the first one;
+# see that method for what happens when GitHub says more remain than this
+# adapter is willing to keep asking for.
 _REVIEW_THREADS_QUERY = """
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           isResolved
           isOutdated
@@ -51,6 +67,14 @@ query($owner: String!, $repo: String!, $number: Int!) {
   }
 }
 """
+
+# A sane upper bound on pages walked per call, so a pathological PR (or a
+# `hasNextPage` that never goes false, whatever the cause) cannot spin this
+# adapter forever. 20 pages at 100 threads each is 2000 threads -- about 20x
+# the 97 this method's originating PR carried on its first live run. Hitting
+# this bound is treated as truncation, not completeness: see
+# `unresolved_bot_threads`.
+_MAX_THREAD_PAGES = 20
 
 
 class GitHubIO:
@@ -209,64 +233,116 @@ class GitHubIO:
         method returns None), rather than silently dropping the one
         unresolved thread that happened to be malformed while reporting the
         rest as if the picture were complete.
-        """
-        out = self._run([
-            "api", "graphql",
-            "-f", f"query={_REVIEW_THREADS_QUERY}",
-            "-f", f"owner={owner}",
-            "-f", f"repo={repo}",
-            "-F", f"number={pr}",
-        ])
-        if out is None or not out.strip():
-            return None
-        try:
-            payload = json.loads(out)
-        except ValueError:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        try:
-            pull_request = payload["data"]["repository"]["pullRequest"]
-            nodes = pull_request["reviewThreads"]["nodes"]
-        except (KeyError, TypeError):
-            return None
-        if not isinstance(nodes, list):
-            return None
 
+        This walks every page `reviewThreads` reports (see
+        `_REVIEW_THREADS_QUERY`'s comment for why a single `first: 100` was
+        the bug), up to `_MAX_THREAD_PAGES`. A malformed or unreadable
+        response on *any* page -- not only the first -- fails the whole read
+        to None, exactly like a single-page failure always has: a thread
+        gathered from page one is no more trustworthy standing alone than
+        one gathered from a request that failed outright, so a break on page
+        two must never hand back page one's partial haul dressed up as the
+        answer. And if GitHub still reports more pages remain after
+        `_MAX_THREAD_PAGES` reads, that is truncation, not completeness --
+        this method returns None there too, deliberately the same value a
+        failed query returns, rather than inventing a fourth state. Nothing
+        this method's three-way contract (None / [] / a list) promises
+        changes: None still means "could not be determined", and reusing it
+        for "determined, but not completely enough to trust" keeps that
+        promise rather than adding a signal callers would have to learn to
+        handle on top of it. `SlackIO.notify_ready` already gives None its
+        own sentence in the ready notice distinct from a clean or a found
+        answer; that sentence covers both an outright failure and a
+        truncated read without misrepresenting either as the other.
+        """
         threads: list[dict] = []
-        for node in nodes:
-            if not isinstance(node, dict):
+        cursor: str | None = None
+        for _page in range(_MAX_THREAD_PAGES):
+            args = [
+                "api", "graphql",
+                "-f", f"query={_REVIEW_THREADS_QUERY}",
+                "-f", f"owner={owner}",
+                "-f", f"repo={repo}",
+                "-F", f"number={pr}",
+            ]
+            if cursor is not None:
+                args += ["-f", f"after={cursor}"]
+            out = self._run(args)
+            if out is None or not out.strip():
                 return None
-            resolved = node.get("isResolved")
-            if not isinstance(resolved, bool):
+            try:
+                payload = json.loads(out)
+            except ValueError:
                 return None
-            if resolved:
-                continue
-            outdated = node.get("isOutdated")
-            if not isinstance(outdated, bool):
+            if not isinstance(payload, dict):
                 return None
-            comments = node.get("comments")
-            if not isinstance(comments, dict):
+            try:
+                pull_request = payload["data"]["repository"]["pullRequest"]
+                review_threads = pull_request["reviewThreads"]
+                nodes = review_threads["nodes"]
+            except (KeyError, TypeError):
                 return None
-            comment_nodes = comments.get("nodes")
-            if not isinstance(comment_nodes, list) or not comment_nodes:
+            if not isinstance(nodes, list):
                 return None
-            opener = comment_nodes[0]
-            if not isinstance(opener, dict):
+
+            for node in nodes:
+                if not isinstance(node, dict):
+                    return None
+                resolved = node.get("isResolved")
+                if not isinstance(resolved, bool):
+                    return None
+                if resolved:
+                    continue
+                outdated = node.get("isOutdated")
+                if not isinstance(outdated, bool):
+                    return None
+                comments = node.get("comments")
+                if not isinstance(comments, dict):
+                    return None
+                comment_nodes = comments.get("nodes")
+                if not isinstance(comment_nodes, list) or not comment_nodes:
+                    return None
+                opener = comment_nodes[0]
+                if not isinstance(opener, dict):
+                    return None
+                author = opener.get("author")
+                if not isinstance(author, dict):
+                    return None
+                login = author.get("login")
+                if not isinstance(login, str) or not login:
+                    return None
+                path = opener.get("path")
+                if not isinstance(path, str) or not path:
+                    return None
+                if login not in REVIEW_BOT_LOGINS:
+                    continue
+                threads.append({"path": path, "outdated": outdated})
+
+            # `review_threads` is known dict-shaped here: the try block above
+            # only reaches this line by successfully subscripting it with
+            # `["nodes"]`, which a non-dict JSON value cannot do without
+            # raising (already caught).
+            page_info = review_threads.get("pageInfo")
+            if not isinstance(page_info, dict):
                 return None
-            author = opener.get("author")
-            if not isinstance(author, dict):
+            has_next = page_info.get("hasNextPage")
+            if not isinstance(has_next, bool):
                 return None
-            login = author.get("login")
-            if not isinstance(login, str) or not login:
+            if not has_next:
+                return threads
+            end_cursor = page_info.get("endCursor")
+            if not isinstance(end_cursor, str) or not end_cursor:
+                # GitHub says more pages exist but did not hand back a
+                # cursor to fetch them with -- an unreadable answer, same as
+                # any other malformed shape here.
                 return None
-            path = opener.get("path")
-            if not isinstance(path, str) or not path:
-                return None
-            if login not in REVIEW_BOT_LOGINS:
-                continue
-            threads.append({"path": path, "outdated": outdated})
-        return threads
+            cursor = end_cursor
+
+        # _MAX_THREAD_PAGES pages read and GitHub still reports more: a
+        # pathological PR, not a bug to spin forever chasing. Truncation,
+        # reported the same way an unreadable response is -- see the
+        # docstring above.
+        return None
 
     def claim(self, owner: str, repo: str, pr: int) -> bool:
         """Add the ownership label. Returns True only if the write

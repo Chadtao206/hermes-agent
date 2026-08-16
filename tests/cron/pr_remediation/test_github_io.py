@@ -292,10 +292,38 @@ def _thread(resolved, outdated, login, path):
     }
 
 
-def _gql(nodes):
+def _gql(nodes, has_next=False, end_cursor=None):
+    """A single page's GraphQL response. Defaults to `hasNextPage: False`
+    (a complete, one-page read) so every pre-pagination test that calls this
+    with just a node list keeps meaning exactly what it always meant."""
     return json.dumps({
         "data": {"repository": {"pullRequest": {
-            "reviewThreads": {"nodes": nodes}}}}})
+            "reviewThreads": {
+                "nodes": nodes,
+                "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+            }}}}})
+
+
+def paged_runner_for(pages):
+    """Fake runner that hands back `pages` in order, one response per call
+    to `gh api graphql`. Deliberately NOT `runner_for`'s single-fixed-answer
+    shape: a fake that always returns the same page regardless of the
+    cursor passed in cannot catch a pagination bug -- a method that never
+    advances the cursor, or that drops a later page's threads, would sail
+    through a fake like that. Non-graphql calls (there aren't any exercised
+    here) get an empty success response, matching `runner_for`.
+    """
+    calls = []
+    remaining = list(pages)
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if "graphql" in command:
+            payload = remaining.pop(0) if remaining else pages[-1]
+            return SimpleNamespace(returncode=0, stdout=payload, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return run, calls
 
 
 def test_the_call_goes_through_gh_api_graphql(tmp_path):
@@ -379,6 +407,94 @@ def test_an_outdated_unresolved_thread_is_still_returned_with_the_flag_set(tmp_p
     ])})
     threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42)
     assert threads == [{"path": "a.ts", "outdated": True}]
+
+
+# --- unresolved_bot_threads(): pagination --------------------------------
+#
+# The gap this closes: `reviewThreads(first: 100)` alone silently drops
+# everything past the hundredth thread. The PR this feature was built for
+# reached 97 threads after its first live run -- one thread away from that
+# cliff. These tests use `paged_runner_for`, not `runner_for`: a fake that
+# always answers the same page cannot tell a real pagination bug (cursor
+# never advances, later pages dropped) from correct behaviour.
+
+
+def test_threads_spanning_multiple_pages_are_all_returned(tmp_path):
+    page_one = _gql([
+        _thread(False, False, "chatgpt-codex-connector", "a.ts"),
+        _thread(False, False, "chatgpt-codex-connector", "b.ts"),
+    ], has_next=True, end_cursor="CURSOR_1")
+    page_two = _gql([
+        _thread(False, False, "chatgpt-codex-connector", "c.ts"),
+    ], has_next=False)
+    runner, calls = paged_runner_for([page_one, page_two])
+
+    threads = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 103)
+
+    assert threads == [
+        {"path": "a.ts", "outdated": False},
+        {"path": "b.ts", "outdated": False},
+        {"path": "c.ts", "outdated": False},
+    ]
+    graphql_calls = [c for c in calls if "graphql" in c]
+    assert len(graphql_calls) == 2, "the second page must actually be fetched"
+    second_call_args = " ".join(graphql_calls[1])
+    assert "after=CURSOR_1" in second_call_args, \
+        "the cursor from page one's pageInfo must be threaded into page two's request"
+
+
+def test_the_page_bound_being_hit_returns_none_not_a_clean_or_partial_answer(
+        tmp_path, monkeypatch):
+    """Hitting `_MAX_THREAD_PAGES` while GitHub still reports more pages is
+    truncation, not completeness, and must not be reported as either a clean
+    read ([]) or a partial-but-trustworthy one (a non-empty list): both of
+    those would repeat the exact false all-clear this whole change exists to
+    remove. A low bound is monkeypatched in so this test doesn't need
+    dozens of fake pages to prove the point."""
+    import pr_remediation.github_io as github_io
+    monkeypatch.setattr(github_io, "_MAX_THREAD_PAGES", 3)
+
+    pages = [
+        _gql([_thread(False, False, "chatgpt-codex-connector", f"{n}.ts")],
+             has_next=True, end_cursor=f"CURSOR_{n}")
+        for n in range(1, 4)
+    ]
+    runner, calls = paged_runner_for(pages)
+
+    result = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 103)
+
+    assert result is None
+    graphql_calls = [c for c in calls if "graphql" in c]
+    assert len(graphql_calls) == 3, \
+        "must stop at the page bound rather than spinning forever"
+
+
+def test_a_failure_mid_pagination_returns_none_not_the_threads_gathered_so_far(
+        tmp_path):
+    """Page one succeeds and finds a real unresolved bot thread; page two's
+    response is garbage. The whole read must fail to None -- handing back
+    page one's thread would be exactly the partial-list-dressed-as-whole
+    this method exists to prevent."""
+    page_one = _gql([
+        _thread(False, False, "chatgpt-codex-connector", "a.ts"),
+    ], has_next=True, end_cursor="CURSOR_1")
+    runner, calls = paged_runner_for([page_one, "{not valid json"])
+
+    result = io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 103)
+
+    assert result is None
+    graphql_calls = [c for c in calls if "graphql" in c]
+    assert len(graphql_calls) == 2, "page two must actually have been attempted"
+
+
+def test_a_page_reporting_more_without_a_cursor_returns_none(tmp_path):
+    """`hasNextPage: true` with no `endCursor` to fetch the next page with
+    cannot be paginated through -- an unreadable answer, not a complete
+    one-page read."""
+    runner, _ = runner_for({"graphql": _gql(
+        [_thread(False, False, "chatgpt-codex-connector", "a.ts")],
+        has_next=True, end_cursor=None)})
+    assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
 
 
 # --- unresolved_bot_threads(): fails closed to None, never to [] -----------

@@ -49,8 +49,14 @@ def _thread_notice(unresolved_threads: list[dict] | None) -> str | None:
 
     Three cases, and they must stay visibly distinct in the notice itself
     (not just in this function's return type), because a human reading Slack
-    sees only the text: `None` in means the GraphQL read failed or came back
-    in a shape this build does not trust, and that is reported as its own
+    sees only the text: `None` in means GitHub's answer cannot be trusted to
+    be both correct and complete -- the GraphQL read failed outright, came
+    back in a shape this build does not trust, or `GitHubIO.unresolved_bot_threads`
+    paginated as far as it is willing to and GitHub still reported more
+    pages remaining. All three collapse to the same `None` and the same
+    sentence here deliberately: a human deciding whether to go check GitHub
+    by hand needs to know the list in front of them is not the whole truth,
+    not which of those reasons produced that. That is reported as its own
     sentence -- never silence, which would be indistinguishable from a
     verified-clean PR and would recreate the false all-clear this whole
     change exists to remove. `[]` in means the read succeeded and nothing is
@@ -75,7 +81,7 @@ def _thread_notice(unresolved_threads: list[dict] | None) -> str | None:
     applies verbatim).
     """
     if unresolved_threads is None:
-        return "⚠️ Could not check for unresolved bot review threads — verify manually."
+        return "⚠️ Could not verify all unresolved bot review threads — verify manually."
     if not unresolved_threads:
         return None
     outdated = sum(1 for t in unresolved_threads if t.get("outdated"))
@@ -185,9 +191,10 @@ class SlackIO:
 
         `unresolved_threads` carries GitHubIO.unresolved_bot_threads()'s own
         contract verbatim, unmodified by anything in between: None means the
-        GraphQL read could not be trusted (a query failure, or a shape this
-        build does not recognise), and an empty list means the read
-        succeeded and found nothing outstanding. The two must never be
+        GraphQL read could not be trusted to be complete (a query failure, a
+        shape this build does not recognise, or pagination hitting its page
+        bound while GitHub still reported more threads to read), and an
+        empty list means the read succeeded and found nothing outstanding. The two must never be
         conflated -- folding None into "nothing to report" is exactly the
         false all-clear this parameter exists to prevent, indistinguishable
         from a genuinely clean PR to anyone reading the notice. So None gets
