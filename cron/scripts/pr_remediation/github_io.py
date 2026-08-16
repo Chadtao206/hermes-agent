@@ -103,7 +103,7 @@ class GitHubIO:
         try:
             proc = self._runner(
                 ["gh", *args], capture_output=True, text=True, timeout=TIMEOUT,
-                env={"PATH": _PATH, "GH_TOKEN": token},
+                env={"PATH": _PATH, "GH_TOKEN": token, "HOME": "/Users/ctao"},
             )
         except Exception:
             return None

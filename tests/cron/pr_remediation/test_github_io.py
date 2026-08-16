@@ -619,3 +619,44 @@ def test_a_missing_or_unreadable_state_reads_as_unknown_not_as_closed(tmp_path):
 
     scalar, _ = runner_for({"view": json.dumps({"labels": [], "state": 7})})
     assert io_with(scalar, tmp_path).state("Ylopo", "example", 42) is None
+
+
+# --- HOME in subprocess environment so gh writes its state correctly ----------
+
+
+def test_subprocess_environment_contains_home(tmp_path):
+    """The gh binary resolves its state directory relative to HOME, so it must
+    be present in the subprocess environment. Without it, gh writes state into
+    the process's working directory, creating .local/state/gh/device-id wherever
+    the subprocess happens to be running."""
+    env_captured = []
+
+    def capturing_runner(command, **kwargs):
+        env_captured.append(kwargs.get("env", {}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    io = io_with(capturing_runner, tmp_path)
+    io.has_hold("Ylopo", "example", 42)
+
+    assert env_captured, "runner must have been called"
+    env = env_captured[0]
+    assert "HOME" in env, "HOME must be in the subprocess environment"
+    assert env["HOME"] == "/Users/ctao", "HOME must be set to the user home directory"
+
+
+def test_token_is_passed_via_environment_not_argv(tmp_path):
+    """The token must never appear in argv, where it could be logged or exposed.
+    It must be passed only through the GH_TOKEN environment variable."""
+    commands_captured = []
+
+    def capturing_runner(command, **kwargs):
+        commands_captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    io = io_with(capturing_runner, tmp_path)
+    io.has_hold("Ylopo", "example", 42)
+
+    assert commands_captured, "runner must have been called"
+    argv = " ".join(commands_captured[0])
+    assert "secret" not in argv, "the token must not appear in argv"
+    assert "GH_TOKEN" not in argv, "GH_TOKEN variable name must not appear in argv"
