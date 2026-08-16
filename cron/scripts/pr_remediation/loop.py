@@ -531,10 +531,11 @@ def _adoptable_orphan(deps: LoopDeps, loop: LoopRequest) -> dict | None:
     transition that would have superseded it. Adopting it there would point the
     loop at a dead lane and rewind its head to that lane's.
 
-    The due pass deletes such a claim; here it is simply not one, and the
-    verdict routes on as though the note were already gone. That division is
-    deliberate: a verdict is consumed whatever this tick does with it, so
-    spending one on bookkeeping stalls a loop that could have been driven.
+    The due pass deletes such a claim, whether or not a lane is in flight;
+    here it is simply not one, and the verdict routes on as though the note
+    were already gone. That division is deliberate: a verdict is consumed
+    whatever this tick does with it, so spending one on bookkeeping stalls a
+    loop that could have been driven.
     """
     if loop.lane_id is not None:
         return None
@@ -738,12 +739,6 @@ def _route_due(deps: LoopDeps, loop: LoopRequest) -> Route | None:
         return Route(ROUTE_SETTLE_ESCALATION,
                      {"reason": debt.reason, "notified": debt.notified},
                      debt=debt, standing=True)
-    if _lane_in_flight(loop):
-        # The same guard the verdict path applies, and for the same reason: an
-        # orphan note that trails a rival's transition is never superseded, so
-        # without this the pass would rewrite a live lane (and its round) with
-        # a stale one.
-        return None
     orphan = _orphaned_lane(deps, loop)
     if orphan is None:
         return None

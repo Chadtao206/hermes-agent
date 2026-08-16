@@ -913,6 +913,64 @@ def test_the_due_pass_never_adopts_an_orphan_over_a_live_lane(tmp_path):
     assert loop.round_count == 3, "a capped loop had two rounds handed back"
 
 
+def test_a_stale_orphan_is_dropped_rather_than_preserved_while_the_lane_runs(
+        tmp_path):
+    """Regression: `_route_due` used to return early on `_lane_in_flight`,
+    before it could reach the drop-orphan route below. That guard was
+    redundant for its stated purpose -- in-flight implies `loop.lane_id is
+    not None`, which is exactly the condition the code below it already
+    routes to drop-orphan on, never adopt -- so it could never have stopped
+    an adopt. Its only real effect was to preserve a stale claim through
+    precisely the window in which orphans are born: a lapsed lease means a
+    rival records *its* lane first, so the orphan note lands after the row
+    is already `remediating` under the rival's lane.
+
+    Left alone, the claim survives every due tick while that lane runs and
+    gets adopted backwards the moment the lane finally clears -- rewinding a
+    round-3 loop to a lane that finished two rounds ago. This is what would
+    happen if the guard came back.
+    """
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    deps = build(tmp_path, SourceFake([]))
+    for n, head in ((1, "a" * 40), (2, "b" * 40), (3, "f" * 40)):
+        deps.source.verdicts = [verdict(rid=f"br_{n}", head=head)]
+        deps.now.advance()
+        tick(deps)
+        if n < 3:
+            rereview_posted(deps)
+    loop_id = _loop_id(deps)
+    loop = deps.store.get(loop_id)
+    assert (loop.round_count, loop.lane_id, loop.head_sha) == (3, "t_3", "f" * 40)
+    assert loop.state is LoopState.REMEDIATING, "the row's own lane is in flight"
+
+    _orphan_note(deps, loop_id)  # lane t_1, round 1, head aaaa: two rounds dead
+
+    # Several due ticks pass while the row's own lane is still in flight.
+    for _ in range(3):
+        deps.now.advance(LANE_POLL_SECONDS + 1)
+        assert tick(deps) == 0, "dropping a claim is bookkeeping, not a step"
+        loop = deps.store.get(loop_id)
+        assert (loop.round_count, loop.lane_id, loop.head_sha) == \
+            (3, "t_3", "f" * 40), "the in-flight lane must not be rewound"
+        assert loop.state is LoopState.REMEDIATING
+
+    assert "orphan_superseded" in kinds(deps, loop_id), \
+        "the stale claim must be dropped while the lane runs, not preserved"
+
+    # The row's own lane completes and lane_id is cleared -- the window a
+    # preserved claim would have been adopted into.
+    lane_cleared(deps)
+    deps.now.advance()
+    assert tick(deps) == 0
+    loop = deps.store.get(loop_id)
+    assert loop.lane_id is None, "must not be adopted backwards to the dead lane"
+    assert loop.head_sha == "f" * 40, "must not be rewound to the dead orphan's head"
+    assert loop.round_count == 3, "must not be rewound to the dead orphan's round"
+    assert loop.state is LoopState.REREVIEW_POSTED, \
+        "must not be dropped back into remediating under the dead lane"
+
+
 def lane_cleared(deps):
     """That lane finished and the row no longer points at it.
 
