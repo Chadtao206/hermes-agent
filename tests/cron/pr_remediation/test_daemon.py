@@ -8,6 +8,8 @@ into the same exception).
 Every test here wires fakes and monkeypatches module-level names -- none of
 this touches the real config.yaml, .env, state databases or the network.
 """
+from pathlib import Path
+
 from pr_remediation import daemon
 from pr_remediation.config import RemediationConfig
 from pr_remediation.loop import LoopDeps
@@ -179,3 +181,100 @@ def test_run_stops_immediately_when_should_stop_is_already_true(tmp_path):
 
     assert calls == []
     assert not heartbeat.exists()
+
+
+# --- C4: importing this module must have no global effect -------------------
+
+def _import_in(*roots: str, script: str | None = None) -> dict:
+    """Load daemon.py in a fresh interpreter with exactly `roots` on sys.path,
+    and report what that did to the path.
+
+    `script` loads the file the way launchd does (as a script, by path);
+    otherwise it is imported as `pr_remediation.daemon`, the way pytest does.
+
+    A subprocess because sys.path damage is global and one-way: by the time a
+    test runs, this process has long since imported the module, so the only
+    place the question can still be asked honestly is a new one.
+    """
+    import json
+    import subprocess
+    import sys
+
+    load = (
+        f"import runpy; runpy.run_path({script!r}, run_name='not_main')"
+        if script else "import pr_remediation.daemon"
+    )
+    probe = (
+        "import json, sys\n"
+        # `roots` and the interpreter's own stdlib/site-packages, and nothing
+        # else -- in particular not the cwd, which `-c` would otherwise add.
+        f"sys.path[:] = {list(roots)!r} + [p for p in sys.path if p]\n"
+        f"{load}\n"
+        "import boris_intake\n"
+        "print(json.dumps({\n"
+        "    'path': sys.path,\n"
+        "    'boris_intake': boris_intake.__file__,\n"
+        "    'slack_read_imported': 'slack_read' in sys.modules,\n"
+        "}))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_importing_the_daemon_does_not_put_the_deployed_tree_on_sys_path():
+    """THE regression test, and it can only be written across two services.
+
+    daemon.py used to `sys.path.insert(0, "/Users/ctao/.hermes/scripts")` at
+    module scope. That tree holds a DEPLOYED copy of `boris_intake`; this repo
+    holds its own under `cron/scripts`. Prepending it therefore rebound the
+    entire `boris_intake` package for the rest of the process the moment pytest
+    merely *collected* this file -- so in the combined run
+    (`pytest tests/cron/pr_remediation tests/cron/boris_intake`) the sibling's
+    tests were exercising the deployed copy, and a defect introduced into the
+    repo's copy could not fail them. Proven at the time by deleting the marker
+    check from cron/scripts/boris_intake/gate.py: the boris_intake suite alone
+    failed 1, the combined run passed 686.
+
+    Two things are asserted, and the second is the one that bites: the deployed
+    root is absent from sys.path, and `boris_intake` resolves out of the repo.
+    """
+    from pr_remediation import daemon
+
+    package_root = str(Path(daemon.__file__).resolve().parent.parent)
+    repo_root = str(Path(package_root).parent.parent)
+    result = _import_in(package_root, repo_root)
+
+    assert daemon.DEPLOYED_SCRIPTS not in result["path"], (
+        "importing the daemon put the deployed script tree on sys.path; every "
+        "package that exists in both trees is now bound to the deployed copy "
+        "for the rest of this process")
+    assert result["boris_intake"].startswith(package_root), (
+        f"boris_intake resolved to {result['boris_intake']}, not the repo copy "
+        f"under {package_root}")
+    assert result["slack_read_imported"] is False, (
+        "slack_read lives only in the deployed tree; importing it at module "
+        "scope is what forced the sys.path mutation in the first place")
+
+
+def test_the_daemon_still_imports_the_way_launchd_actually_starts_it():
+    """The other direction, so the fix above cannot be 'fixed' into a broken
+    daemon. launchd runs `python .../scripts/pr_remediation/daemon.py`, which
+    puts ONLY the package's own directory on sys.path -- not its parent -- so
+    `import pr_remediation.…` needs a root added before those imports run.
+    That root is derived from __file__ and appended, which is what makes it
+    harmless: it can only ever supply what nothing earlier already provides."""
+    from pr_remediation import daemon
+
+    script = str(Path(daemon.__file__).resolve())
+    package_dir = str(Path(script).parent)
+    # Exactly the sys.path `python .../pr_remediation/daemon.py` produces.
+    result = _import_in(package_dir, script=script)
+
+    assert str(Path(package_dir).parent) in result["path"], (
+        "the daemon no longer makes its own package importable, so launchd "
+        "would fail to start it")
+    assert result["boris_intake"].startswith(str(Path(package_dir).parent)), (
+        "boris_intake must come from the same tree as the daemon that is "
+        "running")

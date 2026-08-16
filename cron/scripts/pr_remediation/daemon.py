@@ -24,10 +24,19 @@ import time
 from pathlib import Path
 from typing import Callable
 
-sys.path.insert(0, "/Users/ctao/.hermes/scripts")
-sys.path.insert(0, "/Users/ctao/.hermes/hermes-agent")
-
-from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
+# The directory holding the `pr_remediation` package this file belongs to,
+# derived from __file__ rather than named, so the imports below always resolve
+# the copy that is actually running -- the repo checkout under pytest, the
+# deployed tree under launchd, which starts this as a plain script
+# (`python .../pr_remediation/daemon.py`) and so puts only the package's own
+# directory on sys.path. APPENDED, never prepended: an appended entry can only
+# supply a module nothing earlier on the path already provides, so it can never
+# rebind a package a test runner has pointed somewhere else. See
+# `_bootstrap_sys_path` for why that distinction is the whole of this module's
+# path discipline.
+_PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PACKAGE_ROOT not in sys.path:
+    sys.path.append(_PACKAGE_ROOT)
 
 from pr_remediation.boris_source import BorisSource  # noqa: E402
 from pr_remediation.config import RemediationConfig, load_config  # noqa: E402
@@ -42,9 +51,59 @@ STATE_DB = Path("/Users/ctao/.hermes/state/pr_remediation.db")
 HEARTBEAT = Path("/Users/ctao/.hermes/state/pr_remediation_heartbeat")
 KANBAN_DB = Path("/Users/ctao/.hermes/kanban.db")
 
+# Deployed-only roots. `slack_read` lives under DEPLOYED_SCRIPTS and nowhere in
+# the repo, which is why it is imported inside functions below rather than at
+# module scope.
+DEPLOYED_SCRIPTS = "/Users/ctao/.hermes/scripts"
+HERMES_AGENT = "/Users/ctao/.hermes/hermes-agent"
+
+#: Which `.env` `parse_env` reads. None means "slack_read's own ENV_PATH", so
+#: that location stays defined in exactly one place rather than being copied
+#: here where it could drift out of sync with the module that owns it.
+ENV_PATH: Path | None = None
+
+
+def _bootstrap_sys_path() -> None:
+    """Put the deployed helper roots on sys.path. Called from `main()` only.
+
+    This used to run at module scope, prepending DEPLOYED_SCRIPTS, and that
+    silently disabled a sibling service's regression tests. DEPLOYED_SCRIPTS
+    holds a deployed copy of `boris_intake`; the repo holds its own under
+    `cron/scripts`. Prepending therefore rebound the whole `boris_intake`
+    package for the rest of the process the moment pytest merely *collected*
+    `tests/cron/pr_remediation/test_daemon.py` -- so in any combined run, the
+    boris_intake tests were exercising the deployed copy, and a defect
+    introduced in the repo's copy could not fail them.
+
+    Importing this module must have no global effect, so the mutation happens
+    here, where the process has already committed to being the daemon. It also
+    appends rather than prepends: an appended entry can only ever supply a
+    module nothing earlier on the path provides, so even called from a test it
+    cannot rebind anything.
+    """
+    for root in (DEPLOYED_SCRIPTS, HERMES_AGENT):
+        if root not in sys.path:
+            sys.path.append(root)
+
+
+def parse_env(path: Path | None = None) -> dict[str, str]:
+    """The deployed `.env`, read through `slack_read`.
+
+    A wrapper rather than a re-export because `slack_read` exists only under
+    DEPLOYED_SCRIPTS: importing it at module scope is precisely what forced the
+    sys.path mutation this module no longer takes at import time. Keeping the
+    name at module scope keeps the seam the daemon tests already patch.
+    """
+    from slack_read import ENV_PATH as SLACK_READ_ENV_PATH  # noqa: N811
+    from slack_read import parse_env as _parse_env
+
+    return _parse_env(SLACK_READ_ENV_PATH if path is None else path)
+
 
 def build_deps(cfg: RemediationConfig, slack_token: str) -> LoopDeps:
     """Wire the real adapters. A seam so tests can wire fakes instead."""
+    from slack_read import slack_call
+
     return LoopDeps(
         source=BorisSource(DEFAULT_BORIS_DB, cfg),
         github=GitHubIO(cfg, DEFAULT_TOKEN),
@@ -73,6 +132,7 @@ def _run(deps: LoopDeps, *, should_stop: Callable[[], bool],
 
 
 def main() -> int:
+    _bootstrap_sys_path()
     cfg = load_config()
     if cfg.mode == "off":
         sys.stderr.write("pr_remediation: mode=off, exiting\n")
