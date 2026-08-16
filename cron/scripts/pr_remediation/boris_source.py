@@ -125,16 +125,23 @@ class BorisSource:
         """One blocking issue off the wire, or None when `raw` is not even a
         dict (mirrors the old `isinstance(i, dict)` filter in `_verdict`).
 
-        Every field past `title` degrades independently via `_text`/
-        `_anchors`: a malformed `evidence_anchors` or a non-string
-        `changed_mechanism` must not cost the issue its title, which is the
-        one field this reader has always been able to surface and must go on
-        surfacing even from a payload it otherwise can't fully trust.
+        Every field degrades independently via `_text`/`_anchors`: a
+        malformed `evidence_anchors` or a non-string `changed_mechanism` must
+        not cost the issue its title, which is the one field this reader has
+        always been able to surface and must go on surfacing even from a
+        payload it otherwise can't fully trust.
+
+        `title` goes through `_text` like its seven siblings. It used to be
+        the one field coerced with a bare `str(...)`, which turned a JSON
+        null into the literal four-character string "None" -- and because
+        "None" is truthy, lanes.py's `issue.title or '(untitled)'` fallback
+        never fired and the remediation brief read `1. None`. An empty string
+        reaches that placeholder; a stringified null walks straight past it.
         """
         if not isinstance(raw, dict):
             return None
         return Issue(
-            title=str(raw.get("title", "")),
+            title=cls._text(raw.get("title")),
             expected_behavior=cls._text(raw.get("expected_behavior")),
             changed_mechanism=cls._text(raw.get("changed_mechanism")),
             trigger=cls._text(raw.get("trigger")),

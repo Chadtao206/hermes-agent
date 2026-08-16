@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -30,6 +31,36 @@ RICH_ISSUE = Issue(
     ),
 )
 RICH_VERDICT = replace(VERDICT, blocking_issues=(RICH_ISSUE,))
+
+# Deliberately big enough to overflow BOTH the cap this change lowered
+# MAX_BRIEF_CHARS to and the 20,000 it used to be, so the truncation tests
+# below fail for a truncation reason rather than for the cap's value.
+_OVERFLOW_ISSUE_COUNT = 30
+_OVERFLOW_FILLER = 700
+
+
+def _overflowing_issues(count: int = _OVERFLOW_ISSUE_COUNT) -> tuple[Issue, ...]:
+    """`count` issues, each identifiable on its own and each carrying an
+    evidence anchor whose reference is a real-looking repo path.
+
+    The path is the tell: a render that cuts mid-way leaves something like
+    `src/path_number_18.p` -- a broken path that reads like a complete one --
+    which is exactly what the tests below look for.
+    """
+    return tuple(
+        Issue(title=f"Issue number {n}",
+              expected_behavior="e" * _OVERFLOW_FILLER,
+              evidence_anchors=(
+                  EvidenceAnchor(kind="diff", reference=f"src/path_number_{n}.py"),))
+        for n in range(1, count + 1)
+    )
+
+
+def _issues_rendered(brief: str, count: int = _OVERFLOW_ISSUE_COUNT) -> list[int]:
+    """Which of `_overflowing_issues`'s issues actually reached the brief,
+    matched on the whole heading line so `1` cannot match `11`."""
+    lines = set(brief.splitlines())
+    return [n for n in range(1, count + 1) if f"{n}. Issue number {n}" in lines]
 
 
 def _valid_anchor(tmp_path, monkeypatch, repo=VERDICT.repo):
@@ -98,9 +129,30 @@ def test_non_diff_anchors_are_labelled_by_their_own_kind_not_as_a_file():
 def test_an_issue_with_no_evidence_anchors_still_renders():
     """RICH_ISSUE's siblings in VERDICT carry no evidence at all -- the
     common case for a title-only issue -- and must not blow up or leave a
-    dangling 'Evidence:' header with nothing under it."""
+    dangling 'Evidence:' header with nothing under it.
+
+    The absence assertion is the one that matters and it was missing: with
+    only the two title checks, making `_issue_block`'s
+    `lines.append("   - Evidence:")` unconditional -- producing precisely the
+    dangling header this docstring names -- left the whole suite green. A
+    dangling `Evidence:` tells the agent evidence was recorded and then sends
+    it looking for anchors that were never there.
+    """
     brief = build_brief(VERDICT, 1)
     assert "Null deref in handler" in brief and "Race in seed" in brief
+    assert "Evidence:" not in brief, (
+        "no issue in VERDICT carries an anchor, so an 'Evidence:' header here "
+        "is a label with nothing under it")
+
+
+def test_an_untitled_issue_renders_the_placeholder_not_a_blank_heading():
+    """`_issue_block`'s `issue.title or '(untitled)'` fallback, pinned. It is
+    the reason boris_source must coerce a null title to "" rather than to the
+    literal string "None" -- see test_boris_source.py's null-title test: a
+    truthy "None" walks straight past this fallback and the brief reads
+    `1. None`."""
+    verdict = replace(VERDICT, blocking_issues=(Issue(title=""),))
+    assert "1. (untitled)" in build_brief(verdict, 1)
 
 
 # --- acceptance criteria ----------------------------------------------------
@@ -133,10 +185,19 @@ def test_prohibitions_are_kept():
 
 
 def test_brief_names_the_base_and_head_branch_when_known():
+    """Label-to-value binding, not mere presence.
+
+    Asserting only that both names appear *somewhere* left the header
+    completely unpinned: swapping the two values (so the brief reads
+    `Base branch: chad/fix-webhook` / `Head branch: main`) and deleting the
+    `Head branch:` line outright both kept the suite green. Either one makes
+    the brief contradict its own push instruction about which branch is
+    which -- the exact ambiguity this enrichment existed to remove.
+    """
     brief = build_brief(RICH_VERDICT, 1, base_branch="main",
                         head_branch="chad/fix-webhook")
-    assert "main" in brief
-    assert "chad/fix-webhook" in brief
+    assert "Base branch: main" in brief
+    assert "Head branch: chad/fix-webhook" in brief
 
 
 def test_brief_tells_the_agent_to_push_the_actual_head_branch_not_the_worktree_s():
@@ -161,6 +222,82 @@ def test_brief_degrades_visibly_when_branches_are_unknown():
 
 
 # --- size cap and truncation -------------------------------------------------
+
+
+def test_our_brief_cap_does_not_exceed_the_kanban_body_cap_that_actually_binds():
+    """The limit that binds is kanban's, not ours.
+
+    `hermes_cli/kanban_db.py`'s `build_worker_context` -- what the engineer
+    agent actually reads -- applies `_cap(task.body, _CTX_MAX_BODY_BYTES)`,
+    and that `_cap` truncates from the HEAD:
+    `s[:limit] + "… [truncated, N chars omitted]"`. The acceptance criteria,
+    the three prohibitions and the push target all live at the END of the
+    brief, so they are the first thing kanban drops. A cap of ours that sits
+    above kanban's means our own truncation -- which protects the footer by
+    construction and says what it dropped -- never gets to fire.
+
+    Read off kanban's real constant rather than a literal 8192 on purpose:
+    a copy of a contract can only ever confirm the copy. This must fail if
+    EITHER side moves.
+    """
+    from hermes_cli.kanban_db import _CTX_MAX_BODY_BYTES
+
+    assert MAX_BRIEF_CHARS <= _CTX_MAX_BODY_BYTES, (
+        f"MAX_BRIEF_CHARS={MAX_BRIEF_CHARS} exceeds kanban's "
+        f"_CTX_MAX_BODY_BYTES={_CTX_MAX_BODY_BYTES}; build_worker_context "
+        "head-truncates task.body at that cap, so the brief would lose its "
+        "acceptance criteria and push target before the agent ever read them")
+
+
+def test_truncation_drops_whole_issues_instead_of_cutting_one_mid_render():
+    """The unit of truncation is one issue, not one character.
+
+    Cutting the rendered text mid-way produced lines like
+    `- file: src/path_number_118.p` -- a broken repo path that reads exactly
+    like a complete one, and that the agent would go looking for.
+    """
+    verdict = replace(VERDICT, blocking_issues=_overflowing_issues())
+    brief = build_brief(verdict, 1, base_branch="main", head_branch="chad/fix")
+
+    complete = re.findall(r"src/path_number_\d+\.py", brief)
+    anything = re.findall(r"src/path_number_\S*", brief)
+    assert complete == anything, (
+        f"a path was cut mid-token: {sorted(set(anything) - set(complete))}")
+
+    for n in _issues_rendered(brief):
+        assert f"src/path_number_{n}.py" in brief, (
+            f"issue {n}'s heading is rendered but its evidence anchor is not -- "
+            "a rendered issue must be rendered whole")
+
+
+def test_truncation_states_how_many_issues_it_omitted():
+    """The footer counts every blocking issue in its acceptance criteria, so
+    a brief that renders only some of them has to say how many are missing.
+    Otherwise the agent gets a stopping condition it cannot even enumerate
+    and no signal that anything is absent at all."""
+    verdict = replace(VERDICT, blocking_issues=_overflowing_issues())
+    brief = build_brief(verdict, 1, base_branch="main", head_branch="chad/fix")
+
+    rendered = _issues_rendered(brief)
+    assert rendered, "at least one issue must survive"
+    assert len(rendered) < _OVERFLOW_ISSUE_COUNT, "this fixture must overflow the cap"
+    assert rendered == list(range(1, len(rendered) + 1)), \
+        "the issues kept must be the leading run, not an arbitrary subset"
+
+    omitted = _OVERFLOW_ISSUE_COUNT - len(rendered)
+    assert f"{omitted} further blocking issue(s)" in brief, (
+        f"{omitted} issues were dropped and the brief never says so")
+    assert f"All {_OVERFLOW_ISSUE_COUNT} listed blocking issue(s)" in brief, \
+        "the footer still counts them all, which is what the notice reconciles"
+
+
+def test_a_truncated_brief_still_fits_the_cap_and_keeps_its_footer():
+    verdict = replace(VERDICT, blocking_issues=_overflowing_issues())
+    brief = build_brief(verdict, 1, base_branch="main", head_branch="chad/fix")
+    assert len(brief) <= MAX_BRIEF_CHARS
+    assert "Acceptance criteria" in brief
+    assert "Do not force-push" in brief
+    assert "Head branch: chad/fix" in brief
 
 
 def test_an_ordinary_brief_is_nowhere_near_the_cap():

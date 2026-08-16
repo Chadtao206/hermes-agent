@@ -277,14 +277,19 @@ def test_state_is_upper_cased_so_one_comparison_serves(tmp_path):
 # needs both names at once: the head branch removes a real ambiguity ("push",
 # without saying where, against a worktree that lives on a kanban-generated
 # branch that is not the PR's), and the base branch is context for whoever
-# reviews next. Both must come off the one `_view()` call every other
-# accessor here already makes -- not a second round trip.
+# reviews next. Both come off ONE `_view()` call, so the pair costs one
+# `gh pr view` rather than two. That is a claim about this method only:
+# `_view()` is not memoized, so each accessor on this class -- `has_hold`,
+# `state`, `author`, `branches` -- runs its own `gh pr view` subprocess. See
+# `_view`'s own comment for why that is deliberate.
 
 
-def test_the_view_asks_for_base_and_head_ref_names_so_branches_costs_no_second_call(tmp_path):
+def test_the_view_asks_for_base_and_head_ref_names(tmp_path):
     """Pinned on the argv for the same reason the `state` field is pinned
     above: every driver-level test wires a fake and would never notice a
-    field silently dropped back out of `_view`'s request."""
+    field silently dropped back out of `_view`'s request. Dropping one would
+    turn the pair's single `gh pr view` into a `branches()` that can never
+    answer at all."""
     runner, calls = runner_for({"view": json.dumps({"labels": []})})
     io_with(runner, tmp_path).branches("Ylopo", "example", 42)
     views = [c for c in calls if "view" in c]
@@ -300,8 +305,17 @@ def test_branches_reads_both_names_from_the_live_pr(tmp_path):
         "main", "chad/fix-webhook")
 
 
-def test_branches_costs_exactly_one_gh_call(tmp_path):
-    """The whole point: both names from one _view() invocation, not two."""
+def test_branches_reads_the_pair_in_one_gh_call_not_two(tmp_path):
+    """Both names come from one `_view()` invocation, so reading the PAIR is
+    one `gh pr view` rather than the two that separate `base()`/`head()`
+    accessors would cost.
+
+    This does NOT say the call is free. `_view()` is deliberately not
+    memoized, so `branches()` is its own subprocess on top of whatever
+    `has_hold`/`state`/`author` already spent -- the old name for this test
+    ("costs exactly one gh call") asserted the broader claim while the
+    assertion below only ever proved the narrow one.
+    """
     runner, calls = runner_for({"view": json.dumps(
         {"labels": [], "baseRefName": "main", "headRefName": "chad/fix"})})
     io_with(runner, tmp_path).branches("Ylopo", "example", 42)

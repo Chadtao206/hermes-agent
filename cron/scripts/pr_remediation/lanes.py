@@ -74,26 +74,58 @@ def _repo_is_excluded(verdict: Verdict) -> bool:
 
 
 # The brief is passed as a literal `--body <text>` argv token (see the module
-# docstring above), never written to a file first, so its size is bounded by
-# more than good taste. `Issue`'s own fields can each run to 2,000 characters
-# and an issue can carry up to 50 of them (boris_intake/review_tools_mcp.py's
-# own schema caps), so an unbounded render of `verdict.blocking_issues` could
-# in principle reach the megabytes -- and long before any OS argv limit, a
-# brief that size would blow out the context of the very agent it exists to
-# brief. 20,000 characters is generous next to the three-issue live brief
-# this was built against (a few kilobytes) while still refusing to hand an
-# agent a novel. See `_bounded`: truncation only ever eats the issue detail,
-# never the acceptance criteria or the branch/push footer, and it always
-# says so rather than cutting silently.
-MAX_BRIEF_CHARS = 20_000
+# docstring above) and stored verbatim as the kanban task's `body`, so its
+# size is bounded by more than good taste. `Issue`'s own fields can each run
+# to 2,000 characters and an issue can carry up to 50 anchors
+# (boris_intake/review_tools_mcp.py's own schema caps), so an unbounded render
+# of `verdict.blocking_issues` could in principle reach the megabytes.
+#
+# The limit that binds is KANBAN'S, not the OS's and not our taste. The engineer
+# agent never reads this text directly -- it reads what
+# `hermes_cli/kanban_db.py`'s `build_worker_context` renders, and that applies
+# `_cap(task.body, _CTX_MAX_BODY_BYTES)` with `_CTX_MAX_BODY_BYTES = 8 * 1024`.
+# `_cap` truncates from the HEAD:
+#
+#     return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+#
+# which eats the END of the brief -- exactly where the acceptance criteria, the
+# three prohibitions and the push target live. The first draft's 20,000 was 2.4x
+# that, so kanban's silent head-truncation, not ours, was the one that would
+# fire: the live three-issue brief for Ylopo/million-stars#199 rendered at 6,811
+# characters, 83% of the way to losing its own stopping condition, and a
+# four-issue verdict crosses it. The OS argv limit (~1 MB) never enters into it.
+#
+# Set equal to kanban's cap so OUR truncation always goes first: `_bounded`
+# protects the header and footer by construction and says out loud what it
+# dropped, which is precisely what `_cap` cannot do.
+#
+# Deliberately a literal rather than an import of `_CTX_MAX_BODY_BYTES`: this
+# module also runs from its deployed copy under `~/.hermes/scripts/`, where
+# `hermes_cli` is not importable. tests/cron/pr_remediation/test_lanes.py
+# imports kanban's real constant and pins `MAX_BRIEF_CHARS <=` it, so neither
+# side can drift away from the other unnoticed.
+MAX_BRIEF_CHARS = 8 * 1024
 
-_TRUNCATION_NOTICE = (
-    "\n[BRIEF TRUNCATED: the blocking-issue detail above was cut to stay "
-    f"under this brief's {MAX_BRIEF_CHARS}-character cap. This is a "
-    "shortened view, not the complete evidence Boris recorded -- treat any "
-    "issue cut off mid-way as incomplete and re-check the PR's review "
-    "thread for it before assuming it does not apply.]\n"
-)
+
+def _omission_notice(omitted: int) -> str:
+    """The notice that stands in for the issues that did not fit.
+
+    Says how MANY are missing, because the footer's acceptance criteria count
+    every blocking issue in the verdict. A brief that silently rendered issues
+    1-4 of 20 under a footer reading "All 20 listed blocking issue(s) are
+    cleared" handed the agent a stopping condition it could not even
+    enumerate, with nothing anywhere to say that anything was absent. This
+    count and the footer's count are the two halves of one sentence.
+    """
+    return (
+        f"\n[BRIEF TRUNCATED: {omitted} further blocking issue(s) are NOT "
+        f"shown above -- the rendered issues reached this brief's "
+        f"{MAX_BRIEF_CHARS}-character cap, which is kanban's own limit on a "
+        "task body. Every issue shown above is shown in full; the omitted "
+        "ones are missing entirely, not shortened. The acceptance criteria "
+        "below still count all of them, so read the omitted issues off the "
+        "PR's Boris review thread before treating the review as cleared.]\n"
+    )
 
 
 def _anchor_line(anchor: EvidenceAnchor) -> str:
@@ -125,22 +157,46 @@ def _issue_block(number: int, issue: Issue) -> str:
     return "\n".join(lines)
 
 
-def _issues_section(issues: tuple[Issue, ...]) -> str:
-    if not issues:
-        return "(none listed)\n"
-    return "\n".join(_issue_block(n, issue) for n, issue in enumerate(issues, 1)) + "\n"
+def _issue_blocks(issues: tuple[Issue, ...]) -> list[str]:
+    """One rendered block per issue, kept separate rather than pre-joined so
+    `_bounded` can drop them a whole issue at a time."""
+    return [_issue_block(n, issue) for n, issue in enumerate(issues, 1)]
 
 
-def _bounded(header: str, issues_text: str, footer: str) -> str:
-    """Assemble the brief, truncating only `issues_text` -- never `header` or
-    `footer`, which is where the branch names and the acceptance criteria
-    live -- and saying so when it happens rather than cutting silently. See
-    MAX_BRIEF_CHARS above for why a cap exists at all.
+def _bounded(header: str, blocks: list[str], footer: str) -> str:
+    """Assemble the brief, dropping WHOLE issues when they do not all fit.
+
+    Never truncates `header` or `footer` -- that is where the branch names,
+    the acceptance criteria, the three prohibitions and the push target live,
+    and they are the first thing kanban's own head-truncation would take (see
+    MAX_BRIEF_CHARS).
+
+    Within the issue detail, the unit of truncation is one issue, not one
+    character. Slicing the joined text mid-render produced lines like
+    `- file: src/path_number_118.p` -- a broken repo path that reads exactly
+    like a complete one -- and dropped issues 5..20 of a 20-issue verdict
+    without the notice ever admitting a whole finding was gone. An issue is
+    either rendered in full or counted as omitted; there is no third,
+    half-true state.
+
+    Enough budget is reserved as we go for the omission notice we would owe
+    if the next issue were the one that did not fit, so keeping an issue can
+    never push that notice out of the cap.
     """
-    budget = max(MAX_BRIEF_CHARS - len(header) - len(footer) - len(_TRUNCATION_NOTICE), 0)
-    if len(issues_text) <= budget:
-        return header + issues_text + footer
-    return header + issues_text[:budget].rstrip() + _TRUNCATION_NOTICE + footer
+    budget = max(MAX_BRIEF_CHARS - len(header) - len(footer), 0)
+    if not blocks:
+        return header + "(none listed)\n" + footer
+    body = ""
+    for index, block in enumerate(blocks):
+        candidate = body + block + "\n"
+        remaining_after_this = len(blocks) - index - 1
+        reserve = (len(_omission_notice(remaining_after_this))
+                   if remaining_after_this else 0)
+        if len(candidate) + reserve <= budget:
+            body = candidate
+            continue
+        return header + body + _omission_notice(len(blocks) - index) + footer
+    return header + body + footer
 
 
 def build_brief(verdict: Verdict, round_number: int, *,
@@ -193,7 +249,7 @@ def build_brief(verdict: Verdict, round_number: int, *,
         "- Do not change the PR's base branch.\n\n"
         f"Fix them at this head and push to {push_target}.\n"
     )
-    return _bounded(header, _issues_section(verdict.blocking_issues), footer)
+    return _bounded(header, _issue_blocks(verdict.blocking_issues), footer)
 
 
 def idempotency_key(verdict: Verdict, round_number: int) -> str:

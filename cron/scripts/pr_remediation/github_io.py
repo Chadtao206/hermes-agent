@@ -122,9 +122,21 @@ class GitHubIO:
             #
             # `baseRefName`/`headRefName` ride this same call so that
             # `branches()` below -- which the remediation brief needs (see
-            # pr_remediation/lanes.py's build_brief) -- costs no second round
-            # trip. Every other accessor on this class already gets its field
-            # for free from this one `gh pr view`; these two are no different.
+            # pr_remediation/lanes.py's build_brief) -- can hand back both
+            # names from ONE `gh pr view` rather than two.
+            #
+            # Note what this does NOT buy: `_view` is not memoized, so every
+            # accessor on this class (`head_sha`, `author`, `state`,
+            # `has_hold`, `branches`) spawns its own `gh pr view` subprocess.
+            # A round that reads `has_hold`, `state` and `author` is three
+            # subprocesses, and adding `branches()` makes four. That is
+            # deliberate and must stay that way: `has_hold` is the per-PR kill
+            # switch and `state` gates every write, so serving either from a
+            # snapshot taken earlier in the round would let the loop act on a
+            # PR that has since been held, merged or closed. About a second of
+            # subprocess against a 20-90 minute remediation round is the
+            # cheapest guarantee in this file. Requesting one more field here
+            # is free; adding one more accessor is not.
             "--json", "labels,headRefOid,author,state,baseRefName,headRefName",
         ])
         if out is None:
@@ -187,17 +199,21 @@ class GitHubIO:
         return value.upper() if isinstance(value, str) and value else None
 
     def branches(self, owner: str, repo: str, pr: int) -> tuple[str | None, str | None]:
-        """The PR's (base, head) branch names, in the one call `_view` already
-        makes -- not a second round trip.
+        """The PR's (base, head) branch names, both off a single `_view()`.
 
         Read together, deliberately, rather than as two accessors like
         `head_sha`/`author`/`state` above: a remediation brief needs both at
-        once (pr_remediation/lanes.py's build_brief), and two separate calls
-        would each independently invoke `_view` -- exactly the second round
-        trip this method exists to avoid. The head branch removes a real
-        ambiguity the old brief left open ("push", without saying where,
-        against a worktree that lives on a kanban-generated branch that is
-        not the PR's); the base branch is context for whoever reviews next.
+        once (pr_remediation/lanes.py's build_brief), and two accessors would
+        each invoke `_view` separately, costing two `gh pr view` subprocesses
+        for a pair that one answers. The head branch removes a real ambiguity
+        the old brief left open ("push", without saying where, against a
+        worktree that lives on a kanban-generated branch that is not the
+        PR's); the base branch is context for whoever reviews next.
+
+        That saving is over two accessors, not over zero: `_view` is not
+        memoized, so this method is still its own `gh pr view` on top of
+        whatever `has_hold`/`state`/`author` already spent this round. See
+        `_view` above for why re-reading is worth the subprocess.
 
         Shape-checked exactly like `author`, `state`, and `has_hold` above,
         and for the same reason: a raise here would land inside

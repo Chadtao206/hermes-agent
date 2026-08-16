@@ -228,6 +228,22 @@ def test_an_issue_with_malformed_extra_fields_still_contributes_its_title(tmp_pa
     assert issue.evidence_anchors == ()
 
 
+def test_a_non_string_title_degrades_to_empty_like_its_seven_siblings(tmp_path):
+    """`title` was the one field that skipped `_text`, coercing with a bare
+    `str(...)` instead. A JSON null therefore produced `Issue(title='None')`
+    -- the literal four-character string -- and because "None" is truthy,
+    build_brief's `issue.title or '(untitled)'` fallback never fired and the
+    remediation brief read `1. None`. An empty title reaches the placeholder;
+    a stringified null does not.
+    """
+    path = boris_db(tmp_path, validated_result_json=json.dumps({
+        "blocking_issues": [{"title": None}, {"title": 42}, {"title": ["a"]}],
+        "incomplete": None,
+    }))
+    verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
+    assert [i.title for i in verdict.blocking_issues] == ["", "", ""]
+
+
 def test_an_issue_missing_every_extra_field_still_contributes_its_title(tmp_path):
     """The minimal case: a dict with only a title, nothing else present at
     all (not merely malformed) -- the same "still contributes its title"
