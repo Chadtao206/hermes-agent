@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from pr_remediation import lanes
 from pr_remediation.boris_source import Verdict
 from pr_remediation.lanes import (
     TERMINAL_LANE_STATUSES, LaneIO, build_brief, idempotency_key,
@@ -7,6 +8,19 @@ from pr_remediation.lanes import (
 
 VERDICT = Verdict("br_1", "Ylopo", "example", 42, "a" * 40, "1.0",
                   "ISSUES_FOUND", None, ("Null deref in handler", "Race in seed"))
+
+
+def _valid_anchor(tmp_path, monkeypatch, repo=VERDICT.repo):
+    """Point ANCHOR_ROOT at a temp dir with a valid git anchor for `repo`.
+
+    Mirrors how the module itself resolves ANCHOR_ROOT (via the
+    PR_FIX_ANCHOR_ROOT env var, read live off the module global rather than
+    copied at import time) so tests can redirect it without touching a real
+    anchor under /Users/ctao/.hermes/state/pr-review-anchors.
+    """
+    anchor_root = tmp_path / "anchors"
+    (anchor_root / repo / ".git").mkdir(parents=True)
+    monkeypatch.setattr(lanes, "ANCHOR_ROOT", str(anchor_root))
 
 
 def test_brief_names_every_blocking_issue():
@@ -23,7 +37,9 @@ def test_brief_names_the_pr():
     assert "Ylopo/example#42" in build_brief(VERDICT, 1)
 
 
-def test_create_parses_the_lane_id_out_of_dispatch_output(tmp_path):
+def test_create_parses_the_lane_id_out_of_dispatch_output(tmp_path, monkeypatch):
+    _valid_anchor(tmp_path, monkeypatch)
+
     def run(command, **kwargs):
         return SimpleNamespace(returncode=0, stdout="Created t_abc123 (engineer)\n",
                                stderr="")
@@ -31,7 +47,7 @@ def test_create_parses_the_lane_id_out_of_dispatch_output(tmp_path):
     assert LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1) == "t_abc123"
 
 
-def test_create_uses_the_dispatch_interface_the_script_actually_accepts(tmp_path):
+def test_create_uses_the_dispatch_interface_the_script_actually_accepts(tmp_path, monkeypatch):
     """Guards against drifting back to invented flags like --profile/--pr.
 
     Also guards against a `--body @file` reference: `hermes_cli/kanban.py`'s
@@ -42,6 +58,7 @@ def test_create_uses_the_dispatch_interface_the_script_actually_accepts(tmp_path
     remediation brief. The body must be the real text, passed the same way
     `boris_intake/dispatch.py`'s `create_lane()` already does it.
     """
+    _valid_anchor(tmp_path, monkeypatch)
     seen = {}
 
     def run(command, **kwargs):
@@ -65,8 +82,10 @@ def test_the_idempotency_key_pins_head_and_round(tmp_path):
     assert VERDICT.head_sha[:7] in key and key.endswith(":r2")
 
 
-def test_create_returns_none_when_dispatch_refuses(tmp_path):
+def test_create_returns_none_when_dispatch_refuses(tmp_path, monkeypatch):
     """kanban_dispatch.sh exits non-zero when PR_REVIEW_AUTOFIX != 1."""
+    _valid_anchor(tmp_path, monkeypatch)
+
     def run(command, **kwargs):
         return SimpleNamespace(
             returncode=1, stdout="",
@@ -77,3 +96,50 @@ def test_create_returns_none_when_dispatch_refuses(tmp_path):
 
 def test_terminal_statuses_cover_the_ways_a_lane_can_end():
     assert {"done", "blocked", "failed", "cancelled"} <= TERMINAL_LANE_STATUSES
+
+
+def test_create_refuses_when_the_anchor_does_not_exist_at_all(tmp_path, monkeypatch):
+    """A worker later needs a git repo at the anchor to materialise a linked
+    worktree. kanban_dispatch.sh's clone-on-miss only fires for `prfix:*:fix`
+    keys, not this loop's `borisloop:` keys, so a missing anchor must be
+    refused here rather than dispatched into a lane that is guaranteed to
+    fail far from the cause.
+    """
+    monkeypatch.setattr(lanes, "ANCHOR_ROOT", str(tmp_path / "anchors"))
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="Created t_abc123 (engineer)\n", stderr="")
+
+    result = LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1)
+    assert result is None
+    assert calls == [], "the runner must never be invoked for a missing anchor"
+
+
+def test_create_refuses_when_the_anchor_is_not_a_git_repo(tmp_path, monkeypatch):
+    anchor_root = tmp_path / "anchors"
+    (anchor_root / VERDICT.repo).mkdir(parents=True)
+    monkeypatch.setattr(lanes, "ANCHOR_ROOT", str(anchor_root))
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="Created t_abc123 (engineer)\n", stderr="")
+
+    result = LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1)
+    assert result is None
+    assert calls == [], "the runner must never be invoked for a non-git anchor"
+
+
+def test_create_dispatches_when_the_anchor_is_a_valid_git_repo(tmp_path, monkeypatch):
+    _valid_anchor(tmp_path, monkeypatch)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="Created t_abc123 (engineer)\n", stderr="")
+
+    result = LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1)
+    assert result == "t_abc123"
+    assert len(calls) == 1, "a valid anchor must still dispatch through the runner"

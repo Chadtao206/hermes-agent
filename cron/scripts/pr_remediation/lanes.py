@@ -59,6 +59,21 @@ class LaneIO:
         self._runner = runner
 
     def create(self, verdict: Verdict, round_number: int) -> str | None:
+        # kanban_dispatch.sh's clone-on-miss is gated on `prfix:*:fix`
+        # idempotency keys (see the `case` around line 168 of that script);
+        # this loop deliberately uses `borisloop:` keys instead, because
+        # `prfix:*:fix` keys are not round-aware and a second remediation
+        # round would dedupe into round 1's task and silently never run.
+        # That means the clone-on-miss path never fires for us, so a
+        # missing anchor would otherwise dispatch a lane whose worker fails
+        # later, far from the cause, when it can't materialise a worktree.
+        # Refuse up front instead. We deliberately do not create/clone the
+        # anchor ourselves -- that path is security-hardened inside
+        # kanban_dispatch.sh (confines writes to a canonical root, refuses
+        # traversal, only removes a clone it created) and duplicating it
+        # here would fork a security-sensitive control.
+        if not (Path(ANCHOR_ROOT) / verdict.repo / ".git").exists():
+            return None
         title = f"fix(boris-loop): {verdict.slug} round {round_number}"
         argv = [
             DISPATCH, "create", title,
