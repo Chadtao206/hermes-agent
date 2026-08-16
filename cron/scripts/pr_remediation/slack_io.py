@@ -24,19 +24,27 @@ class SlackIO:
         self._call = caller
 
     def _post(self, channel: str, text: str, thread_ts: str | None = None) -> str | None:
-        payload = {"channel": channel, "text": text, "token": self._token}
+        params = {"channel": channel, "text": text}
         if thread_ts:
-            payload["thread_ts"] = thread_ts
+            params["thread_ts"] = thread_ts
         try:
-            response = self._call("chat.postMessage", **payload)
+            response = self._call(self._token, "chat.postMessage", **params)
         except Exception:
             return None
         if not isinstance(response, dict):
             return None
         return response.get("ts") if response.get("ok") else None
 
-    def post_rereview(self, verdict: Verdict, thread_ts: str,
+    def post_rereview(self, verdict: Verdict, thread_ts: str | None,
                       round_number: int) -> str | None:
+        # The gate (boris_intake/gate.py::_is_loop_repost) admits this bot's
+        # message ONLY as a reply in an existing thread. Posting at top level
+        # when thread_ts is falsy would land a message the gate silently
+        # rejects as NOT_HUMAN — no error anywhere, the loop just stalls
+        # waiting for a verdict that will never come. Refuse instead, so the
+        # caller can see None and escalate.
+        if not thread_ts:
+            return None
         text = (
             f"{self._cfg.marker}\n"
             f"{pr_url(verdict)}\n"
@@ -47,15 +55,15 @@ class SlackIO:
 
     def add_thinkies(self, channel: str, ts: str) -> None:
         try:
-            self._call("reactions.add", channel=channel, timestamp=ts,
-                       name=THINKIES, token=self._token)
+            self._call(self._token, "reactions.add", channel=channel,
+                       timestamp=ts, name=THINKIES)
         except Exception:
             pass
 
     def remove_thinkies(self, channel: str, ts: str) -> None:
         try:
-            self._call("reactions.remove", channel=channel, timestamp=ts,
-                       name=THINKIES, token=self._token)
+            self._call(self._token, "reactions.remove", channel=channel,
+                       timestamp=ts, name=THINKIES)
         except Exception:
             pass
 
