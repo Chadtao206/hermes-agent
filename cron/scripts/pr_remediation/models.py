@@ -42,6 +42,12 @@ class LoopRequest:
     head_sha: str
     boris_request_id: str
     root_thread_ts: str
+    # Where Boris's status message lives -- the anchor for the thinkies
+    # reaction. Distinct from root_thread_ts (see loop.py's
+    # _clear_running_signal / _open_lane for why the two must never be
+    # unified). Nullable: the source column is nullable, and every loop
+    # opened before this field existed carries no anchor either.
+    status_message_ts: str | None
     state: LoopState
     round_count: int
     lane_id: str | None

@@ -628,14 +628,36 @@ def _close(deps: LoopDeps, loop: LoopRequest, target: LoopState,
 def _clear_running_signal(deps: LoopDeps, loop: LoopRequest) -> None:
     """Take off the reaction that says a round is running, because none is.
 
-    Anchored on the *loop's* thread, not on any verdict's: a later verdict can
-    carry a different root, and a reaction added on one message can only ever be
-    removed from that same message. Idempotent by construction -- removing a
-    reaction that is gone is a no-op -- which is what lets every path that ends
-    a round run it without checking whether another already did.
+    Anchored on Boris's status message (`status_message_ts`), NOT on
+    `root_thread_ts`, and the two must never be unified even though both are
+    "a message in the same thread". A thread root can carry several reviews
+    over time, so a per-review signal on it is ambiguous; worse, it collides
+    with `just_do_it_review_reaction_watchdog.py` (live, runs every minute),
+    which drives its own reaction state machine on source PR posts and treats
+    `thinkies` as the retired predecessor of `rubbing` -- it would strip this
+    reaction within a minute of it landing. Boris's status message is not in
+    that watchdog's tracked set, so anchoring there sidesteps the collision
+    without touching that cron. `post_rereview` deliberately keeps targeting
+    `root_thread_ts` -- that is a different requirement (the sibling
+    service's authorization gate admits a post only as a reply in an existing
+    thread) that this reaction anchor must not be conflated with.
+
+    Read from the *loop's own row*, not any verdict's: a later verdict may
+    carry a different status message (or none), and a reaction added on one
+    message can only ever be removed from that same message. Idempotent by
+    construction -- removing a reaction that is gone is a no-op -- which is
+    what lets every path that ends a round run it without checking whether
+    another already did.
+
+    `status_message_ts` is nullable (the source column is nullable, and every
+    loop opened before this column existed carries none either), and a loop
+    with no anchor never had a reaction added for this to be undoing -- so
+    there is nothing to remove and nothing is attempted. The reaction is a
+    convenience signal, not a correctness mechanism: its absence must never
+    stop a round from closing out.
     """
-    if loop.root_thread_ts:
-        deps.slack.remove_thinkies(deps.cfg.boris_channel, loop.root_thread_ts)
+    if loop.status_message_ts:
+        deps.slack.remove_thinkies(deps.cfg.boris_channel, loop.status_message_ts)
 
 
 def _stand_down(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> None:
@@ -818,6 +840,10 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
 
     Retrying the review costs no remediation round: nothing was remediated.
     """
+    # root_thread_ts, deliberately -- NOT the reaction anchor
+    # (status_message_ts). SlackIO's gate admits a re-review only as a reply
+    # in an existing thread; the thinkies reaction anchor is a different
+    # concern (see _clear_running_signal) and must stay separate from this.
     if deps.slack.post_rereview(verdict, loop.root_thread_ts,
                                 loop.round_count + 1) is None:
         # A post that failed with a thread present is a Slack blip. Leave the
@@ -848,6 +874,8 @@ def _lane_pushed(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     is recorded as a lost transition and costs one duplicate review at worst.
     """
     _clear_running_signal(deps, loop)
+    # root_thread_ts, not status_message_ts -- same split as _repost's, for
+    # the same reason.
     if deps.slack.post_rereview(verdict, loop.root_thread_ts,
                                 loop.round_count) is None:
         # Unlike `_repost`'s, this failure is retried by the due pass on every
@@ -1030,9 +1058,10 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         # unspent and a human takes over.
         return _escalate(deps, loop, verdict, EscalationReason.LANE_FAILED.value)
 
-    # The lane exists from here on. Record the round before decorating the
-    # thread: if the compare-and-swap is lost we are no longer the driver, and
-    # a thinkies reaction would claim a round this tick does not own.
+    # The lane exists from here on. Record the round before decorating Boris's
+    # status message: if the compare-and-swap is lost we are no longer the
+    # driver, and a thinkies reaction would claim a round this tick does not
+    # own.
     if not _transition(deps, loop, LoopState.REMEDIATING,
                        round_count=round_number, lane_id=lane_id,
                        head_sha=verdict.head_sha,
@@ -1043,8 +1072,19 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
                                {"lane_id": lane_id, "round": round_number,
                                 "head_sha": verdict.head_sha}, deps.now())
         return False
-    if loop.root_thread_ts:
-        deps.slack.add_thinkies(deps.cfg.boris_channel, loop.root_thread_ts)
+    # Anchored on Boris's status message, not root_thread_ts -- see
+    # _clear_running_signal for why the two anchors must never be unified.
+    if loop.status_message_ts:
+        deps.slack.add_thinkies(deps.cfg.boris_channel, loop.status_message_ts)
+    else:
+        # status_message_ts is nullable (some rows never got one from
+        # boris_intake; every loop opened before this column existed has
+        # none either). The reaction is a convenience signal, not a
+        # correctness mechanism, so its absence must not fail the round --
+        # recorded so a missing thinkies reaction is explainable from the
+        # trail rather than mysterious.
+        deps.store.record_note(loop.loop_id, "reaction_skipped_no_status_message",
+                               {"round": round_number}, deps.now())
     return True
 
 
@@ -1403,7 +1443,8 @@ def _handle(deps: LoopDeps, verdict: Verdict,
         loop = store.open_loop(
             owner=verdict.owner, repo=verdict.repo, pr_number=verdict.pr_number,
             head_sha=verdict.head_sha, boris_request_id=verdict.request_id,
-            root_thread_ts=verdict.root_thread_ts, now=deps.now(),
+            root_thread_ts=verdict.root_thread_ts,
+            status_message_ts=verdict.status_message_ts, now=deps.now(),
         )
     if loop is None:
         # Another tick opened this PR's loop between our read and our insert.
@@ -1497,6 +1538,7 @@ def _verdict_for(loop: LoopRequest) -> Verdict:
         pr_number=loop.pr_number, head_sha=loop.head_sha,
         root_thread_ts=loop.root_thread_ts, outcome="",
         incomplete_origin=None, blocking_issues=(),
+        status_message_ts=loop.status_message_ts,
     )
 
 

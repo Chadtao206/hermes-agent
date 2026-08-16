@@ -10,6 +10,7 @@ SCHEMA = """
 CREATE TABLE review_requests (
     request_id TEXT PRIMARY KEY, owner TEXT, repo TEXT, pr_number INTEGER,
     head_sha TEXT, pr_author TEXT, requester_user_id TEXT, root_thread_ts TEXT,
+    status_message_ts TEXT,
     workflow_state TEXT, semantic_outcome TEXT, validated_result_json TEXT,
     completed_at REAL
 );
@@ -24,6 +25,7 @@ def boris_db(tmp_path, **overrides):
         "request_id": "br_1", "owner": "Ylopo", "repo": "example", "pr_number": 42,
         "head_sha": "a" * 40, "pr_author": "Chadtao206",
         "requester_user_id": "U07E3AHV686", "root_thread_ts": "1.0",
+        "status_message_ts": "2.0",
         "workflow_state": "complete", "semantic_outcome": "ISSUES_FOUND",
         "validated_result_json": json.dumps({
             "blocking_issues": [{"title": "Null deref in handler"}],
@@ -34,8 +36,8 @@ def boris_db(tmp_path, **overrides):
     row.update(overrides)
     db.execute(
         "INSERT INTO review_requests VALUES (:request_id,:owner,:repo,:pr_number,"
-        ":head_sha,:pr_author,:requester_user_id,:root_thread_ts,:workflow_state,"
-        ":semantic_outcome,:validated_result_json,:completed_at)", row)
+        ":head_sha,:pr_author,:requester_user_id,:root_thread_ts,:status_message_ts,"
+        ":workflow_state,:semantic_outcome,:validated_result_json,:completed_at)", row)
     db.commit()
     db.close()
     return path
@@ -47,6 +49,25 @@ def test_a_pr_chad_posted_and_authored_qualifies(tmp_path):
     assert len(verdicts) == 1
     assert verdicts[0].outcome == "ISSUES_FOUND"
     assert verdicts[0].blocking_issues == ("Null deref in handler",)
+
+
+def test_status_message_ts_is_carried_onto_the_verdict(tmp_path):
+    """The reaction anchor (see pr_remediation/loop.py), read from the same
+    column boris_intake stamps and later replaces with its verdict -- distinct
+    from root_thread_ts, which must come through unchanged alongside it."""
+    source = BorisSource(boris_db(tmp_path, status_message_ts="2.0",
+                                  root_thread_ts="1.0"), RemediationConfig())
+    verdict = source.new_verdicts()[0]
+    assert verdict.status_message_ts == "2.0"
+    assert verdict.root_thread_ts == "1.0", "the two columns must not be conflated"
+
+
+def test_a_null_status_message_ts_comes_through_as_none_not_a_crash(tmp_path):
+    """Nullable in the source schema: some rows never got a status message."""
+    source = BorisSource(boris_db(tmp_path, status_message_ts=None),
+                         RemediationConfig())
+    verdict = source.new_verdicts()[0]
+    assert verdict.status_message_ts is None
 
 
 def test_a_pr_chad_posted_but_did_not_author_is_ignored(tmp_path):

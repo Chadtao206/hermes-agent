@@ -25,6 +25,15 @@ class Verdict:
     outcome: str
     incomplete_origin: str | None
     blocking_issues: tuple[str, ...]
+    # boris_intake's status_message_ts: the message Boris posts and later
+    # replaces with its verdict, distinct from both source_message_ts and
+    # root_thread_ts. This is the reaction anchor (see pr_remediation/loop.py's
+    # _clear_running_signal / _open_lane) -- root_thread_ts stays the
+    # re-review post target only. Nullable in the source schema, so this
+    # trails with a default: a verdict read before this field existed on the
+    # Verdict type, or a row admitted before boris_intake ever recorded a
+    # status message, must still construct.
+    status_message_ts: str | None = None
 
     @property
     def slug(self) -> str:
@@ -43,7 +52,8 @@ class BorisSource:
     def new_verdicts(self, limit: int = 50) -> tuple[Verdict, ...]:
         cur = self._db.execute(
             "SELECT request_id, owner, repo, pr_number, head_sha, root_thread_ts, "
-            "semantic_outcome, validated_result_json FROM review_requests "
+            "status_message_ts, semantic_outcome, validated_result_json "
+            "FROM review_requests "
             "WHERE workflow_state='complete' AND semantic_outcome IS NOT NULL "
             "AND requester_user_id=? AND pr_author=? "
             "ORDER BY completed_at DESC LIMIT ?",
@@ -85,4 +95,5 @@ class BorisSource:
             blocking_issues=tuple(
                 str(i.get("title", "")) for i in issues if isinstance(i, dict)
             ),
+            status_message_ts=row["status_message_ts"],
         )

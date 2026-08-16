@@ -22,6 +22,30 @@ def test_opening_a_loop_starts_at_generation_one_in_observed(tmp_path):
     assert loop.round_count == 0
 
 
+# --- the reaction anchor: status_message_ts ---------------------------------
+
+def test_open_loop_persists_the_status_message_anchor(tmp_path):
+    """The column the reaction is anchored on (see loop.py's
+    _clear_running_signal / _open_lane), distinct from root_thread_ts."""
+    store = Store(tmp_path / "r.db")
+    loop = store.open_loop(
+        owner="Ylopo", repo="example", pr_number=42, head_sha="a" * 40,
+        boris_request_id="br_1", root_thread_ts="1.0",
+        status_message_ts="2.0", now=1_000_000.0,
+    )
+    assert loop.status_message_ts == "2.0"
+    assert loop.root_thread_ts == "1.0", "the two anchors are independent columns"
+    assert store.get(loop.loop_id).status_message_ts == "2.0"
+
+
+def test_open_loop_without_a_status_message_leaves_the_anchor_null(tmp_path):
+    """status_message_ts is nullable in the source; a verdict with none must
+    open a loop rather than raise or fabricate one."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    assert loop.status_message_ts is None
+
+
 def test_a_second_open_while_active_is_refused(tmp_path):
     """One live loop per PR; a duplicate verdict must not start a rival."""
     store = Store(tmp_path / "r.db")
@@ -114,11 +138,13 @@ class _RacingConnection:
         if self._armed and sql.startswith("INSERT INTO loops"):
             self._armed = False
             (_loop_id, owner, repo, pr_number, generation, head_sha,
-             boris_request_id, root_thread_ts, state, created_at, updated_at) = params
+             boris_request_id, root_thread_ts, status_message_ts, state,
+             created_at, updated_at) = params
             self._real.execute(
                 sql,
                 ("lp_racer", owner, repo, pr_number, generation, "c" * 40,
-                 "br_racer", "1.0", state, created_at, updated_at),
+                 "br_racer", "1.0", status_message_ts, state, created_at,
+                 updated_at),
             )
             self._real.commit()
         return self._real.execute(sql, params)
@@ -373,6 +399,65 @@ def test_a_store_stamps_the_schema_version_it_wrote(tmp_path):
     store.close()
     # Reopening an existing database re-stamps rather than leaving it stale.
     assert Store(db)._db.execute("PRAGMA user_version").fetchone()[0] == _USER_VERSION
+
+
+def test_a_v1_database_migrates_in_the_status_message_column_without_loss(tmp_path):
+    """A database written before status_message_ts existed (schema version 1,
+    an 11-column `loops` table with no such column) must gain it and keep its
+    data -- not be dropped and recreated, and not raise. This is the migration
+    the store's ALTER-TABLE-in-__init__ mechanism is for; it must follow that
+    existing mechanism (like lease_owner before it) rather than a new one."""
+    db = tmp_path / "r.db"
+    raw = sqlite3.connect(str(db))
+    raw.execute(
+        """
+        CREATE TABLE loops (
+            loop_id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            generation INTEGER NOT NULL,
+            head_sha TEXT NOT NULL,
+            boris_request_id TEXT NOT NULL,
+            root_thread_ts TEXT NOT NULL,
+            state TEXT NOT NULL,
+            round_count INTEGER NOT NULL DEFAULT 0,
+            lane_id TEXT,
+            escalation_reason TEXT,
+            lease_owner TEXT,
+            lease_expires_at REAL NOT NULL DEFAULT 0,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE (owner, repo, pr_number, generation)
+        )
+        """
+    )
+    raw.execute(
+        "INSERT INTO loops (loop_id, owner, repo, pr_number, generation, "
+        "head_sha, boris_request_id, root_thread_ts, state, created_at, "
+        "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("lp_old", "Ylopo", "example", 7, 1, "a" * 40, "br_old", "1.0",
+         LoopState.REMEDIATING.value, 999_000.0, 999_000.0),
+    )
+    raw.execute("PRAGMA user_version=1")
+    raw.commit()
+    raw.close()
+
+    store = Store(db)
+    assert store._db.execute("PRAGMA user_version").fetchone()[0] == _USER_VERSION
+
+    loop = store.get("lp_old")
+    assert loop is not None, "the pre-existing row must survive the migration"
+    assert loop.root_thread_ts == "1.0", "existing data must not be lost"
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.status_message_ts is None, \
+        "an old row has no recoverable anchor -- see loop.py for why that means skip, not backfill"
+
+    # The store is fully usable afterward: a fresh loop can still be opened,
+    # and it carries the new column like any post-migration row.
+    fresh = open_one(store, pr=8)
+    assert fresh.status_message_ts is None
 
 
 # --- I7: only the intended UNIQUE conflict is swallowed -------------------

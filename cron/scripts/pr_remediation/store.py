@@ -26,7 +26,7 @@ from typing import Any
 from pr_remediation.models import TERMINAL_STATES, LoopRequest, LoopState
 
 LEASE_SECONDS = 300.0
-_USER_VERSION = 1
+_USER_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS loops (
@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS loops (
     head_sha TEXT NOT NULL,
     boris_request_id TEXT NOT NULL,
     root_thread_ts TEXT NOT NULL,
+    -- Boris's status message: the thinkies reaction anchor. Nullable like the
+    -- source column it is read from (boris_intake's status_message_ts), and
+    -- absent on every row a database from before this column existed still
+    -- carries -- both read back as "do not react" (see loop.py).
+    status_message_ts TEXT,
     state TEXT NOT NULL,
     round_count INTEGER NOT NULL DEFAULT 0,
     lane_id TEXT,
@@ -183,6 +188,20 @@ class Store:
             }
             if "lease_owner" not in columns:
                 self._db.execute("ALTER TABLE loops ADD COLUMN lease_owner TEXT")
+            if "status_message_ts" not in columns:
+                # A database from before this column existed. SQLite gives a
+                # column added without DEFAULT a NULL value on every existing
+                # row -- exactly the "no anchor" reading loop.py already gives
+                # a NULL status_message_ts, so an upgraded database's old
+                # loops simply skip the reaction rather than reacting on
+                # root_thread_ts (which would reintroduce the watchdog
+                # collision this migration exists to end) or requiring a
+                # backfill this store has no way to perform: boris_intake's
+                # database is the only place that ever knew the real anchor,
+                # and it is not a dependency of this store.
+                self._db.execute(
+                    "ALTER TABLE loops ADD COLUMN status_message_ts TEXT"
+                )
             self._db.execute(f"PRAGMA user_version={_USER_VERSION}")
             self._db.commit()
         except Exception:
@@ -201,7 +220,8 @@ class Store:
             loop_id=row["loop_id"], owner=row["owner"], repo=row["repo"],
             pr_number=row["pr_number"], generation=row["generation"],
             head_sha=row["head_sha"], boris_request_id=row["boris_request_id"],
-            root_thread_ts=row["root_thread_ts"], state=state,
+            root_thread_ts=row["root_thread_ts"],
+            status_message_ts=row["status_message_ts"], state=state,
             round_count=row["round_count"], lane_id=row["lane_id"],
             escalation_reason=row["escalation_reason"],
             created_at=row["created_at"], updated_at=row["updated_at"],
@@ -222,6 +242,7 @@ class Store:
 
     def open_loop(self, *, owner: str, repo: str, pr_number: int, head_sha: str,
                   boris_request_id: str, root_thread_ts: str,
+                  status_message_ts: str | None = None,
                   now: float) -> LoopRequest | None:
         try:
             self._db.execute("BEGIN IMMEDIATE")
@@ -238,10 +259,12 @@ class Store:
             try:
                 self._db.execute(
                     "INSERT INTO loops (loop_id, owner, repo, pr_number, generation, "
-                    "head_sha, boris_request_id, root_thread_ts, state, created_at, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "head_sha, boris_request_id, root_thread_ts, status_message_ts, "
+                    "state, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (loop_id, owner, repo, pr_number, generation, head_sha,
-                     boris_request_id, root_thread_ts, LoopState.OBSERVED.value, now, now),
+                     boris_request_id, root_thread_ts, status_message_ts,
+                     LoopState.OBSERVED.value, now, now),
                 )
             except sqlite3.IntegrityError as exc:
                 if not _is_generation_conflict(exc):

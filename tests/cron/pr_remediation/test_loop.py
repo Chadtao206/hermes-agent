@@ -73,12 +73,18 @@ class SlackFake:
     def __init__(self, repost_ts="9.0", ready_ts="9.1", escalation_ts="9.2"):
         self.reposts, self.ready, self.escalations = [], [], []
         self.thinkies_added, self.thinkies_removed = [], []
+        # The thread_ts each post_rereview call actually targeted -- kept
+        # apart from `reposts` (which every existing assertion already reads
+        # as (slug, round) tuples) so a test can pin the target without
+        # touching every one of those.
+        self.repost_targets = []
         self._repost_ts = repost_ts
         self._ready_ts = ready_ts
         self._escalation_ts = escalation_ts
 
     def post_rereview(self, verdict, thread_ts, round_number):
         self.reposts.append((verdict.slug, round_number))
+        self.repost_targets.append(thread_ts)
         return self._repost_ts
 
     def add_thinkies(self, channel, ts):
@@ -180,9 +186,16 @@ class UnreleasableStore:
 
 
 def verdict(outcome="ISSUES_FOUND", origin=None, head="a" * 40, rid="br_1",
-            pr=42, thread="1.0"):
+            pr=42, thread="1.0", status="2.0"):
+    """`thread` (root_thread_ts) and `status` (status_message_ts) default to
+    different values on purpose: the reaction anchor is status_message_ts, the
+    re-review target stays root_thread_ts, and a test that let the two default
+    to the same literal could not tell them apart -- including from the one
+    regression this module exists to prevent (the anchor reverting to
+    root_thread_ts). See pr_remediation/loop.py's _clear_running_signal.
+    """
     return Verdict(rid, "Ylopo", "example", pr, head, thread, outcome, origin,
-                   ("Null deref",))
+                   ("Null deref",), status)
 
 
 def build(tmp_path, source, github=None, slack=None, lanes=None, clock=None,
@@ -245,21 +258,98 @@ def test_ready_clears_the_thinkies_reaction(tmp_path):
 
     deps = build(tmp_path, SourceFake([verdict(outcome="READY_FOR_HUMAN_REVIEW")]))
     tick(deps)
-    assert deps.slack.thinkies_removed == ["1.0"]
+    assert deps.slack.thinkies_removed == ["2.0"]
 
 
-def test_thinkies_is_anchored_on_the_loop_thread_not_the_verdict(tmp_path):
-    """A reaction can only be removed from the message it was added to."""
+def test_thinkies_is_anchored_on_boris_status_message_not_root_thread_ts(tmp_path):
+    """The regression this module exists to prevent: the reaction must land on
+    (and come off) Boris's status message, never the thread root -- even
+    though `post_rereview` targets the thread root on purpose (see
+    `test_rereview_still_posts_to_the_thread_not_the_status_message` below)."""
     from pr_remediation.loop import tick
 
-    deps = build(tmp_path, SourceFake([verdict()]))
+    deps = build(tmp_path, SourceFake([verdict(thread="1.0", status="2.0")]))
     tick(deps)
-    assert deps.slack.thinkies_added == ["1.0"]
+    assert deps.slack.thinkies_added == ["2.0"], \
+        "the reaction must anchor on status_message_ts, not root_thread_ts"
 
-    deps.source.verdicts = [verdict(rid="br_2", thread="2.0",
+
+def test_thinkies_is_anchored_on_the_loops_own_status_message_not_the_verdict(tmp_path):
+    """A reaction can only be removed from the message it was added to: the
+    loop's own persisted anchor from when it opened, not whatever a later
+    verdict happens to carry."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(status="2.0")]))
+    tick(deps)
+    assert deps.slack.thinkies_added == ["2.0"]
+
+    deps.source.verdicts = [verdict(rid="br_2", status="9.5",
                                     outcome="READY_FOR_HUMAN_REVIEW")]
     tick(deps)
-    assert deps.slack.thinkies_removed == ["1.0"]
+    assert deps.slack.thinkies_removed == ["2.0"], \
+        "removed from the loop's own anchor, not the closing verdict's status message"
+
+
+def test_rereview_still_posts_to_the_thread_not_the_status_message(tmp_path):
+    """Only the reaction anchor moved. `post_rereview` must keep targeting
+    root_thread_ts: boris_intake's gate (gate.py::_is_loop_repost) admits a
+    re-review only as a reply in an existing thread, which is root_thread_ts,
+    not Boris's status message -- unifying the two anchors would silently drop
+    every re-review the moment they diverge."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake(
+        [verdict(outcome="REVIEW_INCOMPLETE", origin="system",
+                 thread="1.0", status="2.0")]))
+    tick(deps)
+    assert deps.slack.repost_targets == ["1.0"], \
+        "the system-incomplete repost must target root_thread_ts, not the anchor"
+
+
+def test_the_due_pass_rereview_also_targets_the_thread(tmp_path):
+    """The other post_rereview call site (a lane that finished and pushed),
+    pinned the same way."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                thread="1.0", status="2.0")
+    deps.github.head = "b" * 40
+    assert tick(deps) == 1
+    assert deps.slack.repost_targets == ["1.0"]
+
+
+def test_a_verdict_with_no_status_message_reacts_not_at_all_but_still_opens_a_lane(
+        tmp_path):
+    """status_message_ts is nullable. Its absence must not fail the round --
+    the reaction is a convenience signal, not a correctness mechanism -- and it
+    must NOT fall back to root_thread_ts, which would reintroduce the
+    watchdog collision this fix exists to end."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([verdict(thread="1.0", status=None)]))
+    assert tick(deps) == 1
+    assert deps.lanes.created == [("Ylopo/example#42", 1)], "the round still ran"
+    assert deps.github.claimed == [("Ylopo", "example", 42)]
+    assert deps.slack.thinkies_added == [], "no anchor, so no reaction at all"
+    loop = only_loop(deps)
+    assert loop.state is LoopState.REMEDIATING
+    assert "reaction_skipped_no_status_message" in kinds(deps, loop.loop_id), \
+        "the omission must be explainable from the trail, not silent"
+
+
+def test_a_loop_with_no_status_message_anchor_still_closes_out_normally(tmp_path):
+    """The missing anchor is a missing convenience signal, nothing more: the
+    round it never decorated still completes and the loop still reaches its
+    terminal state."""
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake(
+        [verdict(status=None, outcome="READY_FOR_HUMAN_REVIEW")]))
+    assert tick(deps) == 1
+    assert deps.slack.ready == [("Ylopo/example#42", 0)]
+    assert deps.slack.thinkies_removed == [], "nothing to remove; no anchor was ever set"
+    assert only_loop(deps) is None, "the loop still reaches its terminal state"
 
 
 def test_a_hold_label_stops_the_loop_before_any_write(tmp_path):
@@ -423,7 +513,7 @@ def test_a_paused_run_never_closes_a_loop_a_live_run_created(
     assert tick(deps) == 1
     loop_id = _loop_id(deps)
     assert deps.github.claimed == [("Ylopo", "example", 42)]
-    assert deps.slack.thinkies_added == ["1.0"]
+    assert deps.slack.thinkies_added == ["2.0"]
     rereview_posted(deps)  # the lane finished, the head moved, the re-review went
 
     paused = in_mode(deps, mode)
@@ -447,7 +537,7 @@ def test_a_paused_run_never_closes_a_loop_a_live_run_created(
     assert tick(live) == 1
     assert deps.store.get(loop_id).state is target
     assert deps.github.released == [("Ylopo", "example", 42)]
-    assert deps.slack.thinkies_removed == ["1.0"]
+    assert deps.slack.thinkies_removed == ["2.0"]
 
 
 @pytest.mark.parametrize("mode", ["shadow", "off"])
@@ -1211,7 +1301,7 @@ def test_a_stand_down_that_died_after_delivery_is_retried(tmp_path):
     assert tick(deps) == 1
     assert deps.github.released == [("Ylopo", "example", 42)], \
         "no later tick would ever hand the PR back"
-    assert deps.slack.thinkies_removed == ["1.0"]
+    assert deps.slack.thinkies_removed == ["2.0"]
     assert len(slack.escalations) == 1, "the human already has the notice"
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
@@ -1542,17 +1632,18 @@ class ReadRecordingLanes(LanesFake):
 
 
 def drive_to_remediating(tmp_path, lanes=None, github=None, slack=None,
-                         store=None, thread="1.0"):
+                         store=None, thread="1.0", status="2.0"):
     """A live tick that opened a lane, with its verdict consumed.
 
     What the next sweep finds: a `remediating` row with a lane to poll, a
-    thinkies reaction on the thread, and no verdict left to route -- so the due
-    pass, not the verdict pass, is what drives everything below.
+    thinkies reaction on Boris's status message, and no verdict left to
+    route -- so the due pass, not the verdict pass, is what drives everything
+    below.
     """
     from pr_remediation.loop import LANE_POLL_SECONDS, tick
 
-    deps = build(tmp_path, SourceFake([verdict(thread=thread)]), lanes=lanes,
-                 github=github, slack=slack, store=store)
+    deps = build(tmp_path, SourceFake([verdict(thread=thread, status=status)]),
+                 lanes=lanes, github=github, slack=slack, store=store)
     assert tick(deps) == 1
     assert deps.lanes.created == [("Ylopo/example#42", 1)]
     deps.source.verdicts = []
@@ -1568,7 +1659,7 @@ def test_a_finished_lane_that_moved_the_head_asks_for_a_rereview(tmp_path):
     assert tick(deps) == 1
     assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
         "the round that just finished, not the one about to start"
-    assert deps.slack.thinkies_removed == ["1.0"], \
+    assert deps.slack.thinkies_removed == ["2.0"], \
         "the running signal must be cleared"
     loop = only_loop(deps)
     assert loop.state is LoopState.REREVIEW_POSTED
@@ -1615,7 +1706,7 @@ def test_a_lane_that_pushed_nothing_gets_one_grace_window_then_escalates(tmp_pat
     assert loop.state is LoopState.AWAITING_HEAD_MOVE
     assert deps.slack.escalations == [], "a push can land just behind its lane"
     assert deps.slack.reposts == []
-    assert deps.slack.thinkies_removed == ["1.0"], "no round is running now"
+    assert deps.slack.thinkies_removed == ["2.0"], "no round is running now"
 
     deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
     assert tick(deps) == 1
@@ -1736,7 +1827,7 @@ def test_the_head_read_budget_exhausting_escalates_with_a_reason_distinct_from_n
     assert only_loop(deps) is None, "an escalated loop is finished"
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
     assert deps.github.released == [("Ylopo", "example", 42)]
-    assert deps.slack.thinkies_removed == ["1.0"]
+    assert deps.slack.thinkies_removed == ["2.0"]
     assert kinds(deps, loop_id).count("head_unreadable") == HEAD_READ_ATTEMPTS - 1, \
         "the exhausting attempt escalates instead of recording one more wait"
 
@@ -2166,7 +2257,7 @@ def test_a_finished_lane_hands_the_loop_to_the_next_verdict(tmp_path):
     assert loop.state is LoopState.REMEDIATING
     assert loop.lane_id == "t_2"
     assert deps.lanes.created == [("Ylopo/example#42", 1), ("Ylopo/example#42", 2)]
-    assert deps.slack.thinkies_added == ["1.0", "1.0"]
+    assert deps.slack.thinkies_added == ["2.0", "2.0"]
 
 
 def test_a_no_op_escalation_never_claims_the_lane_is_still_running(tmp_path):
@@ -2299,7 +2390,7 @@ def test_closing_stale_notifies_nobody_but_still_hands_the_pr_back(tmp_path):
     assert deps.slack.escalations == [], "a closed PR is not an escalation"
     assert deps.slack.ready == []
     assert deps.github.released == [("Ylopo", "example", 42)]
-    assert deps.slack.thinkies_removed == ["1.0"]
+    assert deps.slack.thinkies_removed == ["2.0"]
 
 
 def test_a_stale_close_is_recorded_as_stale_not_as_an_escalation(tmp_path):
