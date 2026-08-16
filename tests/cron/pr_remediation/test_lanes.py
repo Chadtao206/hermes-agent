@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -304,3 +305,42 @@ def test_create_still_dispatches_an_ordinary_repo(tmp_path, monkeypatch):
     result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(VERDICT, 1)
     assert result == "t_abc123"
     assert len(calls) == 1
+
+
+def test_create_with_empty_expected_owner_env_falls_back_to_default(tmp_path, monkeypatch):
+    """When PR_REVIEW_EXPECTED_OWNER is set to an empty string, it must fall
+    back to the default "Ylopo", matching bash ${VAR:-default} semantics and
+    the _excluded_repos() pattern on line 50.
+
+    Otherwise, with an empty EXPECTED_OWNER, every dispatch is silently
+    refused because no real owner equals "" — silently disabling the entire
+    remediation pipeline while looking healthy.
+    """
+    import importlib
+
+    # Save the original environment
+    original_env_value = os.environ.get("PR_REVIEW_EXPECTED_OWNER")
+
+    try:
+        # Set to empty string and reload the module
+        monkeypatch.setenv("PR_REVIEW_EXPECTED_OWNER", "")
+        importlib.reload(lanes)
+
+        # After reload, re-establish the valid anchor (reload resets ANCHOR_ROOT to env)
+        anchor_root = tmp_path / "anchors"
+        (anchor_root / VERDICT.repo / ".git").mkdir(parents=True)
+        monkeypatch.setattr(lanes, "ANCHOR_ROOT", str(anchor_root))
+
+        calls = []
+        result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(VERDICT, 1)
+
+        # Should dispatch normally, not refuse
+        assert result == "t_abc123"
+        assert len(calls) == 1
+    finally:
+        # Restore the original environment and reload
+        if original_env_value is None:
+            monkeypatch.delenv("PR_REVIEW_EXPECTED_OWNER", raising=False)
+        else:
+            monkeypatch.setenv("PR_REVIEW_EXPECTED_OWNER", original_env_value)
+        importlib.reload(lanes)

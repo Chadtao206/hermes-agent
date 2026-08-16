@@ -32,7 +32,7 @@ from pr_remediation.boris_source import Verdict
 DISPATCH = "/Users/ctao/.hermes/scripts/pr/kanban_dispatch.sh"
 ANCHOR_ROOT = os.environ.get(
     "PR_FIX_ANCHOR_ROOT", "/Users/ctao/.hermes/state/pr-review-anchors")
-EXPECTED_OWNER = os.environ.get("PR_REVIEW_EXPECTED_OWNER", "Ylopo")
+EXPECTED_OWNER = os.environ.get("PR_REVIEW_EXPECTED_OWNER") or "Ylopo"
 ASSIGNEE = "engineer"  # SOUL.md: Andrej = engineer
 TIMEOUT = 120
 TERMINAL_LANE_STATUSES = frozenset({"done", "blocked", "failed", "cancelled"})
