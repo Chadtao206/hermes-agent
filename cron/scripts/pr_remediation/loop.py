@@ -237,6 +237,18 @@ NOTIFY_ATTEMPTS = 5
 # Loops the retry pass leases per tick.
 DUE_LIMIT = 20
 
+# How far out the due pass pushes a loop it has just visited and left open.
+#
+# Matched to the daemon's poll interval, because the fastest thing this pass
+# waits on -- a lane in flight -- wants looking at once a tick and no oftener.
+# It is deliberately NOT what makes the pass fair: fairness comes from
+# `claim_due` ordering on `next_attempt_at`, so a loop just visited sorts behind
+# one that has been waiting however small this number is. Tying fairness to a
+# backoff longer than the tick interval would be a coincidence between two
+# constants nothing enforces, and the pass would starve again the day someone
+# tuned `poll_seconds` up.
+DUE_BACKOFF_SECONDS = 15.0
+
 # Stop reasons outside EscalationReason's vocabulary. See the module docstring.
 NOT_CHAD_AUTHORED = "not_chad_authored"
 GITHUB_UNWRITABLE = "github_unwritable"
@@ -1388,6 +1400,33 @@ def _note_quietly(deps: LoopDeps, loop_id: str, kind: str, detail: dict) -> None
         _LOG.exception("could not record %s for loop %s", kind, loop_id)
 
 
+def _reschedule(deps: LoopDeps, loop: LoopRequest) -> None:
+    """Push a loop the due pass has just visited behind the ones it has not.
+
+    The pass claims `next_attempt_at <= now` ordered by that same column, so a
+    loop nothing advances is claimed again on the very next tick, ahead of every
+    loop that has been waiting longer. Twenty of those and the batch never moves:
+    remediation halts for every other pull request, silently. This is the one
+    place that guarantees the rotation, because it does not ask what the route
+    was -- a route added later cannot forget to call it.
+
+    `store.defer` only ever raises the floor, so a route that chose a longer
+    wait (the grace window) keeps it, and a terminal row is refused outright.
+    Best-effort: a loop that could not be rescheduled is worth a log line and
+    nothing more, and this runs on the path that must not throw past `tick`.
+
+    Asked in both modes, and that is not a mode gate this module has grown a
+    fourth of: rescheduling decides nothing and touches no loop state, and a
+    paused pass that did not rotate would starve exactly the shadow soak that
+    exists to find this class of failure.
+    """
+    try:
+        deps.store.defer(loop.loop_id, now=deps.now(),
+                         not_before=deps.now() + DUE_BACKOFF_SECONDS)
+    except Exception:
+        _LOG.exception("loop %s could not be rescheduled", loop.loop_id)
+
+
 def _verdict_for(loop: LoopRequest) -> Verdict:
     """Enough of a Verdict to address Slack and GitHub for a loop we hold.
 
@@ -1458,6 +1497,11 @@ def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
         except Exception:
             _LOG.exception("loop %s could not be settled", loop.loop_id)
         finally:
+            # In the `finally`, so that a loop whose routing threw is
+            # rescheduled too. That is not tidiness: an exception is precisely
+            # the case that would otherwise leave a permanently-due row, and
+            # permanently-due rows are what starve the batch.
+            _reschedule(deps, loop)
             # Guarded: outside a try this is the one statement in the pass that
             # can throw past `tick`, discarding the verdict pass's whole result
             # over a lease we merely failed to drop early. The lease expires on

@@ -2361,3 +2361,102 @@ def test_a_paused_tick_records_the_stale_decision_and_closes_nothing(tmp_path):
     decisions = [e["detail"] for e in shadow.store.events(loop.loop_id)
                  if e["kind"] == "shadow_decision"]
     assert decisions == [{"would": ROUTE_CLOSE_STALE, "pr_state": "MERGED"}]
+
+
+# --- I1: the due pass must rotate ------------------------------------------
+
+
+class RecordsDueBatches:
+    """A real store that remembers which loops each due batch actually held."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.batches = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def claim_due(self, *, now, limit):
+        claimed = self._inner.claim_due(now=now, limit=limit)
+        self.batches.append([loop.loop_id for loop in claimed])
+        return claimed
+
+
+def _open_many(store, clock, count):
+    """`count` loops on distinct pull requests, oldest first."""
+    loop_ids = []
+    for index in range(count):
+        clock.advance(1.0)
+        loop = store.open_loop(
+            owner="Ylopo", repo="example", pr_number=100 + index,
+            head_sha="a" * 40, boris_request_id=f"br_{index}",
+            root_thread_ts=f"{index}.0", now=clock())
+        loop_ids.append(loop.loop_id)
+    return loop_ids
+
+
+def test_the_due_pass_visits_every_loop_and_starves_none(tmp_path):
+    """The fairness the pass had none of.
+
+    `claim_due` selects `next_attempt_at <= now` ordered by age, LIMIT 20, and
+    no route that leaves a loop non-terminal used to advance `next_attempt_at`
+    -- not ROUTE_HELD, not ROUTE_AUTHOR_UNREADABLE, not ROUTE_UNKNOWN_OUTCOME,
+    nor a `rereview_posted` loop whose verdict never arrives, nor the ordinary
+    "nothing owed" return. So the same oldest 20 were claimed on every tick and
+    loops 21+ were never visited at all: once 20 permanently-due loops
+    accumulate, remediation halts for every other pull request, with no alarm.
+
+    Note the compounding the reproduction showed: the likeliest operational
+    failure -- re-review posts not being admitted -- is itself what manufactures
+    permanently-due rows.
+    """
+    from pr_remediation.config import RemediationConfig
+    from pr_remediation.loop import DUE_LIMIT, tick
+
+    clock = Clock()
+    store = RecordsDueBatches(Store(tmp_path / "r.db"))
+    loop_ids = _open_many(store, clock, DUE_LIMIT + 5)
+    deps = build(tmp_path, SourceFake([]), store=store, clock=clock)
+
+    for _ in range(6):
+        clock.advance(RemediationConfig().poll_seconds)
+        tick(deps)
+
+    visited = {loop_id for batch in store.batches for loop_id in batch}
+    starved = [loop_id for loop_id in loop_ids if loop_id not in visited]
+    assert not starved, (
+        f"{len(starved)} of {len(loop_ids)} loops were never claimed in six "
+        f"ticks; the pass is stuck on its oldest {DUE_LIMIT}")
+
+
+def test_a_loop_the_due_pass_leaves_open_is_not_immediately_due_again(tmp_path):
+    """The mechanism behind the rotation above, pinned on its own so a future
+    route cannot quietly reintroduce a permanently-due row."""
+    from pr_remediation.loop import tick
+
+    clock = Clock()
+    store = Store(tmp_path / "r.db")
+    loop_id = _open_many(store, clock, 1)[0]
+    deps = build(tmp_path, SourceFake([]), store=store, clock=clock)
+
+    clock.advance(1.0)
+    tick(deps)
+    row = store._db.execute("SELECT next_attempt_at FROM loops WHERE loop_id=?",
+                            (loop_id,)).fetchone()
+    assert row["next_attempt_at"] > clock(), \
+        "the loop is still due the instant the pass that just visited it ends"
+
+
+def test_rescheduling_never_shortens_a_wait_a_route_chose(tmp_path):
+    """The grace window is the case that matters: `_await_head_move` parks the
+    loop for HEAD_MOVE_GRACE_SECONDS, and a backoff applied on top of it must
+    not cut that short -- the window exists to let a late push become visible."""
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = only_loop(deps).loop_id
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
+    row = deps.store._db.execute(
+        "SELECT next_attempt_at FROM loops WHERE loop_id=?", (loop_id,)).fetchone()
+    assert row["next_attempt_at"] == deps.now() + HEAD_MOVE_GRACE_SECONDS

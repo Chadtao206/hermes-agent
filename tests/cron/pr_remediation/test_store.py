@@ -671,3 +671,96 @@ def test_a_refused_cas_rolls_back_rather_than_committing_an_empty_transaction(tm
     assert [e["kind"] for e in store.events(loop.loop_id)] == ["opened"], \
         "an empty commit would have flushed the pending write"
     assert store._db.in_transaction is False
+
+
+# --- I1: defer(), and the ordering that makes it a rotation ----------------
+
+
+def _next_attempt(store, loop_id):
+    return store._db.execute(
+        "SELECT next_attempt_at FROM loops WHERE loop_id=?",
+        (loop_id,)).fetchone()["next_attempt_at"]
+
+
+def test_defer_pushes_a_loop_out_of_the_next_batch(tmp_path):
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    assert store.claim_due(now=1_000_010.0, limit=10)
+
+    assert store.defer(loop.loop_id, now=1_000_010.0,
+                       not_before=1_000_025.0) is True
+    store.release(loop.loop_id)
+    assert store.claim_due(now=1_000_020.0, limit=10) == ()
+    assert len(store.claim_due(now=1_000_030.0, limit=10)) == 1
+
+
+def test_defer_only_ever_raises_the_floor(tmp_path):
+    """Monotone on purpose. A route that chose a longer wait -- the head-move
+    grace window -- must keep it; a backoff applied on top of that window must
+    not cut it short, or a late push stops being given time to appear."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    store.claim_due(now=1_000_010.0, limit=10)
+    store.transition(loop.loop_id, LoopState.OBSERVED, LoopState.REMEDIATING,
+                     now=1_000_010.0, next_attempt_at=1_000_500.0)
+
+    assert store.defer(loop.loop_id, now=1_000_010.0,
+                       not_before=1_000_025.0) is True
+    assert _next_attempt(store, loop.loop_id) == 1_000_500.0
+
+
+def test_defer_does_not_move_updated_at(tmp_path):
+    """`updated_at` is when the loop last actually changed, and it is what the
+    lane age bound measures from. A reschedule is not a change: bumping it once
+    a tick would push that deadline out forever and silently restore the wedge
+    the bound exists to end."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    store.claim_due(now=1_000_010.0, limit=10)
+
+    assert store.defer(loop.loop_id, now=1_000_020.0,
+                       not_before=1_000_035.0) is True
+    assert store.get(loop.loop_id).updated_at == loop.updated_at
+
+
+def test_defer_refuses_a_terminal_or_missing_loop(tmp_path):
+    store = Store(tmp_path / "r.db")
+    finished = open_one(store)
+    store.transition(finished.loop_id, LoopState.OBSERVED, LoopState.READY,
+                     now=1_000_100.0)
+
+    assert store.defer(finished.loop_id, now=1_000_200.0,
+                       not_before=1_000_215.0) is False
+    assert store.defer("lp_nonexistent", now=1_000_200.0,
+                       not_before=1_000_215.0) is False
+    assert store._db.in_transaction is False, \
+        "a refused defer writes nothing and rolls back"
+
+
+def test_defer_refuses_a_loop_someone_else_holds(tmp_path):
+    db = tmp_path / "r.db"
+    owner_tick, other_tick = Store(db), Store(db)
+    loop = open_one(owner_tick)
+    assert len(owner_tick.claim_due(now=1_000_010.0, limit=10)) == 1
+
+    assert other_tick.defer(loop.loop_id, now=1_000_020.0,
+                            not_before=1_000_035.0) is False
+    assert _next_attempt(owner_tick, loop.loop_id) == 0.0
+
+
+def test_claim_due_serves_the_least_recently_visited_loop_first(tmp_path):
+    """Ordering by age alone is what let twenty permanently-due loops hold the
+    batch forever: they sorted first on every tick and there were always
+    exactly `limit` of them. Leading with `next_attempt_at` makes the batch a
+    rotation -- a loop just visited sorts behind one that has been waiting."""
+    store = Store(tmp_path / "r.db")
+    oldest = open_one(store, pr=1, head="a" * 40, now=1_000_000.0)
+    younger = open_one(store, pr=2, head="b" * 40, now=1_000_001.0)
+
+    assert [c.loop_id for c in store.claim_due(now=1_000_010.0, limit=1)] == \
+        [oldest.loop_id], "with nothing visited yet, age still decides"
+    store.defer(oldest.loop_id, now=1_000_010.0, not_before=1_000_011.0)
+    store.release(oldest.loop_id)
+
+    assert [c.loop_id for c in store.claim_due(now=1_000_020.0, limit=1)] == \
+        [younger.loop_id], "the loop nobody has looked at must come first"

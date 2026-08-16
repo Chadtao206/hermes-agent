@@ -350,7 +350,15 @@ class Store:
                     f"SELECT loop_id FROM loops WHERE state IN ({states}) "
                     "AND next_attempt_at<=? "
                     "AND (lease_owner IS NULL OR lease_expires_at<=?) "
-                    "ORDER BY created_at, loop_id LIMIT ?",
+                    # Least-recently-visited first, then oldest. Ordering by
+                    # age ALONE is what let twenty permanently-due loops hold
+                    # the batch forever while every younger pull request went
+                    # unvisited: they sorted first on every tick and there were
+                    # always exactly `limit` of them. `next_attempt_at` is the
+                    # record of when each loop was last looked at, so leading
+                    # with it turns the batch into a rotation; `created_at`
+                    # still breaks ties, which is every tie on a fresh board.
+                    "ORDER BY next_attempt_at, created_at, loop_id LIMIT ?",
                     (*_CLAIMABLE_STATES, now, now, int(limit)),
                 ).fetchall()
             ]
@@ -377,6 +385,53 @@ class Store:
             claimed = tuple(self._row(row) for row in rows)
             self._db.commit()
             return claimed
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def defer(self, loop_id: str, *, now: float, not_before: float) -> bool:
+        """Push a still-open loop's next due time out to at least `not_before`.
+
+        The counterpart to `claim_due`'s ordering, and what makes that ordering
+        a rotation rather than a re-sort: a loop the pass has just visited is
+        no longer the least-recently-visited one. Without it, every route that
+        leaves a loop non-terminal -- a hold nobody has lifted, an unreadable
+        author, an unknown outcome, a `rereview_posted` loop whose verdict never
+        arrives, or simply nothing owed -- left `next_attempt_at` where it was,
+        so twenty such loops permanently occupied the batch and remediation
+        halted for every other pull request with no alarm.
+
+        Monotone: `MAX`, never a plain assignment. A route that deliberately
+        chose a longer wait -- `_await_head_move`'s grace window is the one that
+        matters -- must keep it, and a backoff applied on top must never cut a
+        window short. So this raises the floor and nothing else.
+
+        Deliberately NOT `transition()`, and deliberately leaving `updated_at`
+        alone. Most of the states that need this have no self-edge (
+        `awaiting_head_move` has none on purpose), a reschedule is not a step
+        the loop took, and `updated_at` is what the lane age bound measures
+        from: bumping it once a tick would push that deadline out forever and
+        silently restore the wedge it exists to end.
+
+        Guarded like `transition`: a non-terminal row, and either unleased or
+        leased by us. False means there was nothing of ours to reschedule.
+        """
+        states = ",".join("?" for _ in _CLAIMABLE_STATES)
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            cur = self._db.execute(
+                f"UPDATE loops SET next_attempt_at=MAX(next_attempt_at, ?) "
+                f"WHERE loop_id=? AND state IN ({states}) "
+                "AND (lease_owner IS NULL OR "
+                "(lease_owner=? AND lease_expires_at>?))",
+                (not_before, loop_id, *_CLAIMABLE_STATES,
+                 self._lease_owner, now),
+            )
+            if cur.rowcount != 1:
+                self._db.rollback()
+                return False
+            self._db.commit()
+            return True
         except Exception:
             self._db.rollback()
             raise
