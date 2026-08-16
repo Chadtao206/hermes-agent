@@ -116,8 +116,11 @@ verdict and spends another round arriving at it.
 first look. Kanban marks a lane terminal when its worker exits, which can be
 moments before GitHub serves the pushed head. `awaiting_head_move` is that
 one grace window, and the store's transition table gives the state no
-self-edge on purpose: a loop enters it once, and the next look either finds
-the push or gives up as `no_op_lane`. A head GitHub could not read at all is
+self-edge on purpose: a loop enters it at most once per round -- a verdict
+arriving inside the window starts the next round fresh, with its own single
+entry, so this is not an invariant over the loop's whole life, only over one
+round's -- and the next look either finds the push or gives up as
+`no_op_lane`. A head GitHub could not read at all is
 neither answer -- like an unreadable author it is recorded and retried,
 because escalating a network blip would burn the loop permanently. Which
 state the loop is in is also what says whether there is a lane to complete at
@@ -517,8 +520,21 @@ def _close(deps: LoopDeps, loop: LoopRequest, target: LoopState,
     The lane is identified before the swap, not after: a successful transition
     appends to the trail the orphan replay reads, and only a landed swap is
     worth reporting -- a lost one leaves the loop open and the lane still ours.
+
+    One reason is exempted from the report outright: `head_read_exhausted`
+    reaches `_route_due`'s escalate branch only after that pass has already
+    read this lane as finished by kanban's own account (`lane.finished` gates
+    the branch it comes from) -- the row still says `remediating` because a
+    lane whose head never once came back readable never earns the transition
+    into `awaiting_head_move` that would say otherwise. `_lane_in_flight`
+    cannot see that; it only has the row. Reporting the lane as still running
+    here would be the same false alarm on a routine path this module already
+    rejected widening this check to `_lane_pending` over -- a GitHub outage
+    would then leave one bogus `lane_abandoned` per affected PR, naming a lane
+    that is not running, beside the notice a human is already being sent.
     """
-    lane_id = _lane_left_running(deps, loop)
+    known_finished = fields.get("escalation_reason") == HEAD_READ_EXHAUSTED
+    lane_id = None if known_finished else _lane_left_running(deps, loop)
     if not _transition(deps, loop, target, **fields):
         return False
     if lane_id:
@@ -1000,16 +1016,34 @@ def _head_read_attempts(deps: LoopDeps, loop: LoopRequest, lane_id: str) -> int:
     another lane starts this count at zero rather than inheriting the last
     round's failures.
 
+    Also scoped to the trailing run, not the lane's whole history: a read that
+    lands resets it, because a landed read is what the budget exists to wait
+    for. The transition into `awaiting_head_move` is that landing -- it is
+    reachable only from a head read that came back unmoved, so it is proof a
+    read for this lane succeeded -- and it is the only such proof this budget
+    needs, because nothing after it can still be counting the run it ended:
+    a moved head or a spent grace window both close the loop out from under
+    this lane before another read of it is ever taken. Without the reset the
+    grace window's own successful read would not end a run of blips, only
+    interrupt it on the way to a cumulative total -- so four blips, a landed
+    read that opens the window, and one blip inside it would already look
+    like a fifth attempt that never happened.
+
     Counts the `head_unreadable` notes a live tick actually wrote, rather than
     keeping a ledger of its own -- which is also what makes this budget
     something only a live tick can spend. A paused tick's decisions go to
     `_shadow` under a different kind (`shadow_decision`), so a pause, however
     long, writes none of these and this always reads zero while one is on.
     """
-    return sum(
-        1 for event in deps.store.events(loop.loop_id)
-        if event["kind"] == ROUTE_HEAD_UNREADABLE
-        and event["detail"].get("lane_id") == lane_id)
+    attempts = 0
+    for event in deps.store.events(loop.loop_id):
+        kind, detail = event["kind"], event["detail"]
+        if kind == ROUTE_HEAD_UNREADABLE and detail.get("lane_id") == lane_id:
+            attempts += 1
+        elif kind == EVENT_TRANSITION and \
+                detail.get("to") == LoopState.AWAITING_HEAD_MOVE.value:
+            attempts = 0
+    return attempts
 
 
 def _route_due(deps: LoopDeps, loop: LoopRequest,

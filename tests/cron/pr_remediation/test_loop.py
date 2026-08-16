@@ -1635,6 +1635,33 @@ def test_the_grace_window_catches_a_push_that_landed_late(tmp_path):
     assert loop.head_sha == "b" * 40
 
 
+def test_a_tick_inside_the_grace_window_neither_escalates_nor_re_reviews(tmp_path):
+    """Every test above advances the clock *past* HEAD_MOVE_GRACE_SECONDS
+    before ticking again, so none of them ever ticks *inside* the window --
+    which is exactly the race the window exists to survive: kanban says the
+    lane is done, GitHub has not yet served the push, and only a beat has
+    passed. The due pass must not even look yet: `next_attempt_at` is what
+    keeps `claim_due` from selecting this loop at all until the window has
+    actually elapsed."""
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = _loop_id(deps)
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
+    before = kinds(deps, loop_id)
+
+    assert HEAD_MOVE_GRACE_SECONDS > 1.0
+    deps.now.advance(1.0)  # nowhere near the window's edge
+    assert tick(deps) == 0
+    assert deps.slack.escalations == []
+    assert deps.slack.reposts == []
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.AWAITING_HEAD_MOVE
+    assert kinds(deps, loop_id) == before, \
+        "the window is still open; a tick inside it must not touch the loop at all"
+
+
 def test_a_held_pr_stops_the_lane_pass_before_any_write(tmp_path):
     """The lane pass writes -- a reaction, a post, a label -- so it reads Chad's
     kill switch first, and `has_hold` fails closed on an unreadable GitHub."""
@@ -1780,6 +1807,45 @@ def test_a_recovered_read_does_not_carry_its_failure_count_into_the_next_round(
         == [1]
 
 
+def test_a_blip_after_a_landed_read_does_not_inherit_earlier_blips_in_the_same_round(
+        tmp_path):
+    """The sibling of the test above, *within* one lane rather than across two:
+    a landed read -- including the grace window's own -- must reset this
+    budget too, not only a fresh lane_id. Four blips, then a read that lands
+    (unmoved, so it opens the grace window), then one blip on the next look
+    inside that window must be attempt 1, not attempt 5: the grace window's
+    own successful read is exactly what makes this reachable, because it is
+    the one event that can land between two runs of blips on the very same
+    lane_id."""
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, HEAD_READ_ATTEMPTS, tick
+
+    github = GitHubFake(head=None)
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=github)
+    loop_id = _loop_id(deps)
+    for _ in range(HEAD_READ_ATTEMPTS - 1):
+        deps.now.advance()
+        assert tick(deps) == 0
+    assert kinds(deps, loop_id).count("head_unreadable") == HEAD_READ_ATTEMPTS - 1
+
+    github.head = "a" * 40  # the read lands, unmoved: opens the grace window
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
+
+    github.head = None  # one blip on the very next look inside that window
+    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    assert tick(deps) == 0
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.AWAITING_HEAD_MOVE, \
+        "this is the round's first blip since the read that landed, not its fifth"
+    assert deps.slack.escalations == [], \
+        "the cumulative bug would escalate head_read_exhausted right here"
+    unreadable = [e["detail"] for e in deps.store.events(loop_id)
+                  if e["kind"] == "head_unreadable"]
+    assert unreadable[-1]["attempt"] == 1
+
+
 @pytest.mark.parametrize("mode", ["shadow", "off"])
 def test_a_paused_tick_neither_escalates_nor_spends_the_head_read_budget(
         tmp_path, mode):
@@ -1809,6 +1875,59 @@ def test_a_paused_tick_neither_escalates_nor_spends_the_head_read_budget(
     assert deps.slack.escalations == \
         [("Ylopo/example#42", 1, "head_read_exhausted")]
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
+def test_a_paused_head_unreadable_wait_does_not_grow_the_trail_without_end(
+        tmp_path):
+    """A paused tick never writes the `head_unreadable` note a live tick spends
+    its budget on, so `_head_read_attempts` reads zero on every single paused
+    tick and the route it names is therefore identical, tick after tick.
+    `standing=True` on that route is what lets `_shadow` recognise the repeat
+    and record it once; drop it and an hour-long outage leaves 240 identical
+    sentences in the trail."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    shadow = in_mode(deps, "shadow")
+    for _ in range(20):
+        shadow.now.advance()
+        assert tick(shadow) == 0
+    assert kinds(deps, loop_id).count("shadow_decision") == 1, \
+        "an outage held open under a pause must not grow the trail per tick"
+
+
+def test_a_paused_head_read_exhaustion_decision_does_not_grow_the_trail_either(
+        tmp_path):
+    """Same shape, past the budget: once a live run has spent
+    HEAD_READ_ATTEMPTS - 1 real attempts, one more tick is enough for
+    `_route_due` to name `head_read_exhausted` -- and it goes on naming it
+    every single tick after that too, live or paused, because nothing paused
+    ever advances the count that would move it past this point. If that next
+    tick (and every one after it) is paused, `standing=True` is what keeps the
+    decision to one recorded sentence rather than one per tick for as long as
+    the pause lasts."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    for _ in range(HEAD_READ_ATTEMPTS - 1):
+        deps.now.advance()
+        assert tick(deps) == 0
+
+    shadow = in_mode(deps, "shadow")
+    for _ in range(20):
+        shadow.now.advance()
+        assert tick(shadow) == 0
+    escalate_notes = [e["detail"] for e in deps.store.events(loop_id)
+                      if e["kind"] == "shadow_decision"
+                      and e["detail"].get("would") == "escalate"]
+    assert len(escalate_notes) == 1, \
+        "a paused outage past the live budget must not grow the trail per tick"
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING, \
+        "a paused tick must not actually close the loop"
 
 
 def test_a_lane_pass_that_cannot_post_the_rereview_escalates(tmp_path):
@@ -1885,6 +2004,32 @@ def test_a_lease_lost_mid_batch_stops_that_loop_and_no_other(tmp_path):
     assert deps.store.get(lost).state is LoopState.REMEDIATING, \
         "a loop we no longer own must not be driven"
     assert deps.store.get(kept).state is LoopState.REREVIEW_POSTED
+
+
+def test_a_lapsed_lease_is_found_before_any_read_the_due_pass_would_make(tmp_path):
+    """The lease is renewed before `_observe_lane` is ever called for that
+    loop, matching `_settle_due`'s own account of itself: renewing first turns
+    a lapsed lease into a refusal before any side effect. Reading first
+    instead would spend a kanban poll and up to two GitHub calls on a loop
+    somebody else already owns -- API budget spent on a loop this tick has no
+    business looking at."""
+    from pr_remediation.loop import tick
+
+    lanes = ReadRecordingLanes(status="done")
+    github = ReadRecordingGitHub()
+    store = LeaseLapses(Store(tmp_path / "r.db"))
+    deps = drive_to_remediating(tmp_path, lanes=lanes, github=github, store=store)
+    loop_id = _loop_id(deps)
+    lanes.polled.clear()
+    github.reads.clear()
+    store.lapsed.add(loop_id)
+
+    deps.now.advance()
+    assert tick(deps) == 0
+    assert lanes.polled == [], \
+        "a lease we no longer hold must not be read against at all"
+    assert github.reads == []
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
 
 
 @pytest.mark.parametrize("mode", ["shadow", "off"])
@@ -2034,6 +2179,32 @@ def test_a_no_op_escalation_never_claims_the_lane_is_still_running(tmp_path):
     deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
     assert tick(deps) == 1
     assert deps.slack.escalations[0][2] == "no_op_lane"
+    assert "lane_abandoned" not in kinds(deps, loop_id)
+
+
+def test_a_head_read_exhaustion_escalation_never_claims_the_lane_is_still_running(
+        tmp_path):
+    """The same false alarm as the test above, on the other escalation that can
+    close a `remediating` loop with a lane still on the row: `head_read_exhausted`
+    only ever fires once `_route_due` has already read this lane as finished by
+    kanban's own account -- `lane.finished` gates the branch it comes from. The
+    row still says `remediating` because a lane whose head never once came back
+    readable never earns the transition into `awaiting_head_move` that would say
+    otherwise, and `_lane_in_flight` only has the row to go on. Widening the leak
+    report to trust it here would fire the alarm on every GitHub outage that
+    outlasts the read budget, once per affected PR, beside the notice a human is
+    already being sent."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    for _ in range(HEAD_READ_ATTEMPTS):
+        deps.now.advance()
+        tick(deps)
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.slack.escalations == \
+        [("Ylopo/example#42", 1, "head_read_exhausted")]
     assert "lane_abandoned" not in kinds(deps, loop_id)
 
 
