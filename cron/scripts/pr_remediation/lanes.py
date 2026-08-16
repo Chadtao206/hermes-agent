@@ -35,7 +35,24 @@ ANCHOR_ROOT = os.environ.get(
 EXPECTED_OWNER = os.environ.get("PR_REVIEW_EXPECTED_OWNER") or "Ylopo"
 ASSIGNEE = "engineer"  # SOUL.md: Andrej = engineer
 TIMEOUT = 120
-TERMINAL_LANE_STATUSES = frozenset({"done", "blocked", "failed", "cancelled"})
+# What kanban means by "this lane is finished", taken from kanban's own
+# vocabulary rather than guessed at. `hermes_cli/kanban_db.py`'s VALID_STATUSES
+# is the whole vocabulary -- kanban *rejects* anything outside it -- and this is
+# the terminal subset of it, identical to the set the sibling consumer
+# `boris_intake/dispatch.py` (TERMINAL_STATUSES) already polls lanes with.
+#
+# The first draft here invented `failed` and `cancelled`, which kanban has never
+# been able to store (0 rows on the live board), and omitted `archived`, which it
+# stores by the hundred. The cost was not cosmetic: a human archiving a stuck
+# card -- ordinary board hygiene -- left the lane forever unfinished, so the loop
+# sat in `remediating` holding the ownership label and `active_for_pr` blocked
+# every future verdict for that pull request. `blocked` belongs here for the
+# same reason it does in the sibling: kanban parks a lane a human must look at
+# there, and nothing this loop does will move it on.
+#
+# tests/cron/pr_remediation/test_lanes.py pins this against the real vocabulary
+# and against the sibling, so neither can drift away from us unnoticed.
+TERMINAL_LANE_STATUSES = frozenset({"done", "archived", "blocked"})
 _TASK_ID = re.compile(r"\bt_[0-9a-z]+")
 _SAFE_REPO_NAME = re.compile(r"[A-Za-z0-9._-]+")
 _DEFAULT_EXCLUDED_REPOS = "Ylopo/ylopo-infra Ylopo/ylopo-github-actions-workflows"

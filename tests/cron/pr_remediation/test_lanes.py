@@ -96,8 +96,51 @@ def test_create_returns_none_when_dispatch_refuses(tmp_path, monkeypatch):
     assert LaneIO(tmp_path / "kanban.db", runner=run).create(VERDICT, 1) is None
 
 
-def test_terminal_statuses_cover_the_ways_a_lane_can_end():
-    assert {"done", "blocked", "failed", "cancelled"} <= TERMINAL_LANE_STATUSES
+# --- C1: the lane vocabulary is kanban's, not ours -------------------------
+#
+# These three replace a test that asserted
+# `{"done","blocked","failed","cancelled"} <= TERMINAL_LANE_STATUSES`. That
+# assertion was a copy of the very guess it was supposed to guard: `failed` and
+# `cancelled` are not kanban statuses at all (`kanban_db.set_status` refuses
+# them, and the live board holds 0 such rows), while `archived` -- 151 live rows
+# -- was missing. A test written against a copy of a contract can only ever
+# confirm the copy, so these read the real vocabulary instead.
+
+
+def test_every_terminal_lane_status_is_a_status_kanban_can_actually_store():
+    """Read from kanban's own contract, not from a copy of it.
+
+    `hermes_cli/kanban_db.py` REJECTS any status outside VALID_STATUSES, so a
+    status named here that is not in there can never be observed: polling for it
+    is polling for something that cannot happen, and the lane reads as unfinished
+    forever. That is what `failed`/`cancelled` did -- and because the loop parks
+    in `remediating` while a lane is unfinished, it held the ownership label and
+    `active_for_pr` blocked every later verdict for that pull request.
+    """
+    from hermes_cli.kanban_db import VALID_STATUSES
+
+    unknown = TERMINAL_LANE_STATUSES - VALID_STATUSES
+    assert not unknown, (
+        f"{sorted(unknown)} are not kanban statuses; kanban_db rejects them, so "
+        f"a lane can never be observed in one. Real vocabulary: "
+        f"{sorted(VALID_STATUSES)}")
+
+
+def test_the_terminal_set_is_exactly_the_sibling_consumer_s():
+    """`boris_intake/dispatch.py` polls the same board for the same reason and
+    already had this right. Two services disagreeing about when a lane is over
+    is how one of them ends up waiting on a card the other has written off, so
+    the sets are pinned equal rather than merely compatible."""
+    from boris_intake.dispatch import TERMINAL_STATUSES
+
+    assert TERMINAL_LANE_STATUSES == frozenset(TERMINAL_STATUSES)
+
+
+def test_archived_counts_as_finished():
+    """The concrete regression. Archiving a stuck card is ordinary board
+    hygiene -- 151 of the live board's rows are in it -- and it is a state
+    nothing will ever move a lane out of."""
+    assert "archived" in TERMINAL_LANE_STATUSES
 
 
 def test_create_refuses_when_the_anchor_does_not_exist_at_all(tmp_path, monkeypatch):

@@ -2230,3 +2230,26 @@ def test_a_verdict_in_the_grace_window_closes_on_a_lane_that_had_exited(tmp_path
                      for event in deps.store.events(loop_id)
                      if event["kind"] == "transition"], \
         "the lane that ran must stay findable in the trail"
+
+
+# --- C1: an archived lane is a finished lane -------------------------------
+
+
+def test_an_archived_lane_is_read_as_finished_and_the_loop_moves_on(tmp_path):
+    """The board-hygiene path, end to end.
+
+    Archiving a stuck card is what a human does to tidy the board; it is a real
+    kanban status (151 rows live) and nothing moves a lane out of it. Before
+    C1 this service polled for `failed`/`cancelled` -- statuses kanban rejects
+    outright -- and never for `archived`, so an archived lane read as "still
+    running" on every tick: the loop stayed in `remediating`, kept the
+    ownership label on the pull request, and `active_for_pr` refused every
+    later verdict for it, forever.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="archived"))
+    deps.github.head = "b" * 40  # the lane did push before it was archived
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    assert only_loop(deps).state is LoopState.REREVIEW_POSTED
