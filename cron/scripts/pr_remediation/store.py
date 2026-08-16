@@ -93,13 +93,21 @@ class Store:
         )
         generation = cur.fetchone()["g"] + 1
         loop_id = f"lp_{uuid.uuid4().hex}"
-        self._db.execute(
-            "INSERT INTO loops (loop_id, owner, repo, pr_number, generation, "
-            "head_sha, boris_request_id, root_thread_ts, state, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (loop_id, owner, repo, pr_number, generation, head_sha,
-             boris_request_id, root_thread_ts, LoopState.OBSERVED.value, now, now),
-        )
+        try:
+            self._db.execute(
+                "INSERT INTO loops (loop_id, owner, repo, pr_number, generation, "
+                "head_sha, boris_request_id, root_thread_ts, state, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (loop_id, owner, repo, pr_number, generation, head_sha,
+                 boris_request_id, root_thread_ts, LoopState.OBSERVED.value, now, now),
+            )
+        except sqlite3.IntegrityError:
+            # Another writer opened a loop for this (owner, repo, pr_number,
+            # generation) between our active_for_pr check and this INSERT.
+            # Honour the documented contract (None means "already active")
+            # instead of leaking the race as an unhandled exception.
+            self._db.rollback()
+            return None
         self._append(loop_id, "opened", {"generation": generation}, now)
         self._db.commit()
         return self.get(loop_id)
@@ -180,4 +188,8 @@ class Store:
             self._db.commit()
             return True
         except sqlite3.IntegrityError:
+            # The INSERT already opened a write transaction; without a
+            # rollback here it stays open, holding a write lock, until the
+            # next successful commit on this connection happens to close it.
+            self._db.rollback()
             return False
