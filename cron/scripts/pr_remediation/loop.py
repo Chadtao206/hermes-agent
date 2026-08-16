@@ -694,10 +694,13 @@ def _clear_running_signal(deps: LoopDeps, loop: LoopRequest) -> None:
 
     Read from the *loop's own row*, not any verdict's: a later verdict may
     carry a different status message (or none), and a reaction added on one
-    message can only ever be removed from that same message. Idempotent by
-    construction -- removing a reaction that is gone is a no-op -- which is
-    what lets every path that ends a round run it without checking whether
-    another already did.
+    message can only ever be removed from that same message. The row's anchor
+    is not frozen for the loop's life -- `_open_lane` moves it to the verdict
+    that opens each round, on that round's own compare-and-swap -- but it
+    always names the round that is running, which is exactly what makes
+    reading it here the right pairing. Idempotent by construction -- removing
+    a reaction that is gone is a no-op -- which is what lets every path that
+    ends a round run it without checking whether another already did.
 
     `status_message_ts` is nullable (the source column is nullable, and every
     loop opened before this column existed carries none either), and a loop
@@ -1251,13 +1254,26 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         # unspent and a human takes over.
         return _escalate(deps, loop, verdict, EscalationReason.LANE_FAILED.value)
 
+    # Where this round's reaction belongs. A loop outlives the verdict that
+    # opened it and every Boris verdict posts its own status message, so an
+    # anchor written once at `open_loop` and never refreshed pins every later
+    # round's reaction to round 1's message -- several messages up the thread
+    # from the round that is actually running, which then shows no signal at
+    # all. A verdict that carries none keeps the anchor the row already has,
+    # deliberately: a null says nothing about where the previous round's
+    # reaction is, and blanking the row on its account would strand that
+    # reaction for good, since `_clear_running_signal` only ever reads the row.
+    anchor = verdict.status_message_ts or loop.status_message_ts
+
     # The lane exists from here on. Record the round before decorating Boris's
     # status message: if the compare-and-swap is lost we are no longer the
     # driver, and a thinkies reaction would claim a round this tick does not
-    # own.
+    # own. The anchor moves on that same swap rather than in a write of its
+    # own, for the same reason and in the same breath: a lost swap must leave
+    # the previous round's anchor exactly where it was.
     if not _transition(deps, loop, LoopState.REMEDIATING,
                        round_count=round_number, lane_id=lane_id,
-                       head_sha=verdict.head_sha,
+                       head_sha=verdict.head_sha, status_message_ts=anchor,
                        next_attempt_at=deps.now() + LANE_POLL_SECONDS):
         # Everything a later tick needs to adopt this lane rather than open a
         # rival one: the row itself will carry no trace of it.
@@ -1265,10 +1281,24 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
                                {"lane_id": lane_id, "round": round_number,
                                 "head_sha": verdict.head_sha}, deps.now())
         return False
+    if loop.status_message_ts != anchor:
+        # The message this round is leaving behind. Its reaction is normally
+        # already gone -- every route out of a running round clears it before
+        # a later verdict can reach here (`_lane_pushed`, `_await_head_move`,
+        # and the stand-downs, which close the loop instead) -- but every one
+        # of those removals is best-effort: SlackIO swallows the failure and
+        # records nothing. While the anchor never moved, such a removal was
+        # retried by the loop's next one; now that it moves, no later
+        # `_clear_running_signal` can ever name that message again, so the one
+        # dropped removal would be stuck on it forever. Removing a reaction
+        # that is gone is a no-op, so this costs one idempotent call on the
+        # ordinary path and closes the only way moving the anchor can strand
+        # one.
+        _clear_running_signal(deps, loop)
     # Anchored on Boris's status message, not root_thread_ts -- see
     # _clear_running_signal for why the two anchors must never be unified.
-    if loop.status_message_ts:
-        deps.slack.add_thinkies(deps.cfg.boris_channel, loop.status_message_ts)
+    if anchor:
+        deps.slack.add_thinkies(deps.cfg.boris_channel, anchor)
     else:
         # status_message_ts is nullable (some rows never got one from
         # boris_intake; every loop opened before this column existed has

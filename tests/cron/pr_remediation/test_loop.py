@@ -486,8 +486,10 @@ def test_thinkies_is_anchored_on_boris_status_message_not_root_thread_ts(tmp_pat
 
 def test_thinkies_is_anchored_on_the_loops_own_status_message_not_the_verdict(tmp_path):
     """A reaction can only be removed from the message it was added to: the
-    loop's own persisted anchor from when it opened, not whatever a later
-    verdict happens to carry."""
+    loop's own persisted anchor, not whatever a later verdict happens to
+    carry. Only `_open_lane`'s own compare-and-swap ever moves that anchor,
+    and it moves the row -- so the closing verdict below, which opens no
+    round, must be removed from where the round that ran put it."""
     from pr_remediation.loop import tick
 
     deps = build(tmp_path, SourceFake([verdict(status="2.0")]))
@@ -560,6 +562,162 @@ def test_a_loop_with_no_status_message_anchor_still_closes_out_normally(tmp_path
     assert deps.slack.ready == [("Ylopo/example#42", 0)]
     assert deps.slack.thinkies_removed == [], "nothing to remove; no anchor was ever set"
     assert only_loop(deps) is None, "the loop still reaches its terminal state"
+
+
+class ReactionRemovalSilentlyFails(SlackFake):
+    """A Slack whose first reaction removal quietly does nothing.
+
+    The real `SlackIO.remove_thinkies` swallows every exception and never
+    inspects `reactions.remove`'s own `ok` field, so a removal that did not
+    land leaves the reaction sitting on the message with no exception raised
+    and no record written anywhere. This reproduces exactly that: the call is
+    counted in `dropped` rather than `thinkies_removed`, so a test can tell
+    "asked, and it did not land" apart from "never asked".
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.dropped = []
+        self._swallow = True
+
+    def remove_thinkies(self, channel, ts):
+        if self._swallow:
+            self._swallow = False
+            self.dropped.append(ts)
+            return
+        return super().remove_thinkies(channel, ts)
+
+
+def rereviewed(tmp_path, slack=None, status="2.0"):
+    """A loop whose round 1 lane finished, pushed, and earned its re-review.
+
+    Where the next verdict finds it: `rereview_posted`, one round spent, and
+    round 1's reaction already taken off `status`.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                slack=slack, status=status)
+    deps.github.head = "b" * 40
+    assert tick(deps) == 1
+    assert deps.store.get(_loop_id(deps)).state is LoopState.REREVIEW_POSTED
+    deps.now.advance()
+    return deps
+
+
+def test_a_new_round_moves_the_anchor_to_the_verdict_that_opened_it(tmp_path):
+    """Every Boris verdict posts its own status message, so a loop that keeps
+    the anchor it opened with reacts on round 1's message for the rest of its
+    life -- several messages up the thread -- and the round actually running
+    shows no signal at all. Live evidence: the loop for Ylopo/million-stars#199
+    held 1786904768.085119 across three verdicts that each had their own."""
+    from pr_remediation.loop import tick
+
+    deps = rereviewed(tmp_path)
+    loop_id = _loop_id(deps)
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40, status="7.0")]
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).status_message_ts == "7.0", \
+        "the row must follow the verdict whose round is now running"
+    assert deps.slack.thinkies_added == ["2.0", "7.0"], \
+        "round 2's signal belongs on round 2's message"
+
+
+def test_the_new_rounds_reaction_comes_off_the_message_it_went_on(tmp_path):
+    """The add and the remove are one pair. Moving the anchor is only correct
+    if the removal follows it, so a round opened against a later verdict is
+    cleared from that verdict's message and not from the one before it."""
+    from pr_remediation.loop import tick
+
+    deps = rereviewed(tmp_path)
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40, status="7.0")]
+    assert tick(deps) == 1
+    deps.source.verdicts = [verdict(rid="br_3", head="b" * 40, status="9.5",
+                                    outcome="READY_FOR_HUMAN_REVIEW")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    # Round 1's clear, round 2's idempotent retry of it as the anchor moves
+    # (see test_a_round_that_moves_the_anchor_retries_the_old_ones_removal),
+    # and then the close -- which is the one that has to name 7.0.
+    assert deps.slack.thinkies_removed == ["2.0", "2.0", "7.0"], \
+        "the running round's own message is what gets cleared"
+    assert only_loop(deps) is None
+
+
+def test_a_later_verdict_with_no_status_message_keeps_the_anchor_it_has(tmp_path):
+    """The anchor is nullable at both ends, and the two nulls do not mean the
+    same thing. A verdict that carries none says nothing about where the
+    previous round's reaction is; blanking the row on its account would strand
+    that reaction for good, because `_clear_running_signal` only ever reads the
+    row. So the anchor already on the row is kept, and the round is decorated
+    there rather than not at all."""
+    from pr_remediation.loop import tick
+
+    deps = rereviewed(tmp_path)
+    loop_id = _loop_id(deps)
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40, status=None)]
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).status_message_ts == "2.0", \
+        "a verdict with no anchor must not blank the one the row already has"
+    assert deps.slack.thinkies_added == ["2.0", "2.0"]
+    assert "reaction_skipped_no_status_message" not in kinds(deps, loop_id), \
+        "there is an anchor; nothing was skipped"
+
+
+def test_the_anchor_moves_inside_the_rounds_own_compare_and_swap(tmp_path):
+    """The swap is where "we own this round" becomes true. A lost one means
+    another tick owns the row, so the anchor must not have moved -- which is
+    only guaranteed if it rides that swap rather than a write of its own."""
+    from pr_remediation.loop import LoopDeps, tick
+
+    deps = rereviewed(tmp_path)
+    loop_id = _loop_id(deps)
+    losing = LosingStore(deps.store)
+    stalled = LoopDeps(**{**deps.__dict__, "store": losing})
+    stalled.source.verdicts = [verdict(rid="br_2", head="b" * 40, status="7.0")]
+    assert tick(stalled) == 0
+    assert losing.attempts[0][2]["status_message_ts"] == "7.0", \
+        "the anchor rides the round's own compare-and-swap"
+    assert deps.store.get(loop_id).status_message_ts == "2.0", \
+        "a swap we lost is not our round: the anchor stays where it was"
+    assert deps.slack.thinkies_added == ["2.0"], \
+        "and no reaction claims a round this tick does not own"
+
+
+def test_a_round_that_moves_the_anchor_retries_the_old_ones_removal(tmp_path):
+    """Every removal in this module is best-effort: SlackIO swallows the
+    failure and nothing records it. While the anchor never moved, a removal
+    that did not land was retried by the loop's next one; once it moves, no
+    later `_clear_running_signal` can ever target the old message again and a
+    dropped removal is stuck there forever. So the round that moves the anchor
+    clears the message it is leaving behind -- idempotent by construction, and
+    on the ordinary path a no-op."""
+    from pr_remediation.loop import tick
+
+    slack = ReactionRemovalSilentlyFails()
+    deps = rereviewed(tmp_path, slack=slack)
+    assert slack.dropped == ["2.0"] and slack.thinkies_removed == [], \
+        "round 1's clear was asked for and quietly did not land"
+
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40, status="7.0")]
+    assert tick(deps) == 1
+    assert slack.thinkies_removed == ["2.0"], \
+        "nothing else would ever have targeted 2.0 again"
+    assert slack.thinkies_added == ["2.0", "7.0"]
+
+
+def test_a_round_that_keeps_its_anchor_does_not_clear_it_first(tmp_path):
+    """The retry above is scoped to an anchor that is actually being left
+    behind. A round opening on the same message must not remove the reaction
+    it is about to add, which would flicker the signal off and on for every
+    verdict that carries no anchor of its own."""
+    from pr_remediation.loop import tick
+
+    deps = rereviewed(tmp_path)
+    deps.slack.thinkies_removed.clear()
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40, status=None)]
+    assert tick(deps) == 1
+    assert deps.slack.thinkies_removed == []
 
 
 def test_a_hold_label_stops_the_loop_before_any_write(tmp_path):

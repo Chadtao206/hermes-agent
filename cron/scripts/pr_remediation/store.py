@@ -85,6 +85,14 @@ _TRANSITION_FIELDS = frozenset({
     "lane_id",
     "escalation_reason",
     "head_sha",
+    # The reaction anchor. Written at open_loop and then moved by the round
+    # that a later verdict opens: a loop outlives the verdict that opened it,
+    # and every Boris verdict posts its own status message, so a row pinned to
+    # the first one reacts several messages up the thread from the round that
+    # is actually running. loop.py's _open_lane moves it on the same swap that
+    # records the round, so the anchor and the round it belongs to can never
+    # disagree.
+    "status_message_ts",
     "next_attempt_at",
 })
 

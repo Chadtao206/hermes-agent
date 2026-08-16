@@ -46,6 +46,50 @@ def test_open_loop_without_a_status_message_leaves_the_anchor_null(tmp_path):
     assert loop.status_message_ts is None
 
 
+def test_transition_can_move_the_reaction_anchor(tmp_path):
+    """`open_loop` writes the anchor once, and a loop outlives the verdict that
+    opened it: every later Boris verdict posts its own status message, so the
+    round a verdict starts has to be able to carry the anchor with it (see
+    loop.py's _open_lane). That makes status_message_ts a writable column on
+    the same compare-and-swap that records the round -- and, because the field
+    name is interpolated into the SET clause, one the allowlist has to admit
+    explicitly."""
+    store = Store(tmp_path / "r.db")
+    loop = store.open_loop(
+        owner="Ylopo", repo="example", pr_number=42, head_sha="a" * 40,
+        boris_request_id="br_1", root_thread_ts="1.0",
+        status_message_ts="2.0", now=1_000_000.0,
+    )
+    assert store.transition(loop.loop_id, LoopState.OBSERVED,
+                            LoopState.REMEDIATING, now=1_000_050.0,
+                            round_count=1, status_message_ts="7.0") is True
+    assert store.get(loop.loop_id).status_message_ts == "7.0"
+    assert store.get(loop.loop_id).root_thread_ts == "1.0", \
+        "the two anchors stay independent columns"
+    moved = [e["detail"] for e in store.events(loop.loop_id)
+             if e["kind"] == "transition"]
+    assert moved == [{"from": "observed", "to": "remediating",
+                      "round_count": 1, "status_message_ts": "7.0"}], \
+        "the trail says which message that round's reaction went on"
+
+
+def test_transition_can_clear_the_reaction_anchor(tmp_path):
+    """Nullable at the column, so nullable through the writer: nothing here
+    decides whether a null anchor is a sensible thing to write (loop.py does,
+    and refuses to), but a store that could not represent one would push that
+    decision into a SQL error."""
+    store = Store(tmp_path / "r.db")
+    loop = store.open_loop(
+        owner="Ylopo", repo="example", pr_number=42, head_sha="a" * 40,
+        boris_request_id="br_1", root_thread_ts="1.0",
+        status_message_ts="2.0", now=1_000_000.0,
+    )
+    assert store.transition(loop.loop_id, LoopState.OBSERVED,
+                            LoopState.REMEDIATING, now=1_000_050.0,
+                            status_message_ts=None) is True
+    assert store.get(loop.loop_id).status_message_ts is None
+
+
 def test_a_second_open_while_active_is_refused(tmp_path):
     """One live loop per PR; a duplicate verdict must not start a rival."""
     store = Store(tmp_path / "r.db")
