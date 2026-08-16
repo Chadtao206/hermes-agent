@@ -27,21 +27,39 @@ driving loops to a *terminal* state from the mode that exists to write nothing.
 A loop a live tick had already claimed the PR for was then closed without
 notifying anyone, without releasing the ownership label and without removing
 the reaction -- and, being terminal, `active_for_pr` refused every later live
-tick the chance to recover it.
+tick the chance to recover it. A third gate then survived in the due pass,
+where an ordinary early return was the only thing between an `off` tick and a
+Slack post, a released label and a loop driven terminal.
 
-So the mode is not asked inside the routing at all. `_route` decides what a
-live tick would do and performs none of it; exactly one of two consumers
-follows, `_perform` (live) or `_rehearse` (paused, which writes the decision to
-the trail and stops). A branch added to `_perform` cannot leak into a paused
-tick, because a paused tick never reaches `_perform`. What a shadow soak shows
-is therefore one recorded decision per verdict rather than a simulated
-multi-round progression: shadow exists to validate routing, not to rehearse
-state.
+So the mode is not asked inside the routing at all, and no pass asks it for
+itself. `_route` (a verdict) and `_route_due` (a debt no verdict will carry)
+decide what a live tick would do and perform none of it; `_consumer` then names
+the one consumer this mode allows, `_perform` (live) or `_rehearse` (paused,
+which writes the decision to the trail and stops). That single line is the
+whole of the module's mode-awareness, both passes go through it, and a branch
+added to `_perform` cannot leak into a paused tick because a paused tick never
+reaches `_perform`. What a shadow soak shows is therefore one recorded decision
+per verdict rather than a simulated multi-round progression: shadow exists to
+validate routing, not to rehearse state. The due pass's decisions are
+`standing` -- retaken every tick until the debt is paid -- so a paused tick
+records each of them once instead of appending the same sentence to the trail
+forever.
+
+`off` goes one step further than shadow: it is the hard kill switch, so it
+stops the work and not merely the writes. A tick in it reads no GitHub at all
+(the reads live in `_observe`, which the mode decides whether to call), and
+`_route` is handed no facts to route on -- so past the debts the store alone
+can answer, it says `unobserved` rather than guessing at a decision it did not
+take. Shadow keeps reading, because rehearsing a decision that was taken
+without them would not be rehearsing the decision a live tick takes.
 
 Opening the loop row is not a state change but the record itself: without one
-there is nowhere to write the decision, and the `observed` row a paused tick
-leaves behind is exactly the row a later live tick would have opened for the
-same verdict.
+there is nowhere to write the decision. It is not a row a later live tick
+inherits the verdict for, though -- `tick` marks a verdict seen before the mode
+is consulted, so the verdict that opened the row is consumed for good and can
+never be routed live. What a paused tick leaves behind is a record of a
+decision nobody acted on, which is why the rollout clears the database at the
+shadow-to-live cutover rather than expecting live to pick these rows up.
 
 Adopting an orphaned lane is the one deliberate exception, and it is consistent
 with the invariant rather than a hole in it: it is a store-only correction that
@@ -71,12 +89,19 @@ replaced. The in-flight lane, not a new verdict, is what drives the loop's next
 step; the refused verdict is written to the trail as `verdict_deferred` rather
 than silently dropped.
 
-Adoption is a correction, never a rewind. The rule that a recorded lane
-supersedes an orphan is order-dependent, and the ordering is inverted in the
-only way an orphan arises: a lapsed lease means the rival records *its* lane
-first and our orphan note lands after it, unsuperseded. So adoption is refused
-outright while a lane is in flight (on the verdict path and in the due pass
-alike), and can never lower `round_count` -- otherwise a loop that had spent
+Adoption is a correction, never a rewind, and that has to hold for every field
+it writes. The rule that a recorded lane supersedes an orphan is
+order-dependent, and the ordering is inverted in the only way an orphan arises:
+a lapsed lease means the rival records *its* lane first and our orphan note
+lands after it, unsuperseded. So what makes a note adoptable is the *row*, not
+the trail's order: a row that carries no lane has a lost write to retry, and a
+row that already records one has nothing to correct -- adopting there would
+point the loop at a dead lane, rewind `head_sha` to that lane's, and drop the
+row back into `remediating`, where the one-lane rule then makes every later
+pass skip it forever. Such a claim is refused and *deleted* (`_drop_orphan`),
+because a note nothing supersedes would otherwise come back the moment the
+row's lane is cleared. Adoption is refused outright while a lane is in flight
+as well, and can never lower `round_count` -- otherwise a loop that had spent
 its whole budget would have rounds handed back to it.
 
 *An escalation is not finished until a human has it.* Escalation exists
@@ -151,26 +176,36 @@ EVENT_ESCALATION_PENDING = "escalation_pending"
 EVENT_ESCALATION_DELIVERED = "escalation_delivered"
 EVENT_ESCALATION_UNREACHABLE = "escalation_unreachable"
 EVENT_ORPHANED_LANE = "orphaned_lane"
+# The end of an orphan's claim on a loop, written when the row it would correct
+# turns out to record a lane of its own. The trail's own superseding rule
+# cannot reach that case: the note lands *after* the transition that overtook
+# it, so nothing in trail order ever clears it.
+EVENT_ORPHAN_SUPERSEDED = "orphan_superseded"
 # Written by store.transition() itself, and only when the swap landed.
 EVENT_TRANSITION = "transition"
 
-# The routes a verdict can take. `_route` names one, `_perform` performs it and
-# `_rehearse` records it -- so the name is both the dispatch key and the word a
-# shadow soak reads back. Three of them (held, author_unreadable,
-# unknown_outcome) are observations rather than acts: they are their own note
-# kind, and a live tick does no more with them than record it.
+# The routes a decision can take, whether a verdict or a due debt prompted it.
+# `_route` and `_route_due` name one, `_perform` performs it and `_rehearse`
+# records it -- so the name is both the dispatch key and the word a shadow soak
+# reads back. Four of them (held, author_unreadable, unknown_outcome, and
+# unobserved, which is the absence of an observation rather than one) are not
+# acts at all: they are their own note kind, and a live tick does no more with
+# them than record it.
 ROUTE_SETTLE_ESCALATION = "settle_escalation"
 ROUTE_HELD = "held"
 ROUTE_AUTHOR_UNREADABLE = "author_unreadable"
 ROUTE_UNKNOWN_OUTCOME = "unknown_outcome"
+ROUTE_UNOBSERVED = "unobserved"
 ROUTE_ESCALATE = "escalate"
 ROUTE_NOTIFY_READY = "notify_ready"
 ROUTE_REPOST_REREVIEW = "repost_rereview"
 ROUTE_ADOPT_LANE = "adopt_lane"
+ROUTE_DROP_ORPHAN = "drop_orphan"
 ROUTE_OPEN_LANE = "open_lane"
 ROUTE_DEFER = "defer_verdict"
 
-_OBSERVATIONS = (ROUTE_HELD, ROUTE_AUTHOR_UNREADABLE, ROUTE_UNKNOWN_OUTCOME)
+_OBSERVATIONS = (ROUTE_HELD, ROUTE_AUTHOR_UNREADABLE, ROUTE_UNKNOWN_OUTCOME,
+                 ROUTE_UNOBSERVED)
 
 _LOG = logging.getLogger(__name__)
 
@@ -204,7 +239,7 @@ class EscalationDebt:
 
 @dataclass(frozen=True)
 class Route:
-    """What a live tick would do with one verdict, decided before it is done.
+    """What a live tick would do about one loop, decided before it is done.
 
     Deciding and doing are split so that the operating mode is asked exactly
     once, outside the routing: a live tick performs the route, a paused one
@@ -216,16 +251,60 @@ class Route:
     the in-flight lane is, or a debt the loop already owes is. It is recorded
     in both modes, because the verdict is marked seen either way and this note
     is the only surviving trace that it existed.
+
+    `standing` marks a decision that will be taken again, unchanged, on the
+    next tick: the due pass's debts, never a verdict's route. One verdict is
+    one decision and a shadow soak counts them, but a debt rehearsed once a
+    tick for as long as the service stays paused would append the same sentence
+    to a trail every later tick reads back in full.
     """
     action: str
     detail: dict = field(default_factory=dict)
     defer: str | None = None
     debt: EscalationDebt | None = None
+    standing: bool = False
 
 
-def _shadow(deps: LoopDeps, loop_id: str, action: str, detail: dict) -> None:
-    deps.store.record_note(loop_id, "shadow_decision",
-                           {"would": action, **detail}, deps.now())
+@dataclass(frozen=True)
+class PrFacts:
+    """What GitHub says about the pull request, read once before any decision.
+
+    Hoisted out of the routing so that *whether this tick reads GitHub at all*
+    is a question about the operating mode, asked where the mode is asked and
+    nowhere else. `author` is None both when GitHub could not be read and when
+    the PR is held -- a held PR's author is moot and is deliberately not
+    fetched -- so `held` must be consulted first.
+    """
+    held: bool
+    author: str | None
+
+
+def _observe(deps: LoopDeps, verdict: Verdict) -> PrFacts:
+    """Read the PR's hold label and author. The only network in a routing pass."""
+    if deps.github.has_hold(verdict.owner, verdict.repo, verdict.pr_number):
+        return PrFacts(held=True, author=None)
+    return PrFacts(held=False,
+                   author=deps.github.author(verdict.owner, verdict.repo,
+                                             verdict.pr_number))
+
+
+def _shadow(deps: LoopDeps, loop: LoopRequest, route: Route) -> None:
+    """Write to the trail the decision a live tick would have acted on.
+
+    A `standing` decision is recorded once, because repeating it adds no fact:
+    the due pass retakes it every tick until the debt is paid or the mode
+    changes. "Once" lasts only as long as nothing else happens to the loop --
+    any event appended after the note (a lost transition, say) makes the next
+    rehearsal a new fact again, so a rehearsal that failed at its one permitted
+    act is never mistaken for one already recorded.
+    """
+    decision = {"would": route.action, **route.detail}
+    if route.standing:
+        trail = deps.store.events(loop.loop_id)
+        if (trail and trail[-1]["kind"] == "shadow_decision"
+                and trail[-1]["detail"] == decision):
+            return
+    deps.store.record_note(loop.loop_id, "shadow_decision", decision, deps.now())
 
 
 def _transition(deps: LoopDeps, loop: LoopRequest, target: LoopState,
@@ -426,8 +505,9 @@ def _orphaned_lane(deps: LoopDeps, loop: LoopRequest) -> dict | None:
     A transition that did record a lane supersedes the orphan: whatever the row
     points at now is what is running. That rule reads the trail in order and is
     therefore only half the answer -- an orphan written *after* a rival's
-    transition is never superseded by it -- so callers must additionally refuse
-    to adopt while a lane is in flight, and `_adopt_lane` refuses to rewind.
+    transition is never superseded by it -- which is what `_adoptable_orphan`
+    answers from the row instead, and what `_drop_orphan` writes down here as
+    the explicit end of the claim.
     """
     orphan: dict | None = None
     for event in deps.store.events(loop.loop_id):
@@ -436,7 +516,29 @@ def _orphaned_lane(deps: LoopDeps, loop: LoopRequest) -> dict | None:
             orphan = detail
         elif kind == EVENT_TRANSITION and detail.get("lane_id"):
             orphan = None
+        elif kind == EVENT_ORPHAN_SUPERSEDED:
+            orphan = None
     return orphan
+
+
+def _adoptable_orphan(deps: LoopDeps, loop: LoopRequest) -> dict | None:
+    """The orphan this loop may still adopt, which is none once it has a lane.
+
+    Adoption retries a lost write, so the only row it can correct is one that
+    still carries no lane. A row recording a lane of its own has nothing to
+    correct -- that lane is the loop's, whatever the trail still claims -- and
+    an orphan note outlives the round it describes, landing after the rival
+    transition that would have superseded it. Adopting it there would point the
+    loop at a dead lane and rewind its head to that lane's.
+
+    The due pass deletes such a claim; here it is simply not one, and the
+    verdict routes on as though the note were already gone. That division is
+    deliberate: a verdict is consumed whatever this tick does with it, so
+    spending one on bookkeeping stalls a loop that could have been driven.
+    """
+    if loop.lane_id is not None:
+        return None
+    return _orphaned_lane(deps, loop)
 
 
 def _adopt_lane(deps: LoopDeps, loop: LoopRequest, orphan: dict) -> bool:
@@ -453,14 +555,23 @@ def _adopt_lane(deps: LoopDeps, loop: LoopRequest, orphan: dict) -> bool:
     poll, so the loop goes on from that lane's completion like any other round;
     until the write lands, every verdict and every due sweep tries it again.
 
+    A correction, never a rewind -- and that has to hold for every field this
+    writes, not only for the round. A row that already records a lane is not
+    corrected by an orphan but overwritten: pointed at a lane that finished
+    rounds ago, rewound to the head that lane was dispatched against, and
+    dropped back into `remediating`, where the one-lane rule then makes every
+    later pass skip it forever. So such a row is refused here whatever the
+    caller decided, and the stale claim is deleted rather than left to be tried
+    again on the next tick.
+
     The round the orphan spent is the round recorded, but never a *lower* one
-    than the row already carries. An orphan note can outlive the round it
-    describes (it is written after the rival transition that supersedes it in
-    trail order, so nothing ever clears it), and adopting it at face value
-    would hand a loop that had exhausted its round cap its whole budget back.
-    Callers must also refuse to adopt while a lane is in flight; this floor is
-    the second half of that guard, not a substitute for it.
+    than the row already carries, for the same reason: adopting a stale note at
+    face value would hand a loop that had exhausted its round cap its whole
+    budget back. Callers must also refuse to adopt while a lane is in flight;
+    neither guard here is a substitute for that one.
     """
+    if loop.lane_id is not None:
+        return _drop_orphan(deps, loop, orphan)
     spent = int(orphan.get("round") or loop.round_count + 1)
     return _transition(
         deps, loop, LoopState.REMEDIATING,
@@ -468,6 +579,26 @@ def _adopt_lane(deps: LoopDeps, loop: LoopRequest, orphan: dict) -> bool:
         lane_id=str(orphan["lane_id"]),
         head_sha=str(orphan.get("head_sha") or loop.head_sha),
         next_attempt_at=deps.now() + LANE_POLL_SECONDS)
+
+
+def _drop_orphan(deps: LoopDeps, loop: LoopRequest, orphan: dict) -> bool:
+    """Delete an orphan's claim on a loop that records a lane of its own.
+
+    The note is superseded in fact and unsuperseded in the trail -- it was
+    written after the transition that overtook it -- so nothing else will ever
+    clear it. Left alone it is not merely noise: it would be adopted, and the
+    loop rewound to it, the first time the row's lane is cleared, however many
+    rounds later. `_orphaned_lane` reads this note as the end of the claim.
+
+    False: a claim was deleted, which is bookkeeping and not a step the loop
+    took.
+    """
+    deps.store.record_note(loop.loop_id, EVENT_ORPHAN_SUPERSEDED, {
+        "lane_id": str(orphan.get("lane_id") or ""),
+        "round": orphan.get("round"),
+        "superseded_by": loop.lane_id,
+    }, deps.now())
+    return False
 
 
 def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
@@ -505,13 +636,20 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     return True
 
 
-def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> Route:
+def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+           facts: PrFacts | None) -> Route:
     """Decide what a live tick would do with this verdict, and do none of it.
 
     The whole routing decision lives here, and nothing here writes loop state,
-    posts, labels or dispatches. Only GitHub *reads* happen -- the hold label
-    and the author -- because a decision taken without them would not be the
-    decision a live tick takes, and a shadow soak exists to check exactly that.
+    posts, labels or dispatches -- nor reads a collaborator. What GitHub says
+    arrives as `facts`, already read, because a decision taken without it would
+    not be the decision a live tick takes (which is what a shadow soak exists
+    to check) while *whether to read at all* is a question about the operating
+    mode, and the mode is asked outside the routing.
+
+    `facts` is None when nothing was read: the `off` switch stops the work as
+    well as the writes. Past the debts the store alone can answer there is then
+    no decision to take, and the route says so rather than inventing one.
     """
     cfg = deps.cfg
 
@@ -529,11 +667,16 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> Route:
                      {"reason": debt.reason, "notified": debt.notified},
                      defer=ESCALATION_OWED, debt=debt)
 
-    if deps.github.has_hold(verdict.owner, verdict.repo, verdict.pr_number):
+    if facts is None:
+        # Nothing was read, so there is nothing to decide from: recorded as
+        # what it is, an unobserved tick, and never as a hold Chad did not put
+        # there or an author GitHub failed to give us.
+        return Route(ROUTE_UNOBSERVED, {"mode": cfg.mode})
+    if facts.held:
         # Chad's kill switch, and also the fail-closed answer when GitHub
         # cannot be read at all.
         return Route(ROUTE_HELD, {"label": cfg.hold_label})
-    author = deps.github.author(verdict.owner, verdict.repo, verdict.pr_number)
+    author = facts.author
     if author is None:
         return Route(ROUTE_AUTHOR_UNREADABLE, {})
     if author != cfg.chad_github_login:
@@ -563,7 +706,7 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> Route:
         # already been spent by the lane in flight.
         return Route(ROUTE_DEFER, {"lane_id": loop.lane_id},
                      defer=LANE_IN_FLIGHT)
-    orphan = _orphaned_lane(deps, loop)
+    orphan = _adoptable_orphan(deps, loop)
     if orphan is not None:
         # The row says no lane, the trail says otherwise, and the trail is
         # right: this loop's own dispatch lost its recording write. Adopt that
@@ -575,9 +718,49 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> Route:
     return Route(ROUTE_OPEN_LANE, {"round": loop.round_count + 1})
 
 
+def _route_due(deps: LoopDeps, loop: LoopRequest) -> Route | None:
+    """Decide what a live tick owes a loop no verdict is going to arrive for.
+
+    `_route`'s counterpart for the retry pass, under the same discipline: it
+    decides, writes nothing, and reads nothing outside the store -- both debts
+    it can find are answered by the loop's own trail. None means the loop owes
+    nothing, which is the ordinary case and is deliberately silent: this pass
+    revisits every unsettled loop on every tick, and a note for a healthy one
+    would grow its trail without end.
+
+    Every route it names is `standing`: a debt is still owed on the next tick,
+    unlike a verdict, which arrives once and is consumed.
+    """
+    debt = _escalation_debt(deps, loop)
+    if debt is not None:
+        # A stopped loop stays stopped: settle it, and never mind the lane,
+        # which its escalation has already given up on.
+        return Route(ROUTE_SETTLE_ESCALATION,
+                     {"reason": debt.reason, "notified": debt.notified},
+                     debt=debt, standing=True)
+    if _lane_in_flight(loop):
+        # The same guard the verdict path applies, and for the same reason: an
+        # orphan note that trails a rival's transition is never superseded, so
+        # without this the pass would rewrite a live lane (and its round) with
+        # a stale one.
+        return None
+    orphan = _orphaned_lane(deps, loop)
+    if orphan is None:
+        return None
+    if loop.lane_id is None:
+        return Route(ROUTE_ADOPT_LANE, dict(orphan), standing=True)
+    # The row records a lane of its own, so this claim can never be adopted --
+    # and nothing in the trail will ever supersede it, so it would come back
+    # the moment that lane is cleared. Deleting it is this pass's job precisely
+    # because this is the pass with nothing else to spend: a verdict is
+    # consumed whatever is done with it, so the verdict path routes past a
+    # stale claim rather than stopping to tidy it.
+    return Route(ROUTE_DROP_ORPHAN, dict(orphan), standing=True)
+
+
 def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
              route: Route) -> bool:
-    """Do what `_route` decided. Reached only in live mode."""
+    """Do what the routing decided. Reached only in live mode."""
     if route.defer is not None:
         _defer_verdict(deps, loop, verdict, route.defer)
     if route.action == ROUTE_SETTLE_ESCALATION:
@@ -598,6 +781,8 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         return _repost(deps, loop, verdict)
     if route.action == ROUTE_ADOPT_LANE:
         return _adopt_lane(deps, loop, route.detail)
+    if route.action == ROUTE_DROP_ORPHAN:
+        return _drop_orphan(deps, loop, route.detail)
     if route.action == ROUTE_OPEN_LANE:
         return _open_lane(deps, loop, verdict, int(route.detail["round"]))
     # ROUTE_DEFER: the in-flight lane drives the loop, not this verdict, and
@@ -613,9 +798,11 @@ def _rehearse(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     so no routing branch can leak a post, a label or a terminal state past it.
     Adoption is the one exception, for the reason the module docstring gives --
     it is a store-only correction recording a lane that is already running, and
-    refusing it would file a round with no lane instead.
+    refusing it would file a round with no lane instead. Deleting a stale
+    orphan's claim is *not* taken here: a paused tick has no reason to tidy the
+    trail, and the live tick that finds the claim still there will drop it.
     """
-    _shadow(deps, loop.loop_id, route.action, route.detail)
+    _shadow(deps, loop, route)
     if route.defer is not None:
         _defer_verdict(deps, loop, verdict, route.defer)
     if route.action == ROUTE_ADOPT_LANE:
@@ -623,16 +810,29 @@ def _rehearse(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     return False
 
 
+def _consumer(deps: LoopDeps) -> Callable[
+        [LoopDeps, LoopRequest, Verdict, Route], bool]:
+    """Which consumer this mode allows: the one place the mode is asked.
+
+    Both passes take their decisions through it, so neither can grow a gate of
+    its own -- the shape that has now failed three times, most recently as an
+    ordinary early return in the due pass, where deleting one line let an `off`
+    tick post to a human channel and close a live-created loop. `_perform`
+    acts; `_rehearse` records and stops.
+    """
+    return _perform if deps.cfg.mode == "live" else _rehearse
+
+
 def _drive(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     """Route one verdict against a loop we hold the lease on.
 
-    The operating mode is asked here and nowhere below: one of two consumers
-    takes the decision, and only one of them can act.
+    The mode is asked here and nowhere below, and it answers two questions:
+    whether this tick looks at GitHub at all -- `off` is the hard kill switch,
+    so it stops the reads too -- and which consumer takes the decision.
     """
-    route = _route(deps, loop, verdict)
-    if deps.cfg.mode != "live":
-        return _rehearse(deps, loop, verdict, route)
-    return _perform(deps, loop, verdict, route)
+    facts = None if deps.cfg.mode == "off" else _observe(deps, verdict)
+    return _consumer(deps)(deps, loop, verdict,
+                           _route(deps, loop, verdict, facts))
 
 
 def _handle(deps: LoopDeps, verdict: Verdict,
@@ -731,9 +931,14 @@ def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
     retries a write: it opens no lane, spends no round, reads nothing from
     GitHub, and says nothing to a human who has already been told. A loop can
     therefore pass through it many times without accumulating side effects.
+
+    It decides and acts through the same two consumers the verdict path uses --
+    `_route_due` names what a live tick owes, `_perform` pays it, `_rehearse`
+    records it -- so there is no mode gate of its own here to forget, and none
+    that a mutation can delete. The one thing it does not share is a verdict:
+    the one that stopped this loop was consumed ticks ago, so it addresses
+    Slack and GitHub from the row (`_verdict_for`).
     """
-    if deps.cfg.mode != "live":
-        return 0
     try:
         due = deps.store.claim_due(now=deps.now(), limit=DUE_LIMIT)
     except Exception:
@@ -741,27 +946,15 @@ def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
         return 0
 
     advanced = 0
+    consume = _consumer(deps)
     for loop in due:
         try:
             if loop.loop_id in driven:
                 continue
-            debt = _escalation_debt(deps, loop)
-            if debt is not None:
-                # A stopped loop stays stopped: settle it, and never mind the
-                # lane, which its escalation has already given up on.
-                if _settle_escalation(deps, loop, _verdict_for(loop), debt):
-                    advanced += 1
+            route = _route_due(deps, loop)
+            if route is None:
                 continue
-            if _lane_in_flight(loop):
-                # The same guard the verdict path applies, and for the same
-                # reason: an orphan note that trails a rival's transition is
-                # never superseded, so without this the pass would rewrite a
-                # live lane (and its round) with a stale one. Deliberately
-                # silent -- this pass runs every tick, and a note here would
-                # grow the trail forever for a loop that is perfectly healthy.
-                continue
-            orphan = _orphaned_lane(deps, loop)
-            if orphan is not None and _adopt_lane(deps, loop, orphan):
+            if consume(deps, loop, _verdict_for(loop), route):
                 advanced += 1
         except Exception:
             _LOG.exception("loop %s could not be settled", loop.loop_id)

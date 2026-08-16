@@ -443,6 +443,133 @@ def test_a_paused_run_never_closes_a_loop_a_live_run_created(
     assert deps.slack.thinkies_removed == ["1.0"]
 
 
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_due_pass_settles_nothing_a_live_run_left_owing(tmp_path, mode):
+    """The third mode gate, in the pass no verdict ever reaches.
+
+    `_settle_due` called the acting code directly, behind an ordinary
+    early-return on the mode -- the per-branch shape that had already failed
+    twice. Deleting that one line let an `off` tick post to the human channel,
+    release the ownership label, remove the reaction and drive a live-created
+    loop to `escalated`, and the whole suite stayed green: every paused test
+    drove a verdict, and this pass runs when there is no verdict at all.
+    """
+    from pr_remediation.loop import tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1")]), slack=slack)
+    assert tick(deps) == 0, "a live tick that owes a human a notice"
+    loop_id = _loop_id(deps)
+    assert kinds(deps, loop_id).count("escalation_pending") == 1
+
+    slack._escalation_ts = "9.2"  # Slack is back. The service is not.
+    paused = in_mode(deps, mode)
+    paused.source.verdicts = []  # nothing to route: the due pass is the tick
+    paused.now.advance()
+    assert tick(paused) == 0
+
+    assert len(slack.escalations) == 1, "a paused due pass posted to a human"
+    assert deps.github.released == [], "a paused due pass handed the label back"
+    assert deps.slack.thinkies_removed == []
+    loop = deps.store.get(loop_id)
+    assert loop.state is not LoopState.ESCALATED, \
+        "a paused due pass drove a live-created loop terminal"
+    assert kinds(deps, loop_id).count("escalation_pending") == 1, \
+        "the debt must survive untouched, and unspent"
+    assert [event["detail"]["would"] for event in deps.store.events(loop_id)
+            if event["kind"] == "shadow_decision"] == ["settle_escalation"], \
+        "the due pass must still record the decision it would have taken"
+
+    # A standing decision is recorded once however long the pause lasts: this
+    # pass retakes it every tick, and every tick reads the whole trail back.
+    for _ in range(3):
+        paused.now.advance()
+        assert tick(paused) == 0
+    assert kinds(deps, loop_id).count("shadow_decision") == 1
+
+    # ...and the debt is still there for whoever turns the service back on.
+    live = in_mode(deps, "live")
+    live.now.advance()
+    assert tick(live) == 1
+    assert len(slack.escalations) == 2
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)]
+
+
+class ReadRecordingGitHub(GitHubFake):
+    """A GitHub that remembers being asked. `off` must ask it nothing."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reads = []
+
+    def head_sha(self, o, r, p):
+        self.reads.append(("head_sha", p))
+        return super().head_sha(o, r, p)
+
+    def author(self, o, r, p):
+        self.reads.append(("author", p))
+        return super().author(o, r, p)
+
+    def has_hold(self, o, r, p):
+        self.reads.append(("has_hold", p))
+        return super().has_hold(o, r, p)
+
+
+def test_the_off_switch_reads_no_github_at_all(tmp_path):
+    """`off` is the hard kill switch, not a quieter shadow: it stops the work,
+    not only the writes. Two API reads per verdict from a service an operator
+    has switched off is rate budget spent on decisions nobody will act on.
+
+    `shadow` still reads, and must: its whole job is rehearsing the decision a
+    live tick would take, and a decision taken without the hold label and the
+    author is a different decision.
+    """
+    from pr_remediation.loop import tick
+
+    github = ReadRecordingGitHub()
+    deps = in_mode(build(tmp_path, SourceFake([verdict()]), github=github), "off")
+    assert tick(deps) == 0
+    assert github.reads == [], "the kill switch still called GitHub"
+    assert deps.lanes.created == deps.github.claimed == deps.slack.reposts == []
+
+    loop = only_loop(deps)
+    assert loop.state is LoopState.OBSERVED
+    assert [event["detail"]["would"] for event in deps.store.events(loop.loop_id)
+            if event["kind"] == "shadow_decision"] == ["unobserved"], \
+        "a tick that looked at nothing must not claim a decision it never took"
+
+    shadow = in_mode(deps, "shadow")
+    shadow.source.verdicts = [verdict(rid="br_2")]
+    shadow.now.advance()
+    assert tick(shadow) == 0
+    assert github.reads == [("has_hold", 42), ("author", 42)], \
+        "shadow rehearses the live decision, so shadow reads"
+
+
+def test_a_paused_tick_consumes_the_verdict_it_opened_the_row_for(tmp_path):
+    """A verdict is marked seen before the mode is consulted, so the row a
+    paused tick leaves behind is *not* one a later live tick takes over: that
+    verdict can never be routed live. The module docstring used to say the
+    opposite, which reads as though pausing costs nothing. It costs every
+    verdict that arrives while paused -- which is why the rollout clears the
+    database at the shadow-to-live cutover rather than inheriting these rows.
+    """
+    from pr_remediation.loop import tick
+
+    deps = in_mode(build(tmp_path, SourceFake([verdict(rid="br_1")])), "shadow")
+    assert tick(deps) == 0
+    loop_id = _loop_id(deps)
+    assert deps.store.get(loop_id).state is LoopState.OBSERVED
+
+    live = in_mode(deps, "live")  # the operator turns the service on
+    live.now.advance()
+    assert tick(live) == 0, "the paused tick consumed the verdict for good"
+    assert live.lanes.created == [], "no lane: there is no verdict left to route"
+    assert deps.store.get(loop_id).state is LoopState.OBSERVED
+    assert deps.store.mark_verdict_seen("br_1", deps.now()) is False
+
+
 def test_the_newest_verdict_wins_and_a_stale_one_never_reopens_the_pr(tmp_path):
     """`new_verdicts` is newest-first, so within one sweep the *older* verdict
     is routed second. Once the newer one has closed the loop, `active_for_pr`
@@ -669,6 +796,102 @@ def _three_rounds(deps):
     return only_loop(deps)
 
 
+def test_a_stale_orphan_never_hijacks_a_loop_that_records_its_own_lane(tmp_path):
+    """Nothing in trail order ever supersedes an orphan note that lands after
+    the transition which overtook it, so `_orphaned_lane` goes on offering it
+    rounds later. Adopting it then is not a correction but a hijack: the loop
+    is pointed at a lane that finished rounds ago, its head is rewound to that
+    lane's, and it is dropped back into `remediating` -- where the in-flight
+    guard makes every later due pass skip it, so it is stuck for good.
+
+    The round floor could not save any of that: it guards `round_count` alone.
+    """
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake([]))
+    for n, head in ((1, "a" * 40), (2, "f" * 40)):
+        deps.source.verdicts = [verdict(rid=f"br_{n}", head=head)]
+        deps.now.advance()
+        tick(deps)
+        rereview_posted(deps)  # the lane finished and the re-review went out
+    loop_id = _loop_id(deps)
+    loop = deps.store.get(loop_id)
+    assert (loop.round_count, loop.lane_id, loop.head_sha) == (2, "t_2", "f" * 40)
+
+    _orphan_note(deps, loop_id)  # lane t_1, round 1, head aaaa: a round dead
+
+    deps.source.verdicts = [verdict(rid="br_3", head="f" * 40)]
+    deps.now.advance()
+    assert tick(deps) == 1, "the loop must go on, not stall on a stale claim"
+    loop = deps.store.get(loop_id)
+    assert loop.lane_id == "t_3", "a lane that finished a round ago took the loop over"
+    assert loop.head_sha == "f" * 40, "the head was rewound to a dead lane's"
+    assert loop.round_count == 3
+    assert deps.lanes.created[-1] == ("Ylopo/example#42", 3), \
+        "the round this verdict paid for must actually have been dispatched"
+
+
+def test_an_orphan_that_can_no_longer_apply_has_its_claim_deleted(tmp_path):
+    """Refusing a stale claim is not enough while the claim survives: the row's
+    lane is cleared when a lane pass finishes with it, and the note would be
+    adopted then, however many rounds later. The due pass deletes it -- the
+    pass with nothing else to spend, because a verdict is consumed whatever is
+    done with it and the verdict path has a loop to drive.
+    """
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]))
+    tick(deps)
+    loop_id = _loop_id(deps)
+    rereview_posted(deps)  # that lane finished; the row still names it
+    _orphan_note(deps, loop_id, lane_id="t_ghost")
+
+    deps.source.verdicts = []
+    deps.now.advance(LANE_POLL_SECONDS + 1)
+    assert tick(deps) == 0, "deleting a stale claim is bookkeeping, not a step"
+    assert "orphan_superseded" in kinds(deps, loop_id)
+
+    # ...so nothing comes back when the row's own lane is cleared.
+    lane_cleared(deps)
+    deps.now.advance()
+    assert tick(deps) == 0
+    loop = deps.store.get(loop_id)
+    assert loop.lane_id is None, "a dead lane came back out of the trail"
+    assert loop.state is LoopState.REREVIEW_POSTED
+
+
+def test_an_adopted_lane_brings_the_head_it_was_dispatched_against(tmp_path):
+    """The row's head is stale by construction here: the write that would have
+    advanced it is the very one the orphan lost. Adopting the row's own head
+    instead points the loop at a head its lane is not pushing to -- and the
+    whole suite missed that, because every other orphan test dispatches against
+    the head the row already carried.
+    """
+    from pr_remediation.loop import LoopDeps, tick
+
+    store = LosingStore(Store(tmp_path / "r.db"))
+    healed = build(tmp_path, SourceFake([
+        verdict(rid="br_1", outcome="REVIEW_INCOMPLETE", origin="system")]),
+        store=store._inner)
+    tick(healed)  # a re-review: the row is opened at head aaaa, with no lane
+    loop_id = _loop_id(healed)
+    assert healed.store.get(loop_id).head_sha == "a" * 40
+
+    losing = LoopDeps(**{**healed.__dict__, "store": store})
+    losing.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    losing.now.advance()
+    assert tick(losing) == 0, "the lane exists; the write recording it is lost"
+    assert healed.store.get(loop_id).head_sha == "a" * 40, "the write that was lost"
+
+    healed.source.verdicts = []
+    healed.now.advance()
+    assert tick(healed) == 1
+    loop = healed.store.get(loop_id)
+    assert loop.lane_id == "t_1"
+    assert loop.head_sha == "b" * 40, \
+        "the loop must record the head its lane is really pushing to"
+
+
 def test_the_due_pass_never_adopts_an_orphan_over_a_live_lane(tmp_path):
     """`_remediate` guards adoption with the in-flight rule and the due pass
     did not, so the pass rewrote a loop at round 3 with a stale round-1 orphan:
@@ -690,14 +913,35 @@ def test_the_due_pass_never_adopts_an_orphan_over_a_live_lane(tmp_path):
     assert loop.round_count == 3, "a capped loop had two rounds handed back"
 
 
+def lane_cleared(deps):
+    """That lane finished and the row no longer points at it.
+
+    The only shape a spent loop can still adopt into: a row that records a lane
+    of its own is never rewritten from an orphan note, so a stale note can only
+    reach a row whose lane has been cleared.
+    """
+    deps.store._db.execute(
+        "UPDATE loops SET state=?, lane_id=NULL WHERE loop_id=?",
+        (LoopState.REREVIEW_POSTED.value, _loop_id(deps)))
+    deps.store._db.commit()
+
+
 def test_adopting_an_orphan_never_rewinds_the_round_cap(tmp_path):
     """Adoption is a correction, not a rewind. It records the lane that is
-    really running; it must not restore budget the loop has already spent."""
+    really running; it must not restore budget the loop has already spent.
+
+    The row must carry no lane for adoption to apply at all now -- a row that
+    records one is never rewritten from an orphan note, which is
+    `test_a_stale_orphan_never_hijacks_a_loop_that_records_its_own_lane` -- so
+    the third round's lane is cleared here the way its completion clears it.
+    That is also the only way `round_count` can outrun an orphan's round, which
+    is what makes the floor this test is about reachable.
+    """
     from pr_remediation.loop import tick
 
     deps = build(tmp_path, SourceFake([]))
     loop = _three_rounds(deps)
-    rereview_posted(deps)  # that lane finished, so nothing is in flight now
+    lane_cleared(deps)  # that lane finished, so nothing is in flight now
     _orphan_note(deps, loop.loop_id)
 
     deps.source.verdicts = [verdict(rid="br_4")]
