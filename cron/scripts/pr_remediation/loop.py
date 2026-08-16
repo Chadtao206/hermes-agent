@@ -451,6 +451,16 @@ def _lane_left_running(deps: LoopDeps, loop: LoopRequest) -> str | None:
     -- the one the row records while it is `remediating`, and the one whose
     recording write was lost -- and neither one of a lane already completed: a
     row that still names the lane of a finished round is not stranding it.
+
+    `_lane_in_flight`, deliberately, and NOT `_lane_pending`: those answer two
+    different questions and only one of them is this one. `_lane_pending` asks
+    whether an *outcome* is still to be determined, which is true throughout
+    `awaiting_head_move`; this asks whether a *worker* is still going, which in
+    `awaiting_head_move` is false by construction -- observing that lane exit is
+    what put the loop there. Widening this to `_lane_pending` would report a
+    stranded lane on every `no_op_lane` escalation, which is the most ordinary
+    way a round fails and is a lane this pass had just watched exit: a leak
+    alarm that fires on the routine path stops being read.
     """
     if _lane_in_flight(loop):
         return loop.lane_id

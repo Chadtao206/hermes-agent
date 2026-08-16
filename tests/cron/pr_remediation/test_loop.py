@@ -1880,3 +1880,47 @@ def test_a_finished_lane_hands_the_loop_to_the_next_verdict(tmp_path):
     assert loop.lane_id == "t_2"
     assert deps.lanes.created == [("Ylopo/example#42", 1), ("Ylopo/example#42", 2)]
     assert deps.slack.thinkies_added == ["1.0", "1.0"]
+
+
+def test_a_no_op_escalation_never_claims_the_lane_is_still_running(tmp_path):
+    """`lane_abandoned` means "a worker is still going and nobody will poll it".
+
+    The no-op escalation is the opposite of that: the lane exited, which is how
+    the loop reached `awaiting_head_move` at all. Widening the leak report to
+    every close from that state -- rather than to the states where a worker is
+    genuinely still running -- would fire the alarm on the single most ordinary
+    way a round fails, and on a lane this pass had *just* watched exit.
+    """
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = _loop_id(deps)
+    assert tick(deps) == 1
+    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    assert tick(deps) == 1
+    assert deps.slack.escalations[0][2] == "no_op_lane"
+    assert "lane_abandoned" not in kinds(deps, loop_id)
+
+
+def test_a_verdict_in_the_grace_window_closes_on_a_lane_that_had_exited(tmp_path):
+    """A loop closing from `awaiting_head_move` strands no worker: the lane had
+    already exited -- observing that is what put the loop in this state. The
+    lane it ran stays recoverable either way, because the transition that
+    recorded it is in the trail whatever the row goes on to say.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = _loop_id(deps)
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
+
+    deps.source.verdicts = [verdict(rid="br_2", outcome="READY_FOR_HUMAN_REVIEW")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.READY
+    assert "lane_abandoned" not in kinds(deps, loop_id)
+    assert "t_1" in [event["detail"].get("lane_id")
+                     for event in deps.store.events(loop_id)
+                     if event["kind"] == "transition"], \
+        "the lane that ran must stay findable in the trail"
