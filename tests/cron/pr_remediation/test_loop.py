@@ -135,6 +135,43 @@ class UnclaimableStore:
         return False
 
 
+class LosesTheClosingWrite:
+    """A real store whose *escalating* compare-and-swap is lost exactly once.
+
+    The narrow race the escalation ordering cannot avoid: the notice reaches
+    the human, and the write that closes the loop does not.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.lost = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def transition(self, loop_id, expected, target, *, now, **fields):
+        if target is LoopState.ESCALATED and not self.lost:
+            self.lost += 1
+            return False
+        return self._inner.transition(loop_id, expected, target, now=now, **fields)
+
+
+class UnreleasableStore:
+    """A real store whose release() explodes for whichever loops are nominated."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.explode = set()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def release(self, loop_id):
+        if loop_id in self.explode:
+            raise RuntimeError(f"the lease on {loop_id} could not be dropped")
+        return self._inner.release(loop_id)
+
+
 def verdict(outcome="ISSUES_FOUND", origin=None, head="a" * 40, rid="br_1",
             pr=42, thread="1.0"):
     return Verdict(rid, "Ylopo", "example", pr, head, thread, outcome, origin,
@@ -158,6 +195,18 @@ def kinds(deps, loop_id):
 
 def only_loop(deps, pr=42):
     return deps.store.active_for_pr("Ylopo", "example", pr)
+
+
+def deferrals(deps, loop_id):
+    return [event["detail"] for event in deps.store.events(loop_id)
+            if event["kind"] == "verdict_deferred"]
+
+
+def in_mode(deps, mode):
+    """The same tick, the same store, a different operating mode."""
+    from pr_remediation.loop import LoopDeps
+
+    return LoopDeps(**{**deps.__dict__, "cfg": RemediationConfig(mode=mode)})
 
 
 # --- the brief's behaviour -------------------------------------------------
@@ -294,6 +343,45 @@ def test_shadow_mode_never_posts_or_labels_on_any_route(tmp_path):
     assert deps.slack.thinkies_added == deps.slack.thinkies_removed == []
 
 
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_run_never_settles_an_escalation_a_live_run_left_pending(tmp_path, mode):
+    """The one branch a pure shadow run cannot reach on its own, which is why
+    walking all four routes in shadow never caught it: only a live run leaves a
+    pending escalation, and the pause procedure is exactly what arrives next.
+    """
+    from pr_remediation.loop import tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1")]), slack=slack)
+    tick(deps)
+    loop_id = _loop_id(deps)
+    assert kinds(deps, loop_id).count("escalation_pending") == 1
+
+    slack._escalation_ts = "9.2"  # Slack is back. The service is not.
+    paused = in_mode(deps, mode)
+    paused.source.verdicts = [verdict(rid="br_2")]
+    paused.now.advance()
+    assert tick(paused) == 0
+
+    assert len(slack.escalations) == 1, "a paused run posted to a human channel"
+    assert deps.github.released == [], "a paused run handed the label back"
+    assert deps.slack.thinkies_removed == []
+    loop = deps.store.get(loop_id)
+    assert loop.state is not LoopState.ESCALATED, "a paused run drove the loop terminal"
+    assert kinds(deps, loop_id).count("escalation_pending") == 1, \
+        "the debt must survive untouched, and unspent"
+    assert "shadow_decision" in kinds(deps, loop_id)
+    assert deferrals(deps, loop_id)[-1]["reason"] == "escalation_owed"
+
+    # ...and the debt is still there for whoever turns the service back on.
+    live = in_mode(deps, "live")
+    live.source.verdicts = []
+    live.now.advance()
+    assert tick(live) == 1
+    assert len(slack.escalations) == 2
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
 def test_the_same_verdict_is_never_consumed_twice(tmp_path):
     from pr_remediation.loop import tick
 
@@ -395,6 +483,70 @@ def test_a_deferred_verdict_leaves_the_loop_due_for_the_lane_sweep(tmp_path):
     assert [loop.loop_id for loop in due] == [only_loop(deps).loop_id]
 
 
+def test_a_lane_whose_write_was_lost_is_not_dispatched_a_second_time(tmp_path):
+    """The row carries no lane, so only the trail can refuse this -- and
+    kanban's idempotency key cannot: it embeds the head sha, and the orphan's
+    own push is what moves the head."""
+    from pr_remediation.loop import tick
+
+    store = LosingStore(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]), store=store)
+    assert tick(deps) == 0
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    loop_id = _loop_id(deps)
+    assert "orphaned_lane" in kinds(deps, loop_id)
+
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    deps.now.advance()
+    assert tick(deps) == 0
+    assert deps.lanes.created == [("Ylopo/example#42", 1)], \
+        "a second live lane on one branch"
+    assert deps.github.claimed == [("Ylopo", "example", 42)]
+    assert deferrals(deps, loop_id)[-1]["reason"] == "lane_orphaned"
+
+
+def test_an_orphaned_lane_is_adopted_by_the_next_verdict(tmp_path):
+    """Refusing the second dispatch must not strand the loop: the lane that is
+    really running becomes the loop's own, and drives it from there."""
+    from pr_remediation.loop import LoopDeps, tick
+
+    store = LosingStore(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]), store=store)
+    tick(deps)
+
+    healed = LoopDeps(**{**deps.__dict__, "store": store._inner})
+    healed.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    healed.now.advance()
+    assert tick(healed) == 1
+    assert healed.lanes.created == [("Ylopo/example#42", 1)]
+    loop = only_loop(healed)
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.lane_id == "t_1", "the lane already running is now the loop's"
+    assert loop.round_count == 1, "the orphan's round, not a second one"
+    assert loop.head_sha == "a" * 40, "the head that lane was dispatched against"
+
+
+def test_an_orphaned_lane_is_adopted_with_no_verdict_at_all(tmp_path):
+    """A lane that changes nothing triggers no re-review, so waiting for a
+    verdict to settle the orphan is waiting for something that may never come."""
+    from pr_remediation.loop import LANE_POLL_SECONDS, LoopDeps, tick
+
+    store = LosingStore(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([verdict(rid="br_1")]), store=store)
+    tick(deps)
+
+    healed = LoopDeps(**{**deps.__dict__, "store": store._inner})
+    healed.source.verdicts = []
+    healed.now.advance()
+    assert tick(healed) == 1
+    assert healed.lanes.created == [("Ylopo/example#42", 1)]
+    loop = only_loop(healed)
+    assert loop.state is LoopState.REMEDIATING and loop.lane_id == "t_1"
+    due = healed.store.claim_due(now=healed.now() + LANE_POLL_SECONDS + 1, limit=5)
+    assert [claimed.loop_id for claimed in due] == [loop.loop_id], \
+        "an adopted lane is due for the lane pass like any other"
+
+
 # --- an escalation is not finished until a human has it --------------------
 
 
@@ -493,6 +645,65 @@ def test_a_permanently_unreachable_channel_stops_retrying(tmp_path):
     assert "escalation_unreachable" in kinds(deps, loop_id)
 
 
+def test_one_sweep_spends_at_most_one_notification_attempt(tmp_path):
+    """NOTIFY_ATTEMPTS is a budget for riding out an outage across ticks. Spent
+    inside one tick it closes the loop unheard over a momentary blip."""
+    from pr_remediation.loop import tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1"),
+                                       verdict(rid="br_2")]), slack=slack)
+    assert tick(deps) == 0
+    assert len(slack.escalations) == 1, "one sweep, one attempt at one outage"
+    loop_id = _loop_id(deps)
+    assert kinds(deps, loop_id).count("escalation_pending") == 1
+    deferred = deferrals(deps, loop_id)
+    assert [d["request_id"] for d in deferred] == ["br_2"]
+    assert deferred[0]["reason"] == "escalation_attempt_spent"
+
+
+def test_a_delivered_escalation_whose_close_was_lost_is_closed_later_in_silence(tmp_path):
+    """"Notified" is not "closed". A loop that never reaches a terminal state
+    blocks every future generation for that PR, forever."""
+    from pr_remediation.loop import tick
+
+    store = LosesTheClosingWrite(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([model_incomplete()]), store=store)
+    assert tick(deps) == 0
+    loop_id = _loop_id(deps)
+    assert len(deps.slack.escalations) == 1
+    assert "escalation_delivered" in kinds(deps, loop_id)
+    assert deps.store.get(loop_id).state is not LoopState.ESCALATED
+
+    deps.source.verdicts = []
+    deps.now.advance()
+    assert tick(deps) == 1, "nothing else will ever come back for this loop"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert len(deps.slack.escalations) == 1, "the human already has it"
+    assert deps.github.released == [("Ylopo", "example", 42)], \
+        "the retry re-attempts the write, not the stand-down"
+
+
+def test_a_delivered_escalation_never_lets_a_later_verdict_restart_remediation(tmp_path):
+    """The ownership label went back to Chad when the notice landed; a lane
+    started after that is remediating a PR this service no longer holds."""
+    from pr_remediation.loop import tick
+
+    store = LosesTheClosingWrite(Store(tmp_path / "r.db"))
+    deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1")]), store=store)
+    tick(deps)
+    loop_id = _loop_id(deps)
+
+    deps.source.verdicts = [verdict(rid="br_2")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.lanes.created == []
+    assert deps.github.claimed == []
+    assert len(deps.slack.escalations) == 1
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deferrals(deps, loop_id)[-1]["reason"] == "escalation_owed"
+
+
 # --- the claim discipline --------------------------------------------------
 
 
@@ -521,6 +732,28 @@ def test_a_lost_transition_leaves_the_lane_recorded_not_celebrated(tmp_path):
     assert loop.round_count == 0
     assert "orphaned_lane" in kinds(deps, loop.loop_id)
     assert "transition_lost" in kinds(deps, loop.loop_id)
+
+
+def test_a_lease_we_cannot_drop_does_not_discard_the_sweep(tmp_path):
+    """release() runs in a finally at the end of the tick. Unguarded, one
+    failure there throws past tick() and takes the verdict pass's result with
+    it -- over a lease that expires on its own anyway."""
+    from pr_remediation.loop import tick
+
+    store = UnreleasableStore(Store(tmp_path / "r.db"))
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1")]),
+                 slack=slack, store=store)
+    tick(deps)
+    stuck = only_loop(deps).loop_id
+    store.explode.add(stuck)
+
+    slack._escalation_ts = "9.2"
+    deps.source.verdicts = [verdict(rid="br_2", pr=43,
+                                    outcome="READY_FOR_HUMAN_REVIEW")]
+    deps.now.advance()
+    assert tick(deps) == 2, "the escalation settled and the ready PR closed"
+    assert deps.store.get(stuck).state is LoopState.ESCALATED
 
 
 def test_a_lost_transition_is_recorded_on_the_ready_route_too(tmp_path):
@@ -688,6 +921,31 @@ def test_every_edge_the_driver_takes_is_legal(tmp_path, prior, outcome, origin, 
         return
     assert tick(deps) == 1
     assert store.get(loop_id).state is target
+
+
+def test_a_remediating_loop_with_no_lane_takes_the_remediating_edge(tmp_path):
+    """The cell the matrix above now skips, and the only path that still
+    reaches `remediating -> remediating`: a row in that state with no lane to
+    poll (a shadow round, or a live flip on top of one) has nothing in flight,
+    so a verdict starts a real round from there."""
+    from pr_remediation.loop import tick
+
+    store = Store(tmp_path / "r.db")
+    deps = build(tmp_path, SourceFake([verdict(rid="br_0")]), store=store)
+    tick(deps)
+    loop_id = _loop_id(deps)
+    store._db.execute(
+        "UPDATE loops SET state=?, lane_id=NULL, round_count=0 WHERE loop_id=?",
+        (LoopState.REMEDIATING.value, loop_id))
+    store._db.commit()
+
+    deps.source.verdicts = [verdict(rid="br_1")]
+    deps.now.advance()
+    assert tick(deps) == 1
+    loop = store.get(loop_id)
+    assert loop.state is LoopState.REMEDIATING
+    assert loop.round_count == 1
+    assert len(deps.lanes.created) == 2
 
 
 def _loop_id(deps):
