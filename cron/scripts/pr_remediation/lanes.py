@@ -25,10 +25,11 @@ threads (see `_bot_threads_section`), but deliberately NOT their comment
 bodies. Boris's findings are inlined in full because they live only in
 `boris_intake.db` -- nowhere else for the lane to go get them. Codex/CodeQL
 threads live on the PR itself, and the lane runs in a worktree with `gh`
-already in it, so the brief hands over a count and the distinct file paths
-involved plus a fetch instruction, and lets the agent read the threads
-itself. Inlining thread bodies too would also fight the cap `MAX_BRIEF_CHARS`
-already sits close to for an ordinary multi-issue verdict.
+already in it, so the brief hands over a count, as many of the distinct
+file paths involved as `MAX_BOT_THREADS_SECTION_CHARS` allows, and a fetch
+instruction, and lets the agent read the threads itself. Inlining thread
+bodies too would also fight the cap `MAX_BRIEF_CHARS` already sits close to
+for an ordinary multi-issue verdict.
 """
 from __future__ import annotations
 
@@ -115,6 +116,49 @@ def _repo_is_excluded(verdict: Verdict) -> bool:
 # imports kanban's real constant and pins `MAX_BRIEF_CHARS <=` it, so neither
 # side can drift away from the other unnoticed.
 MAX_BRIEF_CHARS = 8 * 1024
+
+# The character budget for the WHOLE rendered "## Codex / CodeQL threads"
+# section -- heading, count sentence, path list and fetch instruction
+# together (see `_bot_threads_section`).
+#
+# Boris's blocking issues are this brief's payload; the bot-thread inventory
+# is supporting context, and supporting context must never evict the payload.
+# Before this budget existed it could, in two stages. `_bounded` computes the
+# issue budget as `MAX_BRIEF_CHARS - len(header) - len(footer)` and never
+# trims the footer -- and this section is part of that footer -- so one line
+# per distinct path with no cap first ate the issue budget (issues silently
+# dropped to make room for a path list), and then, once the footer alone
+# outgrew MAX_BRIEF_CHARS, made `_bounded` hand back a brief LONGER than the
+# cap. At which point kanban's `_cap` head-truncation -- the thing this
+# module's entire size discipline exists to get in front of -- took the
+# acceptance criteria and the push target off the end.
+#
+# The unit is CHARACTERS, not a path count, because the cost of one path is
+# its length -- and that length varies by nearly a factor of three across the
+# repos this loop serves. Measured with `git ls-files`: thousand-stars runs 61
+# characters at the median, 140 at the 90th percentile, 246 at its longest;
+# million-stars runs 52 / 86 / 119. A cap of "15 paths" would therefore be 780
+# characters of brief in one and 2,100 in the other. Thread COUNT is not the
+# lever at all -- the render dedups paths, so 2,000 threads across eight files
+# are eight lines.
+#
+# Sized against the live three-issue verdict this module's cap was set from,
+# br_732853620fd14dfb8f6c5db13d8fb1d2 (Ylopo/million-stars#199): its three
+# issues render as 6,252 characters of issue blocks, leaving 1,367 characters
+# for this section before the brief loses either an issue or part of its
+# footer -- 1,248 when neither branch name could be read and the header
+# carries the longer placeholders instead. 1,024 sits under the tighter of
+# those with 224 characters to spare, and is one eighth of MAX_BRIEF_CHARS,
+# so seven eighths of every brief stay reserved for what Boris actually
+# found. It buys a preview, not a full listing, and is meant to: about nine
+# median-length Ylopo paths or four at the 90th percentile, over a heading
+# carrying the true total and an omission line carrying the rest.
+#
+# tests/cron/pr_remediation/test_lanes.py pins both halves of that: that a
+# hostile inventory cannot cost a live-sized verdict an issue, its acceptance
+# criteria or its push target, and that the section itself never exceeds this
+# number.
+MAX_BOT_THREADS_SECTION_CHARS = 1024
 
 
 def _omission_notice(omitted: int) -> str:
@@ -209,6 +253,22 @@ def _bounded(header: str, blocks: list[str], footer: str) -> str:
     return header + body + footer
 
 
+def _paths_omission_line(omitted: int) -> str:
+    """The line that stands in for the paths that did not fit the section's
+    budget. Shaped like `_omission_notice`, and for the same reason: an
+    inventory that quietly lists some of the files and none of the fact that
+    it did so is worse than a short one that admits it.
+
+    It says the paths are missing, never the threads: the count in the
+    heading above stays the true total, so this line is what stops the
+    heading and the list under it from contradicting each other.
+    """
+    return (f"[... {omitted} further file(s) not listed -- the path list hit "
+            f"this section's {MAX_BOT_THREADS_SECTION_CHARS}-character budget. "
+            "The thread count above is still the true total; get the rest off "
+            "the PR with the command below.]\n")
+
+
 def _bot_threads_section(bot_threads: list[dict] | None) -> str:
     """Inventory only -- see the module docstring for why bodies are not inlined.
 
@@ -216,6 +276,26 @@ def _bot_threads_section(bot_threads: list[dict] | None) -> str:
     returns for a failed or truncated read. It must render as its own
     sentence: collapsing it into "none found" is exactly the false
     all-clear that method exists to prevent.
+
+    Bounded by `MAX_BOT_THREADS_SECTION_CHARS`, whole paths at a time. Both
+    halves of that matter. Bounded, because `build_brief` folds this section
+    into the footer `_bounded` refuses to trim, so an unbounded section
+    crowds out Boris's issues and then the brief's own stopping condition.
+    Whole paths, because this file has already shipped the other kind of cut
+    once: slicing a rendered brief mid-token left the line
+    `- file: src/path_number_118.p`, a broken repo path that reads exactly
+    like a complete one and that the agent would go looking for. A path is
+    either listed in full or counted in `_paths_omission_line`; there is no
+    half-true third state. Enough budget is held back as we go for the
+    omission line we would owe if the next path were the one that did not
+    fit, so listing a path can never push that line out of the budget.
+
+    `outdated` is surfaced as a count in the heading, matching the precedent
+    `slack_io.py`'s `_thread_notice` sets and for the reason its docstring
+    argues: an outdated thread is not a resolved one, so it is counted, and
+    the split is shown because it is real triage signal. Deliberately NOT a
+    per-path marker -- that would grow the list, which is the thing this
+    section is being kept small about.
     """
     if bot_threads is None:
         return ("\n## Codex / CodeQL threads\n\n"
@@ -226,15 +306,27 @@ def _bot_threads_section(bot_threads: list[dict] | None) -> str:
                 "No unresolved Codex/CodeQL threads at the time this lane opened.\n"
                 "Re-check before you finish -- bots can post after a push.\n")
     paths = sorted({t["path"] for t in bot_threads if t.get("path")})
-    lines = [f"\n## Codex / CodeQL threads\n",
-             f"{len(bot_threads)} unresolved Codex/CodeQL review thread(s), "
-             f"across these files:\n"]
-    lines += [f"- {p}" for p in paths]
-    lines.append(
-        "\nRead them with "
-        "`gh api graphql` (reviewThreads on this PR) or `gh pr view --comments`, "
-        "fix what they raise, and resolve each thread you addressed.\n")
-    return "\n".join(lines)
+    outdated = sum(1 for t in bot_threads if t.get("outdated"))
+    heading = ("\n## Codex / CodeQL threads\n\n"
+               f"{len(bot_threads)} unresolved Codex/CodeQL review thread(s)"
+               f"{f' ({outdated} outdated)' if outdated else ''}, "
+               "across these files:\n\n")
+    fetch = ("\nRead them with "
+             "`gh api graphql` (reviewThreads on this PR) or `gh pr view --comments`, "
+             "fix what they raise, and resolve each thread you addressed.\n")
+    budget = max(MAX_BOT_THREADS_SECTION_CHARS - len(heading) - len(fetch), 0)
+    listed = ""
+    for index, path in enumerate(paths):
+        candidate = listed + f"- {path}\n"
+        remaining_after_this = len(paths) - index - 1
+        reserve = (len(_paths_omission_line(remaining_after_this))
+                   if remaining_after_this else 0)
+        if len(candidate) + reserve <= budget:
+            listed = candidate
+            continue
+        listed += _paths_omission_line(len(paths) - index)
+        break
+    return heading + listed + fetch
 
 
 def build_brief(verdict: Verdict, round_number: int, *,
@@ -277,9 +369,18 @@ def build_brief(verdict: Verdict, round_number: int, *,
     inlined finding text: unlike Boris's issues, a bot thread carries no
     comment body in what this method's data shape hands back
     (`{"path": str, "outdated": bool}`), and the lane has `gh` in its
-    worktree to fetch the rest itself. That section is folded into the
-    footer, not the truncatable issue body, so it survives truncation the
-    same way the acceptance criteria and push target already do.
+    worktree to fetch the rest itself.
+
+    That section is folded into the footer, not the truncatable issue body,
+    so `_bounded` protects it the same way it protects the acceptance
+    criteria and the push target. Protected from OUR truncation is the whole
+    of that claim, and it cuts both ways: an unbounded section in the footer
+    is precisely how the acceptance criteria and push target stop surviving
+    KANBAN's truncation, because `_bounded` subtracts the footer from the
+    issue budget without ever trimming it, and a footer bigger than
+    MAX_BRIEF_CHARS makes `_bounded` return a brief over the cap for kanban's
+    `_cap` to head-truncate. `MAX_BOT_THREADS_SECTION_CHARS` is what keeps
+    that from happening; see its comment.
     """
     unknown_head = ("(unknown -- confirm with `gh pr view`; this is NOT the "
                     "worktree's own branch)")
@@ -294,10 +395,22 @@ def build_brief(verdict: Verdict, round_number: int, *,
                    "the PR's head branch named above (NOT the worktree's own branch)")
     # A non-empty inventory or an undetermined read (None) both leave
     # something the agent still owes: an unresolved thread to address, or a
-    # check it still has to make itself. Only a verified-clean read ([])
-    # owes nothing, so only that case skips the bullet.
+    # check it still has to make itself. Only a verified-clean read owes
+    # nothing, so only that case skips the bullet.
+    #
+    # `is not None and not bot_threads`, not `== []`: this predicate and
+    # `_bot_threads_section`'s `not bot_threads` decide the same question
+    # about the same value and have to agree on the answer. Under `== []` an
+    # empty TUPLE rendered "No unresolved Codex/CodeQL threads at the time
+    # this lane opened" and then, three lines later, an acceptance criterion
+    # telling the agent to resolve the threads that sentence had just said
+    # did not exist. `GitHubIO.unresolved_bot_threads` only ever returns
+    # `list | None`, so nothing in production could reach it -- but
+    # test_loop.py's fake defaulted to `()`, so every "clean PR" loop test
+    # ran on a value production never produces, which is exactly how a
+    # contradiction like this goes unnoticed.
     bot_threads_bullet = (
-        "" if bot_threads == [] else
+        "" if bot_threads is not None and not bot_threads else
         "- Resolve every unresolved Codex/CodeQL thread you addressed.\n"
     )
     footer = (

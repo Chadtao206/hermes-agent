@@ -37,7 +37,7 @@ class GitHubFake:
 
     def __init__(self, head="a" * 40, author="Chadtao206", hold=False,
                  claim_ok=True, release_ok=True, hold_raises=(),
-                 pr_state="OPEN", bot_threads=(),
+                 pr_state="OPEN", bot_threads=[],
                  base_branch="main", head_branch="chad/example-branch"):
         self.head, self.author_login, self.hold = head, author, hold
         self.claim_ok, self.release_ok = claim_ok, release_ok
@@ -52,11 +52,20 @@ class GitHubFake:
         # What `gh pr view --json state` reports: OPEN / MERGED / CLOSED, or
         # None when GitHub could not be read.
         self.pr_state = pr_state
-        # What unresolved_bot_threads() returns: () (the default) means "read
+        # What unresolved_bot_threads() returns: [] (the default) means "read
         # succeeded, nothing outstanding" -- the ordinary, clean case every
         # existing test exercises without knowing this parameter exists.
-        # None means the read itself failed. A non-empty sequence of dicts
+        # None means the read itself failed. A non-empty list of dicts
         # ({"path": ..., "outdated": ...}) means real bot threads are open.
+        #
+        # A LIST, not the tuple this used to default to. The real adapter's
+        # contract is `list | None` and never a tuple, and lanes.py once read
+        # "clean" two different ways -- `not bot_threads` in the section,
+        # `== []` in the acceptance bullet -- which agreed for `[]` and
+        # disagreed for `()`. Every "clean PR" test here ran on the one value
+        # that told them apart, so a fake that is not shaped like the thing it
+        # stands in for is how that survived. A mutable default is safe here:
+        # nothing on this class or in the code under test mutates it.
         self.bot_threads = bot_threads
         self.bot_thread_calls = []
 
@@ -180,8 +189,8 @@ class LanesFake:
         # passed through without touching the others.
         self.bot_threads_seen = []
 
-    def create(self, verdict, round_number, *, base_branch=None, head_branch=None,
-              bot_threads=None):
+    def create(self, verdict, round_number, *, base_branch=None,
+               head_branch=None, bot_threads=None):
         self.created.append((verdict.slug, round_number))
         self.branches_seen.append((base_branch, head_branch))
         self.bot_threads_seen.append(bot_threads)

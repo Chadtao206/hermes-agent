@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from pr_remediation import lanes
 from pr_remediation.boris_source import EvidenceAnchor, Issue, Verdict
 from pr_remediation.lanes import (
-    MAX_BRIEF_CHARS, TERMINAL_LANE_STATUSES, LaneIO, build_brief, idempotency_key,
+    MAX_BOT_THREADS_SECTION_CHARS, MAX_BRIEF_CHARS, TERMINAL_LANE_STATUSES,
+    LaneIO, build_brief, idempotency_key,
 )
 
 VERDICT = Verdict("br_1", "Ylopo", "example", 42, "a" * 40, "1.0",
@@ -54,6 +55,85 @@ def _overflowing_issues(count: int = _OVERFLOW_ISSUE_COUNT) -> tuple[Issue, ...]
                   EvidenceAnchor(kind="diff", reference=f"src/path_number_{n}.py"),))
         for n in range(1, count + 1)
     )
+
+
+# --- a fixture the size boris_intake's output actually is --------------------
+#
+# RICH_ISSUE above is a stub: ~40 characters a field, and a three-issue
+# verdict built from it renders at 2,324 characters, 28% of the cap. It cannot
+# tell you anything about what the cap does, and a "live-sized" test built on
+# it reported a brief comfortably inside a limit the real thing sits at 88% of.
+#
+# These numbers are the real ones, read off the live verdict this module's cap
+# was measured against -- br_732853620fd14dfb8f6c5db13d8fb1d2
+# (Ylopo/million-stars#199), whose three blocking issues carry 1,271 / 1,328 /
+# 1,414 characters of prose across the same seven fields, plus 3-4 evidence
+# anchors on 29-113-character references with 50-168-character details. Each
+# length below is that verdict's per-field MEDIAN, and three of these issues
+# render as 6,234 characters of issue blocks against the live verdict's 6,252
+# (a 6,889-character brief against its 6,914) -- within 0.4%, which is the
+# whole point: this fixture has to be the size of the thing the cap is about.
+_LIVE_FIELD_CHARS = {
+    "expected_behavior": 158, "changed_mechanism": 326, "trigger": 195,
+    "consequence": 229, "impact_scope": 124, "action": 284,
+}
+_LIVE_ANCHOR_REF_CHARS = 84
+_LIVE_ANCHOR_DETAIL_CHARS = 85
+_LIVE_ANCHOR_PATH = ("src/app/(dashboard)/design-studio/site/(workspace)/"
+                     "_components/workspace-shell-{n:03d}.tsx")
+
+
+def _live_sized_issue(number: int) -> Issue:
+    """One blocking issue at the size Boris really produces them.
+
+    Each field is padded to its live median length but stays individually
+    identifiable, so a test can assert a specific issue survived rather than
+    only that something did.
+    """
+    fields = {name: f"[{number}:{name}] ".ljust(length, "z")
+              for name, length in _LIVE_FIELD_CHARS.items()}
+    detail = f"anchor detail for issue {number}".ljust(_LIVE_ANCHOR_DETAIL_CHARS, ".")
+    return Issue(
+        title=f"Issue {number}: a seeded value passes the first-publish gate",
+        evidence_anchors=(
+            EvidenceAnchor(
+                kind="diff",
+                reference=_LIVE_ANCHOR_PATH.format(n=number).ljust(
+                    _LIVE_ANCHOR_REF_CHARS, "x"),
+                detail=detail),
+            EvidenceAnchor(
+                kind="ticket",
+                reference=f"PLAT-{2300 + number} acceptance".ljust(
+                    _LIVE_ANCHOR_REF_CHARS, "x"),
+                detail=detail),
+            EvidenceAnchor(
+                kind="test",
+                reference=f"tests/publish_gate_{number:03d}.test.tsx".ljust(
+                    _LIVE_ANCHOR_REF_CHARS, "x"),
+                detail=detail),
+        ),
+        **fields,
+    )
+
+
+LIVE_SIZED_VERDICT = replace(
+    VERDICT, blocking_issues=tuple(_live_sized_issue(n) for n in (1, 2, 3)))
+
+
+def _hostile_paths(count: int, length: int = 140) -> list[dict]:
+    """`count` DISTINCT paths of exactly `length` characters each.
+
+    Distinct paths, not thread count, are what drive the section's size --
+    the renderer dedups -- and 140 characters is the 90th percentile of real
+    Ylopo repo paths (the thousand-stars tree: median 61, p90 140, max 246).
+    """
+    threads = []
+    for n in range(count):
+        suffix = f"/component_{n:05d}.tsx"
+        path = "src/" + "d" * (length - len("src/") - len(suffix)) + suffix
+        assert len(path) == length
+        threads.append({"path": path, "outdated": n % 2 == 0})
+    return threads
 
 
 def _issues_rendered(brief: str, count: int = _OVERFLOW_ISSUE_COUNT) -> list[int]:
@@ -242,16 +322,96 @@ def test_bot_threads_render_as_inventory_not_bodies():
     assert brief.count("src/a.ts") == 1
 
 
+def test_bot_threads_render_the_outdated_split_in_the_heading():
+    """Matches the precedent `slack_io.py`'s `_thread_notice` sets ("N
+    unresolved bot review thread(s) (M outdated) on: ...") and its reasoning:
+    an outdated thread is not a resolved one, so it is counted, and the split
+    is shown because it is real triage signal. `outdated` was being fetched
+    and then thrown away here.
+
+    Heading only, deliberately -- a per-path marker would grow the list, and
+    the list is the thing MAX_BOT_THREADS_SECTION_CHARS is keeping small.
+    """
+    brief = build_brief(VERDICT, 1, bot_threads=[
+        {"path": "src/a.ts", "outdated": True},
+        {"path": "src/b.ts", "outdated": True},
+        {"path": "src/c.ts", "outdated": False},
+    ])
+    assert "3 unresolved Codex/CodeQL review thread(s) (2 outdated)" in brief
+
+
+def test_bot_threads_omit_the_outdated_split_when_none_are_outdated():
+    brief = build_brief(VERDICT, 1, bot_threads=[
+        {"path": "src/a.ts", "outdated": False}])
+    assert "1 unresolved Codex/CodeQL review thread(s), across" in brief
+    assert "outdated" not in brief
+
+
+def test_bot_threads_tell_the_agent_how_to_fetch_the_thread_bodies():
+    """The brief carries paths, not comment text, and this sentence is the
+    entire justification for that: the lane runs in a worktree with `gh` in
+    it, so it can read the threads itself. Without the sentence the inventory
+    names files with no way to find out what was said about them.
+    """
+    brief = build_brief(VERDICT, 1, bot_threads=[
+        {"path": "src/a.ts", "outdated": False}])
+    assert "gh api graphql" in brief
+    assert "gh pr view --comments" in brief
+    assert "resolve each thread you addressed" in brief
+
+
+def test_the_bot_thread_section_sits_before_the_acceptance_criteria():
+    """Ordering is load-bearing, not cosmetic. kanban's `_cap` head-truncates
+    the task body, so whatever sits last is what disappears first -- and the
+    last thing in this brief has to be the stopping condition and the push
+    target, never a file listing. Moving the section below the push-target
+    line left the whole suite green.
+    """
+    brief = build_brief(VERDICT, 1, base_branch="main", head_branch="chad/fix",
+                        bot_threads=[{"path": "src/a.ts", "outdated": False}])
+    assert (brief.index("## Codex / CodeQL threads")
+            < brief.index("## Acceptance criteria")
+            < brief.index("Fix them at this head and push to"))
+
+
 def test_bot_threads_none_says_the_check_failed():
-    """None means 'could not be determined' and must never render as clean."""
+    """None means 'could not be determined' and must never render as clean.
+
+    Including in the acceptance criteria: an undetermined read still leaves
+    the agent a check it owes, so the bullet stays. Only a verified-clean
+    read owns nothing. Without this assertion, collapsing lanes.py's
+    `bot_threads is not None and not bot_threads` down to `not bot_threads`
+    -- which drops the bullet for None too, turning "we could not tell" into
+    "nothing to do" in the one section that states what done means -- left
+    the entire suite passing.
+    """
     brief = build_brief(VERDICT, 1, bot_threads=None)
     assert "could not be determined" in brief
     assert "0 unresolved" not in brief
+    assert "resolve every unresolved codex/codeql thread" in brief.lower()
 
 
 def test_bot_threads_empty_says_clean():
     brief = build_brief(VERDICT, 1, bot_threads=[])
     assert "No unresolved Codex/CodeQL threads" in brief
+
+
+def test_an_empty_tuple_is_read_as_clean_by_both_predicates_not_one():
+    """`_bot_threads_section` tests `not bot_threads`; the acceptance bullet
+    used to test `bot_threads == []`. They disagreed for an empty tuple,
+    which rendered "No unresolved Codex/CodeQL threads at the time this lane
+    opened" and then, three lines later, told the agent to resolve the
+    threads that sentence had just said did not exist.
+
+    `GitHubIO.unresolved_bot_threads` only returns `list | None`, so nothing
+    in production reaches this -- but `test_loop.py`'s `GitHubFake` defaulted
+    to `()`, so every existing loop test's "clean PR" case ran on a value
+    production never produces. That is how a self-contradicting brief goes
+    unnoticed, so the two predicates are pinned to agree.
+    """
+    brief = build_brief(VERDICT, 1, bot_threads=())
+    assert "No unresolved Codex/CodeQL threads" in brief
+    assert "resolve every unresolved codex/codeql thread" not in brief.lower()
 
 
 def test_acceptance_criteria_require_bot_threads_resolved():
@@ -393,20 +553,88 @@ def test_a_brief_within_the_cap_is_not_marked_truncated():
     assert "TRUNCATED" not in build_brief(RICH_VERDICT, 1)
 
 
-def test_a_live_sized_brief_with_a_busy_bot_thread_inventory_still_fits_the_cap():
-    """A 3-issue verdict (the module docstring's own live-measured case,
-    6,787 chars before this section existed) plus a busy bot-thread
-    inventory -- 12 threads across 8 files -- must still fit inside the cap
-    and keep its stopping condition."""
-    verdict = replace(VERDICT, blocking_issues=(RICH_ISSUE, RICH_ISSUE, RICH_ISSUE))
-    bot_threads = [{"path": f"src/file_{n % 8}.ts", "outdated": n % 2 == 0}
-                   for n in range(12)]
-    brief = build_brief(verdict, 1, base_branch="main", head_branch="chad/fix",
-                        bot_threads=bot_threads)
-    assert len(brief) <= MAX_BRIEF_CHARS
-    assert "Acceptance criteria" in brief
+def test_a_hostile_bot_thread_inventory_cannot_evict_a_live_sized_verdicts_payload():
+    """The invariant: supporting context never evicts the payload.
+
+    Boris's blocking issues are what this brief is FOR. The bot-thread
+    inventory is context around them, and it lives in the footer `_bounded`
+    deliberately refuses to trim -- so before `MAX_BOT_THREADS_SECTION_CHARS`
+    existed, a PR touching enough distinct files pushed the issues out of the
+    brief (`_bounded` subtracts the footer from the issue budget) and then
+    pushed the brief itself past the cap, at which point kanban's own
+    head-truncate took the acceptance criteria and the push target off the
+    end too. Measured against this fixture's live-sized ancestor: 22 distinct
+    140-character paths cost it an issue, 40 cost it all three, and 60 cost
+    it the acceptance criteria and the push target.
+
+    The assertion that bites is NOT "the brief fits the cap" -- the test this
+    replaces asserted exactly that and passed with the whole section deleted,
+    because a brief with no section trivially fits. It is that every issue
+    Boris found, the stopping condition, and the push target are all still
+    there with a hostile inventory attached.
+    """
+    threads = _hostile_paths(200)
+    brief = build_brief(LIVE_SIZED_VERDICT, 1, base_branch="main",
+                        head_branch="chad/fix", bot_threads=threads)
+
+    for issue in LIVE_SIZED_VERDICT.blocking_issues:
+        assert issue.title in brief, (
+            f"{issue.title!r} was evicted by a 200-path bot-thread inventory")
+    assert "TRUNCATED" not in brief, \
+        "no issue may be dropped to make room for the inventory"
+    assert "## Acceptance criteria" in brief
     assert "Do not force-push" in brief
-    assert "resolve every unresolved codex/codeql thread" in brief.lower()
+    assert "push to the PR's head branch, `chad/fix`" in brief
+    assert len(brief) <= MAX_BRIEF_CHARS
+    # and the inventory is still there doing its job, not silently dropped
+    assert "200 unresolved Codex/CodeQL review thread(s)" in brief
+
+
+def test_the_bot_thread_section_never_outgrows_its_own_budget():
+    """Whatever `unresolved_bot_threads` hands back, including the 2,000
+    threads `_MAX_THREAD_PAGES` x 100 allows at its ceiling, and including
+    paths at the longest length the Ylopo tree contains (246 characters)."""
+    for count, length in ((1, 61), (200, 140), (2000, 140), (2000, 246),
+                          (50, 4000)):
+        section = lanes._bot_threads_section(_hostile_paths(count, length))
+        assert len(section) <= MAX_BOT_THREADS_SECTION_CHARS, (
+            f"{count} paths of {length} chars rendered {len(section)} chars, "
+            f"over the {MAX_BOT_THREADS_SECTION_CHARS} budget")
+
+
+def test_the_bot_thread_inventory_lists_whole_paths_or_none_of_them():
+    """Same rule as `_bounded`'s, for the same reason, learned the same way:
+    a cut that lands mid-token leaves a broken repo path that reads exactly
+    like a complete one and that the agent goes looking for."""
+    threads = _hostile_paths(200)
+    brief = build_brief(LIVE_SIZED_VERDICT, 1, bot_threads=threads)
+    listed = re.findall(r"^- (\S+)$", brief, flags=re.MULTILINE)
+    assert listed, "the inventory must still list something"
+    known = {t["path"] for t in threads}
+    assert set(listed) <= known, (
+        f"a path was cut mid-token: {sorted(set(listed) - known)}")
+
+
+def test_the_bot_thread_inventory_says_how_many_paths_it_did_not_list():
+    """A list that quietly stops is worse than a short one that admits it.
+
+    The count in the heading stays the TRUE thread total -- it is what the
+    agent is being held to -- so the omission line is the only thing that
+    stops the heading and the list under it from contradicting each other.
+    """
+    threads = _hostile_paths(200)
+    brief = build_brief(LIVE_SIZED_VERDICT, 1, bot_threads=threads)
+    listed = re.findall(r"^- (\S+)$", brief, flags=re.MULTILINE)
+    assert 0 < len(listed) < 200, "this fixture must overflow the section budget"
+    assert f"{200 - len(listed)} further file(s) not listed" in brief, (
+        f"{200 - len(listed)} paths were dropped and the brief never says so")
+    assert "200 unresolved Codex/CodeQL review thread(s)" in brief, \
+        "the heading must keep the true thread total, not the listed-path count"
+
+
+def test_a_short_bot_thread_inventory_is_not_marked_as_omitting_anything():
+    brief = build_brief(VERDICT, 1, bot_threads=_hostile_paths(3, 61))
+    assert "further file(s) not listed" not in brief
 
 
 def test_create_parses_the_lane_id_out_of_dispatch_output(tmp_path, monkeypatch):
