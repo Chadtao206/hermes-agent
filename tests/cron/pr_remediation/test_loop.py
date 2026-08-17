@@ -3605,6 +3605,95 @@ def test_the_absolute_deadline_covers_an_unreadable_intake_too(tmp_path):
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
+def test_the_admission_question_is_anchored_to_the_wait_not_the_last_move(tmp_path):
+    """`updated_at` slides forward on every landed re-post. The wait does not.
+
+    Asked from the row's last move instead of from where the wait began, a
+    request admitted earlier in this same wait reads as somebody else's. The
+    gap is real and this pass opens it itself: the intake read is taken first,
+    the re-post goes out, and only then is the row moved -- so a gate that
+    admits that re-post in between writes a row that sits behind
+    `updated_at` and in front of nothing. Every later tick would then re-post
+    on top of a review that is genuinely running, and go on doing so until the
+    budget escalates a pull request under active review.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    started = deps.store.get(loop_id).updated_at
+    deps.source.admitted = False
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1, "the gate had nothing at the read, so this re-posts"
+    moved = deps.store.get(loop_id).updated_at
+    assert moved > started, "and the row moves, which is the whole hazard"
+
+    # The gate took that re-post, in the gap between the read and the swap.
+    deps.source.admitted_at = moved - 0.5
+    for _ in range(3):
+        deps.now.advance(10 * 60)
+        assert tick(deps) == 0
+    assert len(deps.slack.reposts) == 2, \
+        "the original and one re-post: the review on record is this wait's own"
+    assert deps.slack.escalations == []
+
+
+def test_the_deadline_is_anchored_to_the_wait_not_the_last_move(tmp_path):
+    """The same anchor, and the same slide, on the bound that is supposed to be
+    absolute. Measured from the row's last move it is re-armed by every landed
+    re-post -- a full budget's worth of drift, and a wedged review then never
+    escalates at four hours at all. The constant says "measured from when the
+    wait began" and only this holds it to that.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    started = deps.store.get(loop_id).updated_at
+    deps.source.admitted = False
+    spend_reposts(deps, loop_id, 3)
+    assert deps.store.get(loop_id).updated_at == started + 30 * 60, \
+        "half an hour of re-posting has dragged the row's last move with it"
+
+    # The gate takes the third one and the review then wedges -- ends in
+    # `slack_unavailable`, say. No verdict is coming and no re-post is owed, so
+    # the deadline is the only thing left that can end this wait.
+    deps.source.admitted = True
+    deps.now.advance(4 * 60 * 60 + 60 - 30 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
+        "four hours after the wait began, not after its last re-post"
+
+
+def test_a_wait_with_no_opening_transition_claims_the_less_of_the_two(tmp_path):
+    """A row whose trail cannot say how its wait began -- hand-edited, or older
+    than this trail -- still gets a re-send, and it must be the message that
+    claims only what can still be shown. `repost_rereview` says a request is
+    being sent again and nothing else; `post_rereview` would announce that a
+    remediation lane ran and pushed, which is exactly the fact nothing here
+    evidences. Defaulting to the louder of the two would put a false sentence in
+    the review thread on precisely the rows nobody can reconstruct.
+    """
+    import sqlite3
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    with sqlite3.connect(tmp_path / "r.db") as db:
+        db.execute("DELETE FROM loop_events WHERE loop_id=? AND kind='transition'",
+                   (loop_id,))
+        db.commit()
+    deps.source.admitted = False
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 1
+    assert deps.slack.repost_retries == ["Ylopo/example#42"], \
+        "re-sent as the only thing the trail can still support"
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "the lane's own post, and no second claim of a push"
+
+
 def test_the_repost_claims_the_push_the_lane_really_made(tmp_path):
     """`post_rereview`, not `repost_rereview`. A remediation lane genuinely
     ran and genuinely pushed, so "Round 1 -- remediation pushed" is a true

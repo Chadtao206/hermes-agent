@@ -1236,11 +1236,16 @@ def _repost_unacknowledged(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
               else deps.slack.repost_rereview(verdict, loop.root_thread_ts))
     if landed is None:
         # Recorded directly and NOT through `_note_standing`, which is what
-        # `_lane_pushed`'s sibling failure uses: this attempt has to stay
-        # individually countable, because it is one of the twelve. Under the
-        # dedup the first refusal was recorded and every later one silently
-        # swallowed, so a Slack that refused forever produced one sentence and
-        # an unbounded retry.
+        # `_lane_pushed`'s sibling failure uses: each of these is one of the
+        # twelve and has to stay individually countable. As the detail stands
+        # the dedup would not in fact swallow any of them -- `attempt` rises on
+        # every one, so `_repeats_last_note` can never match -- and that is
+        # precisely the reason not to route them through it: it would read as a
+        # safeguard while doing nothing, and this budget's countability would
+        # rest on a field of the payload rather than on the call. It rested on
+        # nothing at all before that field existed, and the dedup then kept the
+        # first refusal and swallowed every later one, which is how a Slack that
+        # refused forever produced one sentence and an unbounded retry.
         deps.store.record_note(loop.loop_id, EVENT_REREVIEW_REPOST_FAILED,
                                {"round": loop.round_count, "attempt": attempt},
                                deps.now())
