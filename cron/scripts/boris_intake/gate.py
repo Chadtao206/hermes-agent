@@ -57,14 +57,36 @@ def _is_loop_repost(event: NormalizedEvent, cfg: Config) -> bool:
     )
 
 
+def _is_discovery_post(event: NormalizedEvent, cfg: Config) -> bool:
+    """The discovery cron's own review request -- the second admitted bot message.
+
+    Mirrors `_is_loop_repost` but inverted on threading: discovery posts are
+    top-level, reposts are replies. Its own marker, not the loop's, is what
+    separates it from Boris's own top-level messages, which carry parseable
+    PR URLs and post as this same bot user.
+    """
+    if not (cfg.discovery_marker and cfg.discovery_bot_user_id
+            and cfg.loop_attributed_user_id):
+        return False
+    return (
+        event.is_bot
+        and event.user_id == cfg.discovery_bot_user_id
+        and not event.subtype
+        and cfg.discovery_marker in (event.text or "")
+        and (not event.thread_ts or event.thread_ts == event.ts)
+    )
+
+
 def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
     # Mode gate first — cheapest possible check.
     if cfg.mode == "off":
         return _reject(ReasonCode.MODE_OFF)
 
-    # 1: real human message, or the remediation loop's own marked re-review
+    # 1: real human message, or the remediation loop's own marked re-review,
+    #    or the discovery cron's own marked top-level request
     loop_repost = _is_loop_repost(event, cfg)
-    if not loop_repost and (event.is_bot or not event.user_id or event.subtype):
+    discovery = _is_discovery_post(event, cfg)
+    if not (loop_repost or discovery) and (event.is_bot or not event.user_id or event.subtype):
         return _reject(ReasonCode.NOT_HUMAN, event.subtype or "no user id")
 
     # 2: channel allowlist (also excludes DMs — no im channel is ever listed)
@@ -99,10 +121,11 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
             "Supported flags: --ignore-ci",
         )
 
-    # 3: identity. Fail closed on lookup failure. A loop repost resolves as Chad
-    #    so every downstream predicate, quota and audit row reads as his request.
+    # 3: identity. Fail closed on lookup failure. A loop repost or discovery
+    #    post resolves as Chad so every downstream predicate, quota and audit
+    #    row reads as his request.
     requester_user_id = (
-        cfg.loop_attributed_user_id if loop_repost else event.user_id
+        cfg.loop_attributed_user_id if (loop_repost or discovery) else event.user_id
     )
     identity = deps.identity(requester_user_id)
     if identity is None:

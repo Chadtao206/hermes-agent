@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -334,3 +335,86 @@ def test_loop_repost_with_a_subtype_is_rejected():
     edited = ev(user_id=BOT, is_bot=True, thread_ts="0.9", subtype="message_changed",
                 text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
     assert reasons(evaluate(edited, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+# --- discovery cron's marked top-level request (Task 3) ----------------------
+#
+# A second, narrower door: discovery posts are top-level (the loop's are always
+# thread replies), and their own marker -- never the loop's -- is what
+# separates them from Boris's own top-level verdicts, which carry parseable PR
+# URLs and post as this same bot user.
+
+DISCOVERY_MARKER = "[swept this one up. v1]"
+DISCOVERY_CFG = Config(mode="live", channels=("C1", "C2"), passive_channels=("C1",),
+                       bot_user_id=BOT, discovery_bot_user_id=BOT,
+                       discovery_marker=DISCOVERY_MARKER,
+                       loop_attributed_user_id="U07E3AHV686")
+
+
+def test_discovery_post_admitted_top_level():
+    post = ev(user_id=BOT, is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    result = evaluate(post, DISCOVERY_CFG, deps(identity=CHAD))
+    assert not result.rejections
+    assert result.commands[0].slug == "Ylopo/repo#5"
+
+
+def test_discovery_post_requires_its_own_marker():
+    """The loop's marker must not open the discovery door."""
+    post = ev(user_id=BOT, is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {MARKER}")
+    assert reasons(evaluate(post, DISCOVERY_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_boris_own_top_level_verdict_is_not_discovery():
+    verdict = ev(
+        user_id=BOT, is_bot=True, thread_ts=None,
+        text="READY — Ylopo/repo#5 @ fffffff\n"
+             "GitHub review: https://github.com/Ylopo/repo/pull/5#pullrequestreview-1",
+    )
+    assert reasons(evaluate(verdict, DISCOVERY_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_discovery_branch_inert_when_unconfigured():
+    """A wholly unconfigured deployment must behave exactly as before."""
+    post = ev(user_id=BOT, is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    assert reasons(evaluate(post, CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_discovery_branch_inert_when_only_marker_is_unset():
+    """discovery_bot_user_id alone configured must not open the door: an empty
+    discovery_marker is trivially "in" every string, so the guard -- not the
+    identity check -- is what has to hold here."""
+    cfg = replace(DISCOVERY_CFG, discovery_marker="")
+    post = ev(user_id=BOT, is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    assert reasons(evaluate(post, cfg, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_discovery_post_rejected_as_thread_reply():
+    """Top-level only -- a threaded post is the loop's door, not this one."""
+    reply = ev(user_id=BOT, is_bot=True, ts="789.012", thread_ts="123.456",
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    assert reasons(evaluate(reply, DISCOVERY_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_discovery_post_from_other_bot_is_rejected():
+    other = ev(user_id="UOTHERBOT", is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    assert reasons(evaluate(other, DISCOVERY_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_discovery_post_with_a_subtype_is_rejected():
+    """message_changed and friends are never a fresh request."""
+    edited = ev(user_id=BOT, is_bot=True, thread_ts=None, subtype="message_changed",
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    assert reasons(evaluate(edited, DISCOVERY_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_discovery_post_attributes_to_chad():
+    post = ev(user_id=BOT, is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    result = evaluate(post, DISCOVERY_CFG, deps(identity=CHAD))
+    assert result.commands[0].requester_user_id == CHAD.user_id
+    assert result.commands[0].requester_email == CHAD.email

@@ -49,6 +49,13 @@ class Config:
     loop_bot_user_id: str = ""
     loop_marker: str = ""
     loop_attributed_user_id: str = ""
+    # The discovery cron's own admitted post — a second, narrower door into the
+    # same gate. Both default to "" so this branch is inert until a later task
+    # deploys the value; see boris_intake/gate.py's _is_discovery_post for why
+    # identity alone cannot separate it from Boris's own messages (the
+    # discovery cron posts as the same bot user as Boris itself).
+    discovery_marker: str = ""
+    discovery_bot_user_id: str = ""
     limits: Limits = field(default_factory=Limits)
 
 
@@ -88,6 +95,8 @@ def load_config(path: Path | None = None) -> Config:
     loop_bot_user_id = str(block.get("loop_bot_user_id", "") or "").strip()
     loop_marker = str(block.get("loop_marker", "") or "").strip()
     loop_attributed_user_id = str(block.get("loop_attributed_user_id", "") or "").strip()
+    discovery_marker = str(block.get("discovery_marker", "") or "").strip()
+    discovery_bot_user_id = str(block.get("discovery_bot_user_id", "") or "").strip()
     return Config(
         mode=mode,
         team_id=str(block.get("team_id", "T02PND103")),
@@ -102,5 +111,7 @@ def load_config(path: Path | None = None) -> Config:
         loop_bot_user_id=loop_bot_user_id,
         loop_marker=loop_marker,
         loop_attributed_user_id=loop_attributed_user_id,
+        discovery_marker=discovery_marker,
+        discovery_bot_user_id=discovery_bot_user_id,
         limits=limits,
     )
