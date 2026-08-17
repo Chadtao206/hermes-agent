@@ -376,7 +376,10 @@ def test_boris_own_top_level_verdict_is_not_discovery():
 
 
 def test_discovery_branch_inert_when_unconfigured():
-    """A wholly unconfigured deployment must behave exactly as before."""
+    """The "both blank" case. Kills nothing on its own -- CFG's blank
+    discovery_bot_user_id blocks independently of the guard below. Still worth
+    asserting; see test_discovery_branch_inert_when_only_marker_is_unset for the
+    test that actually pins the guard."""
     post = ev(user_id=BOT, is_bot=True, thread_ts=None,
               text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
     assert reasons(evaluate(post, CFG, deps())) == {ReasonCode.NOT_HUMAN}
@@ -418,3 +421,29 @@ def test_discovery_post_attributes_to_chad():
     result = evaluate(post, DISCOVERY_CFG, deps(identity=CHAD))
     assert result.commands[0].requester_user_id == CHAD.user_id
     assert result.commands[0].requester_email == CHAD.email
+
+
+def test_discovery_post_as_thread_root_is_admitted():
+    """A thread PARENT carries thread_ts == ts -- this is exactly what
+    daemon.py's catch_up produces when it replays through conversations.history
+    after a restart. Without this arm, a discovery post that had already
+    received Boris's reply before the restart would be silently dropped on
+    catch-up. Mirrors test_marker_on_thread_root_is_rejected on the loop side,
+    except here thread-root must be ADMITTED, not rejected -- the two doors are
+    inverted on threading."""
+    root = ev(user_id=BOT, is_bot=True, ts="123.456", thread_ts="123.456",
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    result = evaluate(root, DISCOVERY_CFG, deps(identity=CHAD))
+    assert not result.rejections
+    assert result.commands[0].slug == "Ylopo/repo#5"
+
+
+def test_discovery_branch_inert_when_attribution_is_unset():
+    """marker and bot id configured but loop_attributed_user_id blank: a post
+    must not be admitted and attributed to "" -- that would only fail closed
+    later at deps.identity(""). The clause is what closes the door here, at the
+    guard, before attribution ever happens."""
+    cfg = replace(DISCOVERY_CFG, loop_attributed_user_id="")
+    post = ev(user_id=BOT, is_bot=True, thread_ts=None,
+              text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
+    assert reasons(evaluate(post, cfg, deps())) == {ReasonCode.NOT_HUMAN}

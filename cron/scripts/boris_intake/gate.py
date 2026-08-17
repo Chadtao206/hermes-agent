@@ -69,6 +69,9 @@ def _is_discovery_post(event: NormalizedEvent, cfg: Config) -> bool:
             and cfg.loop_attributed_user_id):
         return False
     return (
+        # Redundant with the user_id equality check below -- mirrors
+        # _is_loop_repost's own is_bot check. Deliberate defence-in-depth, not
+        # a coverage hole: keep it even though it can never fail on its own.
         event.is_bot
         and event.user_id == cfg.discovery_bot_user_id
         and not event.subtype
