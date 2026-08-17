@@ -441,15 +441,54 @@ def test_a_config_error_still_reports_the_unchecked_heads_alongside_it():
     assert "2 pull request(s) went unchecked" in summary
 
 
+def test_a_failed_pr_read_is_never_silent():
+    """The fifth incompleteness channel. A PR dropped because its `gh pr
+    view` could not be read is indistinguishable from one that legitimately
+    did not qualify unless this reaches a human too."""
+    deps = _deps(result=DiscoveryResult(
+        candidates=(_c(1),),
+        failed_pr_reads=("1 pull request(s) could not be read",)))
+    result = run(deps, mode="live")
+    assert result.failed_pr_reads == ("1 pull request(s) could not be read",)
+    assert result.complete is False
+    assert "could not be read" in result.summary()
+
+
+def test_a_failed_pr_read_does_not_stop_the_post_of_what_was_found():
+    """Unlike a config error, a per-PR read failure is a gap in what was
+    SEEN, not a reason to distrust what WAS found -- the candidates that did
+    come back are still posted."""
+    deps = _deps(result=DiscoveryResult(
+        candidates=(_c(1),),
+        failed_pr_reads=("1 pull request(s) could not be read",)))
+    result = run(deps, mode="live")
+    assert result.posted == ("Ylopo/x#1@abc123",)
+    assert deps.slack.posted != []
+
+
+def test_a_config_error_still_reports_the_failed_pr_reads_alongside_it():
+    """Mirrors `test_a_config_error_still_reports_the_unchecked_heads_alongside_it`
+    for the fifth channel -- the early exit out of `_plan` must carry this
+    one out too."""
+    deps = _deps(result=DiscoveryResult(
+        config_errors=("banned_repos is a str",),
+        failed_pr_reads=("3 pull request(s) could not be read",)))
+    summary = run(deps, mode="live").summary()
+    assert "banned_repos is a str" in summary
+    assert "3 pull request(s) could not be read" in summary
+
+
 def test_the_summary_names_every_channel_at_once():
     deps = _deps(result=DiscoveryResult(candidates=(_c(1),),
                                         failed_orgs=("Foo",),
                                         truncated_orgs=("Bar",),
                                         unverified_heads=("quux went unchecked",),
-                                        config_errors=("baz is wrong",)))
+                                        config_errors=("baz is wrong",),
+                                        failed_pr_reads=("quux2 could not be read",)))
     summary = run(deps, mode="live").summary()
     assert "Foo" in summary and "Bar" in summary and "baz is wrong" in summary
     assert "quux went unchecked" in summary
+    assert "quux2 could not be read" in summary
 
 
 def test_run_result_defaults_are_a_complete_quiet_tick():

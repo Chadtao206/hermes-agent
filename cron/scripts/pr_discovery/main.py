@@ -14,7 +14,7 @@ stops the work rather than merely the writes -- `_observes` is why an `off`
 tick costs no GitHub reads at all.
 
 *An empty tick is not automatically a healthy one.* `DiscoveryResult` reports
-four separate incompleteness channels and this module surfaces all four,
+five separate incompleteness channels and this module surfaces all five,
 because the shipped code this service replaces returned `[]` for a permanent
 credential outage, which read exactly like a clean run for as long as anyone
 cared to look. Only "nothing selected, nothing deferred, nothing failed, and
@@ -153,6 +153,7 @@ class Plan:
     truncated_orgs: tuple[str, ...] = ()
     config_errors: tuple[str, ...] = ()
     unverified_heads: tuple[str, ...] = ()
+    failed_pr_reads: tuple[str, ...] = ()
     enumerated: bool = False
 
 
@@ -170,6 +171,7 @@ class RunResult:
     truncated_orgs: tuple[str, ...] = ()
     config_errors: tuple[str, ...] = ()
     unverified_heads: tuple[str, ...] = ()
+    failed_pr_reads: tuple[str, ...] = ()
     enumerated: bool = False
 
     @property
@@ -181,7 +183,8 @@ class RunResult:
         in what we SAW. Both reach a human through `summary`.
         """
         return not (self.failed_orgs or self.truncated_orgs
-                    or self.config_errors or self.unverified_heads)
+                    or self.config_errors or self.unverified_heads
+                    or self.failed_pr_reads)
 
     @property
     def faults(self) -> tuple[str, ...]:
@@ -215,6 +218,14 @@ class RunResult:
                 "⚠️ the already-reviewed check could not be applied, so this "
                 "tick may repeat a review Boris has already done: "
                 + "; ".join(self.unverified_heads))
+        if self.failed_pr_reads:
+            # Unlike `unverified_heads`, this one DID withhold: the pull
+            # requests it counts never reached `selected` at all, and are
+            # indistinguishable from ones that genuinely did not qualify.
+            out.append(
+                "⚠️ a per-PR read failed, so a pull request may have been "
+                "silently dropped from consideration rather than genuinely "
+                "not qualifying: " + "; ".join(self.failed_pr_reads))
         if self.config_errors:
             out.append(
                 "⚠️ discovery could not be trusted, so nothing was posted: "
@@ -263,7 +274,8 @@ def _plan(deps: DiscoveryDeps) -> Plan:
         return Plan(enumerated=True, config_errors=result.config_errors,
                     failed_orgs=result.failed_orgs,
                     truncated_orgs=result.truncated_orgs,
-                    unverified_heads=result.unverified_heads)
+                    unverified_heads=result.unverified_heads,
+                    failed_pr_reads=result.failed_pr_reads)
 
     selected: list = []
     skipped: list[str] = []
@@ -283,7 +295,8 @@ def _plan(deps: DiscoveryDeps) -> Plan:
     return Plan(selected=tuple(selected), skipped=tuple(skipped),
                 deferred=tuple(deferred), failed_orgs=result.failed_orgs,
                 truncated_orgs=result.truncated_orgs,
-                unverified_heads=result.unverified_heads, enumerated=True)
+                unverified_heads=result.unverified_heads,
+                failed_pr_reads=result.failed_pr_reads, enumerated=True)
 
 
 def _from_plan(mode: str, plan: Plan, *, posted: tuple[str, ...] = (),
@@ -294,7 +307,8 @@ def _from_plan(mode: str, plan: Plan, *, posted: tuple[str, ...] = (),
         posted=posted, skipped=plan.skipped, failed_posts=failed_posts,
         deferred=plan.deferred, failed_orgs=plan.failed_orgs,
         truncated_orgs=plan.truncated_orgs, config_errors=plan.config_errors,
-        unverified_heads=plan.unverified_heads, enumerated=plan.enumerated)
+        unverified_heads=plan.unverified_heads,
+        failed_pr_reads=plan.failed_pr_reads, enumerated=plan.enumerated)
 
 
 def _perform(deps: DiscoveryDeps, plan: Plan, mode: str) -> RunResult:

@@ -47,8 +47,9 @@ class _FakeGh:
     fake's, so the fake hands back whatever it was built with and lets the
     filter decide."""
 
-    def __init__(self, records, *, truncated=False):
-        self._listing = Listing(records=tuple(records), truncated=truncated)
+    def __init__(self, records, *, truncated=False, failed_pr_reads=0):
+        self._listing = Listing(records=tuple(records), truncated=truncated,
+                                failed_pr_reads=failed_pr_reads)
         self.calls: list[tuple[str, str]] = []
 
     def open_prs(self, org, author):
@@ -225,6 +226,7 @@ def test_a_healthy_pass_reports_itself_complete():
     assert result.complete is True
     assert result.failed_orgs == () and result.truncated_orgs == ()
     assert result.config_errors == ()
+    assert result.failed_pr_reads == ()
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +317,54 @@ def test_truncated_listing_is_reported_without_discarding_what_was_found():
     assert len(result.candidates) == 1        # what we saw is still real
     assert result.truncated_orgs == ("Ylopo",)  # ...but it was not all of it
     assert result.complete is False
+
+
+# ---------------------------------------------------------------------------
+# `failed_pr_reads`: a per-PR detail read that failed (`gh pr view`) must be
+# REPORTED, not folded into "this PR did not qualify" -- the same discipline
+# `failed_orgs` applies at the org level, one level down.
+# ---------------------------------------------------------------------------
+
+def test_a_failed_pr_read_is_reported_not_silently_skipped():
+    """`failed_pr_reads` is carried by the `Listing`, independent of
+    `records` -- a PR dropped by `GhClient.open_prs` before it ever became a
+    record never shows up in `records` at all (see the `GhClient` tests
+    below), so `candidates()` must surface the count from the `Listing`
+    itself rather than trying to infer it from what `records` contains."""
+    gh = _FakeGh([_record()], failed_pr_reads=1)
+    result = candidates(gh, **_args())
+    assert len(result.candidates) == 1  # the healthy record still admits...
+    assert result.failed_pr_reads != ()  # ...but the drop is still reported
+    assert "1 pull request" in result.failed_pr_reads[0]
+    assert result.complete is False
+
+
+def test_the_failed_pr_read_count_is_summed_across_orgs():
+    class _TwoOrgGh:
+        def open_prs(self, org, author):
+            return Listing(records=(), failed_pr_reads=2)
+
+    result = candidates(_TwoOrgGh(), orgs=["Ylopo", "AcmeCo"],
+                        author="Chadtao206", banned_repos=frozenset(),
+                        reviewed=_FakeReviewed())
+    assert "4 pull request" in result.failed_pr_reads[0]
+
+
+def test_a_healthy_listing_reports_no_failed_pr_reads():
+    result = candidates(_gh(), **_args())
+    assert result.failed_pr_reads == ()
+
+
+def test_the_failed_pr_read_report_carries_no_github_authored_text():
+    """Reaches a human through the cron's stdout, the same surface
+    `unverified_heads` and `post.py`'s docstring are about: no owner, repo,
+    number or head may appear, only a count."""
+    gh = _FakeGh([_record()], failed_pr_reads=1)
+    result = candidates(gh, **_args())
+    assert "million-stars" not in result.failed_pr_reads[0]
+    assert "42" not in result.failed_pr_reads[0]
+    assert "abc123" not in result.failed_pr_reads[0]
+    assert "Ylopo" not in result.failed_pr_reads[0]
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +598,7 @@ def test_ghclient_merges_search_and_detail_into_one_open_pr_record(tmp_path):
         "merge_state": "CLEAN", "checks_state": "SUCCESS",
     },)
     assert listing.truncated is False
+    assert listing.failed_pr_reads == 0
     # The per-PR reads name the PR in argv and stay inside the scoped org.
     pr_calls = [argv for argv, _ in runner.calls if argv[1] == "pr"]
     assert len(pr_calls) == 2  # one `pr view`, one `pr checks`
@@ -582,6 +633,8 @@ def test_ghclient_skips_a_pr_whose_detail_read_fails_but_keeps_the_rest(tmp_path
     )
     listing = _client(runner, tmp_path).open_prs("Ylopo", "Chadtao206")
     assert [r["repo"] for r in listing.records] == ["repo-b"]
+    # The skip is counted, not just silent -- see `Listing.failed_pr_reads`.
+    assert listing.failed_pr_reads == 1
 
 
 def test_ghclient_skips_a_pr_whose_detail_carries_no_head_sha(tmp_path):
@@ -599,6 +652,7 @@ def test_ghclient_skips_a_pr_whose_detail_carries_no_head_sha(tmp_path):
         )
         listing = _client(runner, tmp_path).open_prs("Ylopo", "Chadtao206")
         assert listing.records == (), bad_view
+        assert listing.failed_pr_reads == 1, bad_view
 
 
 def test_ghclient_drops_a_search_hit_for_another_owner(tmp_path):
@@ -666,6 +720,12 @@ def test_ghclient_no_checks_configured_does_not_read_as_success(tmp_path, checks
     )
     listing = _client(runner, tmp_path).open_prs("Ylopo", "Chadtao206")
     assert listing.records[0]["checks_state"] is None
+    # A `gh pr checks` failure is NOT counted into `failed_pr_reads`: see
+    # `DiscoveryResult.failed_pr_reads`'s docstring -- production cannot tell
+    # "no checks configured" apart from "the read failed" at this boundary,
+    # so counting it here would misreport a routine, correctly-excluded PR as
+    # flakiness on nearly every tick.
+    assert listing.failed_pr_reads == 0
 
 
 def test_ghclient_unreadable_checks_read_is_the_live_exclusion_path(tmp_path):
@@ -686,9 +746,16 @@ def test_ghclient_unreadable_checks_read_is_the_live_exclusion_path(tmp_path):
         checks={"Ylopo/million-stars": _Proc(8, green)},  # 8 == pending
     )
     client = _client(runner, tmp_path)
-    assert client.open_prs("Ylopo", "Chadtao206").records[0]["checks_state"] is None
+    listing = client.open_prs("Ylopo", "Chadtao206")
+    assert listing.records[0]["checks_state"] is None
+    # Excluded via the normal readiness filter (checks_state != SUCCESS),
+    # not reported as a per-PR read failure -- this PR's fate is exactly as
+    # legitimate-looking as a genuinely failing or pending build, which is
+    # the whole reason `failed_pr_reads` deliberately does not cover it.
+    assert listing.failed_pr_reads == 0
     result = candidates(client, **_args())
     assert result.candidates == ()
+    assert result.failed_pr_reads == ()
 
 
 def test_aggregate_checks_treats_an_empty_row_set_as_not_a_pass():

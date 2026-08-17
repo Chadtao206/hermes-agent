@@ -158,10 +158,20 @@ class Listing:
     from the outside, and truncation quietly drops real PRs. The flag rides
     with the records so a caller cannot consume the records without the
     provenance being right there next to them.
+
+    `failed_pr_reads` counts how many hits from this org's search were
+    dropped before ever reaching `records`, because `gh pr view`'s answer for
+    that one PR could not be read or did not carry a usable `head_sha` (see
+    `GhClient.open_prs`). It rides along for the same reason `truncated`
+    does: `candidates()` cannot recover this count after the fact, and a
+    transient per-PR hiccup deserves to be told apart from "this PR did not
+    qualify" -- see `DiscoveryResult.failed_pr_reads`, which is where it
+    surfaces to a human.
     """
 
     records: tuple[dict, ...] = ()
     truncated: bool = False
+    failed_pr_reads: int = 0
 
 
 @dataclass(frozen=True)
@@ -195,6 +205,25 @@ class DiscoveryResult:
       because an unreadable database is one condition for the whole tick
       rather than a property of any one org. See `candidates()` for why
       unreadable admits here when it excludes everywhere else.
+    * `failed_pr_reads` -- one sentence naming how many pull requests were
+      excluded because `gh pr view`'s answer for that one PR could not be
+      read at all (see `GhClient.open_prs`), rather than because the
+      readiness filter actually looked at it and said no. Unlike
+      `unverified_heads` it DOES withhold: a PR whose detail read failed
+      never reaches `candidates`, exactly like one `_evaluate` legitimately
+      excluded -- which is precisely the ambiguity this channel exists to
+      remove. Built the same way as `unverified_heads` (a count, never a
+      slug) and not per-org for the same reason: an unreadable `gh pr view`
+      is a property of one PR, not of the org it was fetched under.
+
+      Deliberately narrower than its name might suggest: an unreadable `gh
+      pr checks` answer is NOT counted here. In production a non-zero exit
+      from `gh pr checks` is the identical signal for "checks are pending",
+      "a check failed" and "the read itself failed" (see `_checks` and
+      `_aggregate_checks`), so counting every one of those as a "read
+      failure" would misreport routine, correctly-excluded PRs as flakiness
+      on nearly every tick -- a noisier ambiguity than the one being fixed,
+      not a clearer one.
 
     Deliberately NOT iterable and NOT a list subclass. A caller that treats
     a result as the candidate list (`for c in candidates(...)`) fails loudly
@@ -208,19 +237,29 @@ class DiscoveryResult:
     truncated_orgs: tuple[str, ...] = ()
     config_errors: tuple[str, ...] = ()
     unverified_heads: tuple[str, ...] = ()
+    failed_pr_reads: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
-        """True iff every configured org was enumerated in full AND every
-        filter clause could actually be applied to what came back.
+        """True iff every configured org was enumerated in full, every
+        filter clause could actually be applied to what came back, AND every
+        pull request's detail could be read.
 
         `unverified_heads` counts against completeness even though it
         withheld nothing: a tick that posted without being able to check
         whether Boris had already reviewed that head is not the whole truth
         about what it did, which is the only thing this property claims.
+
+        `failed_pr_reads` counts against completeness for the more familiar
+        reason: it DID withhold something. A PR dropped because its `gh pr
+        view` could not be read is indistinguishable, from `candidates`
+        alone, from one that was correctly excluded -- so a tick with any
+        failed reads is not the whole truth about which PRs would have been
+        reviewed, only about which ones this tick happened to see.
         """
         return not (self.failed_orgs or self.truncated_orgs
-                    or self.config_errors or self.unverified_heads)
+                    or self.config_errors or self.unverified_heads
+                    or self.failed_pr_reads)
 
 
 def candidates(gh, *, orgs, author, banned_repos, reviewed,
@@ -313,6 +352,7 @@ def candidates(gh, *, orgs, author, banned_repos, reviewed,
     failed: list[str] = []
     truncated: list[str] = []
     unverified = 0
+    failed_pr_reads = 0
     for org in org_list:
         listing = gh.open_prs(org, author)
         if not isinstance(listing, Listing) or not isinstance(
@@ -325,6 +365,7 @@ def candidates(gh, *, orgs, author, banned_repos, reviewed,
             continue
         if listing.truncated:
             truncated.append(org)
+        failed_pr_reads += listing.failed_pr_reads
         for raw in listing.records:
             candidate = _evaluate(raw, org=org, author=author,
                                    banned_repos=banned,
@@ -380,9 +421,19 @@ def candidates(gh, *, orgs, author, banned_repos, reviewed,
         f"{unverified} pull request(s) were posted without checking whether "
         "Boris has already reviewed that head, because the intake review "
         "database could not be read",)
+    # One sentence, built from a count -- same discipline as
+    # `unverified_heads` immediately above, and for the same reason: this
+    # string reaches a human through the cron's stdout, and every one of
+    # owner/repo/number/head is text written by whoever opened the pull
+    # request.
+    failed_pr_reads_reported = () if not failed_pr_reads else (
+        f"{failed_pr_reads} pull request(s) could not be read (gh pr view "
+        "did not answer, or answered without a usable head_sha) and were "
+        "excluded from this tick's candidates",)
     return DiscoveryResult(candidates=tuple(found), failed_orgs=tuple(failed),
                            truncated_orgs=tuple(truncated),
-                           unverified_heads=unverified_heads)
+                           unverified_heads=unverified_heads,
+                           failed_pr_reads=failed_pr_reads_reported)
 
 
 def _string_seq(value) -> tuple[str, ...] | None:
@@ -841,6 +892,7 @@ class GhClient:
         # direction: the alternative is silently dropping PRs.
         truncated = len(hits) >= SEARCH_LIMIT
         out = []
+        failed_pr_reads = 0
         for hit in hits:
             if not isinstance(hit, dict):
                 continue
@@ -851,18 +903,30 @@ class GhClient:
             if not isinstance(detail, dict):
                 # This one PR's detail read failed -- skip only this PR, not
                 # the whole org's batch (a transient per-PR hiccup must not
-                # hide every other PR discovered in the same pass).
+                # hide every other PR discovered in the same pass). Counted,
+                # not just skipped -- see `Listing.failed_pr_reads` and
+                # `DiscoveryResult.failed_pr_reads` for why a silent skip
+                # here is exactly the gap that field exists to close.
+                failed_pr_reads += 1
                 continue
             head_sha = detail.get("headRefOid")
             if not isinstance(head_sha, str) or not head_sha:
+                failed_pr_reads += 1
                 continue
             record["head_sha"] = head_sha
             merge_state = detail.get("mergeStateStatus")
             record["merge_state"] = merge_state if isinstance(merge_state, str) else None
+            # `_checks` failures are deliberately NOT counted into
+            # `failed_pr_reads`: see `DiscoveryResult.failed_pr_reads`'s
+            # docstring for why a `gh pr checks` failure cannot be told apart
+            # from "checks are pending" or "a check failed" in production, and
+            # why counting it here would misreport routine exclusions as
+            # flakiness.
             record["checks_state"] = _aggregate_checks(
                 self._checks(record["owner"], record["repo"], record["number"]))
             out.append(record)
-        return Listing(records=tuple(out), truncated=truncated)
+        return Listing(records=tuple(out), truncated=truncated,
+                       failed_pr_reads=failed_pr_reads)
 
 
 def _record_from_search_hit(hit: dict, org: str) -> dict | None:
