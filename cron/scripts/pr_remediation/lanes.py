@@ -19,6 +19,16 @@ remediation brief, and no fake-runner test would catch it.
 Note that `kanban_dispatch.sh` independently refuses `create` unless
 `PR_REVIEW_AUTOFIX=1` in the live `.env`. That gate is outside this service's
 control, which is why selftest checks it before the daemon claims to be live.
+
+The brief also carries an inventory of unresolved Codex/CodeQL review
+threads (see `_bot_threads_section`), but deliberately NOT their comment
+bodies. Boris's findings are inlined in full because they live only in
+`boris_intake.db` -- nowhere else for the lane to go get them. Codex/CodeQL
+threads live on the PR itself, and the lane runs in a worktree with `gh`
+already in it, so the brief hands over a count and the distinct file paths
+involved plus a fetch instruction, and lets the agent read the threads
+itself. Inlining thread bodies too would also fight the cap `MAX_BRIEF_CHARS`
+already sits close to for an ordinary multi-issue verdict.
 """
 from __future__ import annotations
 
@@ -199,9 +209,38 @@ def _bounded(header: str, blocks: list[str], footer: str) -> str:
     return header + body + footer
 
 
+def _bot_threads_section(bot_threads: list[dict] | None) -> str:
+    """Inventory only -- see the module docstring for why bodies are not inlined.
+
+    None is the "could not be determined" answer `unresolved_bot_threads`
+    returns for a failed or truncated read. It must render as its own
+    sentence: collapsing it into "none found" is exactly the false
+    all-clear that method exists to prevent.
+    """
+    if bot_threads is None:
+        return ("\n## Codex / CodeQL threads\n\n"
+                "The unresolved-thread count could not be determined. Check the PR\n"
+                "yourself before you finish, and resolve anything still open.\n")
+    if not bot_threads:
+        return ("\n## Codex / CodeQL threads\n\n"
+                "No unresolved Codex/CodeQL threads at the time this lane opened.\n"
+                "Re-check before you finish -- bots can post after a push.\n")
+    paths = sorted({t["path"] for t in bot_threads if t.get("path")})
+    lines = [f"\n## Codex / CodeQL threads\n",
+             f"{len(bot_threads)} unresolved Codex/CodeQL review thread(s), "
+             f"across these files:\n"]
+    lines += [f"- {p}" for p in paths]
+    lines.append(
+        "\nRead them with "
+        "`gh api graphql` (reviewThreads on this PR) or `gh pr view --comments`, "
+        "fix what they raise, and resolve each thread you addressed.\n")
+    return "\n".join(lines)
+
+
 def build_brief(verdict: Verdict, round_number: int, *,
                 base_branch: str | None = None,
-                head_branch: str | None = None) -> str:
+                head_branch: str | None = None,
+                bot_threads: list[dict] | None = None) -> str:
     """The remediation brief, dispatched as the lane's `--body`.
 
     Renders the full issue objects Boris produced -- title, expected
@@ -228,6 +267,19 @@ def build_brief(verdict: Verdict, round_number: int, *,
     for) and degrade to a visible placeholder rather than a guess: never
     silently omitted, and never a name invented for a branch nobody
     confirmed.
+
+    `bot_threads` is what `GitHubIO.unresolved_bot_threads()` found on the
+    PR (or None when that could not be determined), read on the same pass
+    as branches() and threaded in from `_open_lane`. This is coverage
+    pr-review-hourly (the cron this loop retires) still tracked and this
+    loop, until now, did not. It renders as an inventory -- a count and the
+    distinct file paths involved, via `_bot_threads_section` -- rather than
+    inlined finding text: unlike Boris's issues, a bot thread carries no
+    comment body in what this method's data shape hands back
+    (`{"path": str, "outdated": bool}`), and the lane has `gh` in its
+    worktree to fetch the rest itself. That section is folded into the
+    footer, not the truncatable issue body, so it survives truncation the
+    same way the acceptance criteria and push target already do.
     """
     unknown_head = ("(unknown -- confirm with `gh pr view`; this is NOT the "
                     "worktree's own branch)")
@@ -240,10 +292,20 @@ def build_brief(verdict: Verdict, round_number: int, *,
     )
     push_target = (f"the PR's head branch, `{head_branch}`" if head_branch else
                    "the PR's head branch named above (NOT the worktree's own branch)")
+    # A non-empty inventory or an undetermined read (None) both leave
+    # something the agent still owes: an unresolved thread to address, or a
+    # check it still has to make itself. Only a verified-clean read ([])
+    # owes nothing, so only that case skips the bullet.
+    bot_threads_bullet = (
+        "" if bot_threads == [] else
+        "- Resolve every unresolved Codex/CodeQL thread you addressed.\n"
+    )
     footer = (
+        _bot_threads_section(bot_threads) +
         "\n## Acceptance criteria\n\n"
         f"- All {len(verdict.blocking_issues)} listed blocking issue(s) are "
         "cleared at a pushed head, with tests covering them.\n"
+        + bot_threads_bullet +
         "- Do not open a new PR.\n"
         "- Do not force-push.\n"
         "- Do not change the PR's base branch.\n\n"
@@ -263,12 +325,16 @@ class LaneIO:
 
     def create(self, verdict: Verdict, round_number: int, *,
                base_branch: str | None = None,
-               head_branch: str | None = None) -> str | None:
+               head_branch: str | None = None,
+               bot_threads: list[dict] | None = None) -> str | None:
         # base_branch/head_branch: read by the caller (loop.py's _open_lane,
         # via GitHubIO.branches()) and threaded straight into the brief.
         # Optional and default None so a caller that cannot read them --  or
         # a test that does not care -- still dispatches a valid, if less
         # specific, brief; see build_brief for how a missing value degrades.
+        # bot_threads: read the same way, off the same _open_lane pass, via
+        # GitHubIO.unresolved_bot_threads() -- see build_brief for how it
+        # renders and why None (undetermined) is never treated as "clean".
         # --- repo-name path safety ---------------------------------------
         # verdict.repo is the only field used to build a filesystem path
         # below (ANCHOR_ROOT/<repo>), so validate it before any path is
@@ -318,7 +384,8 @@ class LaneIO:
             "--created-by", "boris-remediation-loop",
             "--max-retries", "1",
             "--body", build_brief(verdict, round_number,
-                                  base_branch=base_branch, head_branch=head_branch),
+                                  base_branch=base_branch, head_branch=head_branch,
+                                  bot_threads=bot_threads),
         ]
         try:
             proc = self._runner(

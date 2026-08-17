@@ -174,10 +174,17 @@ class LanesFake:
         # that as (slug, round) 2-tuples) so a test can pin what _open_lane
         # passed through without touching those.
         self.branches_seen = []
+        # What each create() call was handed for bot_threads -- kept apart
+        # from `branches_seen` for the same reason `branches_seen` is kept
+        # apart from `created`: a test should be able to pin what _open_lane
+        # passed through without touching the others.
+        self.bot_threads_seen = []
 
-    def create(self, verdict, round_number, *, base_branch=None, head_branch=None):
+    def create(self, verdict, round_number, *, base_branch=None, head_branch=None,
+              bot_threads=None):
         self.created.append((verdict.slug, round_number))
         self.branches_seen.append((base_branch, head_branch))
+        self.bot_threads_seen.append(bot_threads)
         if self._lane_id is None:
             return None
         return f"t_{len(self.created)}"
@@ -378,6 +385,39 @@ def test_open_lane_still_dispatches_when_branches_cannot_be_read(tmp_path):
     assert tick(deps) == 1
     assert deps.lanes.created == [("Ylopo/example#42", 1)]
     assert deps.lanes.branches_seen == [(None, None)]
+
+
+def test_open_lane_reads_bot_threads_on_the_same_pass_and_threads_them_into_the_brief(tmp_path):
+    """The blind spot pr-review-hourly still tracked and this loop did not:
+    unresolved Codex/CodeQL threads. `_open_lane` reads them the same tick
+    it reads branches(), before dispatching, and hands them straight to
+    lanes.create() -- which is what lets build_brief's inventory section say
+    what a lane is walking into instead of the agent discovering it cold."""
+    from pr_remediation.loop import tick
+
+    found = [{"path": "src/webhook.py", "outdated": False}]
+    github = GitHubFake(bot_threads=found)
+    deps = build(tmp_path, SourceFake([verdict()]), github=github)
+    assert tick(deps) == 1
+    assert github.bot_thread_calls == [("Ylopo", "example", 42)]
+    assert deps.lanes.bot_threads_seen == [found]
+
+
+def test_open_lane_still_dispatches_when_bot_threads_cannot_be_read(tmp_path):
+    """None (an unreadable GitHub, or a truncated read) must degrade the
+    brief -- via build_brief's own uncertain sentence -- and must never
+    block, escalate, or hold the lane open. The round still opens."""
+    from pr_remediation.loop import tick
+
+    github = GitHubFake(bot_threads=None)
+    deps = build(tmp_path, SourceFake([verdict()]), github=github)
+    assert tick(deps) == 1
+    assert github.bot_thread_calls == [("Ylopo", "example", 42)], \
+        "the read must actually be attempted, not skipped because it can fail"
+    assert deps.lanes.created == [("Ylopo/example#42", 1)]
+    assert deps.lanes.bot_threads_seen == [None]
+    assert deps.slack.escalations == [], \
+        "a failed bot-thread read must not become an escalation"
 
 
 def test_ready_notifies_and_closes_without_a_lane(tmp_path):

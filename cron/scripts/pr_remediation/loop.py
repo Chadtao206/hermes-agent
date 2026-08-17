@@ -1246,8 +1246,22 @@ def _open_lane(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     base_branch, head_branch = deps.github.branches(
         verdict.owner, verdict.repo, verdict.pr_number)
 
+    # Same pass, same reasoning: the brief also carries an inventory of
+    # unresolved Codex/CodeQL review threads (lanes.build_brief), which is
+    # coverage pr-review-hourly still tracked and this loop, until now, did
+    # not. Unlike branches() above, this does NOT share `_view()` -- it is
+    # its own `gh api graphql` call, a second round trip, not a second field
+    # off the first. `unresolved_bot_threads` already turns a failed or
+    # truncated read into None rather than raising (see its docstring), and
+    # that None must not block, escalate, or hold the lane open here either:
+    # it only changes what the brief says, degrading to its own uncertain
+    # sentence, the same way an unreadable branches() does above.
+    bot_threads = deps.github.unresolved_bot_threads(
+        verdict.owner, verdict.repo, verdict.pr_number)
+
     lane_id = deps.lanes.create(verdict, round_number,
-                                base_branch=base_branch, head_branch=head_branch)
+                                base_branch=base_branch, head_branch=head_branch,
+                                bot_threads=bot_threads)
     if lane_id is None:
         # Dispatch refused (no worktree anchor, an excluded infra repo, a
         # kanban failure). No lane means no remediation, so the round stays

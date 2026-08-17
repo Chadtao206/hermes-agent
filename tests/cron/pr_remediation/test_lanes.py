@@ -221,6 +221,68 @@ def test_brief_degrades_visibly_when_branches_are_unknown():
     assert "confirm" in brief.lower()
 
 
+# --- Codex/CodeQL bot threads ------------------------------------------------
+#
+# GitHubIO.unresolved_bot_threads() only ever hands back an inventory --
+# {"path": str, "outdated": bool} dicts, no comment text, no thread id -- so
+# the brief carries a count and a distinct-path list plus a fetch
+# instruction, never rendered finding bodies. See lanes.py's module
+# docstring for why bodies are not inlined the way Boris's are.
+
+
+def test_bot_threads_render_as_inventory_not_bodies():
+    brief = build_brief(VERDICT, 1, bot_threads=[
+        {"path": "src/a.ts", "outdated": False},
+        {"path": "src/a.ts", "outdated": True},
+        {"path": "src/b.ts", "outdated": False},
+    ])
+    assert "3 unresolved Codex/CodeQL review thread(s)" in brief
+    assert "src/a.ts" in brief and "src/b.ts" in brief
+    # the inventory names each path once, not once per thread
+    assert brief.count("src/a.ts") == 1
+
+
+def test_bot_threads_none_says_the_check_failed():
+    """None means 'could not be determined' and must never render as clean."""
+    brief = build_brief(VERDICT, 1, bot_threads=None)
+    assert "could not be determined" in brief
+    assert "0 unresolved" not in brief
+
+
+def test_bot_threads_empty_says_clean():
+    brief = build_brief(VERDICT, 1, bot_threads=[])
+    assert "No unresolved Codex/CodeQL threads" in brief
+
+
+def test_acceptance_criteria_require_bot_threads_resolved():
+    brief = build_brief(VERDICT, 1, bot_threads=[{"path": "src/a.ts", "outdated": False}])
+    assert "resolve every unresolved codex/codeql thread" in brief.lower()
+
+
+def test_acceptance_criteria_do_not_mention_bot_threads_when_clean():
+    """No unresolved threads means nothing to resolve -- the acceptance
+    bullet must not appear when bot_threads is an empty list."""
+    brief = build_brief(VERDICT, 1, bot_threads=[])
+    assert "resolve every unresolved codex/codeql thread" not in brief.lower()
+
+
+def test_create_threads_bot_threads_into_the_dispatched_body(tmp_path, monkeypatch):
+    """LaneIO.create must hand bot_threads straight to build_brief, the same
+    way it already does for base_branch/head_branch."""
+    _valid_anchor(tmp_path, monkeypatch)
+    seen = {}
+
+    def run(command, **kwargs):
+        seen["argv"] = command
+        return SimpleNamespace(returncode=0, stdout="t_abc123", stderr="")
+
+    LaneIO(tmp_path / "kanban.db", runner=run).create(
+        VERDICT, 1, bot_threads=[{"path": "src/webhook.py", "outdated": False}])
+    body_value = seen["argv"][seen["argv"].index("--body") + 1]
+    assert "src/webhook.py" in body_value
+    assert "unresolved Codex/CodeQL review thread(s)" in body_value
+
+
 # --- size cap and truncation -------------------------------------------------
 
 
@@ -329,6 +391,22 @@ def test_truncation_never_costs_the_acceptance_criteria_or_the_footer():
 
 def test_a_brief_within_the_cap_is_not_marked_truncated():
     assert "TRUNCATED" not in build_brief(RICH_VERDICT, 1)
+
+
+def test_a_live_sized_brief_with_a_busy_bot_thread_inventory_still_fits_the_cap():
+    """A 3-issue verdict (the module docstring's own live-measured case,
+    6,787 chars before this section existed) plus a busy bot-thread
+    inventory -- 12 threads across 8 files -- must still fit inside the cap
+    and keep its stopping condition."""
+    verdict = replace(VERDICT, blocking_issues=(RICH_ISSUE, RICH_ISSUE, RICH_ISSUE))
+    bot_threads = [{"path": f"src/file_{n % 8}.ts", "outdated": n % 2 == 0}
+                   for n in range(12)]
+    brief = build_brief(verdict, 1, base_branch="main", head_branch="chad/fix",
+                        bot_threads=bot_threads)
+    assert len(brief) <= MAX_BRIEF_CHARS
+    assert "Acceptance criteria" in brief
+    assert "Do not force-push" in brief
+    assert "resolve every unresolved codex/codeql thread" in brief.lower()
 
 
 def test_create_parses_the_lane_id_out_of_dispatch_output(tmp_path, monkeypatch):
