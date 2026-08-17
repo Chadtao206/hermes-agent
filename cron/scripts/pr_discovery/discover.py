@@ -33,6 +33,18 @@ duplicate message the intake idempotency key already dedups. It is reported
 either way (`DiscoveryResult.unverified_heads`). The full argument for the
 asymmetry is in `candidates()`, at the clause itself.
 
+Transient faults are retried, exhaustion is still reported. GitHub's search
+endpoint 503s on roughly half of all calls in some windows, which turned a
+correct filter into a flapping one -- ticks minutes apart reported 1, 2, 4, 5
+and 6 candidates from an unchanged set of pull requests, and one enumerated no
+org at all. `GhClient` retries each read a bounded number of times inside a
+wall-clock deadline for the whole tick (see `SEARCH_ATTEMPTS` for the budgets
+and the arithmetic against the 30-minute cron interval). Nothing above the
+adapter changed: a read that fails every attempt answers `None` exactly as it
+did before, so it still lands in `failed_orgs` / `failed_pr_reads` and still
+makes `complete` False. The retry buys fewer false failures, never quieter
+ones.
+
 Readiness filter -- a PR is only admitted when ALL of these hold (see
 `_evaluate`): state is OPEN, not draft, author is the configured `author`,
 the record's owner matches the org it was fetched under (the allowlist is
@@ -50,6 +62,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -762,16 +775,107 @@ _FAILING_CHECK_STATES = frozenset({
 })
 _PASSING_CHECK_STATES = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 
+# --- bounded retry for transient server-side faults ------------------------
+#
+# GitHub's search endpoint answers HTTP 503 ("No server is currently available
+# to service your request") on roughly half of all calls in some windows.
+# Measured against the live API: try1 ok 2.7s, try2 503 1.3s, try3 ok 2.6s,
+# try4 503 1.2s -- retrying the IDENTICAL call succeeds immediately, so these
+# are server-side faults, not a defect in our argv or our credential. Without a
+# retry the observable damage was exactly what this package's reporting
+# channels then had to confess: one tick enumerated no org at all ("1 org(s)
+# could not be enumerated: Ylopo") and posted nothing, ticks twenty minutes
+# apart reported 1, 2, 4, 5 and 6 candidates from an unchanged set of pull
+# requests, and one tick reported "4 pull request(s) could not be read".
+#
+# The two budgets differ because the two calls cost different things when lost:
+#
+#   * the SEARCH is one call per org and losing it costs the ENTIRE tick --
+#     every pull request in that org goes unseen. Worth five attempts; it is one
+#     call, so even its full backoff (1+2+4+4 = 11s) is noise.
+#   * a per-PR read (`pr view`, `pr checks`) is 2N calls for N pull requests
+#     and losing one costs ONE pull request for ONE tick, re-tried by the next
+#     tick 30 minutes later. Worth three.
+#
+# Three, not two, and the difference was measured rather than guessed. A probe
+# against one PR during a bad window answered `pr checks` 503/503/503/200 -- so
+# a two-attempt budget still loses a PR whenever two faults land in a row, which
+# at the observed ~50% fault rate is a quarter of them. Two live ticks 90s apart
+# showed exactly that: 4 candidates, then 1, from an unchanged set of pull
+# requests. Three attempts halves that residue again, and it is the LAST place
+# it can be reduced from, because a `pr checks` fault is indistinguishable here
+# from "checks are pending" (see `_run`) and so is deliberately not reported at
+# all -- unlike a `pr view` fault, which lands in
+# `DiscoveryResult.failed_pr_reads` where a human can see it.
+#
+# Not four: at the observed fault rate a fourth attempt on every per-PR read
+# spends most of the 240s window below on backoff, which starves the retries of
+# whichever pull requests happen to be enumerated last. The budget that fits the
+# window beats the budget that would be ideal in isolation.
+#
+# THE ARITHMETIC, because it is what rules out the obvious choice. A tick makes
+# 2N+1 wrapper calls (N=23 today, so 47) and `TIMEOUT` is 30s each, so retrying
+# everything three times is 47*3*30 = 4230s = 70 minutes against a 30-minute
+# cron interval -- a cron that overruns its own schedule. These budgets are no
+# better on their own: 5*30 + 46*3*30 = 4290s = 71 minutes.
+#
+# `RETRY_DEADLINE` is what actually bounds the worst case. It is a wall-clock
+# window opened by the tick's FIRST wrapper call, and once it closes no further
+# retry is attempted -- remaining failures are reported through the ordinary
+# channels, exactly as they were before this retry existed. So the worst case
+# is the un-retried pass (47*30 = 1410s), plus at most the retry window itself,
+# plus one straggler attempt that began just inside it:
+#
+#     1410 + 240 + 30 (TIMEOUT) + 4 (BACKOFF_CAP) = 1684s = 28.1 minutes
+#
+# under the 30-minute interval with ~2 minutes to spare. 240 was chosen by
+# solving that for the interval: anything up to ~355s still fits, and the
+# margin buys room for the Slack post and the ledger write. Realistically a
+# tick is nowhere near this: 47 calls at ~2.7s with half of them retried once
+# is under 3 minutes.
+#
+# `test_the_retry_budgets_fit_inside_the_cron_interval` pins that inequality,
+# so raising any of these numbers past what the interval can absorb breaks a
+# test rather than silently producing a cron that runs into its own next tick.
+SEARCH_ATTEMPTS = 5
+DETAIL_ATTEMPTS = 3
+RETRY_DEADLINE = 240.0
+# Short on purpose: the 503s recover in about a second, so a long backoff would
+# spend the deadline sleeping instead of retrying. Doubling from 1s, capped, so
+# the search's four retries sleep 1+2+4+4 = 11s in the worst case and a per-PR
+# read's two sleep 1+2 = 3s.
+BACKOFF_BASE = 1.0
+BACKOFF_CAP = 4.0
+
 
 class GhClient:
     """Production `open_prs` adapter. Runner- and token-path-injected so
     nothing here shells out or reads the real credential during a test;
     `runner` defaults to `subprocess.run` and `token_path` to the read-only
-    machine token for real use."""
+    machine token for real use.
 
-    def __init__(self, runner=subprocess.run, token_path=DEFAULT_TOKEN_PATH):
+    `sleep` and `clock` are injected for the same reason: the retry above is
+    time-dependent, and a suite that really slept through its backoffs (or
+    really waited out `RETRY_DEADLINE`) is a suite people stop running. Every
+    test drives both by hand.
+
+    One instance per tick, which is what makes the retry deadline meaningful:
+    it is stored on the instance and opened by the first `_run`, so it bounds
+    one PASS rather than one call. `main.build_deps` constructs exactly one.
+    """
+
+    def __init__(self, runner=subprocess.run, token_path=DEFAULT_TOKEN_PATH,
+                 sleep=time.sleep, clock=time.monotonic):
         self._runner = runner
         self._token_path = Path(token_path)
+        self._sleep = sleep
+        self._clock = clock
+        # Opened lazily by the first `_run` (see `_retry_window_closed`) rather
+        # than in the constructor: `build_deps` builds this adapter before the
+        # tick's preconditions are all settled, and a window that started
+        # ticking during wiring would hand the reads a shorter one than the
+        # arithmetic above assumes.
+        self._retry_deadline: float | None = None
 
     def _token(self) -> str | None:
         """The read-only GitHub credential, or `None` if it cannot be used.
@@ -791,9 +895,31 @@ class GhClient:
             return None
         return token or None
 
-    def _run(self, argv: list[str], *, org: str) -> str | None:
+    def _run(self, argv: list[str], *, org: str, attempts: int = 1) -> str | None:
         """One `ghx_discovery.sh` call's stdout, or `None` if it cannot be
-        trusted to have answered.
+        trusted to have answered -- retried up to `attempts` times first.
+
+        `attempts` counts TOTAL attempts, not retries, and defaults to 1: a
+        future caller that forgets to pass one gets today's single-shot
+        behaviour rather than an unbudgeted retry loop. The two budgets the two
+        real callers pass, and the deadline that bounds them both, are argued in
+        full at `SEARCH_ATTEMPTS` above.
+
+        What is retried, exactly: a non-zero exit from the wrapper, and a runner
+        that raised (a `TIMEOUT` expiry, a spawn failure). What is NOT retried
+        is the local credential refusal below -- a missing, unreadable or empty
+        token file is not a transient fault and will still be missing 1s later,
+        so it must fail fast and stay fast. A zero-exit-but-empty body is also
+        left alone: the callers already treat it as unreadable, and it is not one
+        of the transport-level signals a server-side fault arrives as.
+
+        The cost this knowingly accepts: `gh pr checks` exits non-zero for
+        "checks are pending" and "a check failed" too (see `_checks`), which are
+        routine, and this cannot tell them apart from a 503 by exit code alone,
+        so each such PR now costs one extra wasted call and one 1s backoff. That
+        is the right trade anyway -- a 503 on `pr checks` makes a green PR look
+        pending and drops it from the tick, which is half of the candidate-count
+        flapping this retry exists to stop -- and the deadline bounds the waste.
 
         Two things ride in the environment, and neither is optional. The org
         scope is what the wrapper checks `--owner=`/`-R` against; without it
@@ -818,6 +944,28 @@ class GhClient:
         env = dict(_RUN_ENV)
         env["DISCOVERY_ORG_SCOPE"] = org
         env["DISCOVERY_GH_TOKEN_PATH"] = str(self._token_path)
+        if self._retry_deadline is None:
+            self._retry_deadline = self._clock() + RETRY_DEADLINE
+        for attempt in range(1, attempts + 1):
+            out = self._attempt(argv, env)
+            if out is not None:
+                return out
+            if attempt >= attempts or self._retry_window_closed():
+                break
+            self._sleep(min(BACKOFF_BASE * 2 ** (attempt - 1), BACKOFF_CAP))
+        # Every retry spent and still nothing trustworthy: answer `None`,
+        # unchanged and undiluted. This is the line that keeps the retry from
+        # becoming the very failure this package was already fixed for once --
+        # `_search` turns it into a reported `failed_orgs` entry and `_view` into
+        # a reported `failed_pr_reads` count, both of which make `complete`
+        # False. A retry that swallowed an outage into an empty-but-happy result
+        # would be indistinguishable from a permanently dead credential.
+        return None
+
+    def _attempt(self, argv: list[str], env: dict) -> str | None:
+        """One actual spawn: stdout, or `None` for the two transport-level
+        failures a transient server-side fault can arrive as (a raise from the
+        runner, a non-zero exit)."""
         try:
             proc = self._runner(argv, capture_output=True, text=True,
                                 timeout=TIMEOUT, env=env)
@@ -827,13 +975,27 @@ class GhClient:
             return None
         return proc.stdout or ""
 
+    def _retry_window_closed(self) -> bool:
+        """Has this tick's retry window (opened by the first `_run`) closed?
+
+        Checked before a retry is STARTED, never before a first attempt: a
+        closed window must stop retrying, not stop reading -- refusing first
+        attempts would silently shrink the tick's coverage while every
+        incompleteness channel reported the same thing either way.
+        """
+        return (self._retry_deadline is not None
+                and self._clock() >= self._retry_deadline)
+
     def _search(self, org: str, author: str) -> list[dict] | None:
         # `--owner=` is load-bearing twice over: it is the qualifier that
         # keeps the search inside this org, AND it is what the wrapper
         # compares `DISCOVERY_ORG_SCOPE` against -- a search that lost it is
         # refused rather than quietly widened to all of GitHub.
+        # The most heavily retried call in the module: one per org, and its loss
+        # costs every pull request in that org (see `SEARCH_ATTEMPTS`).
         out = self._run([GHX_DISCOVERY, *_SEARCH_ARGS, f"--owner={org}",
-                         f"--author={author}"], org=org)
+                         f"--author={author}"], org=org,
+                        attempts=SEARCH_ATTEMPTS)
         if out is None or not out.strip():
             return None
         try:
@@ -846,7 +1008,7 @@ class GhClient:
         out = self._run(
             [GHX_DISCOVERY, "pr", "view", str(number), "-R", f"{owner}/{repo}",
              "--json", "headRefOid,mergeStateStatus"],
-            org=owner,
+            org=owner, attempts=DETAIL_ATTEMPTS,
         )
         if out is None or not out.strip():
             return None
@@ -860,7 +1022,7 @@ class GhClient:
         out = self._run(
             [GHX_DISCOVERY, "pr", "checks", str(number), "-R",
              f"{owner}/{repo}", "--json", "name,state"],
-            org=owner,
+            org=owner, attempts=DETAIL_ATTEMPTS,
         )
         if out is None or not out.strip():
             # `gh pr checks` exits 8 while checks are pending, 1 when any

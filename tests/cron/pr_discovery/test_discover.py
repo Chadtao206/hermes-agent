@@ -25,8 +25,14 @@ import sqlite3
 import pytest
 
 from pr_discovery.discover import (
+    BACKOFF_BASE,
+    BACKOFF_CAP,
     BANNED_REPO_SUFFIXES,
+    DETAIL_ATTEMPTS,
+    RETRY_DEADLINE,
+    SEARCH_ATTEMPTS,
     SEARCH_LIMIT,
+    TIMEOUT,
     Candidate,
     GhClient,
     IntakeSource,
@@ -514,6 +520,31 @@ class _Proc:
         self.stderr = ""
 
 
+class _Clock:
+    """The injected `sleep`/`clock` pair, driven by hand.
+
+    Nothing in this suite is allowed to really sleep -- `GhClient` now backs off
+    between retries, and a suite that waited out those backoffs (let alone
+    `RETRY_DEADLINE`) is a suite people stop running. `slept` records what the
+    adapter asked for, and `step` is how much the clock advances on its own per
+    reading, which is how a test walks the retry window shut without waiting.
+    """
+
+    def __init__(self, *, step=0.0):
+        self.now = 0.0
+        self.step = step
+        self.slept: list[float] = []
+
+    def __call__(self):
+        value = self.now
+        self.now += self.step
+        return value
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
 # The wrapper every read is routed through, spelled out rather than imported
 # from `discover`: a test that compared argv[0] against the same constant the
 # production code builds argv[0] from would pass no matter which script that
@@ -559,8 +590,13 @@ def _token_file(tmp_path, content="ghp_test_token"):
     return path
 
 
-def _client(runner, tmp_path, token="ghp_test_token"):
-    return GhClient(runner=runner, token_path=_token_file(tmp_path, token))
+def _client(runner, tmp_path, token="ghp_test_token", clock=None):
+    """A `GhClient` that never really sleeps. Every test gets a hand-driven
+    clock whether or not it inspects one, because several of them script a
+    failing call and would otherwise sit through the real backoff."""
+    clock = clock if clock is not None else _Clock()
+    return GhClient(runner=runner, token_path=_token_file(tmp_path, token),
+                    sleep=clock.sleep, clock=clock)
 
 
 def _hit(**overrides):
@@ -1016,6 +1052,246 @@ def test_a_short_listing_is_not_reported_as_truncated(tmp_path):
     )
     assert _client(runner, tmp_path).open_prs(
         "Ylopo", "Chadtao206").truncated is False
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry of transient server-side faults.
+#
+# GitHub's search endpoint was measured 503-ing on roughly half of all live
+# calls, and with no retry the whole tick flapped: 1, 2, 4, 5 and 6 candidates
+# reported within twenty minutes from an unchanged set of pull requests, one
+# tick that enumerated no org at all, one that reported four unreadable PRs.
+# Retrying the identical call succeeded immediately every time.
+#
+# Two things these tests hold down together, and the second is the one that
+# matters more: that a transient fault is survived, AND that an exhausted one
+# still reaches `failed_orgs` / `failed_pr_reads` with `complete` False. A retry
+# that converted a real outage into a quiet empty result would reintroduce
+# exactly the ambiguity `DiscoveryResult` exists to remove.
+# ---------------------------------------------------------------------------
+
+#: What a 503 looks like by the time it reaches this adapter: `gh` has exited
+#: non-zero and `ghx_discovery.sh` passed the status through. The body is
+#: deliberately empty, as `gh`'s is -- the error text goes to stderr.
+_FAULT = _Proc(1, "")
+
+
+class _FlakyRunner:
+    """Fails the first N calls of each verb, then answers normally.
+
+    Counts calls per verb (`counts`), which is what lets a test assert that the
+    search and the per-PR reads got DIFFERENT attempt budgets rather than merely
+    that both eventually worked.
+    """
+
+    def __init__(self, *, search_out="[]", view_out="{}", checks_out="[]",
+                 search_failures=0, view_failures=0, checks_failures=0):
+        self._out = {"search": search_out, "view": view_out,
+                     "checks": checks_out}
+        self._failures = {"search": search_failures, "view": view_failures,
+                          "checks": checks_failures}
+        self.counts = {"search": 0, "view": 0, "checks": 0}
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), dict(kwargs.get("env") or {})))
+        verb = "search" if argv[1:3] == ["search", "prs"] else argv[2]
+        if verb not in self.counts:
+            raise AssertionError(f"unscripted call: {argv}")
+        self.counts[verb] += 1
+        if self.counts[verb] <= self._failures[verb]:
+            return _FAULT
+        return _Proc(0, self._out[verb])
+
+
+def _flaky(**kwargs):
+    return _FlakyRunner(
+        search_out=json.dumps([_hit(
+            number=7, repository={"nameWithOwner": "Ylopo/million-stars"})]),
+        view_out=json.dumps({"headRefOid": "cafebabe",
+                             "mergeStateStatus": "CLEAN"}),
+        checks_out=json.dumps([{"name": "build", "state": "SUCCESS"}]),
+        **kwargs)
+
+
+def test_a_search_that_503s_once_succeeds_on_the_second_attempt(tmp_path):
+    """The measured live shape: try1 503, try2 fine. Before the retry this was
+    a whole tick lost -- "1 org(s) could not be enumerated at all"."""
+    clock = _Clock()
+    runner = _flaky(search_failures=1)
+    listing = _client(runner, tmp_path, clock=clock).open_prs(
+        "Ylopo", "Chadtao206")
+    assert runner.counts["search"] == 2
+    assert [r["number"] for r in listing.records] == [7]
+    assert listing.failed_pr_reads == 0
+    # Backed off between the attempts, and briefly -- these faults clear in
+    # about a second, so a long sleep would spend the deadline waiting.
+    assert clock.slept == [BACKOFF_BASE]
+
+
+def test_a_per_pr_read_that_503s_once_succeeds_on_the_second_attempt(tmp_path):
+    """The same fault one level down, where it used to surface as "4 pull
+    request(s) could not be read" and as a candidate count that changed every
+    tick."""
+    clock = _Clock()
+    runner = _flaky(view_failures=1, checks_failures=1)
+    listing = _client(runner, tmp_path, clock=clock).open_prs(
+        "Ylopo", "Chadtao206")
+    assert runner.counts["view"] == 2
+    assert runner.counts["checks"] == 2
+    assert listing.failed_pr_reads == 0
+    assert listing.records[0]["head_sha"] == "cafebabe"
+    assert listing.records[0]["checks_state"] == "SUCCESS"
+    assert clock.slept == [BACKOFF_BASE, BACKOFF_BASE]
+
+
+def test_a_per_pr_read_survives_the_two_consecutive_faults_measured_live(tmp_path):
+    """The shape that set the per-PR budget. A probe against one real PR during
+    a bad window answered `pr checks` 503, 503, 503, then 200 -- so a
+    two-attempt budget loses a pull request whenever two faults land in a row,
+    which at the observed ~50% fault rate is a quarter of them. Two live ticks
+    90 seconds apart showed precisely that: 4 candidates, then 1, from an
+    unchanged set of pull requests.
+
+    Worth the third attempt here more than anywhere else, because a `pr checks`
+    fault is the one failure in this module that is NOT reported: it is
+    indistinguishable from "checks are pending", so it excludes the PR while
+    looking exactly like a routine exclusion."""
+    clock = _Clock()
+    runner = _flaky(checks_failures=2)
+    listing = _client(runner, tmp_path, clock=clock).open_prs(
+        "Ylopo", "Chadtao206")
+    assert runner.counts["checks"] == 3
+    assert listing.records[0]["checks_state"] == "SUCCESS"
+    assert clock.slept == [BACKOFF_BASE, 2 * BACKOFF_BASE]
+
+
+def test_the_backoff_doubles_from_a_second_and_stays_short(tmp_path):
+    """Long enough to let a server-side fault clear (they clear in about a
+    second), short enough that spending the entire search budget costs 11s of
+    the 240s window rather than minutes -- a backoff that grew without a cap
+    would spend the window sleeping instead of retrying."""
+    clock = _Clock()
+    runner = _flaky(search_failures=99)
+    _client(runner, tmp_path, clock=clock).open_prs("Ylopo", "Chadtao206")
+    assert clock.slept == [1.0, 2.0, 4.0, 4.0]  # doubling, then the cap
+    assert sum(clock.slept) < 15
+
+
+def test_a_search_that_never_recovers_is_still_reported_as_a_failed_org(tmp_path):
+    """Exhaustion must be LOUD. The retry spends its whole budget and then
+    answers exactly what it answered before this retry existed, so the
+    enumeration failure still reaches a human through `failed_orgs` and still
+    makes the tick incomplete. A retry that returned an empty listing here
+    would be the Critical this package was already fixed for once."""
+    clock = _Clock()
+    runner = _flaky(search_failures=99)
+    client = _client(runner, tmp_path, clock=clock)
+    assert client.open_prs("Ylopo", "Chadtao206") is None
+    assert runner.counts["search"] == SEARCH_ATTEMPTS
+    result = candidates(client, **_args())
+    assert result.failed_orgs == ("Ylopo",)
+    assert result.candidates == ()
+    assert result.complete is False
+
+
+def test_a_pr_read_that_never_recovers_is_still_counted_as_a_failed_read(tmp_path):
+    """Same guarantee for the per-PR half: the PR is withheld and SAID to be
+    withheld, via the channel that tells "we could not read it" apart from
+    "the filter looked at it and said no"."""
+    clock = _Clock()
+    runner = _flaky(view_failures=99)
+    client = _client(runner, tmp_path, clock=clock)
+    listing = client.open_prs("Ylopo", "Chadtao206")
+    assert runner.counts["view"] == DETAIL_ATTEMPTS
+    assert listing.records == ()
+    assert listing.failed_pr_reads == 1
+    result = candidates(client, **_args())
+    assert result.candidates == ()
+    assert len(result.failed_pr_reads) == 1
+    assert "could not be read" in result.failed_pr_reads[0]
+    assert result.complete is False
+
+
+def test_the_search_is_retried_harder_than_a_per_pr_read(tmp_path):
+    """The two budgets are deliberately unequal, and this asserts the
+    BEHAVIOUR rather than the constants: losing the one search call costs every
+    PR in the org, losing one per-PR read costs one PR for one 30-minute tick
+    and is reported. Equal budgets would either under-protect the tick or blow
+    through the interval (see `SEARCH_ATTEMPTS` for that arithmetic)."""
+    search_runner = _flaky(search_failures=99)
+    _client(search_runner, tmp_path).open_prs("Ylopo", "Chadtao206")
+    read_runner = _flaky(view_failures=99)
+    _client(read_runner, tmp_path).open_prs("Ylopo", "Chadtao206")
+    assert search_runner.counts["search"] > read_runner.counts["view"]
+    assert (search_runner.counts["search"], read_runner.counts["view"]) == (
+        SEARCH_ATTEMPTS, DETAIL_ATTEMPTS)
+
+
+def test_the_retry_deadline_stops_retrying_and_reports_normally(tmp_path):
+    """The part that actually bounds the worst case. With the tick's retry
+    window already shut, a failing call is attempted ONCE and its failure is
+    reported through the ordinary channel -- no budget is spent waiting, and
+    nothing is silently dropped in exchange.
+
+    The clock is stepped by the whole window per reading, so the window that
+    the first call opens is closed by the time the first retry is considered."""
+    clock = _Clock(step=RETRY_DEADLINE)
+    runner = _flaky(search_failures=99)
+    client = _client(runner, tmp_path, clock=clock)
+    assert client.open_prs("Ylopo", "Chadtao206") is None
+    assert runner.counts["search"] == 1  # first attempt only, no retries
+    assert clock.slept == []
+    assert candidates(client, **_args()).failed_orgs == ("Ylopo",)
+
+
+def test_the_deadline_does_not_suppress_first_attempts(tmp_path):
+    """A closed window must stop RETRYING, not stop reading. Every call still
+    gets its first attempt, so a long tick keeps enumerating (and keeps
+    succeeding, whenever the fault has cleared on its own) instead of
+    degrading into a silently empty pass."""
+    clock = _Clock(step=RETRY_DEADLINE)
+    runner = _flaky()  # nothing fails; the window is shut from the first call
+    listing = _client(runner, tmp_path, clock=clock).open_prs(
+        "Ylopo", "Chadtao206")
+    assert (runner.counts["search"], runner.counts["view"],
+            runner.counts["checks"]) == (1, 1, 1)
+    assert [r["number"] for r in listing.records] == [7]
+
+
+def test_a_missing_credential_is_never_retried(tmp_path):
+    """The one failure in this adapter that is NOT transient. A token file that
+    is missing, unreadable or empty will still be missing a second later, so it
+    must fail fast: no spawn, no backoff, no budget spent pretending."""
+    clock = _Clock()
+    runner = _flaky()
+    client = GhClient(runner=runner, token_path=tmp_path / "nope" / ".gh_token",
+                      sleep=clock.sleep, clock=clock)
+    assert client.open_prs("Ylopo", "Chadtao206") is None
+    assert runner.calls == []
+    assert clock.slept == []
+
+
+def test_the_retry_budgets_fit_inside_the_cron_interval():
+    """The arithmetic that chose these numbers, pinned so raising one cannot
+    quietly produce a cron that overruns its own schedule.
+
+    A tick makes 2N+1 wrapper calls at `TIMEOUT` each. Retries only START
+    inside the deadline, so the worst case is the un-retried pass, plus the
+    window, plus one straggler attempt that began just inside it. Naive
+    three-attempts-everywhere is the choice this rules out: 47*3*30 = 70
+    minutes against a 30-minute interval.
+    """
+    interval = 30 * 60
+    calls = 2 * 23 + 1
+    unretried_worst = calls * TIMEOUT
+    worst = unretried_worst + RETRY_DEADLINE + TIMEOUT + BACKOFF_CAP
+    assert worst < interval, worst
+    assert calls * SEARCH_ATTEMPTS * TIMEOUT > interval  # why a deadline exists
+    assert SEARCH_ATTEMPTS > DETAIL_ATTEMPTS > 1
+    # The faults clear in about a second; a backoff long enough to matter
+    # against the deadline would be spending the window on sleep.
+    assert BACKOFF_BASE <= 1.0 and BACKOFF_CAP <= 4.0
 
 
 # ---------------------------------------------------------------------------
