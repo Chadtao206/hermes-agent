@@ -687,6 +687,42 @@ def test_missing_path_returns_none(tmp_path):
     assert io_with(runner, tmp_path).unresolved_bot_threads("Ylopo", "example", 42) is None
 
 
+# --- M8: head_sha() is shape-checked, exactly as its five siblings are -------
+#
+# The one accessor on this adapter that trusted its payload. A non-string
+# `headRefOid` was handed straight back and reached
+# `transition(head_sha=...)`, where sqlite refuses to bind it -- and that raise
+# lands inside the due pass, which catches per loop and reschedules, so the
+# same bad value comes back on the next tick and every tick after it. None
+# instead is a `head_unreadable` observation, which is bounded.
+
+
+def test_a_non_string_head_reads_as_unreadable_not_as_a_sha(tmp_path):
+    for value in (7, ["b" * 40], {"oid": "b" * 40}, True, None):
+        runner, _ = runner_for({"view": json.dumps(
+            {"labels": [], "headRefOid": value,
+             "author": {"login": "Chadtao206"}})})
+        assert io_with(runner, tmp_path).head_sha("Ylopo", "example", 42) is None, \
+            f"{value!r} is not a sha"
+
+
+def test_a_missing_head_key_reads_as_unreadable(tmp_path):
+    runner, _ = runner_for({"view": json.dumps({"labels": []})})
+    assert io_with(runner, tmp_path).head_sha("Ylopo", "example", 42) is None
+
+
+def test_a_head_from_an_unreadable_pr_is_unreadable(tmp_path):
+    runner, _ = runner_for({})  # empty stdout: nothing to parse
+    assert io_with(runner, tmp_path).head_sha("Ylopo", "example", 42) is None
+
+
+def test_a_scalar_payload_does_not_reach_the_head_accessor(tmp_path):
+    """`gh` answering with a JSON scalar rather than an object: the old
+    `(data or {}).get(...)` form raised AttributeError here."""
+    runner, _ = runner_for({"view": json.dumps("nope")})
+    assert io_with(runner, tmp_path).head_sha("Ylopo", "example", 42) is None
+
+
 def test_a_missing_or_unreadable_state_reads_as_unknown_not_as_closed(tmp_path):
     """Unknown must never be read as "not open": that answer closes the loop,
     and terminal states are absorbing."""

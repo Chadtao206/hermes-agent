@@ -154,8 +154,26 @@ class GitHubIO:
         return data if isinstance(data, dict) else None
 
     def head_sha(self, owner: str, repo: str, pr: int) -> str | None:
+        """The PR's head commit sha, or None when GitHub's answer cannot be
+        trusted to name one.
+
+        Shape-checked like every other accessor on this adapter, and it was the
+        only one that was not. `(data or {}).get("headRefOid") or None` hands
+        back whatever `headRefOid` happens to be -- an int, a dict, a list from
+        a truncated or changed response -- and the driver puts that value
+        straight into `transition(head_sha=...)`, where sqlite refuses to bind
+        it and the raise lands inside the due pass. That pass catches per loop
+        and reschedules, so the loop is not lost, but it can never be advanced
+        either: the same bad value comes back on every tick and no bound here
+        counts a route that never returned. None is a safe answer where an
+        exception is not -- `_route_due` reads it as `head_unreadable`, waits,
+        and escalates at HEAD_READ_ATTEMPTS.
+        """
         data = self._view(owner, repo, pr)
-        return (data or {}).get("headRefOid") or None
+        if not isinstance(data, dict):
+            return None
+        head = data.get("headRefOid")
+        return head if isinstance(head, str) and head else None
 
     def author(self, owner: str, repo: str, pr: int) -> str | None:
         """The PR's author login, or None when GitHub's answer cannot be

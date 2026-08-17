@@ -89,17 +89,33 @@ def _thread_notice(unresolved_threads: list[dict] | None) -> str | None:
     itself informative (it says some of this PR's history moved past a
     review comment, which is worth knowing even if that comment no longer
     applies verbatim).
+
+    A thread with no path is dropped from the list and kept in the count, which
+    is what `lanes.py`'s `_bot_threads_section` does with the same input --
+    deliberately the same, because the two render one read for one audience
+    apiece and a human comparing the Slack notice with the remediation brief
+    must not find them disagreeing. `GitHubIO.unresolved_bot_threads` validates
+    `path` as a non-empty string before appending a thread at all, so nothing in
+    production reaches this; the previous `str(t.get("path"))` would have
+    rendered such a thread as the literal `"None"` in a human's notice, which
+    reads as a filename and is the one failure this whole notice exists to
+    avoid -- a sentence that misdescribes what is outstanding. The count stays
+    truthful because the thread is real whatever this build can say about where
+    it is.
     """
     if unresolved_threads is None:
         return "⚠️ Could not verify all unresolved bot review threads — verify manually."
     if not unresolved_threads:
         return None
     outdated = sum(1 for t in unresolved_threads if t.get("outdated"))
-    paths = ", ".join(sorted({str(t.get("path")) for t in unresolved_threads}))
+    paths = sorted({str(t["path"]) for t in unresolved_threads if t.get("path")})
     plural = "" if len(unresolved_threads) == 1 else "s"
     outdated_note = f" ({outdated} outdated)" if outdated else ""
+    # No path on any of them leaves the count and drops the "on:" clause, rather
+    # than trailing an empty one -- there is nothing to name.
+    where = f" on: {', '.join(paths)}" if paths else ""
     return (f"⚠️ {len(unresolved_threads)} unresolved bot review thread{plural}"
-            f"{outdated_note} on: {paths}")
+            f"{outdated_note}{where}")
 
 
 class SlackIO:

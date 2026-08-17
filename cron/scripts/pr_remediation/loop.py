@@ -583,10 +583,12 @@ EVENT_TRANSITION = "transition"
 # The routes a decision can take, whether a verdict or a due debt prompted it.
 # `_route` and `_route_due` name one, `_perform` performs it and `_rehearse`
 # records it -- so the name is both the dispatch key and the word a shadow soak
-# reads back. Four of them (held, author_unreadable, unknown_outcome, and
-# unobserved, which is the absence of an observation rather than one) are not
-# acts at all: they are their own note kind, and a live tick does no more with
-# them than record it.
+# reads back. Six of them -- `_OBSERVATIONS` below: held, author_unreadable,
+# head_unreadable, intake_unreadable, unknown_outcome, and unobserved, which is
+# the absence of an observation rather than one -- are not acts at all: they are
+# their own note kind, and a live tick does no more with them than record it
+# (head_unreadable also waits out HEAD_READ_RETRY_SECONDS before the next one,
+# which changes when the note is next written and nothing else).
 ROUTE_SETTLE_ESCALATION = "settle_escalation"
 ROUTE_HELD = "held"
 ROUTE_AUTHOR_UNREADABLE = "author_unreadable"

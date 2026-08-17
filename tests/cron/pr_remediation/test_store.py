@@ -281,6 +281,79 @@ def test_a_raise_inside_claim_due_rolls_back_instead_of_holding_the_lock(tmp_pat
     assert len(store.claim_due(now=1_000_011.0, limit=10)) == 1
 
 
+# --- M6: the grace window is entered once, and only from `remediating` -----
+
+
+def test_the_grace_window_has_no_self_edge(tmp_path):
+    """The guarantee the whole no-op judgement rests on.
+
+    `awaiting_head_move` is one wait for a push that may be moments late, and
+    `HEAD_MOVE_GRACE_SECONDS`'s own comment cites the absent self-edge as what
+    makes it exactly one: the next look either finds the push or calls the
+    round a no-op. With a self-edge here, a loop could be parked again on every
+    due-pass visit and the window would never end -- the wedge this state was
+    added to close, rebuilt inside it. It raises rather than returning False so
+    a driver that tried would be loud, not quietly stuck.
+    """
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    assert store.transition(loop.loop_id, LoopState.OBSERVED,
+                            LoopState.REMEDIATING, now=1_000_100.0) is True
+    assert store.transition(loop.loop_id, LoopState.REMEDIATING,
+                            LoopState.AWAITING_HEAD_MOVE, now=1_000_200.0) is True
+    with pytest.raises(ValueError, match="invalid transition"):
+        store.transition(loop.loop_id, LoopState.AWAITING_HEAD_MOVE,
+                         LoopState.AWAITING_HEAD_MOVE, now=1_000_300.0)
+    assert store.get(loop.loop_id).state is LoopState.AWAITING_HEAD_MOVE
+    assert store._db.in_transaction is False
+
+
+@pytest.mark.parametrize("origin", [LoopState.OBSERVED,
+                                    LoopState.REREVIEW_POSTED])
+def test_the_grace_window_is_reachable_from_remediating_alone(tmp_path, origin):
+    """A table is a claim about the driver, so an edge nothing takes is a false
+    one. `loop.py`'s `_await_head_move` is the only write that targets this
+    state, and it is reached only from `_route_due`'s last branch -- which needs
+    a `LaneFacts`, which `_observe_lane` produces only for a `_lane_pending`
+    row: `remediating` with a lane, or `awaiting_head_move` itself, whose own
+    self-edge is refused above. Neither of these two states can ever satisfy
+    that, so these edges were listed and dead.
+    """
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    if origin is not LoopState.OBSERVED:
+        assert store.transition(loop.loop_id, LoopState.OBSERVED, origin,
+                                now=1_000_100.0) is True
+    with pytest.raises(ValueError, match="invalid transition"):
+        store.transition(loop.loop_id, origin, LoopState.AWAITING_HEAD_MOVE,
+                         now=1_000_200.0)
+    assert store.get(loop.loop_id).state is origin
+    assert store._db.in_transaction is False
+
+
+@pytest.mark.parametrize("origin", [LoopState.AWAITING_HEAD_MOVE,
+                                    LoopState.REREVIEW_POSTED])
+def test_a_pull_request_that_stops_being_open_can_go_stale_from_either_wait(
+        tmp_path, origin):
+    """The commonest ending there is, from the two states a loop spends most of
+    its life waiting in. Both edges are live in the driver -- a merge during the
+    grace window, and a merge while Boris re-reviews -- and neither was pinned
+    here."""
+    store = Store(tmp_path / "r.db")
+    loop = open_one(store)
+    if origin is LoopState.AWAITING_HEAD_MOVE:
+        assert store.transition(loop.loop_id, LoopState.OBSERVED,
+                                LoopState.REMEDIATING, now=1_000_100.0) is True
+        assert store.transition(loop.loop_id, LoopState.REMEDIATING, origin,
+                                now=1_000_150.0) is True
+    else:
+        assert store.transition(loop.loop_id, LoopState.OBSERVED, origin,
+                                now=1_000_100.0) is True
+    assert store.transition(loop.loop_id, origin, LoopState.STALE,
+                            now=1_000_200.0, escalation_reason="pr_not_open") is True
+    assert store.get(loop.loop_id).state is LoopState.STALE
+
+
 # --- I2: terminal states are absorbing ------------------------------------
 
 @pytest.mark.parametrize("terminal", [LoopState.READY, LoopState.ESCALATED])

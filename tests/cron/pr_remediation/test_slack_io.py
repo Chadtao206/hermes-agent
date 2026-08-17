@@ -134,6 +134,36 @@ def test_outdated_threads_are_counted_not_dropped():
     assert "a.ts" in text
 
 
+def test_a_thread_with_no_path_is_never_rendered_as_the_word_none():
+    """`lanes.py`'s brief section drops a pathless thread from its file list
+    and keeps it in its count; this notice used to render one as the literal
+    `"None"`, which reads as a filename. The two render one read for one
+    audience apiece and must not disagree about it -- a human comparing the
+    Slack notice against the remediation brief would find one naming a file
+    that does not exist."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=1, unresolved_threads=[
+            {"path": "a.ts", "outdated": False},
+            {"outdated": False},
+        ])
+    text = calls[0][2]["text"]
+    assert "None" not in text, "a missing path must not read as a filename"
+    assert "2 unresolved bot review threads" in text, \
+        "the thread is real whatever this build can say about where it is"
+    assert "a.ts" in text
+
+
+def test_threads_with_no_path_at_all_still_report_their_count():
+    """And drop the "on:" clause rather than trailing an empty one."""
+    call, calls = caller_for()
+    SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
+        VERDICT, rounds=1, unresolved_threads=[{"outdated": False}])
+    text = calls[0][2]["text"]
+    assert "1 unresolved bot review thread" in text
+    assert "None" not in text and "on:" not in text
+
+
 def test_a_failed_thread_check_says_so_rather_than_staying_silent():
     """The failure mode that matters most: None must never read as 'nothing
     outstanding'. A transient GraphQL error must produce a notice that says

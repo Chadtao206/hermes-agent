@@ -99,10 +99,22 @@ _TRANSITION_FIELDS = frozenset({
 # Forward-only edges. Terminal states are absorbing: a ready or escalated loop
 # is finished, and re-driving one would re-run every side effect (opening a
 # lane, posting to GitHub) the loop already performed.
+#
+# `awaiting_head_move` is reachable from `remediating` alone, and that is a
+# property of the driver rather than a convention here: the only write that
+# targets it is `loop.py`'s `_await_head_move`, which is reached only from
+# `_route_due`'s last branch -- and that branch requires a `LaneFacts`, which
+# `_observe_lane` returns only for a `_lane_pending` row (`remediating` with a
+# lane, or `awaiting_head_move`), a *finished* lane, and a state that is not
+# already `awaiting_head_move`. `observed` and `rereview_posted` cannot satisfy
+# the first condition and so cannot reach the state; the edges were listed and
+# dead, and a dead edge in a table like this reads as a claim about the driver
+# that is not true. The absent self-edge is not dead but load-bearing: it is
+# what makes the grace window a window rather than a place a loop can be parked
+# again on every visit, and `HEAD_MOVE_GRACE_SECONDS`'s own comment cites it.
 _ALLOWED_TRANSITIONS: dict[LoopState, frozenset[LoopState]] = {
     LoopState.OBSERVED: frozenset({
         LoopState.REMEDIATING,
-        LoopState.AWAITING_HEAD_MOVE,
         LoopState.REREVIEW_POSTED,
         LoopState.READY,
         LoopState.ESCALATED,
@@ -125,7 +137,6 @@ _ALLOWED_TRANSITIONS: dict[LoopState, frozenset[LoopState]] = {
     }),
     LoopState.REREVIEW_POSTED: frozenset({
         LoopState.REMEDIATING,
-        LoopState.AWAITING_HEAD_MOVE,
         LoopState.REREVIEW_POSTED,
         LoopState.READY,
         LoopState.ESCALATED,

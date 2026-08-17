@@ -3253,6 +3253,52 @@ def test_the_due_pass_does_not_post_a_rereview_into_a_merged_pr(tmp_path):
     assert deps.github.released == [("Ylopo", "example", 42)]
 
 
+def test_a_merge_inside_the_grace_window_closes_the_loop_stale(tmp_path):
+    """`awaiting_head_move -> stale`, driven. The lane exited without a visible
+    push, the loop took its one grace window, and the pull request was merged
+    while it waited -- which is a live edge in the store's table and the
+    commonest way this particular wait ends, since a human merging is what
+    usually makes a late push moot."""
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
+    loop_id = _loop_id(deps)
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
+
+    deps.github.pr_state = "MERGED"
+    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    assert tick(deps) == 1
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.STALE, \
+        "a merged PR is not a no-op lane a human must accept"
+    assert loop.escalation_reason == "pr_not_open"
+    assert deps.slack.escalations == [], "nobody is paged about their own merge"
+    assert deps.github.released == [("Ylopo", "example", 42)]
+
+
+def test_a_merge_while_boris_re_reviews_closes_the_loop_stale(tmp_path):
+    """`rereview_posted -> stale`, driven from the verdict side. The re-review
+    ran to completion and the pull request was merged before its verdict landed
+    -- the ordinary ending, and the other live edge into `stale` that nothing
+    pinned."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.github.pr_state = "MERGED"
+    deps.source.verdicts = [verdict(rid="br_9", head="b" * 40)]
+    deps.now.advance()
+
+    assert tick(deps) == 1
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.STALE
+    assert loop.escalation_reason == "pr_not_open"
+    assert deps.lanes.created == [("Ylopo/example#42", 1)], \
+        "no round is opened against a branch nobody can push to"
+    assert deps.slack.escalations == []
+
+
 def test_a_paused_tick_records_the_stale_decision_and_closes_nothing(tmp_path):
     """The mode invariant holds for the new route like every other: shadow
     decides and writes no loop state."""
