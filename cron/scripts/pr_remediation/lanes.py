@@ -305,6 +305,13 @@ def _bot_threads_section(bot_threads: list[dict] | None) -> str:
         return ("\n## Codex / CodeQL threads\n\n"
                 "No unresolved Codex/CodeQL threads at the time this lane opened.\n"
                 "Re-check before you finish -- bots can post after a push.\n")
+    # `if t.get("path")` is unreachable in production: `GitHubIO.
+    # unresolved_bot_threads` validates `path` as a non-empty `str` before
+    # appending a thread at all (github_io.py's page-read loop), so nothing
+    # this method sees is ever missing one. Kept anyway as defence against a
+    # shape the adapter already excludes, not as coverage this file expects
+    # a test to reach -- a future mutation run should not misread this line
+    # as a hole.
     paths = sorted({t["path"] for t in bot_threads if t.get("path")})
     outdated = sum(1 for t in bot_threads if t.get("outdated"))
     heading = ("\n## Codex / CodeQL threads\n\n"

@@ -136,6 +136,28 @@ def _hostile_paths(count: int, length: int = 140) -> list[dict]:
     return threads
 
 
+def _hostile_paths_with_duplicate_threads(
+        path_count: int, threads_per_path: int, length: int = 140) -> list[dict]:
+    """`path_count` DISTINCT paths, each carrying `threads_per_path` threads
+    against it -- so `len(bot_threads) == path_count * threads_per_path`
+    while the number of distinct paths stays `path_count`.
+
+    Every other fixture in this file (`_hostile_paths`) uses exactly one
+    thread per distinct path, so `len(bot_threads)` and the number of
+    distinct paths are always numerically identical there -- a real PR with
+    more review comments than touched files (a normal shape: bots post one
+    thread per finding, not per file) is exactly what this fixture is for.
+    """
+    threads = []
+    for n in range(path_count):
+        suffix = f"/component_{n:05d}.tsx"
+        path = "src/" + "d" * (length - len("src/") - len(suffix)) + suffix
+        assert len(path) == length
+        for t in range(threads_per_path):
+            threads.append({"path": path, "outdated": t % 2 == 0})
+    return threads
+
+
 def _issues_rendered(brief: str, count: int = _OVERFLOW_ISSUE_COUNT) -> list[int]:
     """Which of `_overflowing_issues`'s issues actually reached the brief,
     matched on the whole heading line so `1` cannot match `11`."""
@@ -590,6 +612,40 @@ def test_a_hostile_bot_thread_inventory_cannot_evict_a_live_sized_verdicts_paylo
     assert "200 unresolved Codex/CodeQL review thread(s)" in brief
 
 
+def test_a_hostile_bot_thread_inventory_cannot_evict_a_live_sized_verdicts_payload_when_branches_are_unknown():
+    """Same invariant as the test above, swept against the header shape that
+    actually decides where the budget's guard bites.
+
+    `base_branch="main", head_branch="chad/fix"` renders the SHORT header.
+    `branches()` returns `None, None` whenever `gh pr view` fails -- a real
+    production path, not a hypothetical one -- and that renders a header 119
+    characters longer via the "(unknown -- confirm with `gh pr view`...)"
+    placeholders. `_bounded` computes the issue budget as
+    `MAX_BRIEF_CHARS - len(header) - len(footer)`, so the longer header
+    leaves less room before the same `MAX_BOT_THREADS_SECTION_CHARS`-sized
+    inventory starts costing an issue. Sweeping only the known-branch shape
+    left `MAX_BOT_THREADS_SECTION_CHARS` free to drift up to 1450 with
+    nothing here noticing that 1308-1450 all lose a Boris issue on this
+    header.
+    """
+    threads = _hostile_paths(200)
+    brief = build_brief(LIVE_SIZED_VERDICT, 1, base_branch=None,
+                        head_branch=None, bot_threads=threads)
+
+    for issue in LIVE_SIZED_VERDICT.blocking_issues:
+        assert issue.title in brief, (
+            f"{issue.title!r} was evicted by a 200-path bot-thread inventory")
+    assert "TRUNCATED" not in brief, \
+        "no issue may be dropped to make room for the inventory"
+    assert "## Acceptance criteria" in brief
+    assert "Do not force-push" in brief
+    assert ("push to the PR's head branch named above "
+            "(NOT the worktree's own branch)") in brief
+    assert len(brief) <= MAX_BRIEF_CHARS
+    # and the inventory is still there doing its job, not silently dropped
+    assert "200 unresolved Codex/CodeQL review thread(s)" in brief
+
+
 def test_the_bot_thread_section_never_outgrows_its_own_budget():
     """Whatever `unresolved_bot_threads` hands back, including the 2,000
     threads `_MAX_THREAD_PAGES` x 100 allows at its ceiling, and including
@@ -615,20 +671,45 @@ def test_the_bot_thread_inventory_lists_whole_paths_or_none_of_them():
         f"a path was cut mid-token: {sorted(set(listed) - known)}")
 
 
+def test_the_bot_thread_inventory_previews_the_lexicographically_first_paths():
+    """`paths = sorted({...})` is a deliberate choice, not an artifact of set
+    iteration order: preview the lexicographically-first N paths every time,
+    not whichever N a set's iteration order (hash-randomized per process for
+    strings, by default) happens to produce first. Without `sorted`, the same
+    PR would preview a different N files on every render.
+    """
+    threads = _hostile_paths(200)
+    brief = build_brief(LIVE_SIZED_VERDICT, 1, bot_threads=threads)
+    listed = re.findall(r"^- (\S+)$", brief, flags=re.MULTILINE)
+    assert listed, "the inventory must still list something"
+    assert len(listed) < 200, "this fixture must overflow the section budget"
+    expected = sorted({t["path"] for t in threads})[:len(listed)]
+    assert listed == expected, (
+        "the preview must be the sorted-first N paths, not an arbitrary N")
+
+
 def test_the_bot_thread_inventory_says_how_many_paths_it_did_not_list():
     """A list that quietly stops is worse than a short one that admits it.
 
     The count in the heading stays the TRUE thread total -- it is what the
     agent is being held to -- so the omission line is the only thing that
     stops the heading and the list under it from contradicting each other.
+
+    Fixture is 200 distinct paths carrying 10 threads each (2,000 threads),
+    not `_hostile_paths`' one-thread-per-path shape: with one thread per
+    path, `len(paths)` and `len(bot_threads)` are numerically identical, so
+    `_paths_omission_line(len(paths) - index)` mutated to
+    `len(bot_threads) - index` renders the same digits and the assertion
+    below cannot tell the two apart. 200 paths / 2,000 threads makes the
+    omission count PATHS, provably, not threads.
     """
-    threads = _hostile_paths(200)
+    threads = _hostile_paths_with_duplicate_threads(200, 10)
     brief = build_brief(LIVE_SIZED_VERDICT, 1, bot_threads=threads)
     listed = re.findall(r"^- (\S+)$", brief, flags=re.MULTILINE)
     assert 0 < len(listed) < 200, "this fixture must overflow the section budget"
     assert f"{200 - len(listed)} further file(s) not listed" in brief, (
         f"{200 - len(listed)} paths were dropped and the brief never says so")
-    assert "200 unresolved Codex/CodeQL review thread(s)" in brief, \
+    assert "2000 unresolved Codex/CodeQL review thread(s)" in brief, \
         "the heading must keep the true thread total, not the listed-path count"
 
 
