@@ -113,6 +113,71 @@ def test_unfinished_reviews_are_not_verdicts_yet(tmp_path):
     assert source.new_verdicts() == ()
 
 
+def test_a_review_whose_slack_thread_vanished_is_not_a_verdict(tmp_path):
+    """`slack_unavailable` is terminal for boris_intake too, and the row keeps
+    its semantic_outcome, so it passes every other filter here. It must not be
+    routed: it reaches that state only when the source thread is gone, and
+    root_thread_ts -- the one place this loop can post a re-review -- points
+    into it. Routing one spends a remediation round and then posts into
+    nothing, with SlackIO._post swallowing the error into a bare None."""
+    source = BorisSource(boris_db(tmp_path, workflow_state="slack_unavailable"),
+                         RemediationConfig())
+    assert source.new_verdicts() == ()
+
+
+def test_a_completed_review_with_no_outcome_is_not_a_verdict(tmp_path):
+    """loop.py branches on verdict.outcome; a NULL arrives as None and matches
+    no branch. boris_intake sets the outcome before it transitions to
+    complete, but that is boris_intake's invariant, not this reader's."""
+    source = BorisSource(boris_db(tmp_path, semantic_outcome=None),
+                         RemediationConfig())
+    assert source.new_verdicts() == ()
+
+
+def _backlog(tmp_path, count):
+    """`count` completed verdicts, inserted oldest first so insertion order and
+    completed_at order agree -- which is what makes a dropped ORDER BY
+    detectable here rather than accidentally right."""
+    path = boris_db(tmp_path, request_id="br_0", completed_at=ADMITTED_AT)
+    db = sqlite3.connect(str(path))
+    for index in range(1, count):
+        db.execute(
+            "INSERT INTO review_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"br_{index}", "Ylopo", "example", 42 + index, "a" * 40,
+             "Chadtao206", "U07E3AHV686", "1.0", "2.0", "complete",
+             "ISSUES_FOUND", json.dumps({"blocking_issues": [], "incomplete": None}),
+             ADMITTED_AT, ADMITTED_AT + index),
+        )
+    db.commit()
+    db.close()
+    return path
+
+
+def test_verdicts_come_back_newest_first(tmp_path):
+    source = BorisSource(_backlog(tmp_path, 5), RemediationConfig())
+
+    assert [v.request_id for v in source.new_verdicts()] == [
+        "br_4", "br_3", "br_2", "br_1", "br_0"]
+
+
+def test_a_backlog_wider_than_the_window_keeps_the_newest_not_the_oldest(tmp_path):
+    """The ordering is load-bearing because nothing marks a row consumed on
+    this side -- `store.mark_verdict_seen` does that after reading, so this is
+    a window over the whole matching history. The live database already holds
+    58 rows matching against a default window of 50, so a cold start after
+    extended downtime reads a truncated view either way; DESC is what makes
+    the truncation fall on verdicts the loop has already routed instead of on
+    the ones that arrived while it was down."""
+    source = BorisSource(_backlog(tmp_path, 60), RemediationConfig())
+
+    verdicts = source.new_verdicts()
+
+    assert len(verdicts) == 50, "the default window is 50, not 1 and not 60"
+    assert verdicts[0].request_id == "br_59"
+    assert verdicts[-1].request_id == "br_10"
+    assert "br_0" not in {v.request_id for v in verdicts}
+
+
 def test_the_source_never_writes_to_the_boris_database(tmp_path):
     path = boris_db(tmp_path)
     BorisSource(path, RemediationConfig()).new_verdicts()
@@ -150,6 +215,27 @@ def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
                          RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "b" * 40,
                                  ADMITTED_AT - 60) is False
+
+
+@pytest.mark.parametrize(
+    "owner,repo,head_sha",
+    [("ylopo", "example", "a" * 40),
+     ("Ylopo", "EXAMPLE", "a" * 40),
+     ("Ylopo", "example", "A" * 40)],
+    ids=["owner", "repo", "head_sha"],
+)
+def test_case_alone_never_makes_a_request_look_absent(tmp_path, owner, repo,
+                                                      head_sha):
+    """`pr_discovery/discover.py::IntakeSource.already_requested` queries these
+    same three columns of this same table with COLLATE NOCASE and argues at
+    length why it must: GitHub resolves owner and repo case-insensitively and a
+    commit SHA is case-insensitive hex, so `Ylopo/Million-Stars` and
+    `Ylopo/million-stars` are one repository. The invariant was documented in
+    one module and not honoured in its sibling; a False here re-posts a
+    re-review on top of a live one."""
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    assert source.request_exists(owner, repo, 42, head_sha,
+                                 ADMITTED_AT - 60) is True
 
 
 @pytest.mark.parametrize(

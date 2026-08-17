@@ -152,6 +152,50 @@ class BorisSource:
         )
 
     def new_verdicts(self, limit: int = 50) -> tuple[Verdict, ...]:
+        """The completed reviews this loop owns, newest first.
+
+        Every clause is load-bearing, and none of them is enforced anywhere
+        else -- `loop.py` routes whatever comes back out of here.
+
+        `workflow_state='complete'` and NOT `slack_unavailable`, even though
+        boris_intake treats both as terminal (`store._TERMINAL_STATES`). A
+        request reaches `slack_unavailable` from exactly one place:
+        `reconciler._reconcile_delivery` catching `SlackRootUnavailable`, i.e.
+        the source thread this review was requested in no longer exists. Its
+        `semantic_outcome` is already set by then, so it passes every other
+        filter here -- but its `root_thread_ts` points at a thread that is
+        gone, and `root_thread_ts` is the ONLY place this loop can post a
+        re-review (`SlackIO._post_thread_reply`). Routing one would spend a
+        remediation round on a pull request whose verdict never reached a
+        human, then fail to ask for the re-review that round exists to
+        trigger, with `_post` swallowing the Slack error into a bare `None`.
+        Excluding it leaves the request where boris_intake left it: terminal,
+        undelivered, and visible to a human rather than churned by a loop.
+
+        `semantic_outcome IS NOT NULL` because `loop.py` branches on
+        `verdict.outcome` and a NULL would arrive as `None`, matching no
+        branch. Redundant with `complete` today (boris_intake sets the
+        outcome before it transitions), but it is boris_intake's invariant,
+        not this reader's, and this file's whole discipline is not trusting a
+        payload whose shape it does not own.
+
+        `requester_user_id` and `pr_author` are the two identity filters:
+        Chad asked for the review, and Chad wrote the pull request. The
+        second is the SOUL.md third-party gate -- this loop must never push
+        commits to someone else's branch. Contrast `request_exists` below,
+        which deliberately applies neither.
+
+        `ORDER BY completed_at DESC LIMIT ?` is not cosmetic and not a
+        safety net. Nothing marks a row consumed on this side; the loop's own
+        `store.mark_verdict_seen` does that, AFTER reading. So the window is
+        a window over the whole matching history, and the live database
+        already holds 58 rows matching this query against a default `limit`
+        of 50. Ordering ascending, or not ordering at all, means a cold start
+        after extended downtime silently reads the oldest 50 and never the
+        verdicts that arrived while it was down -- no error, no backlog
+        anywhere, just a loop that never sees the work it exists to do. DESC
+        makes the truncation fall on history the loop has already routed.
+        """
         cur = self._db.execute(
             "SELECT request_id, owner, repo, pr_number, head_sha, root_thread_ts, "
             "status_message_ts, semantic_outcome, validated_result_json "
@@ -210,6 +254,18 @@ class BorisSource:
         exists at this head, whoever asked for it, and a narrower query would
         answer False for a live review and re-post on top of it.
 
+        `COLLATE NOCASE` on the three text columns, matching
+        `pr_discovery/discover.py::IntakeSource.already_requested`, which
+        queries these same columns of this same table and argues the case at
+        length: GitHub resolves owner and repo names case-insensitively and a
+        commit SHA is case-insensitive hex, so `Ylopo/Million-Stars` and
+        `Ylopo/million-stars` are one repository and must not disagree about
+        whether a review exists. It does not misfire today because this loop's
+        `owner`/`repo`/`head_sha` come off the very row it is asking about --
+        but that is an accident of the caller, not a property of the query, and
+        the invariant was documented in one module and not honoured in its
+        sibling. A False here re-posts a re-review on top of a live one.
+
         Wrapped rather than allowed to raise: this runs inside a routing
         pass, where an exception would abort the whole settle for a loop that
         may owe other writes.
@@ -217,7 +273,8 @@ class BorisSource:
         try:
             row = self._db.execute(
                 "SELECT 1 FROM review_requests "
-                "WHERE owner=? AND repo=? AND pr_number=? AND head_sha=? "
+                "WHERE owner=? COLLATE NOCASE AND repo=? COLLATE NOCASE "
+                "AND pr_number=? AND head_sha=? COLLATE NOCASE "
                 "AND created_at>=? LIMIT 1",
                 (owner, repo, pr_number, head_sha, since),
             ).fetchone()
