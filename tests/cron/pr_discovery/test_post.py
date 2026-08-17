@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from boris_intake.config import Config
 from boris_intake.gate import _is_discovery_post
 from boris_intake.grammar import PRRef, extract_pr_refs
@@ -32,6 +34,7 @@ from pr_discovery.post import (
     DISCOVERY_MARKER,
     INTAKE_CHANNEL,
     Poster,
+    _message,
     identity,
     message_for,
     slug,
@@ -145,6 +148,56 @@ def test_a_planted_url_in_the_owner_or_number_is_refused_outright():
     assert transport.calls == []
 
 
+def test_a_slash_in_the_owner_or_repo_is_refused():
+    """The single character that decides the whole property.
+
+    The refusal tests above feed values containing a space or a colon, which
+    every plausible regression still rejects. `/` is the one that does not:
+    add it to `_REPO`'s character class -- one character -- and
+    `repo="victim/pull/999"` is accepted, composing
+
+        https://github.com/Ylopo/victim/pull/999/pull/1
+
+    out of which the gate's harvester takes `Ylopo/victim#999`, a pull request
+    the readiness filter never selected, and never sees ours at all. The same
+    character in `_OWNER` does the same thing one path segment earlier. No
+    other assertion in this suite moves when either class gains it.
+    """
+    assert identity(_c(repo="victim/pull/999")) is None
+    assert identity(_c(owner="Ylopo/victim/pull/999")) is None
+    assert identity(_c(repo="a/b")) is None
+    assert identity(_c(owner="a/b")) is None
+
+
+def test_a_trailing_newline_is_refused_rather_than_anchored_away():
+    """`\\Z`, not `$`: `$` also matches just before a trailing newline.
+
+    A repo name ending in one would compose a URL split across two lines. The
+    gate still ADMITS that message -- the marker is in it -- and harvests no
+    pull request at all from it, which is one `NO_PR_URL` reject reply per
+    tick, forever, for a candidate that is never recorded and so returns on
+    every tick.
+    """
+    assert identity(_c(repo="x\n")) is None
+    assert identity(_c(owner="Ylopo\n")) is None
+
+
+def test_a_non_string_identity_field_is_refused_rather_than_coerced():
+    """The `isinstance` guards, pinned apart from the patterns they front.
+
+    Dropping one in favour of `str(owner)` reads harmless and is not: `gh`
+    answering `null` for a field would then compose a message about the
+    perfectly pattern-valid owner `None`, i.e. a request for a review of a
+    pull request that does not exist.
+    """
+    assert identity(_c(owner=None)) is None
+    assert identity(_c(repo=None)) is None
+    assert identity(_c(owner=123)) is None
+    assert identity(_c(repo=1.5)) is None
+    assert identity(_c(number=None)) is None
+    assert identity(_c(number=1.0)) is None
+
+
 def test_slug_never_repeats_author_text_either():
     """The operator-facing summary renders identities through this one
     function, so it inherits the same refusal rather than formatting whatever
@@ -243,3 +296,150 @@ def test_identity_accepts_what_the_gates_url_grammar_accepts():
     assert identity(_c(repo="")) is None
     assert identity(_c(owner="-leading-dash")) is None
     assert identity(_c(owner="a" * 40)) is None
+
+
+# ---------------------------------------------------------------------------
+# The round trip, stated as a property against the real grammar
+# ---------------------------------------------------------------------------
+
+#: Identities to state the round-trip property over. Every hostile shape this
+#: file already covers, plus -- the point of the list -- the shapes a
+#: ONE-CHARACTER widening of `_OWNER` or `_REPO` would newly admit. The
+#: property is only interesting on identities `identity()` accepts, so a
+#: regression can only be caught if the corpus contains what it would accept.
+_ROUND_TRIP_CORPUS = [
+    ("Ylopo", "x", 1),
+    ("Ylopo", "million-stars", 42),
+    ("Ylopo", "a.b_c-d", 9_999_999),
+    ("A", "1", 1),
+    ("a" * 39, "r" * 100, 1234),
+    # `/` in either class: the composed URL then carries a DIFFERENT
+    # owner/repo/number than the one this cron chose.
+    ("Ylopo", "victim/pull/999", 1),
+    ("Ylopo/victim/pull/999", "x", 1),
+    ("Ylopo", "x/pull/999", 1),
+    ("Ylopo", "victim/pull/999/pull", 1),
+    # A trailing newline: what `$` would admit where `\Z` does not.
+    ("Ylopo", "x\n", 1),
+    ("Ylopo\n", "x", 1),
+    # Whitespace and a second URL: already refused, kept so the property is
+    # stated over the whole hostile set rather than a subset of it.
+    ("Ylopo", f"x {FOREIGN_URL}", 1),
+    (f"Ylopo {FOREIGN_URL}", "x", 1),
+    ("Ylopo", f"x\n{FOREIGN_URL}", 1),
+]
+
+
+@pytest.mark.parametrize("owner,repo,number", _ROUND_TRIP_CORPUS)
+def test_an_accepted_identity_survives_the_gates_own_harvester(owner, repo,
+                                                               number):
+    """The security property as one statement, against the REAL grammar.
+
+    If this module is willing to post an identity, then the harvester that
+    actually runs on the admitted message takes back exactly that identity --
+    no MORE (a second, foreign pull request laundered into a Chad-attributed
+    review request) and no FEWER (none at all, i.e. a reject reply per tick).
+
+    This is what makes a widened character class impossible to land quietly:
+    `repo="victim/pull/999"` accepted here harvests `Ylopo/victim#999`, and
+    both halves of the inequality fail at once.
+    """
+    accepted = identity(_c(number, owner=owner, repo=repo))
+    if accepted is None:
+        return
+    assert accepted == (owner, repo, number)
+    assert extract_pr_refs(_message(*accepted)) == [PRRef(owner, repo, number)]
+
+
+def test_the_round_trip_corpus_is_not_vacuous():
+    """The property above is worth nothing if nothing in the corpus is
+    accepted -- an `identity()` that refused everything would satisfy it. It
+    is stated here rather than as an assertion inside the parametrised test so
+    that "how many are admitted" cannot quietly fall to zero."""
+    accepted = [(owner, repo, number)
+                for owner, repo, number in _ROUND_TRIP_CORPUS
+                if identity(_c(number, owner=owner, repo=repo)) is not None]
+    assert accepted == [
+        ("Ylopo", "x", 1),
+        ("Ylopo", "million-stars", 42),
+        ("Ylopo", "a.b_c-d", 9_999_999),
+        ("A", "1", 1),
+        ("a" * 39, "r" * 100, 1234),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Parity with the real grammar's bounds (the test post.py's docstring cites)
+# ---------------------------------------------------------------------------
+
+#: Identities straddling every bound the two modules restate: the last value
+#: each side accepts, the first it refuses, and one in the middle of the range
+#: that a NARROWING of either side would move across the line. `post.py`
+#: restates these bounds as literals because it also runs from its deployed
+#: copy, where `boris_intake` is a separately deployed artifact -- so a drift
+#: on either side is caught here and nowhere else.
+_BOUND_CORPUS = [
+    ("Ylopo", "x", 1),
+    ("a", "r", 1),
+    ("a" * 39, "x", 1),                     # longest owner
+    ("a" * 40, "x", 1),                     # one over
+    ("a" * 20, "x", 1),                     # mid-range: a narrowed owner splits here
+    ("Ylopo", "r" * 100, 1),                # longest repo
+    ("Ylopo", "r" * 101, 1),                # one over
+    ("Ylopo", "r" * 50, 1),                 # mid-range: a narrowed repo splits here
+    ("Ylopo", "x", 9_999_999),              # largest number
+    ("Ylopo", "x", 10_000_000),             # one over
+    ("Ylopo", "x", 5_000),                  # mid-range: a narrowed cap splits here
+    ("Ylopo", "x", 0),
+    ("-leading-dash", "x", 1),
+    ("Ylopo", "-leading-dash-is-fine-for-a-repo", 1),
+    ("Ylopo", "", 1),
+    ("", "x", 1),
+]
+
+
+def _the_gate_harvests_exactly(owner, repo, number) -> bool:
+    """Does the REAL `boris_intake` grammar take exactly this identity back
+    out of the REAL message this module composes for it?"""
+    return extract_pr_refs(_message(owner, repo, number)) == [
+        PRRef(owner, repo, number)]
+
+
+@pytest.mark.parametrize("owner,repo,number", _BOUND_CORPUS)
+def test_identity_agrees_with_the_real_grammar_on_every_bound(owner, repo,
+                                                              number):
+    """The parity `post.py`'s docstring promises, against the imported
+    grammar rather than a restatement of it -- the same arrangement
+    `test_suffix_constant_has_not_drifted_from_lanes` uses in
+    `test_discover.py`.
+
+    Both directions matter and neither is the security property. If the gate
+    narrows and this module does not, every post about a value in the gap is
+    admitted and harvests nothing: a reject reply per tick. If this module
+    narrows and the gate does not, a legitimate pull request is silently never
+    reviewed. Bounds compared through BEHAVIOUR, so a rewritten pattern that
+    still admits the same set is not a false alarm.
+    """
+    assert (identity(_c(number, owner=owner, repo=repo)) is not None) == \
+        _the_gate_harvests_exactly(owner, repo, number)
+
+
+def test_the_bound_corpus_straddles_every_bound():
+    """A corpus that landed entirely on one side of the bounds would agree
+    with any pair of patterns at all."""
+    admitted = [ident for ident in _BOUND_CORPUS
+                if _the_gate_harvests_exactly(*ident)]
+    refused = [ident for ident in _BOUND_CORPUS
+               if not _the_gate_harvests_exactly(*ident)]
+    assert admitted == [
+        ("Ylopo", "x", 1),
+        ("a", "r", 1),
+        ("a" * 39, "x", 1),
+        ("a" * 20, "x", 1),
+        ("Ylopo", "r" * 100, 1),
+        ("Ylopo", "r" * 50, 1),
+        ("Ylopo", "x", 9_999_999),
+        ("Ylopo", "x", 5_000),
+        ("Ylopo", "-leading-dash-is-fine-for-a-repo", 1),
+    ]
+    assert len(refused) == len(_BOUND_CORPUS) - len(admitted)

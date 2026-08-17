@@ -85,14 +85,17 @@ AUTHOR = "Chadtao206"
 _DEFAULT_EXCLUDED_REPOS = "Ylopo/ylopo-infra Ylopo/ylopo-github-actions-workflows"
 
 #: How many pull requests one tick may post. Not a safety net against a bug --
-#: a bound on a stampede. Every admitted discovery post is attributed to Chad,
-#: so it spends HIS intake quota (`boris_intake.Limits.per_user_hourly`, 30),
-#: and each one that lands over the limit costs a reject reply a human reads.
-#: The first live tick meets a whole backlog at once; at the planned 30-minute
-#: interval this bounds the service to 20 requests an hour, leaving Chad's own
-#: requests room inside his hourly quota. Nothing is lost by deferring: an
-#: unposted pull request is simply not recorded, so it is selected again on the
-#: next tick.
+#: a bound on a stampede. Every post the gate admits starts a Boris review
+#: lane, each of which spends a model budget and ends in a review a human
+#: reads, so what this caps is CONCURRENT REVIEWS: the first live tick meets a
+#: whole backlog at once, and without a cap that backlog enters review in a
+#: single burst rather than over an afternoon. Ten is small for that reason,
+#: not for a quota one -- Chad's hourly intake limit
+#: (`boris_intake.limits.per_user_hourly`) is 120 in the deployed config, and
+#: at the planned 30-minute interval this cron asks for at most 20 an hour, so
+#: the quota is not the binding constraint at any cap worth choosing. Nothing
+#: is lost by deferring: an unposted pull request is simply not recorded, so it
+#: is selected again on the next tick.
 MAX_POSTS_PER_TICK = 10
 
 

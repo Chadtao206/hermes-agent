@@ -30,10 +30,15 @@ into the operator summary (`slug`). The accepted shapes are exactly
 `boris_intake.grammar._PR_URL`'s own owner/repo/number bounds, restated here
 as literals: this package also runs from its deployed copy under
 `~/.hermes/scripts/`, where `boris_intake` is importable but is a separately
-deployed artifact, so the two are kept in agreement by a test that imports the
-real grammar (`tests/cron/pr_discovery/test_post.py`) rather than by a runtime
-import -- the same arrangement `discover.BANNED_REPO_SUFFIXES` uses against
-`lanes._EXCLUDED_REPO_SUFFIXES`.
+deployed artifact, so the two are kept in agreement by tests that import the
+real grammar rather than by a runtime import -- the same arrangement
+`discover.BANNED_REPO_SUFFIXES` uses against `lanes._EXCLUDED_REPO_SUFFIXES`.
+Those tests are `test_identity_agrees_with_the_real_grammar_on_every_bound`
+(both sides of every bound) and
+`test_an_accepted_identity_survives_the_gates_own_harvester` (the round trip:
+whatever this module accepts, the real harvester takes back out of the real
+message, and takes back nothing else), in
+`tests/cron/pr_discovery/test_post.py`.
 """
 from __future__ import annotations
 
@@ -84,20 +89,26 @@ def identity(candidate) -> tuple[str, str, int] | None:
     return owner, repo, number
 
 
-def message(owner: str, repo: str, number: int) -> str:
+def _message(owner: str, repo: str, number: int) -> str:
     """The whole message: the link, then the marker.
 
     Takes three scalars rather than the candidate on purpose -- composition
-    cannot repeat a field it was never handed. Call it through `message_for`,
-    which validates first.
+    cannot repeat a field it was never handed.
+
+    Private, and deliberately so: it validates nothing, so handing it an
+    unchecked `repo` is exactly the laundering `identity()` exists to stop
+    (`_message('Ylopo', 'x ' + a_foreign_url, 1)` composes a message carrying
+    two PR links). `message_for` is the only supported way in, and the only
+    caller. Tests reach it directly to probe composition against the real
+    grammar -- which is the whole point of it staying a pure composer.
     """
     return f"https://github.com/{owner}/{repo}/pull/{number}\n{DISCOVERY_MARKER}"
 
 
 def message_for(candidate) -> str | None:
-    """`message()` for a validated candidate, or `None` if it is unpostable."""
+    """The message for a validated candidate, or `None` if it is unpostable."""
     parts = identity(candidate)
-    return None if parts is None else message(*parts)
+    return None if parts is None else _message(*parts)
 
 
 def slug(candidate) -> str:

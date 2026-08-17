@@ -55,8 +55,12 @@ class _Slack:
 
     Deliberately not a hand-written fake poster: composing the message is the
     thing most worth not faking, so the double replaces only `slack_call`.
-    `posted` is the text of every message that actually reached the
-    transport, which is what the shadow assertions read.
+
+    `calls` is every ATTEMPT; `posted` is only the text Slack accepted. The
+    two are kept apart on purpose -- an assertion reading `posted == []` is
+    meant to say "nothing landed in the intake channel", and a `posted` that
+    recorded refused attempts too would have read as a much stronger claim
+    than it was making.
     """
 
     def __init__(self, *, fails=False, fail_calls=()):
@@ -68,9 +72,9 @@ class _Slack:
 
     def _call(self, token, method, **params):
         self.calls.append((token, method, params))
-        self.posted.append(params["text"])
         if self._fails or len(self.calls) in self._fail_calls:
             return {"ok": False, "error": "not_in_channel"}
+        self.posted.append(params["text"])
         return {"ok": True, "ts": f"{len(self.calls)}.0"}
 
     def post(self, candidate):
@@ -78,7 +82,15 @@ class _Slack:
 
 
 class _ExplodingSlack:
-    posted: list[str] = []
+    """A poster that detonates on any use at all.
+
+    `posted` is per-INSTANCE. As a class attribute it was one list shared by
+    every instance for the whole session, so a leak in one test could have
+    been read as another test's evidence.
+    """
+
+    def __init__(self):
+        self.posted: list[str] = []
 
     def post(self, candidate):
         raise AssertionError("a paused tick reached the poster")
@@ -241,6 +253,17 @@ def test_ledger_records_only_after_a_successful_post():
     assert result.posted == ()
 
 
+def test_a_refused_post_is_an_attempt_and_not_a_post():
+    """Slack refusing the call means nothing landed in the intake channel --
+    so the attempt is on `calls` and NOT on `posted`, which is what every
+    "posted == []" assertion in this file is claiming."""
+    deps = _deps(candidates=[_c(1)], slack_fails=True)
+    result = run(deps, mode="live")
+    assert len(deps.slack.calls) == 1
+    assert deps.slack.posted == []
+    assert result.posted == ()
+
+
 def test_a_successful_post_is_recorded_with_the_ticks_clock():
     deps = _deps(candidates=[_c(1)])
     run(deps, mode="live")
@@ -254,6 +277,19 @@ def test_a_failed_post_does_not_stop_the_next_pr():
     assert result.failed_posts == ("Ylopo/x#1@abc123",)
     assert result.posted == ("Ylopo/x#2@abc123",)
     assert deps.ledger.records == [("Ylopo", "x", 2, "abc123", 1000.0)]
+
+
+def test_the_per_tick_cap_is_ten():
+    """The literal, because every other cap assertion here reads the constant
+    and so moves with it: raising the cap to 40 changes what a first live tick
+    does to the review fleet and nothing in this file notices.
+
+    Ten is a ceiling on how many Boris review lanes one tick may start at
+    once, which is why it is a small number rather than a fraction of Chad's
+    hourly intake quota (`boris_intake.limits.per_user_hourly`, 120 in the
+    deployed config -- not the binding constraint at any plausible cap).
+    """
+    assert MAX_POSTS_PER_TICK == 10
 
 
 def test_the_per_tick_cap_defers_the_rest_rather_than_dropping_them():
@@ -420,68 +456,115 @@ def _boom(*args, **kwargs):
     raise AssertionError("a tick was built after a precondition failed")
 
 
-def test_main_runs_no_tick_when_a_precondition_fails(monkeypatch):
+class _Recorder:
+    """Records the mode each stage of `main()` was actually asked to run in.
+
+    `main()`'s whole job is joining `cfg.mode` to `run()` and `run_selftest()`,
+    and that join is one keyword on one line each. Everything either function
+    then does with the mode is pinned thoroughly elsewhere in this file -- but
+    an assertion that reads only the exit code and stdout cannot tell the real
+    line from `run(deps, mode="live")` with `cfg.mode` dropped on the floor,
+    which is a shadow-configured deployment posting for real. Nor from
+    `run_selftest(mode="shadow")` on a live tick, which silently retires the
+    live-only gate checks (marker drift, inert door, CHANNEL_NOT_ALLOWED,
+    MENTION_REQUIRED) in exactly the deployment they exist for.
+    """
+
+    def __init__(self, *, failures=(), result=None):
+        self.selftest: list[str] = []
+        self.run: list[str] = []
+        self._failures = tuple(failures)
+        self._result = result
+
+    def selftest_stub(self, *, mode, **kwargs):
+        self.selftest.append(mode)
+        return list(self._failures)
+
+    def crashing_selftest_stub(self, *, mode, **kwargs):
+        self.selftest.append(mode)
+        raise RuntimeError("boris_intake is not importable from here")
+
+    def run_stub(self, deps, *, mode):
+        self.run.append(mode)
+        return self._result if self._result is not None else RunResult(mode=mode)
+
+
+def _wire(monkeypatch, *, mode, token="tok", failures=(), result=None,
+          selftest_crashes=False, run=None):
+    """Point `main()` at doubles for one tick, recording the mode each is
+    handed. Nothing here touches the real config, Slack or GitHub."""
     import pr_discovery.main as module
 
+    recorder = _Recorder(failures=failures, result=result)
     monkeypatch.setattr(module, "load_config",
-                        lambda *a, **k: DiscoveryConfig(mode="live"))
-    monkeypatch.setattr(module, "run_selftest", lambda **k: ["token missing"])
+                        lambda *a, **k: DiscoveryConfig(mode=mode))
+    monkeypatch.setattr(module, "run_selftest",
+                        recorder.crashing_selftest_stub if selftest_crashes
+                        else recorder.selftest_stub)
+    monkeypatch.setattr(module, "slack_token", lambda: token)
+    monkeypatch.setattr(module, "build_deps", lambda token, **k: token)
+    monkeypatch.setattr(module, "run",
+                        recorder.run_stub if run is None else run)
+    return module, recorder
+
+
+def test_main_runs_no_tick_when_a_precondition_fails(monkeypatch):
+    module, calls = _wire(monkeypatch, mode="live",
+                          failures=["token missing"], run=_boom)
     monkeypatch.setattr(module, "slack_token", _boom)
     monkeypatch.setattr(module, "build_deps", _boom)
     assert module.main() == 1
+    assert calls.selftest == ["live"] and calls.run == []
 
 
 def test_main_runs_no_tick_when_a_precondition_check_crashes(monkeypatch):
     """Under a cron, an exploding check has to fail closed like any other
     precondition rather than escaping as a traceback."""
-    import pr_discovery.main as module
-
-    monkeypatch.setattr(module, "load_config",
-                        lambda *a, **k: DiscoveryConfig(mode="live"))
-    monkeypatch.setattr(module, "run_selftest", _boom)
+    module, calls = _wire(monkeypatch, mode="live", run=_boom,
+                          selftest_crashes=True)
     monkeypatch.setattr(module, "slack_token", _boom)
     monkeypatch.setattr(module, "build_deps", _boom)
     assert module.main() == 1
+    assert calls.selftest == ["live"] and calls.run == []
 
 
 def test_main_refuses_a_live_tick_without_the_bot_token(monkeypatch):
-    import pr_discovery.main as module
-
-    monkeypatch.setattr(module, "load_config",
-                        lambda *a, **k: DiscoveryConfig(mode="live"))
-    monkeypatch.setattr(module, "run_selftest", lambda **k: [])
-    monkeypatch.setattr(module, "slack_token", lambda: "")
+    module, calls = _wire(monkeypatch, mode="live", token="", run=_boom)
     monkeypatch.setattr(module, "build_deps", _boom)
     assert module.main() == 1
+    assert calls.selftest == ["live"] and calls.run == []
 
 
 def test_main_reports_the_tick_on_stdout_and_exits_zero(monkeypatch, capsys):
-    import pr_discovery.main as module
-
-    monkeypatch.setattr(module, "load_config",
-                        lambda *a, **k: DiscoveryConfig(mode="live"))
-    monkeypatch.setattr(module, "run_selftest", lambda **k: [])
-    monkeypatch.setattr(module, "slack_token", lambda: "tok")
-    monkeypatch.setattr(module, "build_deps", lambda token, **k: token)
-    monkeypatch.setattr(module, "run", lambda deps, *, mode: RunResult(
-        mode=mode, posted=("Ylopo/x#1@abc123",)))
+    module, calls = _wire(monkeypatch, mode="live", result=RunResult(
+        mode="live", posted=("Ylopo/x#1@abc123",)))
     assert module.main() == 0
     assert "posted 1: Ylopo/x#1@abc123" in capsys.readouterr().out
+    assert calls.selftest == ["live"] and calls.run == ["live"]
 
 
 def test_main_says_nothing_at_all_on_a_quiet_healthy_tick(monkeypatch, capsys):
     """Empty stdout is what makes the deterministic cron silent."""
-    import pr_discovery.main as module
-
-    monkeypatch.setattr(module, "load_config",
-                        lambda *a, **k: DiscoveryConfig(mode="shadow"))
-    monkeypatch.setattr(module, "run_selftest", lambda **k: [])
-    monkeypatch.setattr(module, "slack_token", lambda: "")
-    monkeypatch.setattr(module, "build_deps", lambda token, **k: token)
-    monkeypatch.setattr(module, "run",
-                        lambda deps, *, mode: RunResult(mode=mode))
+    module, calls = _wire(monkeypatch, mode="shadow", token="")
     assert module.main() == 0
     assert capsys.readouterr().out == ""
+    assert calls.selftest == ["shadow"] and calls.run == ["shadow"]
+
+
+def test_main_runs_the_tick_in_the_mode_the_config_asks_for(monkeypatch):
+    """The pin Task 6's whole safety story rests on: "deploy in shadow first"
+    is only true if the mode YAML declares is the mode both stages are handed.
+
+    Asserted on the kwarg each stage RECEIVES, not on what the tick did with
+    it: a hardcoded `mode="live"` leaves a shadow deployment posting for real
+    with every other test in this file still green, because every one of them
+    passes `run()` its mode directly.
+    """
+    for mode in ("off", "shadow", "live"):
+        module, calls = _wire(monkeypatch, mode=mode)
+        assert module.main() == 0
+        assert calls.selftest == [mode], mode
+        assert calls.run == [mode], mode
 
 
 # ---------------------------------------------------------------------------
