@@ -3475,10 +3475,96 @@ def test_an_unreadable_intake_database_provokes_no_repost(tmp_path):
 
     deps = drive_to_rereview_posted(tmp_path)
     deps.source.admitted = None
-    deps.now.advance(3 * 60 * 60)
+    deps.now.advance(2 * 60 * 60)
     assert tick(deps) == 0
     assert deps.slack.reposts == [("Ylopo/example#42", 1)]
     assert only_loop(deps).state is LoopState.REREVIEW_POSTED
+
+
+def test_an_unreadable_intake_database_says_so_once(tmp_path):
+    """The one branch here that can repeat indefinitely on a fault nothing in
+    this service controls, and it used to record nothing at all -- so a loop
+    could sit through an outage of any length leaving no trace whatever, which
+    is precisely the silence this route exists to end. Standing, like
+    `head_unreadable`, its closest analogue: said once, not once a tick."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = None
+    loop_id = only_loop(deps).loop_id
+    for _ in range(20):
+        deps.now.advance(10 * 60)
+        assert tick(deps) == 0
+    notes = [e["detail"] for e in deps.store.events(loop_id)
+             if e["kind"] == "intake_unreadable"]
+    assert notes == [{"head_sha": "b" * 40}], \
+        "one sentence for the outage, naming the head it could not ask about"
+
+
+def test_the_window_is_waited_out_without_reading_the_intake_database(tmp_path):
+    """Two numbers already in hand versus a database this process does not
+    own. Inside the window the read cannot change the answer, and this route
+    is reached on every tick for every `rereview_posted` loop -- including
+    every loop that is admitted and simply waiting for its verdict."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.exists_calls.clear()
+    for _ in range(19):
+        deps.now.advance(30.0)
+        assert tick(deps) == 0
+    assert deps.source.exists_calls == [], \
+        "nothing inside the window is worth a read of boris_intake"
+
+    deps.now.advance(30.0)
+    tick(deps)
+    assert len(deps.source.exists_calls) == 1, "and the window ending earns one"
+
+
+def test_a_review_that_never_completes_escalates_on_the_absolute_deadline(tmp_path):
+    """`admitted is True` is not a promise that a verdict is coming.
+
+    boris_intake has a second terminal state -- `slack_unavailable`, whose
+    transition set is empty -- so a request can end there and never be
+    `complete`. `new_verdicts` then never returns it, `request_exists` goes on
+    answering True at this loop's head, and the loop parks with nothing
+    recorded and no alarm: the original bug, through the door the new guard
+    holds open. A request wedged in `reviewing` does the same.
+
+    The deadline is the one check here that does not depend on the intake
+    read, which is why it is the only one that can close this wait.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)  # admitted, and it stays admitted
+    loop_id = only_loop(deps).loop_id
+
+    deps.now.advance(3 * 60 * 60)
+    assert tick(deps) == 0, \
+        "three hours in, an admitted review may still legitimately be running"
+    assert deps.slack.escalations == []
+
+    deps.now.advance(60 * 60 + 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
+def test_the_absolute_deadline_covers_an_unreadable_intake_too(tmp_path):
+    """The `admitted is None` branch needs no attempt bound of its own: it
+    cannot be retried into an answer, and this deadline ends its wait like
+    every other."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = None
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(4 * 60 * 60 + 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
 def test_the_repost_claims_the_push_the_lane_really_made(tmp_path):
@@ -3838,6 +3924,12 @@ def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path, mode):
     the trail replays `_route_due` already takes ahead of it in every mode.
     What `off` stops is the *work* -- the kanban poll and the GitHub reads --
     and none of those is reached from here. Nothing is posted either way.
+
+    Ticked twice, because a pause is not one tick: this decision is retaken
+    unchanged on every one of them, and a route that forgot to mark itself
+    `standing` would append the same sentence to the trail four times a minute
+    for as long as the service stayed paused -- to a trail every later tick
+    reads back in full.
     """
     from pr_remediation.loop import tick
 
@@ -3848,10 +3940,43 @@ def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path, mode):
 
     paused = in_mode(deps, mode)
     assert tick(paused) == 0
+    paused.now.advance(30.0)
+    assert tick(paused) == 0
     assert len(paused.slack.reposts) == 1, "the original post and no other"
     assert paused.store.get(loop_id).state is LoopState.REREVIEW_POSTED
     assert reposts(paused, loop_id) == [], "a pause spends none of the budget"
     decisions = [e["detail"] for e in paused.store.events(loop_id)
                  if e["kind"] == "shadow_decision"]
-    assert decisions[-1] == {"would": "rereview_unacknowledged", "attempt": 1,
-                             "origin": "lane_pushed"}
+    assert decisions == [{"would": "rereview_unacknowledged", "attempt": 1,
+                          "origin": "lane_pushed"}], \
+        "one sentence for a decision that is retaken every tick"
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_tick_at_the_attempt_bound_records_the_escalation_once(tmp_path, mode):
+    """The other new route, under the same rule and pinned the same way.
+
+    A loop that has spent its budget re-decides `escalate` on every tick until
+    something settles it, and in a paused mode nothing ever will -- so this is
+    the route where a missing `standing` costs the most.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    loop_id = only_loop(deps).loop_id
+    spend_reposts(deps, loop_id, 12)
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED, \
+        "the budget is spent but nothing has escalated yet"
+
+    paused = in_mode(deps, mode)
+    paused.now.advance(10 * 60)
+    assert tick(paused) == 0
+    paused.now.advance(30.0)
+    assert tick(paused) == 0
+    assert paused.slack.escalations == [], "a pause escalates nothing"
+    assert paused.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+    decisions = [e["detail"] for e in paused.store.events(loop_id)
+                 if e["kind"] == "shadow_decision"]
+    assert decisions == [{"would": "escalate",
+                          "reason": "rereview_unacknowledged"}]

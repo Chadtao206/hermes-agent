@@ -319,6 +319,26 @@ REREVIEW_ACK_GRACE_SECONDS = 10 * 60
 # permanently strands a pull request that would have recovered on its own.
 REREVIEW_REPOST_ATTEMPTS = 12
 
+# How long a loop may sit in `rereview_posted` at all, measured from when the
+# wait began, before a human is told regardless of what boris_intake's own
+# tables say. The backstop the retry budget above cannot be: that budget is
+# only ever spent when the intake read comes back False, and the read coming
+# back True is not a promise of a verdict. `slack_unavailable` is a second
+# terminal state in boris_intake (its store.py gives it an empty transition
+# set), and a request that ends there is never `complete` -- so `new_verdicts`
+# never returns it, `request_exists` goes on answering True at this loop's
+# head, and the loop parks exactly as it did before this guard existed. A
+# request wedged in `reviewing` does the same.
+#
+# Four hours, and both halves of that matter. It must exceed the re-post
+# budget's own span so it never preempts the ordinary path: twelve attempts one
+# grace window apart, plus the first window, is 130 minutes. And it must
+# comfortably exceed boris_intake's REVIEW_WAIT_SECONDS (90 minutes, in its
+# reconciler.py), which is that service's own bound on how long an admitted
+# review may legitimately take -- so any wait this one ends is a wait the
+# review path had already given up on.
+REREVIEW_ABSOLUTE_DEADLINE_SECONDS = 4 * 60 * 60
+
 # Loops the retry pass leases per tick.
 DUE_LIMIT = 20
 
@@ -433,6 +453,13 @@ ROUTE_SETTLE_ESCALATION = "settle_escalation"
 ROUTE_HELD = "held"
 ROUTE_AUTHOR_UNREADABLE = "author_unreadable"
 ROUTE_HEAD_UNREADABLE = "head_unreadable"
+# boris_intake's database could not be read, so whether the re-review request
+# ever arrived is unknown. An observation, like `head_unreadable` above and for
+# the same reason -- a live tick can only record that it asked and got no
+# answer -- but with no attempt bound of its own: unlike a head read, nothing
+# here can be retried into an answer, and REREVIEW_ABSOLUTE_DEADLINE_SECONDS
+# already ends this wait whatever the read is doing.
+ROUTE_INTAKE_UNREADABLE = "intake_unreadable"
 ROUTE_UNKNOWN_OUTCOME = "unknown_outcome"
 ROUTE_UNOBSERVED = "unobserved"
 ROUTE_ESCALATE = "escalate"
@@ -458,7 +485,8 @@ ROUTE_OPEN_LANE = "open_lane"
 ROUTE_DEFER = "defer_verdict"
 
 _OBSERVATIONS = (ROUTE_HELD, ROUTE_AUTHOR_UNREADABLE, ROUTE_HEAD_UNREADABLE,
-                 ROUTE_UNKNOWN_OUTCOME, ROUTE_UNOBSERVED)
+                 ROUTE_INTAKE_UNREADABLE, ROUTE_UNKNOWN_OUTCOME,
+                 ROUTE_UNOBSERVED)
 
 _LOG = logging.getLogger(__name__)
 
@@ -1684,27 +1712,38 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     production does today. On `_lane_pushed`'s route it changes nothing
     observable, the head being new.
 
-    The four ways this is asked to do nothing are all deliberate, and three of
-    them are worth more than the tick they cost:
+    The absolute deadline is asked first and answered regardless of anything
+    below it -- see REREVIEW_ABSOLUTE_DEADLINE_SECONDS. It is the only check
+    here that does not depend on the intake read, which is exactly why it is
+    the one that closes the wait a True read can otherwise hold open forever.
 
-    None -- the intake database could not be read at all. Not False: waiting
-    costs a tick, guessing costs a duplicate review on a PR whose review may
-    well be live.
+    Then the grace window, and it is asked before the read on purpose: it is a
+    comparison of two numbers already in hand, the read is a database this
+    process does not own, and inside the window the answer changes nothing. So
+    the ordinary case -- a loop waiting out its window, and a loop admitted and
+    simply waiting for its verdict -- costs no read at all.
+
+    The two ways this is then asked to do nothing are both deliberate:
+
+    None -- the intake database could not be read. Not False: waiting costs a
+    tick, guessing costs a duplicate review on a PR whose review may well be
+    live. Unlike the other do-nothings it is *recorded*, because it is the one
+    that can repeat indefinitely on an external fault, and a branch that
+    repeats indefinitely writing nothing is the shape this whole route exists
+    to remove. Standing, so an outage lasting a day leaves one sentence.
 
     True -- a request for this episode is on record, whatever workflow_state it
     is in, so re-posting would be noise on top of a review that already exists.
-    It does NOT promise a verdict is coming: `slack_unavailable` is a second
-    terminal state in boris_intake with an empty transition set, and a request
-    that ends there is never completed and never routed.
+    It does NOT promise a verdict is coming, which is what the deadline above
+    is for.
 
-    Inside the grace window -- see REREVIEW_ACK_GRACE_SECONDS. Measured from
-    `updated_at`, which is when the loop entered `rereview_posted` or last
-    re-sent (the self-edge is what re-arms it), and which `store.defer`
-    deliberately leaves alone, so a due-pass visit does not push the deadline
-    out. Deliberately NOT measured from the episode start, which does not move
-    on a re-send and would fire this route on every tick after the first. A
-    *refused* re-send moves neither, and waits the same interval out through
-    the due time instead -- see `_repost_unacknowledged`.
+    The grace window is measured from `updated_at`, which is when the loop
+    entered `rereview_posted` or last re-sent (the self-edge is what re-arms
+    it), and which `store.defer` deliberately leaves alone, so a due-pass visit
+    does not push the deadline out. Deliberately NOT measured from the episode
+    start, which does not move on a re-send and would fire this route on every
+    tick after the first. A *refused* re-send moves neither, and waits the same
+    interval out through the due time instead -- see `_repost_unacknowledged`.
 
     At the attempt bound -- escalate rather than go on re-posting forever. The
     reason is its own (REREVIEW_UNACKNOWLEDGED) because the place to go and look
@@ -1712,13 +1751,17 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     the gate keeps rejecting the post for.
     """
     episode = _rereview_episode(deps, loop)
+    if deps.now() >= episode.started_at + REREVIEW_ABSOLUTE_DEADLINE_SECONDS:
+        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
+                     standing=True)
+    if deps.now() < loop.updated_at + REREVIEW_ACK_GRACE_SECONDS:
+        return None
     admitted = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
                                           loop.head_sha, episode.started_at)
     if admitted is None:
-        return None
+        return Route(ROUTE_INTAKE_UNREADABLE, {"head_sha": loop.head_sha},
+                     standing=True)
     if admitted is True:
-        return None
-    if deps.now() < loop.updated_at + REREVIEW_ACK_GRACE_SECONDS:
         return None
     if episode.attempts >= REREVIEW_REPOST_ATTEMPTS:
         return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
