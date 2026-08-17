@@ -86,7 +86,16 @@ have.
 *One lane per loop.* A round may start only while no lane is in flight -- from
 `observed`, `awaiting_head_move` or `rereview_posted`, never from
 `remediating` with a lane recorded, and never while a lane this loop opened but
-failed to record is still outstanding. Kanban's idempotency key does not cover
+failed to record is still outstanding. Stated that way it was enforced in the
+one branch that dispatches a lane, and that was not enough: a route that merely
+moves the row *off* `remediating` produces the same two lanes one verdict
+later, because the row is the whole of `_lane_in_flight`'s account. So the rule
+a verdict is actually held to is the stronger one -- while a lane is in flight
+no verdict moves the loop at all, whatever its outcome -- and it is asked once,
+above the outcome dispatch, where a branch added later cannot fail to inherit
+it. That subsumes the closing outcomes too: standing the pull request down over
+a live worker is the same collision read from the other end (see `_route`).
+Kanban's idempotency key does not cover
 the orphaned case, because that key embeds the head sha and the orphan's own
 push is what moves the head -- so the trail, not the row, has to answer for it,
 and the orphan is *adopted* (the lost write retried, nothing else) rather than
@@ -1616,6 +1625,44 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     if author != cfg.chad_github_login:
         return Route(ROUTE_ESCALATE, {"reason": NOT_CHAD_AUTHORED})
 
+    if _lane_in_flight(loop):
+        # A second lane on this branch is the collision this service exists to
+        # remove, and here we would be causing it ourselves. Asked once, ahead
+        # of the whole outcome dispatch, rather than inside the one branch that
+        # dispatches a lane -- because opening a second lane is not the only way
+        # to end up with two. A system-origin REVIEW_INCOMPLETE used to swap
+        # `remediating -> rereview_posted` with the lane still running, after
+        # which `_lane_in_flight` answered False and the very next ISSUES_FOUND
+        # opened a rival lane against the same branch; kanban's idempotency key
+        # does not cover that pair either, because it embeds the round. Checked
+        # here, no outcome added later can forget it -- the same argument
+        # `_consumer` wins for the mode gate, and for the same reason: a rule
+        # spelled out once per branch is a rule one branch will eventually miss.
+        #
+        # It covers the two outcomes that would *close* the loop as well, and
+        # that widening is deliberate. Both of them stand the pull request down
+        # -- `hermes-owner-andrej` released, the reaction cleared -- which is
+        # exactly what `_settle_escalation` refuses to do over a lane kanban has
+        # not confirmed finished, for exactly the reason given there: a human
+        # reads that label coming off as permission to touch the branch, while a
+        # worker in a worktree this loop cannot cancel is still able to push to
+        # it. Closing also abandons that lane for good (`_close` can report it
+        # and nothing more), on a verdict computed against a head the lane is in
+        # the middle of replacing -- so a READY closed here tells a human the
+        # pull request is finished while unreviewed commits are still landing on
+        # it.
+        #
+        # Deferring costs none of what closing would have bought. The lane in
+        # flight drives the next step: it finishes, the head moves, the
+        # re-review goes out, and *that* verdict decides the loop -- and the
+        # whole wait is bounded by LANE_WAIT_SECONDS, so this can never become
+        # the "pin the pull request open for good" failure that makes abandoning
+        # a lane the lesser evil inside `_close`. Ahead of the round cap too,
+        # because the round this verdict would spend has already been spent by
+        # the lane in flight.
+        return Route(ROUTE_DEFER, {"lane_id": loop.lane_id},
+                     defer=LANE_IN_FLIGHT)
+
     if verdict.outcome == "READY_FOR_HUMAN_REVIEW":
         return Route(ROUTE_NOTIFY_READY, {"rounds": loop.round_count})
     if verdict.outcome == "REVIEW_INCOMPLETE":
@@ -1631,15 +1678,6 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     if verdict.outcome != "ISSUES_FOUND":
         return Route(ROUTE_UNKNOWN_OUTCOME, {"outcome": verdict.outcome})
 
-    if _lane_in_flight(loop):
-        # A second lane on this branch is the collision this service exists to
-        # remove, and here we would be causing it ourselves. The lane already
-        # running drives the next step: it finishes, the head moves, the
-        # re-review goes out, and *that* verdict starts the next round. Checked
-        # before the round cap, because the round this verdict would spend has
-        # already been spent by the lane in flight.
-        return Route(ROUTE_DEFER, {"lane_id": loop.lane_id},
-                     defer=LANE_IN_FLIGHT)
     orphan = _adoptable_orphan(deps, loop)
     if orphan is not None:
         # The row says no lane, the trail says otherwise, and the trail is

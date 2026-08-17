@@ -591,15 +591,22 @@ def test_thinkies_is_anchored_on_the_loops_own_status_message_not_the_verdict(tm
     loop's own persisted anchor, not whatever a later verdict happens to
     carry. Only `_open_lane`'s own compare-and-swap ever moves that anchor,
     and it moves the row -- so the closing verdict below, which opens no
-    round, must be removed from where the round that ran put it."""
+    round, must be removed from where the round that ran put it.
+
+    Closed by a merge rather than a READY verdict, because a merge is the one
+    ending that still closes a loop whose lane is in flight: everything past
+    the pull request's own state defers to the running lane (see
+    `test_a_ready_verdict_never_hands_back_a_pr_a_lane_is_pushing_to`), while a
+    branch nobody can push to any more is not a branch this loop is protecting.
+    """
     from pr_remediation.loop import tick
 
     deps = build(tmp_path, SourceFake([verdict(status="2.0")]))
     tick(deps)
     assert deps.slack.thinkies_added == ["2.0"]
 
-    deps.source.verdicts = [verdict(rid="br_2", status="9.5",
-                                    outcome="READY_FOR_HUMAN_REVIEW")]
+    deps.source.verdicts = [verdict(rid="br_2", status="9.5")]
+    deps.github.pr_state = "MERGED"
     tick(deps)
     assert deps.slack.thinkies_removed == ["2.0"], \
         "removed from the loop's own anchor, not the closing verdict's status message"
@@ -728,14 +735,17 @@ def test_a_new_round_moves_the_anchor_to_the_verdict_that_opened_it(tmp_path):
 def test_the_new_rounds_reaction_comes_off_the_message_it_went_on(tmp_path):
     """The add and the remove are one pair. Moving the anchor is only correct
     if the removal follows it, so a round opened against a later verdict is
-    cleared from that verdict's message and not from the one before it."""
+    cleared from that verdict's message and not from the one before it.
+
+    Closed by a merge for the reason the anchor test above gives: it is the one
+    ending a verdict can still bring to a loop whose round is in flight."""
     from pr_remediation.loop import tick
 
     deps = rereviewed(tmp_path)
     deps.source.verdicts = [verdict(rid="br_2", head="b" * 40, status="7.0")]
     assert tick(deps) == 1
-    deps.source.verdicts = [verdict(rid="br_3", head="b" * 40, status="9.5",
-                                    outcome="READY_FOR_HUMAN_REVIEW")]
+    deps.source.verdicts = [verdict(rid="br_3", head="b" * 40, status="9.5")]
+    deps.github.pr_state = "MERGED"
     deps.now.advance()
     assert tick(deps) == 1
     # Round 1's clear, round 2's idempotent retry of it as the anchor moves
@@ -2007,9 +2017,16 @@ def test_every_edge_the_driver_takes_is_legal(tmp_path, prior, outcome, origin, 
     store._db.commit()
 
     deps.source.verdicts = [verdict(rid="br_1", outcome=outcome, origin=origin)]
-    if prior is LoopState.REMEDIATING and outcome == "ISSUES_FOUND":
-        # The one cell where the driver deliberately takes no edge at all: the
-        # lane opened by the first tick is still in flight.
+    if prior is LoopState.REMEDIATING:
+        # The whole row of cells where the driver deliberately takes no edge at
+        # all: the lane the first tick opened is still in flight, and while one
+        # is, no verdict moves this loop whatever its outcome. Four cells, not
+        # the one an earlier reading of this matrix saw -- `ISSUES_FOUND` is
+        # merely the outcome that would have dispatched the rival lane itself,
+        # while the system-origin incomplete produced the same pair one verdict
+        # later by swapping the row out of `remediating` first, and the two
+        # closing outcomes stand the pull request down over a worker still
+        # pushing to it. See loop.py's `_route`.
         assert tick(deps) == 0
         assert store.get(loop_id).state is LoopState.REMEDIATING
         return
@@ -2017,12 +2034,20 @@ def test_every_edge_the_driver_takes_is_legal(tmp_path, prior, outcome, origin, 
     assert store.get(loop_id).state is target
 
 
-def test_a_remediating_loop_with_no_lane_takes_the_remediating_edge(tmp_path):
-    """The cell the matrix above now skips, and the only path that still
-    reaches `remediating -> remediating`: a row in that state with no lane to
+@pytest.mark.parametrize("outcome,origin,target", [
+    ("ISSUES_FOUND", None, LoopState.REMEDIATING),
+    ("READY_FOR_HUMAN_REVIEW", None, LoopState.READY),
+    ("REVIEW_INCOMPLETE", "system", LoopState.REREVIEW_POSTED),
+    ("REVIEW_INCOMPLETE", "model", LoopState.ESCALATED),
+])
+def test_a_remediating_loop_with_no_lane_still_takes_its_edges(
+        tmp_path, outcome, origin, target):
+    """The row the matrix above skips, and the only shape that still takes an
+    edge out of `remediating` on a verdict: a row in that state with no lane to
     poll (a hand-edit, or a round an older build's shadow mode wrote before a
     paused tick stopped writing state) has nothing in flight, so a verdict
-    starts a real round from there."""
+    drives it exactly as it would from anywhere else -- including the
+    `remediating -> remediating` edge no other path reaches."""
     from pr_remediation.loop import tick
 
     store = Store(tmp_path / "r.db")
@@ -2034,13 +2059,73 @@ def test_a_remediating_loop_with_no_lane_takes_the_remediating_edge(tmp_path):
         (LoopState.REMEDIATING.value, loop_id))
     store._db.commit()
 
-    deps.source.verdicts = [verdict(rid="br_1")]
+    deps.source.verdicts = [verdict(rid="br_1", outcome=outcome, origin=origin)]
     deps.now.advance()
     assert tick(deps) == 1
-    loop = store.get(loop_id)
-    assert loop.state is LoopState.REMEDIATING
-    assert loop.round_count == 1
-    assert len(deps.lanes.created) == 2
+    assert store.get(loop_id).state is target
+
+
+def test_a_system_incomplete_mid_round_opens_no_second_lane(tmp_path):
+    """C1, end to end: two engineer lanes on one branch.
+
+    A review lane boris_intake gives up on at ninety minutes emits a
+    system-origin `REVIEW_INCOMPLETE`, and a remediation round runs for twenty
+    to ninety -- so this verdict arrives *inside* a round as a matter of
+    routine, on the route that produces a fifth of live verdicts. It used to
+    take `ROUTE_REPOST_REREVIEW` and swap `remediating -> rereview_posted` with
+    the lane still running: `_lane_in_flight` reads the row, so it then answered
+    False, and the next `ISSUES_FOUND` dispatched a second code-editing worker
+    against the same branch. The first lane was overwritten on the row and
+    polled by nobody after that, so `LANE_WAIT_SECONDS` could never fire for it
+    either.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path)
+    loop_id = only_loop(deps).loop_id
+
+    deps.source.verdicts = [verdict(rid="br_2", outcome="REVIEW_INCOMPLETE",
+                                    origin="system")]
+    assert tick(deps) == 0
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.REMEDIATING, \
+        "the row must not leave `remediating` while its lane runs"
+    assert loop.lane_id == "t_1"
+    assert deps.slack.repost_retries == [], "and nothing is re-posted"
+    assert deferrals(deps, loop_id)[-1]["reason"] == "lane_in_flight"
+
+    deps.now.advance()
+    deps.source.verdicts = [verdict(rid="br_3", head="b" * 40)]
+    assert tick(deps) == 0
+    assert deps.lanes.created == [("Ylopo/example#42", 1)], \
+        "a second code-editing worker on one branch"
+    assert deps.store.get(loop_id).lane_id == "t_1"
+
+
+def test_a_ready_verdict_never_hands_back_a_pr_a_lane_is_pushing_to(tmp_path):
+    """The same collision `_settle_escalation` already refuses to cause, on the
+    path that had never been asked the question.
+
+    Releasing `hermes-owner-andrej` is how every other agent -- and every human
+    reading the label -- learns the branch is free, and a kanban lane cannot be
+    cancelled from here. A READY verdict arriving mid-round was computed against
+    a head this lane is in the middle of replacing, so closing on it both hands
+    the branch back under a live worker and calls a pull request finished that
+    is still receiving unreviewed commits.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.github.released.clear()
+
+    deps.source.verdicts = [verdict(rid="br_2", outcome="READY_FOR_HUMAN_REVIEW")]
+    assert tick(deps) == 0
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    assert deps.slack.ready == [], "nobody is told a live branch is ready"
+    assert deps.github.released == [], "and the ownership label stays on"
+    assert "lane_abandoned" not in kinds(deps, loop_id), \
+        "nothing was abandoned, because nothing was closed"
 
 
 def _loop_id(deps):
@@ -2662,16 +2747,29 @@ def test_the_off_switch_polls_no_lane_and_reads_no_github(tmp_path):
 
 
 def test_a_lane_still_running_when_the_loop_closes_is_recorded(tmp_path):
-    """A ready verdict arriving mid-round closes the loop, and terminal states
-    are absorbing and unclaimable -- so that lane is polled by nobody, finishes,
-    and pushes to a PR this service has just handed back."""
-    from pr_remediation.loop import tick
+    """A loop that closes mid-round leaves its lane to nobody: terminal states
+    are absorbing and unclaimable, so that worker finishes, pushes to a PR this
+    service has just handed back, and is polled by no later tick.
+
+    Driven through the one verdict-path route that still closes over a live
+    lane -- an escalation this loop already owes, which is settled ahead of
+    every other consideration precisely because a stopped loop stays stopped.
+    The outcome routes no longer reach here at all (see
+    `test_a_ready_verdict_never_hands_back_a_pr_a_lane_is_pushing_to`); the
+    due pass's own `lane_timeout` close is pinned separately.
+    """
+    from pr_remediation.loop import LANE_TIMEOUT, tick
 
     deps = drive_to_remediating(tmp_path)  # a lane still in progress
     loop_id = _loop_id(deps)
+    # A lane_timeout escalation whose notice Slack refused: the debt is on the
+    # trail, the row is still `remediating`, and the lane is still going.
+    deps.store.record_note(loop_id, "escalation_pending",
+                           {"reason": LANE_TIMEOUT, "attempt": 1}, deps.now())
+
     deps.source.verdicts = [verdict(rid="br_2", outcome="READY_FOR_HUMAN_REVIEW")]
     assert tick(deps) == 1
-    assert deps.store.get(loop_id).state is LoopState.READY
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
     abandoned = [event["detail"] for event in deps.store.events(loop_id)
                  if event["kind"] == "lane_abandoned"]
     assert [d["lane_id"] for d in abandoned] == ["t_1"], \
