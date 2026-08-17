@@ -3589,9 +3589,17 @@ def test_an_escalation_already_owed_outranks_the_repost(tmp_path):
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
-def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path):
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path, mode):
     """The kill switch, structurally: routing decides, `_consumer` picks who
-    consumes, and `_rehearse` never reaches `_perform`'s branch."""
+    consumes, and `_rehearse` never reaches `_perform`'s branch.
+
+    `off` decides this one too, and that is not a fourth mode gate gone
+    missing: the acknowledgement check is a local sqlite read, exactly like
+    the trail replays `_route_due` already takes ahead of it in every mode.
+    What `off` stops is the *work* -- the kanban poll and the GitHub reads --
+    and none of those is reached from here. Nothing is posted either way.
+    """
     from pr_remediation.loop import tick
 
     deps = drive_to_rereview_posted(tmp_path)
@@ -3599,11 +3607,11 @@ def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path):
     loop_id = only_loop(deps).loop_id
     deps.now.advance(10 * 60)
 
-    shadow = in_mode(deps, "shadow")
-    assert tick(shadow) == 0
-    assert len(shadow.slack.reposts) == 1, "the original post and no other"
-    assert shadow.store.get(loop_id).state is LoopState.REREVIEW_POSTED
-    assert reposts(shadow, loop_id) == []
-    decisions = [e["detail"] for e in shadow.store.events(loop_id)
+    paused = in_mode(deps, mode)
+    assert tick(paused) == 0
+    assert len(paused.slack.reposts) == 1, "the original post and no other"
+    assert paused.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+    assert reposts(paused, loop_id) == [], "a pause spends none of the budget"
+    decisions = [e["detail"] for e in paused.store.events(loop_id)
                  if e["kind"] == "shadow_decision"]
     assert decisions[-1] == {"would": "rereview_unacknowledged", "attempt": 1}
