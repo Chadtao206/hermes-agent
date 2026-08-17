@@ -1852,8 +1852,9 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     admitted = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
                                           loop.head_sha, episode.started_at)
     if admitted is False:
-        # The gate never took it, so the budget governs and the deadline above
-        # does not apply -- see REREVIEW_ABSOLUTE_DEADLINE_SECONDS.
+        # The gate never took it, so the budget governs and this path returns
+        # ahead of the deadline below rather than being bounded by it -- see
+        # REREVIEW_ABSOLUTE_DEADLINE_SECONDS.
         if episode.attempts >= REREVIEW_REPOST_ATTEMPTS:
             return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
                          standing=True)

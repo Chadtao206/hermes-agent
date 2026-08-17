@@ -303,6 +303,29 @@ class UnclaimableStore:
         return False
 
 
+class LosesTheRepostSelfEdge:
+    """A real store whose `rereview_posted` -> `rereview_posted` swap is lost.
+
+    The lapsed-lease race, aimed at the one edge where losing it used to hide a
+    request that had already gone out: `_repost` sends a fresh re-review into a
+    loop already waiting, and the swap that records it does not land.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.lost = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def transition(self, loop_id, expected, target, *, now, **fields):
+        if not self.lost and expected is LoopState.REREVIEW_POSTED and \
+                target is LoopState.REREVIEW_POSTED:
+            self.lost += 1
+            return False
+        return self._inner.transition(loop_id, expected, target, now=now, **fields)
+
+
 class LosesTheClosingWrite:
     """A real store whose *escalating* compare-and-swap is lost exactly once.
 
@@ -4129,6 +4152,39 @@ def test_a_repost_into_a_waiting_loop_brings_its_own_budget(tmp_path):
     numbered = [d["attempt"] for d in reposts(deps, loop_id)]
     assert numbered[11:] == list(range(1, 13)), \
         "the second wait counts from one and gets all twelve attempts"
+
+
+def test_a_repost_whose_swap_is_lost_still_names_the_request_it_sent(tmp_path):
+    """The send is the fact; the swap is only the record of it.
+
+    `_repost` posts and then moves the row, and that move can be lost -- our
+    lease lapsed, or another tick took the row over. The request is out there
+    either way, so a marker written only once the swap landed would leave the
+    guard waiting on the request this one replaced: admitted by construction,
+    so the intake answers "already admitted" forever and the loop parks
+    silently, which is the whole failure this marker exists to prevent.
+    """
+    from pr_remediation.loop import LoopDeps, tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.source.admitted_at = deps.store.get(loop_id).updated_at + 1
+    losing = LoopDeps(**{**deps.__dict__,
+                         "store": LosesTheRepostSelfEdge(deps.store)})
+
+    losing.now.advance(20 * 60)
+    losing.source.verdicts = [verdict(rid="br_2", head="b" * 40,
+                                      outcome="REVIEW_INCOMPLETE",
+                                      origin="system")]
+    assert tick(losing) == 0, "the swap was lost, so the row advanced nothing"
+    assert losing.slack.repost_retries == ["Ylopo/example#42"], \
+        "but the request went out, and it is the one outstanding now"
+    losing.source.verdicts = []
+
+    losing.now.advance(10 * 60)
+    assert tick(losing) == 1
+    assert losing.slack.repost_retries == ["Ylopo/example#42"] * 2, \
+        "so the guard waits on it, not on the request it replaced"
 
 
 def test_an_escalation_already_owed_outranks_the_repost(tmp_path):
