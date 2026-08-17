@@ -164,8 +164,9 @@ class BorisSource:
         return tuple(self._verdict(row) for row in cur.fetchall())
 
     def request_exists(self, owner: str, repo: str, pr_number: int,
-                       head_sha: str) -> bool | None:
-        """Is there a review request at exactly this head? None if unreadable.
+                       head_sha: str, since: float) -> bool | None:
+        """Has a review request been admitted at this head since `since`?
+        None if the database could not be read.
 
         Three-way, the same contract shape `github_io.unresolved_bot_threads`
         uses, and for the same reason: the caller
@@ -175,12 +176,28 @@ class BorisSource:
         re-review; taking it on a database this process merely could not open
         buys a duplicate review for nothing.
 
-        `head_sha` is in the WHERE clause and is the whole point of the
-        query. A remediation round always leaves an older request behind --
-        the one whose verdict started the round, admitted at the head the
-        lane has since moved off -- so a query without it answers "already
-        admitted" from that stale row for every head after it, and the loop
-        this read exists to rescue strands exactly as it does today.
+        The question is deliberately "admitted *since* this wait began", not
+        "exists at all", and both terms are load-bearing because each catches a
+        stale row the other cannot.
+
+        `head_sha` catches the request a remediation round leaves behind: the
+        one whose verdict started the round, admitted at the head the lane has
+        since moved off. Without it that row answers "already admitted" for
+        every head after it, and the loop this read exists to rescue strands
+        exactly as it does today.
+
+        `since` catches the one the head term is blind to, because on that path
+        the head never moves. `loop._repost` re-sends a re-review after a
+        system-origin incomplete without touching `head_sha`, so the request
+        that produced *that very verdict* is still sitting at the loop's head:
+        a head-only query answers True unconditionally there, the guard is
+        inert, and a rejected re-post strands the loop silently. `created_at`
+        is boris_intake's REAL epoch column and the caller's timestamp comes
+        off this same machine's clock, so the two are directly comparable.
+
+        Inclusive (`>=`): the caller's `since` is when it entered the wait, and
+        the post that opens that wait is made *before* the row moves, so a
+        request admitted in the same instant is this one, not a predecessor.
 
         Any `workflow_state` counts. A request that is still `reviewing` will
         produce a verdict on its own, so re-posting under it would be
@@ -200,8 +217,9 @@ class BorisSource:
         try:
             row = self._db.execute(
                 "SELECT 1 FROM review_requests "
-                "WHERE owner=? AND repo=? AND pr_number=? AND head_sha=? LIMIT 1",
-                (owner, repo, pr_number, head_sha),
+                "WHERE owner=? AND repo=? AND pr_number=? AND head_sha=? "
+                "AND created_at>=? LIMIT 1",
+                (owner, repo, pr_number, head_sha, since),
             ).fetchone()
         except Exception:
             return None

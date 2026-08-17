@@ -25,7 +25,7 @@ class Clock:
 
 
 class SourceFake:
-    def __init__(self, verdicts=(), admitted=True):
+    def __init__(self, verdicts=(), admitted=True, admitted_at=None):
         self.verdicts = list(verdicts)
         # What request_exists() answers -- boris_intake's own account of
         # whether a re-review request exists at the head asked about. True is
@@ -35,16 +35,25 @@ class SourceFake:
         # owes nothing. False is a rejected post; None is an intake database
         # this process could not read.
         self.admitted = admitted
-        # Every (owner, repo, pr_number, head_sha) the loop asked about, so a
-        # test can pin that it asks at its *own* head rather than at whatever
-        # head the round started from.
+        # When the one request in this fake's world was admitted, for the tests
+        # that care that the read is windowed rather than timeless. Set it and
+        # the answer is computed the way the real query computes it
+        # (`created_at >= since`), which is the only way to model the
+        # `_repost` path at all: there the stale request sits at exactly the
+        # head being asked about, so nothing but the timestamp tells it apart.
+        self.admitted_at = admitted_at
+        # Every (owner, repo, pr_number, head_sha, since) the loop asked
+        # about, so a test can pin that it asks at its *own* head rather than
+        # at whatever head the round started from.
         self.exists_calls = []
 
     def new_verdicts(self, limit=50):
         return tuple(self.verdicts)
 
-    def request_exists(self, owner, repo, pr_number, head_sha):
-        self.exists_calls.append((owner, repo, pr_number, head_sha))
+    def request_exists(self, owner, repo, pr_number, head_sha, since):
+        self.exists_calls.append((owner, repo, pr_number, head_sha, since))
+        if self.admitted_at is not None:
+            return self.admitted_at >= since
         return self.admitted
 
 
@@ -3426,7 +3435,7 @@ def test_the_acknowledgement_is_checked_at_the_loops_own_head(tmp_path):
     deps = drive_to_rereview_posted(tmp_path)
     deps.now.advance(10 * 60)
     tick(deps)
-    assert deps.source.exists_calls[-1] == ("Ylopo", "example", 42, "b" * 40)
+    assert deps.source.exists_calls[-1][:4] == ("Ylopo", "example", 42, "b" * 40)
 
 
 def test_the_repost_waits_out_the_grace_window(tmp_path):
@@ -3568,6 +3577,173 @@ def test_a_rereview_that_never_lands_escalates_after_twelve_attempts(tmp_path):
         "no lane is running here, so the ownership label goes back"
 
 
+def spend_reposts(deps, loop_id, count):
+    """Burn `count` landed re-post attempts, one per grace window."""
+    from pr_remediation.loop import tick
+
+    for _ in range(count):
+        deps.now.advance(10 * 60)
+        tick(deps)
+    assert len(reposts(deps, loop_id)) == count
+
+
+def test_the_repost_budget_belongs_to_the_wait_not_the_whole_loop(tmp_path):
+    """A later round must not be charged for an earlier round's retries.
+
+    A head that moves ends the *wait* -- moving it takes a lane, a lane takes a
+    round, and a round leaves `rereview_posted` -- but it does not clear the
+    *count*. Summed over the whole loop, a round that spent eleven re-posts
+    riding out a GitHub incident leaves the next round one attempt and a
+    twenty-minute fuse; twelve leaves it none at all. Escalation is absorbing,
+    so a single transient `gate_snapshot_unavailable` then strands the pull
+    request for good -- exactly the outcome the budget exists to prevent.
+    """
+    from pr_remediation.loop import LANE_POLL_SECONDS, tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.source.admitted = False
+    spend_reposts(deps, loop_id, 11)
+
+    # A verdict arrives after all, and its round runs, pushes, and asks for a
+    # re-review of its own: a second request outstanding, and a second wait.
+    deps.source.admitted = True
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40)]
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    deps.source.verdicts = []
+    deps.now.advance(LANE_POLL_SECONDS + 1)
+    deps.github.head = "c" * 40  # round two pushed
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+
+    # ...and the gate rejects this one too. The new wait gets the whole budget.
+    deps.source.admitted = False
+    for _ in range(20):
+        deps.now.advance(10 * 60)
+        tick(deps)
+        if deps.store.get(loop_id).state is LoopState.ESCALATED:
+            break
+    numbered = [d["attempt"] for d in reposts(deps, loop_id)]
+    assert numbered[11:] == list(range(1, 13)), \
+        "the second wait counts from one and gets all twelve attempts"
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 2, "rereview_unacknowledged")]
+
+
+def test_a_repost_does_not_reset_the_budget_it_is_spending(tmp_path):
+    """The other half of the same rule, and the direction that matters more:
+    the self-edge a re-post takes must NOT open a new wait. The same request is
+    still the one outstanding -- it was merely sent again -- so resetting there
+    would zero the budget on every attempt and put escalation permanently out
+    of reach, which is the silent park this whole route exists to end.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.source.admitted = False
+    spend_reposts(deps, loop_id, 3)
+    assert [d["attempt"] for d in reposts(deps, loop_id)] == [1, 2, 3], \
+        "three re-posts of one request, numbered consecutively"
+
+
+# --- the other way into `rereview_posted`, where the guard was inert --------
+#
+# `_repost` (a system-origin REVIEW_INCOMPLETE) transitions with no `head_sha`,
+# so `loop.head_sha` stays the head of the verdict that opened the loop -- and
+# a `review_requests` row provably exists at that head, because it is the
+# request that produced that verdict. A guard that asks "does a request exist
+# at this head" therefore reads True forever on this route and never fires.
+
+
+def drive_to_a_repost(tmp_path):
+    """A loop parked in `rereview_posted` by `_repost`, not by a lane.
+
+    Nothing was pushed, no round was spent, and `head_sha` never moved -- so
+    the request that produced this very verdict is still sitting at exactly the
+    head the acknowledgement check asks about.
+    """
+    from pr_remediation.loop import tick
+
+    deps = build(tmp_path, SourceFake(
+        [verdict(outcome="REVIEW_INCOMPLETE", origin="system")]))
+    # boris_intake admitted that request one second before this tick.
+    deps.source.admitted_at = deps.now() - 1
+    assert tick(deps) == 1
+    loop = only_loop(deps)
+    assert loop.state is LoopState.REREVIEW_POSTED
+    assert loop.head_sha == "a" * 40, "this route moves no head"
+    assert loop.round_count == 0, "and spends no round"
+    assert deps.slack.repost_retries == ["Ylopo/example#42"]
+    deps.source.verdicts = []
+    return deps
+
+
+def test_a_repost_the_gate_never_admitted_is_sent_again(tmp_path):
+    """The strand this task was meant to close, through the door the guard
+    itself held open. The stale request at the loop's head is not this
+    episode's, and asking "admitted since this wait began" is the only way to
+    say so -- there is no second head here to tell them apart with."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_a_repost(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 1
+    assert reposts(deps, loop_id) == [{"attempt": 1}]
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+
+
+def test_a_repost_resent_says_no_round_was_spent(tmp_path):
+    """`repost_rereview`, because that is how this episode began. Nothing was
+    pushed and no round was spent, so `post_rereview`'s "Round N of M --
+    remediation pushed" would announce work that never happened, under a
+    `Round 0` that names nothing. slack_io.py keeps the two methods apart
+    precisely so a human scanning the thread can tell which occurred."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_a_repost(tmp_path)
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.repost_retries == ["Ylopo/example#42"] * 2, \
+        "the same message, re-sent"
+    assert deps.slack.reposts == [], \
+        "post_rereview would claim a push and a round that never happened"
+    assert deps.slack.repost_retry_targets[-1] == "1.0", \
+        "the review thread, not the reaction anchor"
+
+
+def test_a_lane_pushed_episode_still_claims_its_push(tmp_path):
+    """The other selection, pinned from the other side: an episode a lane
+    opened re-sends with `post_rereview`, because there the push and the round
+    are both real. Swapping the two selections must fail in both directions."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.reposts[-1] == ("Ylopo/example#42", 1)
+    assert deps.slack.repost_retries == []
+
+
+def test_an_admitted_repost_is_left_alone(tmp_path):
+    """The windowed read must not turn every `_repost` wait into a re-post:
+    a request admitted *after* the wait began is this episode's, and the loop
+    owes nothing."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_a_repost(tmp_path)
+    # `catch_up` replayed the message and the gate took it, three minutes in.
+    deps.source.admitted_at = deps.now() + 3 * 60
+    deps.now.advance(3 * 60 * 60)
+    assert tick(deps) == 0
+    assert len(deps.slack.repost_retries) == 1, "the original post and no other"
+    assert only_loop(deps).state is LoopState.REREVIEW_POSTED
+
+
 def test_an_escalation_already_owed_outranks_the_repost(tmp_path):
     """Ordering, and not an arbitrary one: a stopped loop's escalation debt
     is a write already owed to a human, and it must still take precedence
@@ -3614,4 +3790,5 @@ def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path, mode):
     assert reposts(paused, loop_id) == [], "a pause spends none of the budget"
     decisions = [e["detail"] for e in paused.store.events(loop_id)
                  if e["kind"] == "shadow_decision"]
-    assert decisions[-1] == {"would": "rereview_unacknowledged", "attempt": 1}
+    assert decisions[-1] == {"would": "rereview_unacknowledged", "attempt": 1,
+                             "origin": "lane_pushed"}

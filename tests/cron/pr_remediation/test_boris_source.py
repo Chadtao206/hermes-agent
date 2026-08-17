@@ -6,15 +6,23 @@ import pytest
 from pr_remediation.boris_source import BorisSource, EvidenceAnchor, Issue, Verdict
 from pr_remediation.config import RemediationConfig
 
+# `created_at` is boris_intake's own REAL epoch column (see its store.py's
+# schema), carried here because `request_exists` asks a question about *when* a
+# request was admitted, not only whether one was.
 SCHEMA = """
 CREATE TABLE review_requests (
     request_id TEXT PRIMARY KEY, owner TEXT, repo TEXT, pr_number INTEGER,
     head_sha TEXT, pr_author TEXT, requester_user_id TEXT, root_thread_ts TEXT,
     status_message_ts TEXT,
     workflow_state TEXT, semantic_outcome TEXT, validated_result_json TEXT,
-    completed_at REAL
+    created_at REAL, completed_at REAL
 );
 """
+
+# The epoch the fixture's single request was admitted at, and the value every
+# `since` below is written relative to. A literal, so no test asserts a
+# boundary against the same expression the fixture builds it from.
+ADMITTED_AT = 1_000_000.0
 
 
 def boris_db(tmp_path, **overrides):
@@ -31,13 +39,15 @@ def boris_db(tmp_path, **overrides):
             "blocking_issues": [{"title": "Null deref in handler"}],
             "incomplete": None,
         }),
+        "created_at": ADMITTED_AT,
         "completed_at": 1_000_000.0,
     }
     row.update(overrides)
     db.execute(
         "INSERT INTO review_requests VALUES (:request_id,:owner,:repo,:pr_number,"
         ":head_sha,:pr_author,:requester_user_id,:root_thread_ts,:status_message_ts,"
-        ":workflow_state,:semantic_outcome,:validated_result_json,:completed_at)", row)
+        ":workflow_state,:semantic_outcome,:validated_result_json,:created_at,"
+        ":completed_at)", row)
     db.commit()
     db.close()
     return path
@@ -122,7 +132,8 @@ def test_the_source_never_writes_to_the_boris_database(tmp_path):
 
 def test_a_request_at_exactly_this_head_is_admitted(tmp_path):
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
-    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is True
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT - 60) is True
 
 
 def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
@@ -137,7 +148,8 @@ def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
     """
     source = BorisSource(boris_db(tmp_path, head_sha="a" * 40),
                          RemediationConfig())
-    assert source.request_exists("Ylopo", "example", 42, "b" * 40) is False
+    assert source.request_exists("Ylopo", "example", 42, "b" * 40,
+                                 ADMITTED_AT - 60) is False
 
 
 @pytest.mark.parametrize(
@@ -148,7 +160,8 @@ def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
 def test_a_request_for_a_different_pull_request_does_not_count(
         tmp_path, owner, repo, pr_number):
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
-    assert source.request_exists(owner, repo, pr_number, "a" * 40) is False
+    assert source.request_exists(owner, repo, pr_number, "a" * 40,
+                                 ADMITTED_AT - 60) is False
 
 
 def test_a_review_still_under_way_counts_as_admitted(tmp_path):
@@ -159,7 +172,8 @@ def test_a_review_still_under_way_counts_as_admitted(tmp_path):
     source = BorisSource(
         boris_db(tmp_path, workflow_state="reviewing", semantic_outcome=None),
         RemediationConfig())
-    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is True
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT - 60) is True
 
 
 def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
@@ -170,7 +184,34 @@ def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
     source = BorisSource(
         boris_db(tmp_path, pr_author="jacobmaurer", requester_user_id="U5GB9F75Z"),
         RemediationConfig())
-    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is True
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT - 60) is True
+
+
+def test_a_request_admitted_before_this_wait_began_does_not_count(tmp_path):
+    """The other half of "is this request in?", and the one the head term alone
+    cannot answer.
+
+    `_repost` re-sends a re-review without moving the loop's head, so the row
+    that produced the verdict which opened the loop still sits at exactly that
+    head -- and answers "already admitted" for a post the gate has just
+    rejected. Asking "admitted since this wait began" instead of "admitted at
+    all" is what tells the two apart. There is no head-based way to: on that
+    path there is only ever one head.
+    """
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT + 1) is False
+
+
+def test_a_request_admitted_at_the_instant_the_wait_began_counts(tmp_path):
+    """Inclusive, and it has to be: the request and the transition that starts
+    the wait are written by two clocks on this one machine within the same
+    second, and the post is made *before* the row moves -- so a strict `>`
+    would drop the very request this read exists to find."""
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT) is True
 
 
 def test_a_read_that_fails_answers_none_rather_than_raising(tmp_path):
@@ -181,7 +222,8 @@ def test_a_read_that_fails_answers_none_rather_than_raising(tmp_path):
     simply could not read."""
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     source.close()  # the read now raises ProgrammingError from sqlite3
-    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is None
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT - 60) is None
 
 
 # --- defensive parsing: boris_intake owns validated_result_json's shape and
