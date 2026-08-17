@@ -151,11 +151,12 @@ entered its current state, and it escalates as `lane_timeout` -- a third dead
 end, distinct from the two the next paragraph separates, and pointing a human
 at the kanban card rather than at the branch or at GitHub.
 
-That retry is bounded by HEAD_READ_ATTEMPTS, the same shape as NOTIFY_ATTEMPTS
-below and for the same reason: a blip is worth riding out, but a PR that was
-deleted, a repo that was renamed or transferred, or a token that lost its
-scope reads exactly like a blip on every single tick, and nothing else would
-ever end the wait -- leaving the loop non-terminal blocks every later
+That retry is bounded by HEAD_READ_ATTEMPTS *spaced by*
+HEAD_READ_RETRY_SECONDS -- the same shape as NOTIFY_ATTEMPTS below and for the
+same reason, including the spacing, without which neither count was a
+tolerance at all: a blip is worth riding out, but a PR that was deleted, a repo
+that was renamed or transferred, or a token that lost its scope reads exactly
+like a blip on every single tick, and nothing else would ever end the wait -- leaving the loop non-terminal blocks every later
 generation of this PR (`active_for_pr`) behind a human who was never told.
 At the bound the loop escalates as `head_read_exhausted` rather than
 `no_op_lane`: the two are not the same dead end. `no_op_lane` means the read
@@ -201,7 +202,10 @@ that never goes terminal blocks every later loop on that PR
 (`active_for_pr`). At the bound the loop closes with `escalation_unreachable`
 in the trail and an ERROR in the log. That budget is spread across ticks by
 design, so one sweep spends at most one attempt on a loop -- which the
-newest-verdict rule above is what guarantees.
+newest-verdict rule above is what guarantees -- and, because the due pass's own
+cadence is fifteen seconds, spread across NOTIFY_RETRY_SECONDS as well: a count
+alone gave up on Slack after a minute, which is a bound on nothing anybody
+would have chosen.
 
 "Notified" and "closed" are two debts, not one: the notice is recorded before
 the closing compare-and-swap (so a crash cannot double-post), which means the
@@ -272,12 +276,36 @@ HEAD_MOVE_GRACE_SECONDS = 60.0
 # the push is late, which its single one-shot wait is built to survive; this
 # is for when GitHub cannot even answer the question, which no fixed wait
 # survives on its own. Mirrors NOTIFY_ATTEMPTS below for the same reason and
-# at the same value: high enough to ride out a GitHub outage across several
-# ticks, low enough that a head that is unreadable for a real reason -- the
-# PR deleted, the repo renamed or transferred, a token that lost its scope --
-# cannot pin this PR's lane loop, and with it every later generation
-# (`active_for_pr`), open forever.
+# at the same value, and neither number means anything on its own: what rides
+# out an outage is this count times HEAD_READ_RETRY_SECONDS below, and it was
+# the spacing rather than the count that this budget was missing. Low enough,
+# at that spacing, that a head unreadable for a real reason -- the PR deleted,
+# the repo renamed or transferred, a token that lost its scope -- cannot pin
+# this PR's lane loop, and with it every later generation (`active_for_pr`),
+# open forever.
 HEAD_READ_ATTEMPTS = 5
+
+# How long the due pass waits before spending the next of those attempts.
+#
+# The count is not the bound; the count times this is. Spent one per due-pass
+# visit and revisited every DUE_BACKOFF_SECONDS, the five attempts above bought
+# sixty seconds of tolerance, measured by driving the real tick at the real
+# cadence -- so a GitHub incident of the kind we watched last for hours ended
+# the wait as `head_read_exhausted` inside the first minute of it, stranding a
+# pull request that would have recovered on its own. Raising the count would
+# not have fixed that: at fifteen seconds a visit, any count anyone would write
+# down still only buys minutes.
+#
+# Half an hour, which is what REREVIEW_REPOST_ATTEMPTS' own spacing is for
+# (REREVIEW_ACK_GRACE_SECONDS, twelve attempts one window apart, 130 minutes)
+# arrived at from the other direction: four spacings is two hours, the same
+# order as that budget's span and comfortably inside LANE_WAIT_SECONDS. It
+# costs nothing on the path that matters -- a read that lands, lands on the
+# first attempt -- and what it lengthens is only how long this loop waits
+# before deciding a transient is permanent. Escalation is absorbing, so that
+# asymmetry is the whole argument: a needless wait costs two hours, a needless
+# escalation costs the pull request.
+HEAD_READ_RETRY_SECONDS = 30 * 60
 
 # How long a lane may sit without reaching a terminal kanban status before this
 # loop stops waiting for it. The one bound that does not presuppose a finished
@@ -318,10 +346,30 @@ LANE_WAIT_SECONDS = 180 * 60
 STILL_RUNNING_THRESHOLD_SECONDS = 30 * 60
 
 # How many times a single escalation may be posted before the loop closes
-# unheard. Chosen high enough to ride out a Slack outage across several ticks,
-# low enough that a misconfigured channel cannot hold the PR's loop open (and
-# with it every later loop for that PR) indefinitely.
+# unheard. Like HEAD_READ_ATTEMPTS above, this number is only half of a bound:
+# what rides out a Slack outage is this count times NOTIFY_RETRY_SECONDS below,
+# and the count alone bought a minute. Low enough, at that spacing, that a
+# misconfigured channel cannot hold the PR's loop open (and with it every later
+# loop for that PR) indefinitely.
 NOTIFY_ATTEMPTS = 5
+
+# How long the due pass waits before spending the next of those attempts, for
+# the reason HEAD_READ_RETRY_SECONDS gives and at the same value -- and the
+# consequence here is worse. One per visit at DUE_BACKOFF_SECONDS bought sixty
+# seconds, measured at the real cadence: a minute of Slack being down closed
+# the loop `escalation_unreachable`, released the ownership label and told
+# nobody, which this module's own `_settle_escalation` calls the worst outcome
+# this system can produce. Meanwhile the re-review budget waits ten minutes
+# between attempts for a strictly smaller consequence.
+#
+# It delays no escalation that is going to land: a reachable Slack takes the
+# post on the first attempt, and only a failed one is spaced. What it delays is
+# giving up. The one gap it does not cover is a verdict arriving for a loop
+# that owes an escalation -- `_handle` claims by pull request and never asks
+# `next_attempt_at` -- so a burst of verdicts can still spend attempts faster
+# than this; the newest-verdict rule bounds that at one per sweep, which is the
+# same guarantee the docstring already claims for this budget.
+NOTIFY_RETRY_SECONDS = 30 * 60
 
 # How long a `rereview_posted` loop waits for its request to show up in
 # boris_intake before assuming the post was rejected and sending it again.
@@ -618,6 +666,12 @@ class Route:
     JSON-shaped; `debt` is the replayed trail the escalation actor would
     otherwise have to read a second time, and is deliberately not recorded.
 
+    `retry_after`, when set, is how long the loop waits before this decision is
+    retaken -- for a route that has just spent one attempt out of a budget and
+    whose next attempt is worth nothing sooner. Honoured by `_perform` alone: a
+    paused tick spends none of these budgets, so it has none to space out, and
+    slowing the rotation a shadow soak depends on would buy nothing.
+
     `defer`, when set, is why this verdict is not itself driving the loop --
     the in-flight lane is, or a debt the loop already owes is. It is recorded
     in both modes, because the verdict is marked seen either way and this note
@@ -634,6 +688,7 @@ class Route:
     defer: str | None = None
     debt: EscalationDebt | None = None
     standing: bool = False
+    retry_after: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1016,6 +1071,29 @@ def _escalation_debt(deps: LoopDeps, loop: LoopRequest) -> EscalationDebt | None
     return EscalationDebt(reason=reason, attempts=attempts, notified=notified)
 
 
+def _space_attempt(deps: LoopDeps, loop: LoopRequest, seconds: float) -> None:
+    """Wait `seconds` before this loop's next attempt at whatever just failed.
+
+    The due pass revisits a loop it leaves open every DUE_BACKOFF_SECONDS,
+    which is the cadence a lane in flight wants and is far too fast to be a
+    retry interval: a budget of five attempts spent one per visit gave up on an
+    outage after sixty seconds, on both of the paths that keep one. Spacing is
+    what turns a count into a tolerance, and it is the mechanism
+    REREVIEW_REPOST_ATTEMPTS already used (`_repost_unacknowledged` defers a
+    window between its own attempts) for the same reason.
+
+    `store.defer` and deliberately not a transition: nothing here is a step the
+    loop took, `updated_at` must not move (LANE_WAIT_SECONDS and the
+    acknowledgement window are both measured from it), and `defer` is monotone,
+    so the pass's own DUE_BACKOFF_SECONDS floor afterwards cannot cut this
+    short. Unguarded, like `_repost_unacknowledged`'s: the attempt is already on
+    the trail by the time this runs, so a defer that fails costs this wait and
+    nothing else -- the bound still closes.
+    """
+    deps.store.defer(loop.loop_id, now=deps.now(),
+                     not_before=deps.now() + seconds)
+
+
 def _lane_still_running(deps: LoopDeps, lane_id: str) -> bool:
     """Read the lane's status fresh, right here, for one settle and no other.
 
@@ -1096,6 +1174,12 @@ def _settle_escalation(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
                 deps.store.record_note(loop.loop_id, EVENT_ESCALATION_PENDING,
                                        {"reason": debt.reason, "attempt": attempt},
                                        deps.now())
+                # And waited out before the next one. The budget is spread
+                # across ticks by design, but the due pass's own cadence is
+                # DUE_BACKOFF_SECONDS -- so spread across *those* ticks the five
+                # attempts gave up on Slack after sixty seconds and closed the
+                # loop with nobody told. See NOTIFY_RETRY_SECONDS.
+                _space_attempt(deps, loop, NOTIFY_RETRY_SECONDS)
                 # Nobody has the notice, so the PR stays owned and the reaction
                 # stays on: the loop is still open and will be retried.
                 return False
@@ -2196,7 +2280,7 @@ def _route_due(deps: LoopDeps, loop: LoopRequest, lane: LaneFacts | None,
                          standing=True)
         return Route(ROUTE_HEAD_UNREADABLE,
                      {"lane_id": loop.lane_id, "attempt": attempt},
-                     standing=True)
+                     standing=True, retry_after=HEAD_READ_RETRY_SECONDS)
     if lane.head != loop.head_sha:
         if not loop.root_thread_ts:
             # SlackIO refuses to post outside a thread because the intake gate
@@ -2240,6 +2324,13 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         else:
             deps.store.record_note(loop.loop_id, route.action, route.detail,
                                    deps.now())
+        if route.retry_after is not None:
+            # An observation that is also one attempt out of a budget: the note
+            # above is what spends it, and this is what stops the next one being
+            # spent fifteen seconds later. Read off the route rather than off the
+            # action, so a second such observation cannot arrive here and be
+            # silently retried at the pass's own cadence.
+            _space_attempt(deps, loop, route.retry_after)
         return False
     if route.action == ROUTE_CLOSE_STALE:
         return _close_stale(deps, loop, verdict, str(route.detail["pr_state"]))

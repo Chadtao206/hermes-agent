@@ -1051,7 +1051,7 @@ def test_a_paused_run_never_settles_an_escalation_a_live_run_left_pending(tmp_pa
     walking all four routes in shadow never caught it: only a live run leaves a
     pending escalation, and the pause procedure is exactly what arrives next.
     """
-    from pr_remediation.loop import tick
+    from pr_remediation.loop import NOTIFY_RETRY_SECONDS, tick
 
     slack = SlackFake(escalation_ts=None)
     deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1")]), slack=slack)
@@ -1062,7 +1062,7 @@ def test_a_paused_run_never_settles_an_escalation_a_live_run_left_pending(tmp_pa
     slack._escalation_ts = "9.2"  # Slack is back. The service is not.
     paused = in_mode(deps, mode)
     paused.source.verdicts = [verdict(rid="br_2")]
-    paused.now.advance()
+    paused.now.advance(NOTIFY_RETRY_SECONDS)
     assert tick(paused) == 0
 
     assert len(slack.escalations) == 1, "a paused run posted to a human channel"
@@ -1078,7 +1078,7 @@ def test_a_paused_run_never_settles_an_escalation_a_live_run_left_pending(tmp_pa
     # ...and the debt is still there for whoever turns the service back on.
     live = in_mode(deps, "live")
     live.source.verdicts = []
-    live.now.advance()
+    live.now.advance(NOTIFY_RETRY_SECONDS)
     assert tick(live) == 1
     assert len(slack.escalations) == 2
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
@@ -1145,7 +1145,7 @@ def test_a_paused_due_pass_settles_nothing_a_live_run_left_owing(tmp_path, mode)
     loop to `escalated`, and the whole suite stayed green: every paused test
     drove a verdict, and this pass runs when there is no verdict at all.
     """
-    from pr_remediation.loop import tick
+    from pr_remediation.loop import NOTIFY_RETRY_SECONDS, tick
 
     slack = SlackFake(escalation_ts=None)
     deps = build(tmp_path, SourceFake([model_incomplete(rid="br_1")]), slack=slack)
@@ -1156,7 +1156,7 @@ def test_a_paused_due_pass_settles_nothing_a_live_run_left_owing(tmp_path, mode)
     slack._escalation_ts = "9.2"  # Slack is back. The service is not.
     paused = in_mode(deps, mode)
     paused.source.verdicts = []  # nothing to route: the due pass is the tick
-    paused.now.advance()
+    paused.now.advance(NOTIFY_RETRY_SECONDS)
     assert tick(paused) == 0
 
     assert len(slack.escalations) == 1, "a paused due pass posted to a human"
@@ -1747,7 +1747,7 @@ def test_an_undelivered_escalation_does_not_close_the_loop(tmp_path):
 def test_a_pending_escalation_is_retried_until_it_lands(tmp_path):
     """No further verdict will ever come for an escalated PR, so the retry
     cannot depend on one."""
-    from pr_remediation.loop import tick
+    from pr_remediation.loop import NOTIFY_RETRY_SECONDS, tick
 
     slack = SlackFake(escalation_ts=None)
     deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
@@ -1756,7 +1756,7 @@ def test_a_pending_escalation_is_retried_until_it_lands(tmp_path):
 
     deps.source.verdicts = []
     slack._escalation_ts = "9.2"
-    deps.now.advance()
+    deps.now.advance(NOTIFY_RETRY_SECONDS)
     assert tick(deps) == 1
     assert len(slack.escalations) == 2
     assert deps.lanes.created == [], "a retry is a post, not a round"
@@ -1767,14 +1767,14 @@ def test_a_pending_escalation_is_retried_until_it_lands(tmp_path):
 
 
 def test_a_delivered_escalation_is_never_notified_twice(tmp_path):
-    from pr_remediation.loop import tick
+    from pr_remediation.loop import NOTIFY_RETRY_SECONDS, tick
 
     slack = SlackFake(escalation_ts=None)
     deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
     tick(deps)
     deps.source.verdicts = []
     slack._escalation_ts = "9.2"
-    deps.now.advance()
+    deps.now.advance(NOTIFY_RETRY_SECONDS)
     tick(deps)
     deps.now.advance()
     assert tick(deps) == 0
@@ -1803,20 +1803,91 @@ def test_a_verdict_during_a_pending_escalation_retries_instead_of_remediating(tm
 
 def test_a_permanently_unreachable_channel_stops_retrying(tmp_path):
     """Retrying forever would pin the PR's loop open and never notify anyone."""
-    from pr_remediation.loop import NOTIFY_ATTEMPTS, tick
+    from pr_remediation.loop import NOTIFY_ATTEMPTS, NOTIFY_RETRY_SECONDS, tick
 
     slack = SlackFake(escalation_ts=None)
     deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
     tick(deps)
     deps.source.verdicts = []
     for _ in range(NOTIFY_ATTEMPTS):
-        deps.now.advance()
+        deps.now.advance(NOTIFY_RETRY_SECONDS)
         tick(deps)
     assert len(slack.escalations) == NOTIFY_ATTEMPTS
     loop_id = _loop_id(deps)
     assert deps.store.get(loop_id).state is LoopState.ESCALATED, \
         "a loop held open forever blocks every later loop on this PR"
     assert "escalation_unreachable" in kinds(deps, loop_id)
+
+
+def spend_until(deps, spent, cap_seconds):
+    """Tick at the due pass's own cadence until `spent()` next rises.
+
+    Returns the wall-clock the loop actually waited. The pass revisits a loop
+    it leaves open every DUE_BACKOFF_SECONDS, so this is the interval a budget
+    spent one-per-visit really runs at -- the thing neither of these two
+    budgets had, and the thing no count can substitute for.
+    """
+    from pr_remediation.loop import DUE_BACKOFF_SECONDS, tick
+
+    before, waited = spent(), 0.0
+    while waited < cap_seconds:
+        deps.now.advance(DUE_BACKOFF_SECONDS)
+        waited += DUE_BACKOFF_SECONDS
+        tick(deps)
+        if spent() > before:
+            return waited
+    return None
+
+
+def test_a_refused_escalation_post_waits_before_it_tries_again(tmp_path):
+    """The budget is five attempts; the tolerance is five attempts times the
+    wait between them, and there was no wait.
+
+    Spent one per due-pass visit at DUE_BACKOFF_SECONDS, NOTIFY_ATTEMPTS gave
+    up on Slack after sixty seconds -- closing the loop `escalation_unreachable`,
+    releasing the ownership label and telling nobody, which `_settle_escalation`
+    calls the worst outcome this system can produce. Nothing about this delays
+    an escalation that is going to land: a reachable Slack takes the post on the
+    first attempt, and only a refused one waits.
+    """
+    from pr_remediation.loop import NOTIFY_RETRY_SECONDS, tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    assert tick(deps) == 0
+    assert len(slack.escalations) == 1, "the first attempt, refused"
+    deps.source.verdicts = []
+
+    waited = spend_until(deps, lambda: len(slack.escalations),
+                         NOTIFY_RETRY_SECONDS * 2)
+    assert waited is not None, "the retry must still happen"
+    assert waited >= NOTIFY_RETRY_SECONDS, \
+        "a refused post must not be retried at the pass's own cadence"
+
+
+def test_the_notify_budget_rides_out_an_outage_of_more_than_an_hour(tmp_path):
+    """The whole budget, measured end to end at the real cadence rather than
+    multiplied out of two constants. An hour is the floor this asserts against
+    because a minute -- what it bought before -- is not a tolerance for any
+    outage anyone has ever had."""
+    from pr_remediation.loop import DUE_BACKOFF_SECONDS, tick
+
+    slack = SlackFake(escalation_ts=None)
+    deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
+    assert tick(deps) == 0
+    deps.source.verdicts = []
+
+    loop_id = _loop_id(deps)
+    start, gave_up = deps.now(), None
+    while deps.now() - start < 24 * 60 * 60:
+        deps.now.advance(DUE_BACKOFF_SECONDS)
+        tick(deps)
+        if "escalation_unreachable" in kinds(deps, loop_id):
+            gave_up = deps.now() - start
+            break
+    assert gave_up is not None, "the loop must still close rather than pin the PR"
+    assert gave_up > 60 * 60, \
+        f"gave up on Slack after only {gave_up / 60:.0f} minutes"
 
 
 def test_one_sweep_spends_at_most_one_notification_attempt(tmp_path):
@@ -1964,7 +2035,7 @@ def test_a_lease_we_cannot_drop_does_not_discard_the_sweep(tmp_path):
     """release() runs in a finally at the end of the tick. Unguarded, one
     failure there throws past tick() and takes the verdict pass's result with
     it -- over a lease that expires on its own anyway."""
-    from pr_remediation.loop import tick
+    from pr_remediation.loop import NOTIFY_RETRY_SECONDS, tick
 
     store = UnreleasableStore(Store(tmp_path / "r.db"))
     slack = SlackFake(escalation_ts=None)
@@ -1977,7 +2048,7 @@ def test_a_lease_we_cannot_drop_does_not_discard_the_sweep(tmp_path):
     slack._escalation_ts = "9.2"
     deps.source.verdicts = [verdict(rid="br_2", pr=43,
                                     outcome="READY_FOR_HUMAN_REVIEW")]
-    deps.now.advance()
+    deps.now.advance(NOTIFY_RETRY_SECONDS)
     assert tick(deps) == 2, "the escalation settled and the ready PR closed"
     assert deps.store.get(stuck).state is LoopState.ESCALATED
 
@@ -2464,13 +2535,13 @@ def test_an_unreadable_head_waits_instead_of_calling_the_lane_a_no_op(tmp_path):
     wait is bounded (HEAD_READ_ATTEMPTS), but three ticks is nowhere near it,
     so each is still just a wait -- see the budget tests below for the bound
     itself."""
-    from pr_remediation.loop import tick
+    from pr_remediation.loop import HEAD_READ_RETRY_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=GitHubFake(head=None))
     loop_id = _loop_id(deps)
     for _ in range(3):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         assert tick(deps) == 0
     assert deps.slack.escalations == [], "a read blip must not burn the loop"
     assert deps.slack.reposts == []
@@ -2482,7 +2553,7 @@ def test_an_unreadable_head_waits_instead_of_calling_the_lane_a_no_op(tmp_path):
             if e["kind"] == "head_unreadable"] == [1, 2, 3]
 
     deps.github.head = "b" * 40  # GitHub came back
-    deps.now.advance()
+    deps.now.advance(HEAD_READ_RETRY_SECONDS)
     assert tick(deps) == 1
     assert deps.slack.reposts == [("Ylopo/example#42", 1)]
 
@@ -2493,13 +2564,13 @@ def test_the_head_read_budget_exhausting_escalates_with_a_reason_distinct_from_n
     the read succeeded and the lane genuinely pushed nothing, which asks a
     human to accept the round as spent; this reason means the read itself
     never landed, which asks a human to go look at GitHub instead."""
-    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=GitHubFake(head=None))
     loop_id = _loop_id(deps)
     for _ in range(HEAD_READ_ATTEMPTS):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         tick(deps)
     assert deps.slack.escalations == \
         [("Ylopo/example#42", 1, "head_read_exhausted")]
@@ -2511,19 +2582,64 @@ def test_the_head_read_budget_exhausting_escalates_with_a_reason_distinct_from_n
         "the exhausting attempt escalates instead of recording one more wait"
 
 
+def test_a_failed_head_read_waits_before_it_tries_again(tmp_path):
+    """The same missing spacing on the other budget of the same shape.
+
+    Five attempts spent one per due-pass visit gave up on GitHub after sixty
+    seconds and stranded the pull request as `head_read_exhausted` -- against a
+    GitHub incident this branch measured lasting hours. A read that lands, lands
+    on the first attempt, so nothing here slows the ordinary path down.
+    """
+    from pr_remediation.loop import HEAD_READ_RETRY_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    assert tick(deps) == 0
+    spent = lambda: kinds(deps, loop_id).count("head_unreadable")
+    assert spent() == 1, "the first attempt"
+
+    waited = spend_until(deps, spent, HEAD_READ_RETRY_SECONDS * 2)
+    assert waited is not None, "the retry must still happen"
+    assert waited >= HEAD_READ_RETRY_SECONDS, \
+        "a blip must not be re-read at the pass's own cadence"
+
+
+def test_the_head_read_budget_rides_out_an_outage_of_more_than_an_hour(tmp_path):
+    """The whole budget end to end at the real cadence, against the same floor
+    the notify budget's own measurement uses and for the same reason."""
+    from pr_remediation.loop import DUE_BACKOFF_SECONDS, tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                github=GitHubFake(head=None))
+    loop_id = _loop_id(deps)
+    start, gave_up = deps.now(), None
+    while deps.now() - start < 24 * 60 * 60:
+        deps.now.advance(DUE_BACKOFF_SECONDS)
+        tick(deps)
+        if deps.slack.escalations:
+            gave_up = deps.now() - start
+            break
+    assert gave_up is not None, "the wait must still end rather than pin the PR"
+    assert deps.slack.escalations[0][2] == "head_read_exhausted"
+    assert gave_up > 60 * 60, \
+        f"gave up on GitHub after only {gave_up / 60:.0f} minutes"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
 def test_a_head_read_escalation_retries_through_the_same_notify_budget(tmp_path):
     """head_read_exhausted is an ordinary escalation once it exists: a failed
     post leaves the loop non-terminal and owned, and retries through
     NOTIFY_ATTEMPTS exactly like every other reason -- there is no bespoke
     delivery path for this one to have its own bugs."""
-    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, NOTIFY_RETRY_SECONDS, tick
 
     slack = SlackFake(escalation_ts=None)
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=GitHubFake(head=None), slack=slack)
     loop_id = _loop_id(deps)
     for _ in range(HEAD_READ_ATTEMPTS):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         tick(deps)
     assert deps.store.get(loop_id).state is not LoopState.ESCALATED, \
         "nobody has heard yet"
@@ -2532,7 +2648,7 @@ def test_a_head_read_escalation_retries_through_the_same_notify_budget(tmp_path)
     assert len(slack.escalations) == 1, "the exhausting tick spent its first attempt"
 
     slack._escalation_ts = "9.2"  # Slack recovers
-    deps.now.advance()
+    deps.now.advance(NOTIFY_RETRY_SECONDS)
     assert tick(deps) == 1
     assert [e[2] for e in deps.slack.escalations] == \
         ["head_read_exhausted", "head_read_exhausted"], \
@@ -2547,20 +2663,20 @@ def test_a_recovered_read_does_not_carry_its_failure_count_into_the_next_round(
     id, so a round that opens after a recovery starts this budget at zero
     rather than inheriting the round before it. Carrying the count over would
     escalate a brand new round's very first blip."""
-    from pr_remediation.loop import HEAD_READ_ATTEMPTS, LANE_POLL_SECONDS, tick
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, LANE_POLL_SECONDS, tick
 
     github = GitHubFake(head=None)
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=github)
     loop_id = _loop_id(deps)
     for _ in range(HEAD_READ_ATTEMPTS - 1):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         assert tick(deps) == 0
     assert deps.store.get(loop_id).state is LoopState.REMEDIATING, \
         "one tick short of round 1's own budget"
 
     github.head = "b" * 40  # round 1's push shows up
-    deps.now.advance()
+    deps.now.advance(HEAD_READ_RETRY_SECONDS)
     assert tick(deps) == 1
     assert deps.store.get(loop_id).lane_id == "t_1"
 
@@ -2594,19 +2710,19 @@ def test_a_blip_after_a_landed_read_does_not_inherit_earlier_blips_in_the_same_r
     own successful read is exactly what makes this reachable, because it is
     the one event that can land between two runs of blips on the very same
     lane_id."""
-    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, HEAD_READ_ATTEMPTS, tick
+    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, tick
 
     github = GitHubFake(head=None)
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=github)
     loop_id = _loop_id(deps)
     for _ in range(HEAD_READ_ATTEMPTS - 1):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         assert tick(deps) == 0
     assert kinds(deps, loop_id).count("head_unreadable") == HEAD_READ_ATTEMPTS - 1
 
     github.head = "a" * 40  # the read lands, unmoved: opens the grace window
-    deps.now.advance()
+    deps.now.advance(HEAD_READ_RETRY_SECONDS)
     assert tick(deps) == 1
     assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
 
@@ -2628,8 +2744,12 @@ def test_a_paused_tick_neither_escalates_nor_spends_the_head_read_budget(
         tmp_path, mode):
     """A pause must not quietly burn through HEAD_READ_ATTEMPTS while nobody is
     driving: whatever ticks pass while paused must cost the live budget
-    nothing, or resuming live would escalate sooner than the budget promises."""
-    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+    nothing, or resuming live would escalate sooner than the budget promises.
+
+    The paused half runs at the pass's own cadence and the live half at
+    HEAD_READ_RETRY_SECONDS, which is the point: only a spent attempt spaces
+    the next one, and a paused tick spends none."""
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=GitHubFake(head=None))
@@ -2647,7 +2767,7 @@ def test_a_paused_tick_neither_escalates_nor_spends_the_head_read_budget(
     # Resuming live still gets the full budget: nothing was spent while paused.
     live = in_mode(deps, "live")
     for _ in range(HEAD_READ_ATTEMPTS):
-        live.now.advance()
+        live.now.advance(HEAD_READ_RETRY_SECONDS)
         tick(live)
     assert deps.slack.escalations == \
         [("Ylopo/example#42", 1, "head_read_exhausted")]
@@ -2685,16 +2805,20 @@ def test_a_paused_head_read_exhaustion_decision_does_not_grow_the_trail_either(
     tick (and every one after it) is paused, `standing=True` is what keeps the
     decision to one recorded sentence rather than one per tick for as long as
     the pause lasts."""
-    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=GitHubFake(head=None))
     loop_id = _loop_id(deps)
     for _ in range(HEAD_READ_ATTEMPTS - 1):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         assert tick(deps) == 0
 
     shadow = in_mode(deps, "shadow")
+    # Past the wait the last live attempt bought itself: a paused tick spends
+    # no attempt and so spaces none, but it still has to wait out the one the
+    # live tick before it did spend.
+    shadow.now.advance(HEAD_READ_RETRY_SECONDS)
     for _ in range(20):
         shadow.now.advance()
         assert tick(shadow) == 0
@@ -2984,13 +3108,13 @@ def test_a_head_read_exhaustion_escalation_never_claims_the_lane_is_still_runnin
     report to trust it here would fire the alarm on every GitHub outage that
     outlasts the read budget, once per affected PR, beside the notice a human is
     already being sent."""
-    from pr_remediation.loop import HEAD_READ_ATTEMPTS, tick
+    from pr_remediation.loop import HEAD_READ_ATTEMPTS, HEAD_READ_RETRY_SECONDS, tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
                                 github=GitHubFake(head=None))
     loop_id = _loop_id(deps)
     for _ in range(HEAD_READ_ATTEMPTS):
-        deps.now.advance()
+        deps.now.advance(HEAD_READ_RETRY_SECONDS)
         tick(deps)
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
     assert deps.slack.escalations == \
