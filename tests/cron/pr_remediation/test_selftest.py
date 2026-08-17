@@ -3,10 +3,12 @@
 Two checks reach outside this package on purpose, and both are covered here
 against fakes rather than the real deployment:
 
-* the marker sync check, which loads boris_intake's own config.yaml block and
-  refuses to start unless its loop_marker matches this service's marker
-  byte-for-byte -- the two are otherwise never tied together, and a drift
-  between them makes re-review posts vanish with no error anywhere;
+* the gate checks, which load boris_intake's own config.yaml block and refuse
+  to start unless all five things its loop door needs are true of it -- the
+  marker matching byte-for-byte, both loop user ids set, and the review
+  channel both allowlisted and passive. None of the five is tied to this
+  service by anything else, and every one of them makes re-review posts vanish
+  with no error anywhere;
 * the autofix gate check, which mirrors kanban_dispatch.sh's independent
   refusal to create a lane unless PR_REVIEW_AUTOFIX=1 is set in the live
   .env, checked only in live mode since shadow never dispatches a lane.
@@ -17,9 +19,26 @@ from pr_remediation.config import RemediationConfig
 from pr_remediation.selftest import run_selftest
 
 MATCHING_MARKER = RemediationConfig().marker
+#: Anything but "" -- the values themselves are boris_intake's to know; all
+#: this service can check is that they are set at all.
+SOME_BOT_ID = "UBOTID"
+SOME_ATTRIBUTED_ID = "UCHADID"
 
 
-def _boris_intake_config(tmp_path, marker=MATCHING_MARKER, mode="live"):
+def _boris_intake_config(tmp_path, marker=MATCHING_MARKER, mode="live", *,
+                         loop_bot_user_id=SOME_BOT_ID,
+                         loop_attributed_user_id=SOME_ATTRIBUTED_ID,
+                         channels=None, passive_channels=None):
+    """A boris_intake config block whose loop door admits this service's
+    re-reviews, plus one keyword per way a deployment can silently close it.
+
+    `channels`/`passive_channels` default to the channel this service actually
+    posts re-reviews into, read off `RemediationConfig` rather than restated,
+    because the pairing under test is "does boris_intake's allowlist contain
+    the channel pr_remediation posts to" -- restating it here would let the two
+    drift and the test would keep passing.
+    """
+    channel = RemediationConfig().boris_channel
     path = tmp_path / "boris_config.yaml"
     # json.dumps produces a double-quoted YAML flow scalar (JSON is a valid
     # YAML subset), which sidesteps YAML's own quoting rules entirely -- safe
@@ -28,6 +47,11 @@ def _boris_intake_config(tmp_path, marker=MATCHING_MARKER, mode="live"):
         "boris_intake:\n"
         f"  mode: {mode}\n"
         f"  loop_marker: {json.dumps(marker)}\n"
+        f"  loop_bot_user_id: {json.dumps(loop_bot_user_id)}\n"
+        f"  loop_attributed_user_id: {json.dumps(loop_attributed_user_id)}\n"
+        f"  channels: {json.dumps(list(channels if channels is not None else [channel]))}\n"
+        "  passive_channels: "
+        f"{json.dumps(list(passive_channels if passive_channels is not None else [channel]))}\n"
     )
     return path
 
@@ -150,6 +174,72 @@ def test_selftest_fails_closed_when_boris_intake_marker_differs(tmp_path):
         boris_intake_config_path=_boris_intake_config(
             tmp_path, marker="[some other marker]"))
     assert any("marker" in f.lower() for f in failures)
+
+
+def test_selftest_fails_closed_when_the_loop_bot_id_is_unset(tmp_path):
+    """`_is_loop_repost`'s guard clause returns False outright when
+    `loop_bot_user_id` is blank, so the door never opens and the re-review is
+    dropped as NOT_HUMAN -- one of boris_intake's SILENT_REASONS, so there is
+    no reply in the thread either. Indistinguishable from Boris being slow."""
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path), env_path=_env(tmp_path, autofix="1"),
+        boris_intake_config_path=_boris_intake_config(
+            tmp_path, loop_bot_user_id=""))
+    assert any("loop_bot_user_id" in f for f in failures)
+
+
+def test_selftest_fails_closed_when_the_attributed_user_is_unset(tmp_path):
+    """Same guard clause, other field. A blank `loop_attributed_user_id` closes
+    the door at the guard rather than letting an admitted re-review be
+    attributed to "" and fail later at `deps.identity("")`."""
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path), env_path=_env(tmp_path, autofix="1"),
+        boris_intake_config_path=_boris_intake_config(
+            tmp_path, loop_attributed_user_id=""))
+    assert any("loop_attributed_user_id" in f for f in failures)
+
+
+def test_selftest_fails_closed_when_the_review_channel_is_not_allowlisted(tmp_path):
+    """Gate check 2. The re-review lands in a channel boris_intake will not
+    read requests from, and is dropped as CHANNEL_NOT_ALLOWED."""
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path), env_path=_env(tmp_path, autofix="1"),
+        boris_intake_config_path=_boris_intake_config(
+            tmp_path, channels=["C_SOMEWHERE_ELSE"],
+            passive_channels=["C_SOMEWHERE_ELSE"]))
+    assert any("CHANNEL_NOT_ALLOWED" in f for f in failures)
+
+
+def test_selftest_fails_closed_when_the_review_channel_is_not_passive(tmp_path):
+    """Gate check 1b, and the least obvious of the four. `post_rereview`
+    deliberately carries no `<@bot>` mention, so an allowlisted-but-not-passive
+    channel rejects every re-review as THREAD_REPLY_NO_MENTION. The channel is
+    still in `channels`, so nothing else about the deployment looks wrong."""
+    channel = RemediationConfig().boris_channel
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path), env_path=_env(tmp_path, autofix="1"),
+        boris_intake_config_path=_boris_intake_config(
+            tmp_path, channels=[channel, "C_OTHER"],
+            passive_channels=["C_OTHER"]))
+    assert any("THREAD_REPLY_NO_MENTION" in f for f in failures)
+
+
+def test_an_unallowlisted_channel_reports_once_not_twice(tmp_path):
+    """boris_intake's own loader drops a passive channel that is not also an
+    allowlisted one, so a channel missing from `channels` is necessarily
+    missing from `passive_channels` too. Reporting both would tell an operator
+    to fix two things when there is one."""
+    failures = run_selftest(
+        RemediationConfig(mode="live"), token_path=_token(tmp_path),
+        boris_db=_boris_db(tmp_path), env_path=_env(tmp_path, autofix="1"),
+        boris_intake_config_path=_boris_intake_config(
+            tmp_path, channels=["C_SOMEWHERE_ELSE"],
+            passive_channels=["C_SOMEWHERE_ELSE"]))
+    assert len(failures) == 1
 
 
 def test_selftest_fails_closed_when_boris_intake_config_is_unreadable(tmp_path):

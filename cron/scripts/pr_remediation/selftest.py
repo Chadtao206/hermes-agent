@@ -3,22 +3,39 @@
 Two of these checks reach outside this package on purpose, because a failure
 in either would otherwise be invisible everywhere in this service.
 
-The marker check ties this service's `cfg.marker` to boris_intake's own
-`loop_marker`. boris_intake's gate (`gate.py::_is_loop_repost`) admits a
-re-review post from this loop only when the message carries boris_intake's
-configured marker literal, verbatim -- but that marker is deployed
-independently, in boris_intake's own block of config.yaml, of the default
-this service holds in `config.py`. Nothing else keeps the two in sync: if
-they ever differ by a single character, boris_intake silently drops every
-re-review this loop posts (SlackIO still gets a `ts` back -- the post really
-lands, in a channel, it is simply never read as a loop repost) and the loop
-stalls waiting for a verdict that will never arrive, with no exception, no
-log line, nothing. An earlier attempt guarded this from inside this package
-alone and only checked this service's own default against itself -- a
-tautology that could never catch a real drift -- and was removed. The only
-check that can catch the real failure is one that loads boris_intake's own
-deployed configuration, the same file boris_intake itself reads, and compares
-it against what this service is about to use.
+The gate checks tie this service to boris_intake's own deployed
+configuration. boris_intake's gate (`gate.py::_is_loop_repost`) admits a
+re-review post from this loop only if FOUR separate things about that
+configuration hold, and every one of them is deployed independently, in
+boris_intake's own block of config.yaml, of the defaults this service holds
+in `config.py`. Nothing else keeps them in sync, and every one of them fails
+the same way: boris_intake silently drops every re-review this loop posts
+(SlackIO still gets a `ts` back -- the post really lands, in a channel, it is
+simply never read as a loop repost) and the loop stalls waiting for a verdict
+that will never arrive, with no exception, no log line, nothing. All four
+rejection reasons are in boris_intake's `SILENT_REASONS`, so there is not even
+a reply in the thread:
+
+| drift | how the gate rejects the re-review |
+|---|---|
+| `loop_marker` differs by one character | `not_human` |
+| `loop_bot_user_id` unset | `not_human` |
+| `loop_attributed_user_id` unset | `not_human` |
+| the review channel left `passive_channels` | `thread_reply_no_mention` |
+| the review channel left `channels` | `channel_not_allowed` |
+
+The `passive_channels` one is the least obvious and entirely live:
+`SlackIO.post_rereview` deliberately carries no `<@bot>` mention, so gate check
+1b rejects it the moment that channel stops being passive.
+
+An earlier attempt guarded the marker from inside this package alone and only
+checked this service's own default against itself -- a tautology that could
+never catch a real drift -- and was removed. The only checks that can catch
+the real failures are ones that load boris_intake's own deployed
+configuration, the same file boris_intake itself reads, and compare it
+against what this service is about to use. `pr_discovery/main.py::_gate_failures`
+makes exactly this argument for the gate's *other* door and checks the same
+shapes; see `_gate_failures` below for why the two are not one function.
 
 The autofix check guards `kanban_dispatch.sh`'s independent refusal to create
 any lane unless `PR_REVIEW_AUTOFIX=1` is set in the live `.env`. That gate is
@@ -149,6 +166,76 @@ def _channel_membership(caller: Callable[..., Any], token: str,
     return None
 
 
+def _gate_failures(cfg: RemediationConfig,
+                   intake_config_path: Path) -> list[str]:
+    """Would a re-review this loop posts actually be admitted?
+
+    Every one of these makes boris_intake's loop door close silently -- see the
+    module docstring's table. `boris_intake`'s half of each pairing is
+    YAML-deployed and this half is a fixed default in `config.py`, so nothing
+    but this check keeps them equal.
+
+    Deliberately NOT shared with `pr_discovery/main.py::_gate_failures`, which
+    asks the same five questions of the same config for the *discovery* door.
+    A shared helper would have to be imported by one cron package from the
+    other -- coupling two separately deployed artifacts, which
+    `pr_discovery/post.py`'s docstring already refuses to do for a single
+    constant -- or moved into `boris_intake`, making the reviewed service carry
+    its consumers' startup checks. Both packages instead read boris_intake's
+    real deployed config and phrase their own findings, which is the property
+    that matters: neither can pass by agreeing with itself.
+
+    What this cannot check is a `loop_bot_user_id` that is set but names the
+    wrong Slack user. Only Slack knows which user `TICKET_HUB_SLACK_BOT_TOKEN`
+    posts as, and answering that would mean a network call in a startup gate
+    whose whole discipline is failing closed only on proven negatives (see the
+    reachability check below). `pr_discovery`'s own gate check catches the
+    subset that matters in practice -- the two configured bot ids naming one
+    identity and disagreeing.
+
+    Unconditional, in every mode, unlike its `pr_discovery` counterpart: this
+    service's marker check has always run in every mode, and a deployment that
+    has not wired the loop door already fails it in shadow (boris_intake's
+    `loop_marker` defaults to `""`, which can never equal this service's
+    non-empty default). Scoping the other four to live would put two different
+    mode rules inside one function for no gain.
+    """
+    intake = load_boris_intake_config(intake_config_path)
+    failures: list[str] = []
+    if intake.loop_marker != cfg.marker:
+        failures.append(
+            f"marker drift: boris_intake.loop_marker {intake.loop_marker!r} "
+            f"(from {intake_config_path}) != pr_remediation.marker "
+            f"{cfg.marker!r}; boris_intake would silently drop every "
+            "re-review this loop posts")
+    if not intake.loop_bot_user_id:
+        failures.append(
+            f"boris_intake.loop_bot_user_id is unset (from {intake_config_path}), "
+            "so the gate's loop door is inert and every re-review would be "
+            "dropped as NOT_HUMAN")
+    if not intake.loop_attributed_user_id:
+        failures.append(
+            f"boris_intake.loop_attributed_user_id is unset (from "
+            f"{intake_config_path}), so the gate's loop door is inert and every "
+            "re-review would be dropped as NOT_HUMAN")
+    if cfg.boris_channel not in intake.channels:
+        failures.append(
+            f"{cfg.boris_channel} is not in boris_intake.channels (from "
+            f"{intake_config_path}); every re-review would be rejected as "
+            "CHANNEL_NOT_ALLOWED")
+    elif cfg.boris_channel not in intake.passive_channels:
+        # Checked only when the channel IS allowlisted: boris_intake's own
+        # config loader drops a passive channel that is not an allowlisted one,
+        # so the two findings would otherwise both fire and say the same thing
+        # twice.
+        failures.append(
+            f"{cfg.boris_channel} is not one of boris_intake.passive_channels "
+            f"(from {intake_config_path}); SlackIO.post_rereview deliberately "
+            "carries no bot mention, so every re-review would be rejected as "
+            "THREAD_REPLY_NO_MENTION")
+    return failures
+
+
 def _slack_reachability_failures(cfg: RemediationConfig, review_token: str,
                                  notify_token: str,
                                  caller: Callable[..., Any] | None,
@@ -211,18 +298,12 @@ def run_selftest(cfg: RemediationConfig, *, token_path: Path = DEFAULT_TOKEN,
         failures.append("loop marker is empty; re-reviews would never be admitted")
 
     # The real runtime sync point: boris_intake's OWN deployed config, read
-    # the same way boris_intake itself reads it (load_config fails safe to
-    # loop_marker="" on a missing or malformed file, which can never equal
-    # this service's non-empty default -- so an unreadable boris_intake
-    # config surfaces here as a mismatch rather than being silently
-    # swallowed by boris_intake's own fail-safe default).
-    boris_marker = load_boris_intake_config(boris_intake_config_path).loop_marker
-    if boris_marker != cfg.marker:
-        failures.append(
-            f"marker drift: boris_intake.loop_marker {boris_marker!r} "
-            f"(from {boris_intake_config_path}) != pr_remediation.marker "
-            f"{cfg.marker!r}; boris_intake would silently drop every "
-            "re-review this loop posts")
+    # the same way boris_intake itself reads it (load_config fails safe to an
+    # unconfigured Config on a missing or malformed file -- every field of
+    # which fails one of the checks below, so an unreadable boris_intake config
+    # surfaces here rather than being silently swallowed by boris_intake's own
+    # fail-safe defaults).
+    failures.extend(_gate_failures(cfg, boris_intake_config_path))
 
     if cfg.mode == "live" and not _autofix_open(env_path):
         failures.append(
