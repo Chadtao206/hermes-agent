@@ -337,6 +337,31 @@ def test_loop_repost_with_a_subtype_is_rejected():
     assert reasons(evaluate(edited, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
 
 
+def test_loop_branch_inert_when_attribution_is_unset():
+    """The mirror of test_discovery_branch_inert_when_attribution_is_unset, which
+    the loop door was missing. marker and bot id configured but
+    loop_attributed_user_id blank: a repost must not be admitted and attributed
+    to "" -- that would only fail closed later at deps.identity(""). The clause
+    is what closes the door here, at the guard, before attribution ever
+    happens."""
+    cfg = replace(LOOP_CFG, loop_attributed_user_id="")
+    repost = ev(user_id=BOT, is_bot=True, thread_ts="0.9",
+                text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(repost, cfg, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+def test_loop_branch_inert_when_only_the_marker_is_unset():
+    """loop_bot_user_id and loop_attributed_user_id configured but the marker
+    blank. `"".startswith("")` is True for every string, so without the guard
+    every message from that bot in any thread would be a re-review request --
+    the guard, not the predicate, is what has to hold here. The discovery door
+    has had this pin since it was written."""
+    cfg = replace(LOOP_CFG, loop_marker="")
+    repost = ev(user_id=BOT, is_bot=True, thread_ts="0.9",
+                text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5")
+    assert reasons(evaluate(repost, cfg, deps())) == {ReasonCode.NOT_HUMAN}
+
+
 def test_a_message_that_merely_quotes_the_marker_is_rejected():
     """The loop always OPENS its re-review with the marker
     (`pr_remediation/slack_io.py::post_rereview`). A message that quotes it
