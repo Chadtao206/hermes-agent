@@ -717,10 +717,30 @@ def _observe_lane(deps: LoopDeps, loop: LoopRequest) -> LaneFacts | None:
     and the two GitHub reads only once one has actually finished. That ordering
     is also what makes the hold label a read-before-write: the lane's status is
     the last question that can be answered without writing anything.
+
+    A kanban read that raises is answered the same way a status this build does
+    not recognise is: unreadable is not finished, so the loop stays where it is
+    rather than escalating on a blip -- the answer `LaneFacts` already
+    documents, and the one `_lane_still_running` already gives at the sibling
+    call site. Guarded rather than left to propagate, because propagating is
+    not "leave the loop where it is": `KanbanIO.lane_status` raises
+    `RuntimeError` on any `sqlite3.Error` and a busy or locked `kanban.db` is a
+    known transient here, so the throw landed in `_settle_due`'s per-loop
+    `except`, `_route_due` never ran at all, and LANE_WAIT_SECONDS -- the one
+    bound that does not wait for a finished lane, and so the only one that
+    could ever end this -- could never fire. Driven at the real cadence that
+    left a loop `remediating` for thirty simulated hours, ten times its own
+    bound, with the ownership label still held and `active_for_pr` refusing
+    every later generation of that pull request.
     """
     if not _lane_pending(loop):
         return None
-    status = deps.lanes.status(loop.lane_id)
+    try:
+        status = deps.lanes.status(loop.lane_id)
+    except Exception:
+        _LOG.warning("lane %s could not be read for loop %s; "
+                     "treating it as unfinished", loop.lane_id, loop.loop_id)
+        status = None
     if status not in TERMINAL_LANE_STATUSES:
         return LaneFacts(status=status)
     if deps.github.has_hold(loop.owner, loop.repo, loop.pr_number):

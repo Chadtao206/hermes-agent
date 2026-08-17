@@ -3279,6 +3279,72 @@ def test_a_deleted_kanban_card_does_not_wedge_the_loop_forever(tmp_path):
         "an unresolvable card is not evidence the lane is done"
 
 
+class RaisingLanesFake(LanesFake):
+    """A kanban whose status() raises once armed.
+
+    `KanbanIO.lane_status` turns any `sqlite3.Error` into a `RuntimeError`, and
+    a busy or locked `kanban.db` is a known transient in this service -- worker
+    spawn bursts contend on the WAL. Armed after dispatch, because the round has
+    to open before there is a lane to fail to read.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.armed = False
+
+    def status(self, lane_id):
+        if self.armed:
+            raise RuntimeError("database is locked")
+        return super().status(lane_id)
+
+
+def test_an_unreadable_kanban_does_not_wedge_the_loop_past_its_bound(tmp_path):
+    """An unreadable lane is an unfinished lane, not an exception.
+
+    Unguarded, the raise landed in `_settle_due`'s per-loop `except`, so
+    `_route_due` never ran for this loop at all -- and LANE_WAIT_SECONDS is the
+    one bound here that does not wait for a finished lane, so it was the only
+    thing that could ever have ended the wait. Ten times that bound later the
+    row was still `remediating`, nothing had been escalated, the ownership
+    label was still on the pull request and `active_for_pr` was still refusing
+    every later generation of it.
+
+    `_lane_still_running` catches exactly this exception at the sibling call
+    site and answers "still running"; this is the same answer, given by the
+    same reasoning, at the site that was missing it.
+    """
+    from pr_remediation.loop import LANE_TIMEOUT, LANE_WAIT_SECONDS, tick
+
+    lanes = RaisingLanesFake(status="running")
+    deps = drive_to_remediating(tmp_path, lanes=lanes)
+    loop_id = only_loop(deps).loop_id
+    lanes.armed = True
+
+    deps.now.advance(LANE_WAIT_SECONDS)
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.slack.escalations == [("Ylopo/example#42", 1, LANE_TIMEOUT)]
+    assert deps.github.released == [], \
+        "a kanban that cannot be read is not evidence the lane is done"
+
+
+def test_an_unreadable_kanban_inside_the_bound_leaves_the_loop_alone(tmp_path):
+    """And it is a blip until the bound says otherwise: unreadable is neither
+    "finished" (which would read an unmoved head as a no-op round and escalate
+    a lane that may well be working) nor grounds for escalating on its own."""
+    from pr_remediation.loop import LANE_WAIT_SECONDS, tick
+
+    lanes = RaisingLanesFake(status="running")
+    deps = drive_to_remediating(tmp_path, lanes=lanes)
+    loop_id = only_loop(deps).loop_id
+    lanes.armed = True
+
+    deps.now.advance(LANE_WAIT_SECONDS - 60)
+    assert tick(deps) == 0
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    assert deps.slack.escalations == []
+
+
 def test_a_running_lane_inside_the_bound_is_left_alone(tmp_path):
     """The bound must not cut a lane that is simply taking a while: it is
     dispatched with --max-retries 1, so kanban may legitimately run the work
