@@ -3893,6 +3893,117 @@ def test_an_admitted_repost_is_left_alone(tmp_path):
     assert only_loop(deps).state is LoopState.REREVIEW_POSTED
 
 
+# --- and the same route arriving at a loop already waiting -----------------
+#
+# `_repost` is not only a way *into* `rereview_posted`: a system-origin
+# REVIEW_INCOMPLETE arriving at a loop already parked there takes the self-edge,
+# and the transition it writes is byte-identical to the one the guard's own
+# re-send writes. Read as a continuation, the wait stays pinned to the request
+# whose verdict prompted the re-send -- which is admitted by construction -- so
+# `request_exists` answers True forever and the guard never fires once. Live
+# boris_intake: 14 of 71 completed reviews are system-origin incompletes, so
+# this is a fifth of the traffic, not a corner.
+
+
+def drive_to_a_repost_inside_a_wait(tmp_path):
+    """A lane's wait interrupted by a system-origin incomplete.
+
+    Round one ran, pushed, and had its re-review admitted; the review came back
+    REVIEW_INCOMPLETE with a system origin, so `_repost` sends a fresh request
+    into a loop that is already in `rereview_posted`. Nothing about the head
+    can tell the two waits apart -- this route moves no head -- and the request
+    that produced this very verdict is sitting at it.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    started = deps.store.get(loop_id).updated_at
+    deps.source.admitted_at = started + 1  # the gate took the lane's request
+    deps.now.advance(20 * 60)
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40,
+                                    outcome="REVIEW_INCOMPLETE",
+                                    origin="system")]
+    assert tick(deps) == 1
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.REREVIEW_POSTED, "the self-edge"
+    assert loop.round_count == 1, "and no round spent"
+    assert loop.head_sha == "b" * 40, "and no head moved"
+    assert deps.slack.repost_retries == ["Ylopo/example#42"]
+    deps.source.verdicts = []
+    return deps
+
+
+def test_a_repost_into_a_waiting_loop_starts_a_new_wait(tmp_path):
+    """The request `_repost` just sent is the one outstanding now, and the
+    admitted one it replaced answers for nothing. Asked about the old wait,
+    boris_intake says "already admitted" -- from the very request whose verdict
+    this re-send is reacting to -- and the guard goes inert on the route that
+    produces a fifth of live verdicts, which is the strand this whole guard
+    exists to end, rebuilt one door along."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_a_repost_inside_a_wait(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 1
+    assert reposts(deps, loop_id) == [{"attempt": 1}]
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+
+
+def test_a_repost_into_a_waiting_loop_resends_its_own_message(tmp_path):
+    """And it re-sends as what it is. The wait now open was opened by
+    `_repost`, which pushed nothing and spent no round, so `post_rereview`'s
+    "Round 1 of 3 -- remediation pushed" would claim the earlier round's work
+    for a request that has nothing to do with it."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_a_repost_inside_a_wait(tmp_path)
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 1
+    assert deps.slack.repost_retries == ["Ylopo/example#42"] * 2, \
+        "the message this wait can truthfully carry, re-sent"
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "the lane's own post, and no second claim of a push"
+
+
+def test_a_repost_into_a_waiting_loop_brings_its_own_budget(tmp_path):
+    """A new request outstanding is a new thing to be patient about. Inheriting
+    the interrupted wait's count would hand this one whatever the last one left
+    -- nothing at all, if that one had spent its twelve -- and escalation is
+    absorbing, so the pull request would be stranded on the first blip."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    started = deps.store.get(loop_id).updated_at
+    deps.source.admitted = False
+    spend_reposts(deps, loop_id, 11)
+
+    # The gate took one of those after all, and the review it produced came
+    # back a system-origin incomplete: a fresh request goes out.
+    deps.source.admitted_at = started + 1
+    deps.source.verdicts = [verdict(rid="br_2", head="b" * 40,
+                                    outcome="REVIEW_INCOMPLETE",
+                                    origin="system")]
+    assert tick(deps) == 1
+    deps.source.verdicts = []
+
+    # ...and the gate rejects that one. The new wait gets the whole budget.
+    deps.source.admitted_at = None
+    deps.source.admitted = False
+    for _ in range(20):
+        deps.now.advance(10 * 60)
+        tick(deps)
+        if deps.store.get(loop_id).state is LoopState.ESCALATED:
+            break
+    numbered = [d["attempt"] for d in reposts(deps, loop_id)]
+    assert numbered[11:] == list(range(1, 13)), \
+        "the second wait counts from one and gets all twelve attempts"
+
+
 def test_an_escalation_already_owed_outranks_the_repost(tmp_path):
     """Ordering, and not an arbitrary one: a stopped loop's escalation debt
     is a write already owed to a human, and it must still take precedence

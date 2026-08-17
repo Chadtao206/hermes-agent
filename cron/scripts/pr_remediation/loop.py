@@ -434,11 +434,33 @@ EVENT_REREVIEW_REPOSTED = "rereview_reposted"
 # `_repost`'s can even be written inside one of these episodes, by a
 # system-origin verdict arriving mid-wait -- and one literal serving as both
 # would let an unrelated failure spend this loop's retries. Written directly
-# rather than through `_note_standing`, because each attempt must stay
-# individually countable; the dedup would keep the first and swallow the rest,
-# which is how the failure became invisible in the first place. It cannot grow
+# rather than through `_note_standing`, because each attempt is a fact of its
+# own and must stay individually countable. The dedup would not in fact swallow
+# these today -- the detail carries a rising `attempt`, so `_repeats_last_note`
+# never matches -- but that is a coincidence of the payload, not a property of
+# the ledger: the day this detail stops varying, the dedup would silently keep
+# the first refusal and drop the rest, and the unbounded retry this kind exists
+# to bound would be back with nothing in the trail to show it. It cannot grow
 # without end: REREVIEW_REPOST_ATTEMPTS bounds it at twelve.
 EVENT_REREVIEW_REPOST_FAILED = "rereview_repost_failed"
+# One re-review request sent by `_repost` -- the system-origin REVIEW_INCOMPLETE
+# route, which spends no round and moves no head. Written when that send lands,
+# and it is what tells `_rereview_episode` that a *new* request is outstanding.
+#
+# It exists because that route can reach `rereview_posted` from
+# `rereview_posted`: a system-origin incomplete arriving at a loop already
+# waiting takes the self-edge, and the transition it writes is byte-identical to
+# the one the acknowledgement guard's own re-send writes ({'from':
+# 'rereview_posted', 'to': 'rereview_posted'}). Told apart by the transitions
+# alone they cannot be, and reading this one as a continuation is what left the
+# guard inert on a fifth of live reviews: the episode stayed pinned to the
+# previous request, so `request_exists` answered "already admitted" from the very
+# request whose verdict this re-send is reacting to, and the guard returned None
+# forever. A marker rather than trail adjacency (a self-edge with no
+# `rereview_reposted` immediately before it) because adjacency is an accident of
+# what nothing else happens to write in between; this says the thing directly and
+# survives anything later inserted into the trail.
+EVENT_REPOST_REREVIEW_SENT = "repost_rereview_sent"
 # Written by store.transition() itself, and only when the swap landed.
 EVENT_TRANSITION = "transition"
 
@@ -550,11 +572,13 @@ class Route:
 class RereviewEpisode:
     """One stretch of waiting for a single outstanding re-review request.
 
-    An episode opens when the loop enters `rereview_posted` from somewhere else
-    and ends when it leaves for somewhere else -- a verdict arriving, a round
-    opening, an escalation. The self-edge a re-post takes stays *inside* it: the
-    same request is still outstanding, merely sent again, and the retry budget
-    is what bounds that sending.
+    An episode opens when a request goes out with nothing outstanding behind it
+    -- the loop entering `rereview_posted` from somewhere else, or `_repost`
+    sending a fresh request into a loop already parked here -- and ends when the
+    loop leaves for somewhere else: a verdict arriving, a round opening, an
+    escalation. The self-edge the acknowledgement guard's own re-send takes
+    stays *inside* it: the same request is still outstanding, merely sent again,
+    and the retry budget is what bounds that sending.
 
     Named because both questions the acknowledgement guard asks are questions
     about an episode, and answering either one about the whole loop is wrong in
@@ -1076,6 +1100,17 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
     """A system-origin incomplete is Boris failing, not the PR failing.
 
     Retrying the review costs no remediation round: nothing was remediated.
+
+    The send is marked on the trail (EVENT_REPOST_REREVIEW_SENT) because this
+    route can be taken by a loop already sitting in `rereview_posted`, and then
+    the transition below is a self-edge indistinguishable from the one the
+    acknowledgement guard's own re-send takes. The marker is what makes the
+    request this route just sent a new wait rather than a continuation of the
+    one it interrupted -- see `_rereview_episode`. Written before the swap and
+    not after it, because the fact it records is the *post*, which has already
+    landed by this line: a swap lost to a lapsed lease leaves the row where it
+    was, but the request is out there either way and the guard must be waiting
+    on that one, not on its predecessor.
     """
     # root_thread_ts, deliberately -- NOT the reaction anchor
     # (status_message_ts). SlackIO's gate admits a re-review only as a reply
@@ -1094,6 +1129,8 @@ def _repost(deps: LoopDeps, loop: LoopRequest, verdict: Verdict) -> bool:
         deps.store.record_note(loop.loop_id, "rereview_post_failed",
                                {"round": loop.round_count + 1}, deps.now())
         return False
+    deps.store.record_note(loop.loop_id, EVENT_REPOST_REREVIEW_SENT,
+                           {"round": loop.round_count}, deps.now())
     return _transition(deps, loop, LoopState.REREVIEW_POSTED)
 
 
@@ -1659,17 +1696,33 @@ def _rereview_episode(deps: LoopDeps, loop: LoopRequest) -> RereviewEpisode:
     REREVIEW_REPOST_ATTEMPTS exists to prevent. Nor is the number of episodes
     bounded by `round_cap`: `_repost` re-enters this state spending no round.
 
-    The self-edge deliberately does NOT reset it. A re-post re-arms the wait
-    without ending it -- the same request is still the one outstanding -- and
-    resetting there would zero the budget on every attempt, making escalation
-    unreachable. That is the same permanent silence read from the other end.
+    The guard's *own* self-edge deliberately does NOT reset it. A re-post
+    re-arms the wait without ending it -- the same request is still the one
+    outstanding -- and resetting there would zero the budget on every attempt,
+    making escalation unreachable. That is the same permanent silence read from
+    the other end.
 
-    `origin` comes off the opening transition itself rather than a new column:
-    `_lane_pushed` is the only route that records the head its lane pushed on
-    this edge, and `_repost`, which moves no head, writes none. A row with no
-    such transition on record at all -- hand-edited, or older than this trail
-    -- falls back to `updated_at` for when the wait began and to the message
-    that claims the less of the two, since nothing here can evidence a push.
+    `_repost`'s self-edge is the other thing entirely, and telling the two apart
+    is what EVENT_REPOST_REREVIEW_SENT is for. A system-origin incomplete
+    arriving at a loop already parked here sends a *new* request and leaves the
+    old one moot -- so that is a new wait, with its own budget, its own deadline
+    and its own message, and the transition it writes is byte-identical to the
+    guard's. Read as a continuation instead, the episode stayed pinned to the
+    previous request and `request_exists` answered "already admitted" from the
+    very request whose verdict prompted the re-send: the guard then never fired
+    once, on the route that produces a fifth of live verdicts. This is not the
+    self-edge reset above wearing a different hat -- a marker is written only
+    where a genuinely new request went out, and only a completed review can
+    prompt one, so no amount of re-sending by the guard itself can refresh a
+    budget it is spending.
+
+    `origin` otherwise comes off the opening transition itself rather than a new
+    column: `_lane_pushed` is the only route that records the head its lane
+    pushed on this edge, and `_repost`, which moves no head, writes none. A row
+    with no such transition on record at all -- hand-edited, or older than this
+    trail -- falls back to `updated_at` for when the wait began and to the
+    message that claims the less of the two, since nothing here can evidence a
+    push.
     """
     posted = LoopState.REREVIEW_POSTED.value
     started_at, origin, attempts = loop.updated_at, ROUTE_REPOST_REREVIEW, 0
@@ -1677,6 +1730,12 @@ def _rereview_episode(deps: LoopDeps, loop: LoopRequest) -> RereviewEpisode:
         kind, detail = event["kind"], event["detail"]
         if kind in (EVENT_REREVIEW_REPOSTED, EVENT_REREVIEW_REPOST_FAILED):
             attempts += 1
+        elif kind == EVENT_REPOST_REREVIEW_SENT:
+            # A new request, whether or not the swap that follows it is a
+            # self-edge. On the way in from anywhere else the transition below
+            # says the same thing at the same instant, so this is simply the
+            # opener that also works when the loop was already here.
+            started_at, origin, attempts = event["at"], ROUTE_REPOST_REREVIEW, 0
         elif kind == EVENT_TRANSITION and detail.get("to") == posted \
                 and detail.get("from") != posted:
             started_at, attempts = event["at"], 0
