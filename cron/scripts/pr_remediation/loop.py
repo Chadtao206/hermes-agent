@@ -168,11 +168,19 @@ problem.
 The hold label is read before any of that is acted on, because all of it
 writes -- a reaction removed, a re-review posted, an escalation notice, the
 ownership label handed back. `has_hold` fails closed, so a GitHub this pass
-cannot read is a hold and the pass writes nothing at all. The escalation
-retry is the one due-pass route that does not read it, and deliberately: what
-it does is notify a human and (`lane_timeout` against a lane not confirmed
-finished excepted -- see below) stand down the signals this loop itself
-added, which is what a hold wants to happen anyway.
+cannot read is a hold and the pass writes nothing at all. Four due-pass routes
+write without it, all deliberately and three for one reason: what the
+escalation retry, the `lane_timeout` escalation and the acknowledgement
+guard's deadline escalation do is notify a human and (`lane_timeout` against a
+lane not confirmed finished excepted -- see below) stand down the signals this
+loop itself added, which is what a hold wants to happen anyway. Two of them
+could not read it in any case -- a `lane_timeout` fires on the branch where
+the kanban poll was the only read taken, and the deadline fires on the branch
+where the gate says a review is already live. The fourth is `still_running`,
+which posts one progress line into the review thread and touches neither the
+pull request nor the loop's state. The re-review re-post is *not* among them
+any more: it writes to the pull request through boris_intake's gate, which has
+no hold check of its own, so it reads the label itself (`_route_rereview_ack`).
 
 A loop that closes while its lane is still running is the one thing neither
 pass can repair. Terminal states are absorbing and unclaimable, so that lane
@@ -678,6 +686,26 @@ def _observe(deps: LoopDeps, verdict: Verdict) -> PrFacts:
                                               verdict.pr_number),
                    author=deps.github.author(verdict.owner, verdict.repo,
                                              verdict.pr_number))
+
+
+def _observe_pr(deps: LoopDeps, loop: LoopRequest) -> PrFacts:
+    """Read the hold label and the pull request's state for a loop we hold.
+
+    `_observe`'s counterpart for a pass with no verdict in hand, and one field
+    shorter on purpose: the author is a question only the verdict path asks (a
+    pull request that changed hands between two rounds is escalated there, once)
+    and every accessor on `GitHubIO` costs its own `gh pr view` subprocess. So
+    `author` stays None here, which `PrFacts` already documents as "not asked
+    for", and no caller of this reads it.
+
+    Taken only on the tick that is about to write, never on the ordinary tick
+    that finds nothing owed -- see `_route_rereview_ack`, its one caller.
+    """
+    if deps.github.has_hold(loop.owner, loop.repo, loop.pr_number):
+        return PrFacts(held=True, author=None)
+    return PrFacts(held=False, author=None,
+                   pr_state=deps.github.state(loop.owner, loop.repo,
+                                              loop.pr_number))
 
 
 def _observe_lane(deps: LoopDeps, loop: LoopRequest) -> LaneFacts | None:
@@ -1804,7 +1832,8 @@ def _rereview_episode(deps: LoopDeps, loop: LoopRequest) -> RereviewEpisode:
     return RereviewEpisode(started_at, origin, attempts)
 
 
-def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
+def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest,
+                        observes: bool) -> Route | None:
     """Did the re-review request this loop posted ever reach boris_intake?
 
     `rereview_posted` is left only by an arriving verdict, and the verdict comes
@@ -1815,10 +1844,22 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     one afternoon: nothing recorded, no alarm, and no rescue from pr_discovery
     either, which treats this loop's own ownership label as a kill switch.
 
-    The check is a local sqlite read, like the trail replays above it in
-    `_route_due` and unlike the lane and GitHub reads below -- which is why it
-    sits where it does and needs no `_observes` gate of its own. It decides and
+    The admission check is a local sqlite read, like the trail replays above it
+    in `_route_due` and unlike the GitHub read below -- which is why it sits
+    where it does and needs no `_observes` gate of its own. It decides and
     performs nothing; `_perform` re-posts and `_rehearse` records.
+
+    This is the one routing function that reads GitHub itself rather than being
+    handed facts, and that is not a hole in the discipline the rest of the
+    module keeps -- it is what that discipline costs here. Everywhere else,
+    *whether* to read is a question about the operating mode alone, so the read
+    hoists cleanly out to `_observe`/`_observe_lane`. Here it is a question
+    about the two answers below as well: on the ordinary tick this route owes
+    nothing, and a read hoisted above them would spend a `gh pr view` per open
+    `rereview_posted` loop per tick to learn that. So the read stays where the
+    write is, `observes` carries the mode's answer in from `_settle_due` (the
+    routing still never asks the mode itself), and an `off` tick reads nothing
+    from GitHub exactly as it reads no lane.
 
     The question asked is "has a request been admitted since this episode
     began", not "does a request exist at this head" -- see `_rereview_episode`
@@ -1831,18 +1872,26 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     production does today. On `_lane_pushed`'s route it changes nothing
     observable, the head being new.
 
-    The grace window is asked before the read on purpose: it is a comparison of
-    two numbers already in hand, the read is a database this process does not
-    own, and inside the window the answer changes nothing. So the ordinary case
-    -- a loop waiting out its window, and a loop admitted and simply waiting for
-    its verdict -- costs no read at all.
+    The three reads are ordered by what they cost and by how often they can
+    change the answer. The grace window first: two numbers already in hand, and
+    inside it nothing else matters. Then the admission read, a database this
+    process does not own but a local one. Then -- only on the branch that is
+    about to post -- GitHub, the read that costs a subprocess and can only ever
+    be spent on the write path. So the ordinary case, a loop waiting out its
+    window or admitted and simply waiting for its verdict, costs nothing but a
+    comparison and at most one sqlite query.
 
     What the read comes back with then decides which bound applies, because the
     two bounds here answer different questions and each is wrong for the other's
     case:
 
     False -- the gate never admitted this request, so nobody is reviewing
-    anything and the re-post budget governs. Twelve attempts a window apart
+    anything and the re-post budget governs. This is the branch that writes, so
+    it is the branch that reads GitHub: a hold stops it (Chad has taken the pull
+    request back, and boris_intake's own gate has no hold check to stop the
+    review this post would start), and a pull request that is no longer open
+    closes the loop `stale` instead of spending twelve rejected retries and
+    escalating over somebody's own merge. Twelve attempts a window apart
     already bounds this at 130 minutes, counted from the first tick that finds
     it, so the absolute deadline is deliberately NOT consulted: measured from
     when the wait began, it would escalate every loop already older than four
@@ -1890,8 +1939,36 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     admitted = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
                                           loop.head_sha, episode.started_at)
     if admitted is False:
-        # The gate never took it, so the budget governs and this path returns
-        # ahead of the deadline below rather than being bounded by it -- see
+        # The gate never took it, so this pass is about to write -- and every
+        # other writing route in this module reads GitHub first. This one is
+        # where that read has to live rather than in `_observe_lane` with the
+        # others, because *whether* it is owed is a question only the two
+        # answers above can settle, and taking it up there would spend a `gh pr
+        # view` per open loop per tick on the loops that owe nothing at all.
+        # None means the tick looked at nothing (`off`), which is not a hold
+        # Chad did not put there and not a pull request GitHub called merged.
+        facts = _observe_pr(deps, loop) if observes else None
+        if facts is None:
+            return Route(ROUTE_UNOBSERVED, {"mode": deps.cfg.mode}, standing=True)
+        if facts.held:
+            # Chad's kill switch, and the fail-closed answer when GitHub cannot
+            # be read at all. Without it a held pull request still got its
+            # re-review re-posted, boris_intake's own gate has no hold check,
+            # and a full review then published a GitHub review on a pull request
+            # Chad had explicitly taken back.
+            return Route(ROUTE_HELD, {"label": deps.cfg.hold_label},
+                         standing=True)
+        if _not_open(facts.pr_state):
+            # Chad merging while Boris re-reviews is the ordinary ending, and
+            # the gate rejects every re-post for a pull request that is no
+            # longer open -- so without this the loop spent all twelve retries
+            # over two hours and escalated as `rereview_unacknowledged`, paging
+            # the person who merged it about their own merge and sending them
+            # to the intake gate's admission log to find out why.
+            return Route(ROUTE_CLOSE_STALE, {"pr_state": facts.pr_state},
+                         standing=True)
+        # The budget governs this path, and it returns ahead of the deadline
+        # below rather than being bounded by it -- see
         # REREVIEW_ABSOLUTE_DEADLINE_SECONDS.
         if episode.attempts >= REREVIEW_REPOST_ATTEMPTS:
             return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
@@ -1911,8 +1988,8 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     return None
 
 
-def _route_due(deps: LoopDeps, loop: LoopRequest,
-               lane: LaneFacts | None) -> Route | None:
+def _route_due(deps: LoopDeps, loop: LoopRequest, lane: LaneFacts | None,
+               observes: bool) -> Route | None:
     """Decide what a live tick owes a loop no verdict is going to arrive for.
 
     `_route`'s counterpart for the due pass, under the same discipline: it
@@ -1920,6 +1997,11 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
     `lane`, already read, for the reason `_route` takes `facts` that way --
     whether to read at all is a question about the operating mode, and `None`
     is both "this loop waits on no lane" and "this tick looked at nothing".
+
+    `observes` carries the same mode answer for the one read this pass cannot
+    hoist, the acknowledgement guard's -- see `_route_rereview_ack`. It is the
+    answer `_observes` already gave in `_settle_due`, passed down rather than
+    asked again, so the routing still never consults `cfg.mode` itself.
 
     None means the loop owes nothing, which is the ordinary case and is
     deliberately silent: this pass revisits every unsettled loop on every tick,
@@ -1962,7 +2044,7 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
         # stopped loop's escalation debt outranks a request there is no longer
         # anyone waiting on, and a lost lane-recording write must be settled
         # before a route that moves the row.
-        return _route_rereview_ack(deps, loop)
+        return _route_rereview_ack(deps, loop, observes)
 
     if lane is None:
         # This loop waits on no lane at all, so there is nothing to decide and
@@ -2314,7 +2396,8 @@ def _settle_due(deps: LoopDeps, driven: set[str]) -> int:
                              "leaving it to whoever holds it now", loop.loop_id)
                 continue
             route = _route_due(deps, loop,
-                               _observe_lane(deps, loop) if observes else None)
+                               _observe_lane(deps, loop) if observes else None,
+                               observes)
             if route is None:
                 continue
             if consume(deps, loop, _verdict_for(loop), route):

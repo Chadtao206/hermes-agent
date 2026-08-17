@@ -1076,7 +1076,13 @@ def test_a_paused_due_pass_settles_nothing_a_live_run_left_owing(tmp_path, mode)
 
 
 class ReadRecordingGitHub(GitHubFake):
-    """A GitHub that remembers being asked. `off` must ask it nothing."""
+    """A GitHub that remembers being asked. `off` must ask it nothing.
+
+    Every accessor the loop calls is recorded, `state` included: each one is
+    its own `gh pr view` subprocess (GitHubIO._view is not memoised, on
+    purpose), so a read this fake forgot to record is a read no test can see
+    arriving on a path that must not take it.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1089,6 +1095,10 @@ class ReadRecordingGitHub(GitHubFake):
     def author(self, o, r, p):
         self.reads.append(("author", p))
         return super().author(o, r, p)
+
+    def state(self, o, r, p):
+        self.reads.append(("state", p))
+        return super().state(o, r, p)
 
     def has_hold(self, o, r, p):
         self.reads.append(("has_hold", p))
@@ -1122,7 +1132,7 @@ def test_the_off_switch_reads_no_github_at_all(tmp_path):
     shadow.source.verdicts = [verdict(rid="br_2")]
     shadow.now.advance()
     assert tick(shadow) == 0
-    assert github.reads == [("has_hold", 42), ("author", 42)], \
+    assert github.reads == [("has_hold", 42), ("state", 42), ("author", 42)], \
         "shadow rehearses the live decision, so shadow reads"
 
 
@@ -2743,7 +2753,7 @@ def test_the_off_switch_polls_no_lane_and_reads_no_github(tmp_path):
     shadow.now.advance()
     assert tick(shadow) == 0
     assert lanes.polled == ["t_1"], "shadow rehearses the live decision, so it reads"
-    assert github.reads == [("has_hold", 42), ("head_sha", 42)]
+    assert github.reads == [("has_hold", 42), ("state", 42), ("head_sha", 42)]
 
 
 def test_a_lane_still_running_when_the_loop_closes_is_recorded(tmp_path):
@@ -3622,6 +3632,120 @@ def test_an_unreadable_intake_database_says_so_once(tmp_path):
         "one sentence for the outage, naming the head it could not ask about"
 
 
+def test_a_held_pr_is_never_re_reviewed_by_the_acknowledgement_guard(tmp_path):
+    """Chad's kill switch reaches this route too.
+
+    `hermes-hold` says a pull request has been taken back, and this is the one
+    place the loop asks boris_intake to start a whole review -- which publishes
+    a GitHub review on it. That gate has no hold check of its own (its
+    admission looks at CI state and the review identity, nothing else), so if
+    this route does not read the label nothing downstream will. `has_hold`
+    fails closed, so a GitHub this pass cannot read lands here as well.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False  # the gate rejected the post
+    loop_id = only_loop(deps).loop_id
+    deps.github.hold = True
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 0
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "the original post and no other: Chad has taken this PR back"
+    assert only_loop(deps).state is LoopState.REREVIEW_POSTED
+    assert reposts(deps, loop_id) == [], "a held PR spends none of the budget"
+    assert "held" in kinds(deps, loop_id)
+
+
+def test_a_merged_pr_waiting_on_a_rejected_repost_is_closed_stale(tmp_path):
+    """Chad merging while Boris re-reviews is the ordinary ending, not an
+    incident -- and the gate rejects every post for a pull request that is no
+    longer open (`pr_not_open`).
+
+    Without the state read this loop spent all twelve retries against that
+    rejection, two hours of them, and then escalated as
+    `rereview_unacknowledged`: a page about somebody's own merge, carrying the
+    one reason that sends them to the intake gate's admission log to find out
+    why. `_close_stale` exists precisely so that ending is silent.
+    """
+    from pr_remediation.loop import REREVIEW_REPOST_ATTEMPTS, tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    loop_id = only_loop(deps).loop_id
+    deps.github.pr_state = "MERGED"
+
+    for _ in range(REREVIEW_REPOST_ATTEMPTS + 2):
+        deps.now.advance(10 * 60)
+        tick(deps)
+
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.STALE
+    assert loop.escalation_reason == "pr_not_open"
+    assert deps.slack.escalations == [], "nobody is paged about their own merge"
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "and no re-review is asked for on a branch nobody can push to"
+    assert deps.github.released == [("Ylopo", "example", 42)], \
+        "the ownership label still comes off"
+
+
+def test_the_acknowledgement_guard_reads_github_only_when_it_would_post(tmp_path):
+    """Three reads, ordered by cost, and each one able to end the tick.
+
+    The grace window is two numbers already in hand; the admission check is a
+    local sqlite query; the GitHub read is a `gh pr view` subprocess, and this
+    route is reached on every tick for every `rereview_posted` loop -- including
+    every loop that is admitted and simply waiting for its verdict. Taking that
+    read any earlier spends a subprocess per loop per tick to learn there is
+    nothing to do.
+    """
+    from pr_remediation.loop import tick
+
+    github = ReadRecordingGitHub()
+    deps = drive_to_rereview_posted(tmp_path, github=github)
+    github.reads.clear()
+
+    for _ in range(19):  # inside the grace window
+        deps.now.advance(30.0)
+        assert tick(deps) == 0
+    assert github.reads == [], "nothing inside the window is worth a read"
+
+    deps.now.advance(30.0)  # past it, and the gate admitted the request
+    assert tick(deps) == 0
+    assert github.reads == [], "an admitted request owes no write and no read"
+
+    deps.source.admitted = False  # now the post is owed
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
+    assert github.reads == [("has_hold", 42), ("state", 42)], \
+        "read before write, on the tick that actually writes"
+
+
+def test_the_off_switch_reads_no_github_for_the_acknowledgement_guard(tmp_path):
+    """The route grew a GitHub read, so it grew the kill switch's reach too.
+
+    `off` stops the work and not merely the writes, and it must not claim a
+    decision it never took -- an unobserved tick is recorded as exactly that,
+    the same answer `_route` gives when nothing was read.
+    """
+    from pr_remediation.loop import tick
+
+    github = ReadRecordingGitHub()
+    deps = drive_to_rereview_posted(tmp_path, github=github)
+    deps.source.admitted = False
+    loop_id = only_loop(deps).loop_id
+    github.reads.clear()
+    deps.now.advance(10 * 60)
+
+    off = in_mode(deps, "off")
+    assert tick(off) == 0
+    assert github.reads == [], "the kill switch still called GitHub"
+    assert reposts(off, loop_id) == []
+    assert [e["detail"]["would"] for e in off.store.events(loop_id)
+            if e["kind"] == "shadow_decision"] == ["unobserved"]
+
+
 def test_the_window_is_waited_out_without_reading_the_intake_database(tmp_path):
     """Two numbers already in hand versus a database this process does not
     own. Inside the window the read cannot change the answer, and this route
@@ -4311,11 +4435,14 @@ def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path, mode):
     """The kill switch, structurally: routing decides, `_consumer` picks who
     consumes, and `_rehearse` never reaches `_perform`'s branch.
 
-    `off` decides this one too, and that is not a fourth mode gate gone
-    missing: the acknowledgement check is a local sqlite read, exactly like
-    the trail replays `_route_due` already takes ahead of it in every mode.
-    What `off` stops is the *work* -- the kanban poll and the GitHub reads --
-    and none of those is reached from here. Nothing is posted either way.
+    `shadow` reaches the decision itself, because rehearsing a decision taken
+    without the facts would not be rehearsing the decision a live tick takes.
+    `off` does not, and that is not a fourth mode gate gone missing either: the
+    branch this route would take is the one that writes, so it reads GitHub
+    first (a hold, and whether the pull request is still open), and `off` stops
+    the *work* as well as the writes. What it records is what `_route` records
+    for the same reason -- an unobserved tick, never a decision it did not take.
+    Nothing is posted in either mode.
 
     Ticked twice, because a pause is not one tick: this decision is retaken
     unchanged on every one of them, and a route that forgot to mark itself
@@ -4339,8 +4466,10 @@ def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path, mode):
     assert reposts(paused, loop_id) == [], "a pause spends none of the budget"
     decisions = [e["detail"] for e in paused.store.events(loop_id)
                  if e["kind"] == "shadow_decision"]
-    assert decisions == [{"would": "rereview_unacknowledged", "attempt": 1,
-                          "origin": "lane_pushed"}], \
+    expected = ({"would": "rereview_unacknowledged", "attempt": 1,
+                 "origin": "lane_pushed"} if mode == "shadow"
+                else {"would": "unobserved", "mode": "off"})
+    assert decisions == [expected], \
         "one sentence for a decision that is retaken every tick"
 
 
@@ -4351,6 +4480,10 @@ def test_a_paused_tick_at_the_attempt_bound_records_the_escalation_once(tmp_path
     A loop that has spent its budget re-decides `escalate` on every tick until
     something settles it, and in a paused mode nothing ever will -- so this is
     the route where a missing `standing` costs the most.
+
+    `off` stops short of the decision, as it does for the re-post above and for
+    the same reason: this branch reads GitHub before it writes, and the hard
+    kill switch reads nothing.
     """
     from pr_remediation.loop import tick
 
@@ -4371,7 +4504,9 @@ def test_a_paused_tick_at_the_attempt_bound_records_the_escalation_once(tmp_path
     decisions = [e["detail"] for e in paused.store.events(loop_id)
                  if e["kind"] == "shadow_decision"]
     assert decisions == [{"would": "escalate",
-                          "reason": "rereview_unacknowledged"}]
+                          "reason": "rereview_unacknowledged"}
+                         if mode == "shadow"
+                         else {"would": "unobserved", "mode": "off"}]
 
 
 @pytest.mark.parametrize("mode", ["shadow", "off"])
