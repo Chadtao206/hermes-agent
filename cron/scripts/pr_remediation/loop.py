@@ -399,10 +399,26 @@ EVENT_LANE_ABANDONED = "lane_abandoned"
 # One re-review request re-sent because boris_intake never showed a request for
 # the one already posted. The trail is the ledger here for the same reason it
 # is for the escalation debt and the head-read budget: the row has no column
-# for it, and counting these is what bounds the retry -- so only a landed post
-# writes one, and only a live tick can (a paused tick's decisions go to
-# `_shadow` under a different kind, so a pause spends none of this budget).
+# for it, and counting these is what bounds the retry -- so only a live tick
+# writes one (a paused tick's decisions go to `_shadow` under a different kind,
+# so a pause spends none of this budget).
 EVENT_REREVIEW_REPOSTED = "rereview_reposted"
+# One such re-send Slack refused. Counted against the same budget as a landed
+# one, because a budget that only advances on success is no budget at all: a
+# Slack that refuses forever left the route deciding and performing nothing,
+# once every fifteen seconds, indefinitely -- the exact silent stall this
+# route exists to end, rebuilt inside it.
+#
+# Its own kind, deliberately, and NOT `_lane_pushed`'s and `_repost`'s
+# `rereview_post_failed`. Those two read alike but belong to other budgets --
+# `_repost`'s can even be written inside one of these episodes, by a
+# system-origin verdict arriving mid-wait -- and one literal serving as both
+# would let an unrelated failure spend this loop's retries. Written directly
+# rather than through `_note_standing`, because each attempt must stay
+# individually countable; the dedup would keep the first and swallow the rest,
+# which is how the failure became invisible in the first place. It cannot grow
+# without end: REREVIEW_REPOST_ATTEMPTS bounds it at twelve.
+EVENT_REREVIEW_REPOST_FAILED = "rereview_repost_failed"
 # Written by store.transition() itself, and only when the swap landed.
 EVENT_TRANSITION = "transition"
 
@@ -1104,9 +1120,10 @@ def _repost_unacknowledged(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     arrived, it does not start a new round. `round_count` is unchanged.
 
     Posted before the row is moved on, the ordering `_lane_pushed` uses and for
-    the same reason: a post that failed leaves the loop exactly where it was and
-    immediately due, so the next tick tries again rather than re-arming a window
-    for a request nobody received and spending an attempt on nothing.
+    the same reason: a row moved ahead of a post that never landed would say a
+    request is outstanding when none is, and re-arm a wait for it. So a refused
+    post leaves the loop exactly where it was -- but it does spend an attempt,
+    and it does wait out a window before the next one, both below.
 
     The self-edge into REREVIEW_POSTED is what re-arms that window -- the wait
     is measured from `updated_at`, and only a real transition moves it (see
@@ -1136,13 +1153,24 @@ def _repost_unacknowledged(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
               if origin == ROUTE_LANE_PUSHED
               else deps.slack.repost_rereview(verdict, loop.root_thread_ts))
     if landed is None:
-        # Standing, like `_lane_pushed`'s: the due pass rediscovers this on
-        # every tick for as long as Slack keeps refusing, and the detail is
-        # stable across those ticks (the attempt only moves when a post lands),
-        # so the dedup holds. `attempt` is carried all the same -- it is what
-        # distinguishes this failure from the original post's in the trail.
-        _note_standing(deps, loop, "rereview_post_failed",
-                       {"round": loop.round_count, "attempt": attempt})
+        # Recorded directly and NOT through `_note_standing`, which is what
+        # `_lane_pushed`'s sibling failure uses: this attempt has to stay
+        # individually countable, because it is one of the twelve. Under the
+        # dedup the first refusal was recorded and every later one silently
+        # swallowed, so a Slack that refused forever produced one sentence and
+        # an unbounded retry.
+        deps.store.record_note(loop.loop_id, EVENT_REREVIEW_REPOST_FAILED,
+                               {"round": loop.round_count, "attempt": attempt},
+                               deps.now())
+        # And waited on, rather than retried on the next tick. The loop stays
+        # where it is -- the row must not claim a request is outstanding when
+        # none is -- so `updated_at` does not move and the routing window
+        # cannot do this waiting; the due time is what is pushed out instead.
+        # `defer` is monotone, so the pass's own backoff cannot cut it short.
+        # A defer that fails costs this wait and nothing more: the attempt is
+        # already on record above, so the bound still closes.
+        deps.store.defer(loop.loop_id, now=deps.now(),
+                         not_before=deps.now() + REREVIEW_ACK_GRACE_SECONDS)
         return False
     deps.store.record_note(loop.loop_id, EVENT_REREVIEW_REPOSTED,
                            {"attempt": attempt}, deps.now())
@@ -1586,6 +1614,11 @@ def _rereview_episode(deps: LoopDeps, loop: LoopRequest) -> RereviewEpisode:
     decisions are recorded by `_shadow` under `shadow_decision` and never as
     these kinds.
 
+    An attempt is an attempt, landed or refused: a budget that only advanced on
+    a landed post never advanced at all while Slack was refusing, so the one
+    failure mode with no way out -- a post that can never land -- was the one
+    the bound did not cover.
+
     Scoped to the episode, exactly as `_head_read_attempts` is scoped to the
     lane's trailing run, and for the same reason: a budget that is never reset
     is spent for good. A head that moves ends this *wait* -- moving it takes a
@@ -1614,7 +1647,7 @@ def _rereview_episode(deps: LoopDeps, loop: LoopRequest) -> RereviewEpisode:
     started_at, origin, attempts = loop.updated_at, ROUTE_REPOST_REREVIEW, 0
     for event in deps.store.events(loop.loop_id):
         kind, detail = event["kind"], event["detail"]
-        if kind == EVENT_REREVIEW_REPOSTED:
+        if kind in (EVENT_REREVIEW_REPOSTED, EVENT_REREVIEW_REPOST_FAILED):
             attempts += 1
         elif kind == EVENT_TRANSITION and detail.get("to") == posted \
                 and detail.get("from") != posted:
@@ -1669,7 +1702,9 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     re-sent (the self-edge is what re-arms it), and which `store.defer`
     deliberately leaves alone, so a due-pass visit does not push the deadline
     out. Deliberately NOT measured from the episode start, which does not move
-    on a re-send and would fire this route on every tick after the first.
+    on a re-send and would fire this route on every tick after the first. A
+    *refused* re-send moves neither, and waits the same interval out through
+    the due time instead -- see `_repost_unacknowledged`.
 
     At the attempt bound -- escalate rather than go on re-posting forever. The
     reason is its own (REREVIEW_UNACKNOWLEDGED) because the place to go and look

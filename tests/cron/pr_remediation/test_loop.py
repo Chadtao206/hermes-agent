@@ -3385,8 +3385,15 @@ def drive_to_rereview_posted(tmp_path, **kwargs):
 
 
 def reposts(deps, loop_id):
+    """The re-posts that actually landed."""
     return [e["detail"] for e in deps.store.events(loop_id)
             if e["kind"] == "rereview_reposted"]
+
+
+def repost_attempts(deps, loop_id):
+    """Every re-post attempt, landed or refused -- what the budget counts."""
+    return [(e["kind"], e["detail"]["attempt"]) for e in deps.store.events(loop_id)
+            if e["kind"] in ("rereview_reposted", "rereview_repost_failed")]
 
 
 def test_an_admitted_rereview_is_left_alone(tmp_path):
@@ -3520,7 +3527,7 @@ def test_a_failed_repost_leaves_the_loop_where_it_is_and_tries_again(tmp_path):
     """The same ordering `_lane_pushed` uses, for the same reason: post
     first, move the row second. A row moved ahead of a post that never
     landed would re-arm the window for a request nobody received, and the
-    attempt would be spent on nothing."""
+    row would say a request is outstanding when none is."""
     from pr_remediation.loop import tick
 
     deps = drive_to_rereview_posted(tmp_path)
@@ -3534,18 +3541,74 @@ def test_a_failed_repost_leaves_the_loop_where_it_is_and_tries_again(tmp_path):
     after = deps.store.get(loop_id)
     assert after.state is LoopState.REREVIEW_POSTED
     assert after.updated_at == before.updated_at, "the window must not re-arm"
-    assert "rereview_post_failed" in kinds(deps, loop_id)
-    assert reposts(deps, loop_id) == [], \
-        "an attempt is spent by a post that landed, not by one that failed"
+    assert reposts(deps, loop_id) == [], "nothing landed, so nothing is recorded landed"
+    assert repost_attempts(deps, loop_id) == [("rereview_repost_failed", 1)], \
+        "but the attempt is on record, individually and by number"
 
     deps.slack.post_rereview_fails = False
-    deps.now.advance(30.0)
-    assert tick(deps) == 1, "the next tick retries; it does not wait out a " \
-        "window the failed post never re-armed"
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
     # Three calls: the original, the one Slack refused, and the retry that
-    # landed -- and only the last of those spends an attempt.
+    # landed. The refused one already spent attempt 1, so this is attempt 2.
     assert len(deps.slack.reposts) == 3
-    assert reposts(deps, loop_id) == [{"attempt": 1}]
+    assert repost_attempts(deps, loop_id) == [("rereview_repost_failed", 1),
+                                              ("rereview_reposted", 2)]
+
+
+def test_a_rereview_slack_will_never_take_still_escalates(tmp_path):
+    """A route that decides and performs nothing, indefinitely, with no
+    record, is the hazard this whole task exists to remove -- and counting
+    only landed posts rebuilt it inside the fix. With `post_rereview` refused
+    forever the budget never advanced, so the loop tried once every fifteen
+    seconds until someone noticed, which nobody would: `_note_standing`'s
+    dedup left exactly one sentence in the trail for all of it.
+
+    An attempt is an attempt, landed or refused. Escalation is then reachable
+    on every path out of this state.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.slack.post_rereview_fails = True
+    loop_id = only_loop(deps).loop_id
+
+    for _ in range(40):
+        deps.now.advance(10 * 60)
+        tick(deps)
+        if deps.store.get(loop_id).state is LoopState.ESCALATED:
+            break
+
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+    assert repost_attempts(deps, loop_id) == [
+        ("rereview_repost_failed", n) for n in range(1, 13)], \
+        "twelve refusals, each on record by number -- and no thirteenth"
+
+
+def test_a_refused_repost_waits_a_window_rather_than_retrying_every_tick(tmp_path):
+    """Retrying a refused post on the very next tick is four attempts a
+    minute at a Slack that has just said no, and the trail records one of
+    them. The same window a landed post re-arms is the right wait here too:
+    six attempts an hour, each one recorded."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.slack.post_rereview_fails = True
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 0
+    assert len(deps.slack.reposts) == 2, "the original, and the one Slack refused"
+
+    for _ in range(19):
+        deps.now.advance(30.0)  # the daemon's own tick interval
+        assert tick(deps) == 0
+    assert len(deps.slack.reposts) == 2, \
+        "nineteen ticks inside the window must cost Slack nothing"
+
+    deps.now.advance(30.0)
+    tick(deps)
+    assert len(deps.slack.reposts) == 3, "and the window ending must end the wait"
 
 
 def test_a_rereview_that_never_lands_escalates_after_twelve_attempts(tmp_path):
