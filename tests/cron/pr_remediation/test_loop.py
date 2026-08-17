@@ -25,11 +25,27 @@ class Clock:
 
 
 class SourceFake:
-    def __init__(self, verdicts=()):
+    def __init__(self, verdicts=(), admitted=True):
         self.verdicts = list(verdicts)
+        # What request_exists() answers -- boris_intake's own account of
+        # whether a re-review request exists at the head asked about. True is
+        # the default because it is the ordinary case (the gate admitted the
+        # post) and the one every test that is not about the acknowledgement
+        # check assumes: an admitted request has a verdict coming, so the loop
+        # owes nothing. False is a rejected post; None is an intake database
+        # this process could not read.
+        self.admitted = admitted
+        # Every (owner, repo, pr_number, head_sha) the loop asked about, so a
+        # test can pin that it asks at its *own* head rather than at whatever
+        # head the round started from.
+        self.exists_calls = []
 
     def new_verdicts(self, limit=50):
         return tuple(self.verdicts)
+
+    def request_exists(self, owner, repo, pr_number, head_sha):
+        self.exists_calls.append((owner, repo, pr_number, head_sha))
+        return self.admitted
 
 
 class GitHubFake:
@@ -141,11 +157,16 @@ class SlackFake:
         # notify_still_running behave like a failed Slack call, mirroring
         # the real SlackIO's contract of returning None on failure.
         self.still_running_fails = False
+        # The same, for post_rereview -- and settable *after* construction on
+        # purpose, unlike `repost_ts`: the re-post tests need the loop's first
+        # post (the one `_lane_pushed` makes, which is what puts the row in
+        # `rereview_posted` at all) to succeed and only a later one to fail.
+        self.post_rereview_fails = False
 
     def post_rereview(self, verdict, thread_ts, round_number):
         self.reposts.append((verdict.slug, round_number))
         self.repost_targets.append(thread_ts)
-        return self._repost_ts
+        return None if self.post_rereview_fails else self._repost_ts
 
     def repost_rereview(self, verdict, thread_ts):
         self.repost_retries.append(verdict.slug)
@@ -3314,3 +3335,275 @@ def test_the_escalation_timeout_still_fires_at_its_own_bound_regardless(
     # label stays -- see test_a_lane_that_never_finishes_is_given_up_on_and_
     # escalated for why.
     assert deps.github.released == []
+
+
+# --- a re-review request that never reached Boris ---------------------------
+#
+# `rereview_posted` is left only by an arriving verdict, and boris_intake's
+# gate reads GitHub synchronously while admitting a message -- so during a
+# GitHub outage the gate cannot tell a failed read from a missing pull request
+# and rejects the loop's post outright (`pr_not_found`,
+# `gate_snapshot_unavailable`). Three live loops parked that way in one
+# afternoon: `_lane_pending` excludes `rereview_posted`, so `_observe_lane`
+# answered None, `_route_due` returned on `lane is None`, and every tick
+# deferred the row with nothing recorded and no alarm. pr_discovery could not
+# rescue them either -- the loop holds `hermes-owner-andrej`, which discover.py
+# treats as a kill switch.
+
+
+def drive_to_rereview_posted(tmp_path, **kwargs):
+    """A round that ran, pushed, and had its re-review posted.
+
+    Where a loop waits for the verdict that is the only thing which leaves
+    this state -- and where, if the gate never admitted that post, it waits
+    for good. Driven through the real path (`_lane_pushed`) rather than a
+    hand-written row, so the head the loop carries is the one its lane pushed
+    and not the one the round started from: the acknowledgement check asks
+    about the former, and a fixture that let the two be the same literal
+    could not tell them apart.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"),
+                                **kwargs)
+    deps.github.head = "b" * 40  # the lane pushed
+    assert tick(deps) == 1
+    loop = only_loop(deps)
+    assert loop.state is LoopState.REREVIEW_POSTED
+    assert loop.head_sha == "b" * 40
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    return deps
+
+
+def reposts(deps, loop_id):
+    return [e["detail"] for e in deps.store.events(loop_id)
+            if e["kind"] == "rereview_reposted"]
+
+
+def test_an_admitted_rereview_is_left_alone(tmp_path):
+    """The verdict is coming, so there is nothing owed and nothing to say --
+    however long it takes. Deleting the `admitted is True` branch would
+    re-post on top of a live review the moment the window elapsed, which is
+    a duplicate review and a second lane's worth of noise in the thread."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)  # SourceFake admits by default
+    deps.now.advance(3 * 60 * 60)
+    assert tick(deps) == 0
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "one post, the original -- a review already exists at this head"
+    assert only_loop(deps).state is LoopState.REREVIEW_POSTED
+
+
+def test_a_rereview_the_gate_never_admitted_is_posted_again(tmp_path):
+    """The three stranded loops, recovered."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False  # the gate rejected it: pr_not_found
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 1
+    assert deps.slack.reposts == [("Ylopo/example#42", 1),
+                                  ("Ylopo/example#42", 1)]
+    assert reposts(deps, loop_id) == [{"attempt": 1}]
+    loop = deps.store.get(loop_id)
+    assert loop.state is LoopState.REREVIEW_POSTED, \
+        "the self-edge re-arms the window; it does not start a new round"
+    assert loop.round_count == 1, "a lost post is not a spent round"
+    assert deps.lanes.created == [("Ylopo/example#42", 1)], \
+        "re-sending a request must not dispatch a second remediation lane"
+
+
+def test_the_acknowledgement_is_checked_at_the_loops_own_head(tmp_path):
+    """`b`, the head the lane pushed and the re-review was posted for -- not
+    `a`, the head the round started from. A stale request at the previous
+    head is exactly what a round leaves behind, and reading one as this
+    request's acknowledgement strands the loop silently."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.now.advance(10 * 60)
+    tick(deps)
+    assert deps.source.exists_calls[-1] == ("Ylopo", "example", 42, "b" * 40)
+
+
+def test_the_repost_waits_out_the_grace_window(tmp_path):
+    """Nine minutes is inside it, ten is not.
+
+    The window is not slack for the gate, which admits synchronously -- it is
+    for `catch_up`, which replays a message missed while the daemon was down
+    on the next start and can legitimately admit minutes late. Re-posting
+    inside it would race that replay and buy a duplicate.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.now.advance(9 * 60)
+    assert tick(deps) == 0
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "nine minutes in, the post may still be being replayed"
+
+    deps.now.advance(60)
+    assert tick(deps) == 1
+    assert len(deps.slack.reposts) == 2
+
+
+def test_an_unreadable_intake_database_provokes_no_repost(tmp_path):
+    """None is not False. Waiting costs a tick; guessing costs a duplicate
+    review, so an intake database this pass could not read leaves the loop
+    exactly where it is -- for as long as it stays unreadable."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = None
+    deps.now.advance(3 * 60 * 60)
+    assert tick(deps) == 0
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)]
+    assert only_loop(deps).state is LoopState.REREVIEW_POSTED
+
+
+def test_the_repost_claims_the_push_the_lane_really_made(tmp_path):
+    """`post_rereview`, not `repost_rereview`. A remediation lane genuinely
+    ran and genuinely pushed, so "Round 1 -- remediation pushed" is a true
+    claim and the round number is one there is to report. `repost_rereview`
+    says the opposite ("no remediation round was spent"), which would leave
+    a human scanning the thread unable to tell what actually happened."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.reposts[-1] == ("Ylopo/example#42", 1), \
+        "the same round, re-sent -- not the next one"
+    assert deps.slack.repost_retries == [], \
+        "repost_rereview would deny the push the lane really made"
+    assert deps.slack.repost_targets[-1] == "1.0", \
+        "the review thread, not the reaction anchor"
+
+
+def test_the_repost_rearms_the_window_rather_than_firing_every_tick(tmp_path):
+    """The self-edge is what makes this a bounded retry instead of a flood:
+    `updated_at` moves, and the window is measured from it."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
+    assert len(deps.slack.reposts) == 2
+
+    for _ in range(5):
+        deps.now.advance(60)
+        assert tick(deps) == 0
+    assert len(deps.slack.reposts) == 2, \
+        "a re-post every tick would flood the review thread"
+
+    deps.now.advance(5 * 60)
+    assert tick(deps) == 1
+    assert len(deps.slack.reposts) == 3
+
+
+def test_a_failed_repost_leaves_the_loop_where_it_is_and_tries_again(tmp_path):
+    """The same ordering `_lane_pushed` uses, for the same reason: post
+    first, move the row second. A row moved ahead of a post that never
+    landed would re-arm the window for a request nobody received, and the
+    attempt would be spent on nothing."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    deps.slack.post_rereview_fails = True
+    loop_id = only_loop(deps).loop_id
+    before = deps.store.get(loop_id)
+    deps.now.advance(10 * 60)
+
+    assert tick(deps) == 0, "a post that never landed advanced nothing"
+    after = deps.store.get(loop_id)
+    assert after.state is LoopState.REREVIEW_POSTED
+    assert after.updated_at == before.updated_at, "the window must not re-arm"
+    assert "rereview_post_failed" in kinds(deps, loop_id)
+    assert reposts(deps, loop_id) == [], \
+        "an attempt is spent by a post that landed, not by one that failed"
+
+    deps.slack.post_rereview_fails = False
+    deps.now.advance(30.0)
+    assert tick(deps) == 1, "the next tick retries; it does not wait out a " \
+        "window the failed post never re-armed"
+    # Three calls: the original, the one Slack refused, and the retry that
+    # landed -- and only the last of those spends an attempt.
+    assert len(deps.slack.reposts) == 3
+    assert reposts(deps, loop_id) == [{"attempt": 1}]
+
+
+def test_a_rereview_that_never_lands_escalates_after_twelve_attempts(tmp_path):
+    """Escalation is absorbing, so it is deliberately slow: twelve attempts
+    at ten minutes is about two hours, longer than a typical GitHub incident.
+    Escalating earlier permanently strands a pull request that would have
+    recovered on its own; never escalating leaves the loop non-terminal, and
+    `active_for_pr` then blocks every later generation of that PR behind a
+    human nobody told.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    loop_id = only_loop(deps).loop_id
+
+    for _ in range(20):
+        deps.now.advance(10 * 60)
+        tick(deps)
+        if deps.store.get(loop_id).state is LoopState.ESCALATED:
+            break
+
+    assert len(reposts(deps, loop_id)) == 12
+    assert [d["attempt"] for d in reposts(deps, loop_id)] == list(range(1, 13))
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+    assert deps.github.released == [("Ylopo", "example", 42)], \
+        "no lane is running here, so the ownership label goes back"
+
+
+def test_an_escalation_already_owed_outranks_the_repost(tmp_path):
+    """Ordering, and not an arbitrary one: a stopped loop's escalation debt
+    is a write already owed to a human, and it must still take precedence
+    over a request this pass would otherwise re-send into a loop that has
+    already given up."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    loop_id = only_loop(deps).loop_id
+    deps.store.record_note(loop_id, "escalation_pending",
+                           {"reason": "no_op_lane"}, deps.now())
+
+    deps.now.advance(10 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [("Ylopo/example#42", 1, "no_op_lane")]
+    assert deps.slack.reposts == [("Ylopo/example#42", 1)], \
+        "the debt is settled, not overwritten with another request"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
+def test_a_paused_tick_records_the_repost_and_sends_nothing(tmp_path):
+    """The kill switch, structurally: routing decides, `_consumer` picks who
+    consumes, and `_rehearse` never reaches `_perform`'s branch."""
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted = False
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(10 * 60)
+
+    shadow = in_mode(deps, "shadow")
+    assert tick(shadow) == 0
+    assert len(shadow.slack.reposts) == 1, "the original post and no other"
+    assert shadow.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+    assert reposts(shadow, loop_id) == []
+    decisions = [e["detail"] for e in shadow.store.events(loop_id)
+                 if e["kind"] == "shadow_decision"]
+    assert decisions[-1] == {"would": "rereview_unacknowledged", "attempt": 1}

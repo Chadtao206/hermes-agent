@@ -306,6 +306,19 @@ STILL_RUNNING_THRESHOLD_SECONDS = 30 * 60
 # with it every later loop for that PR) indefinitely.
 NOTIFY_ATTEMPTS = 5
 
+# How long a `rereview_posted` loop waits for its request to show up in
+# boris_intake before assuming the post was rejected and sending it again.
+# The gate admits synchronously, so a successful request appears within
+# seconds; this window is sized for `catch_up`, which replays a missed
+# message on the next daemon start and can legitimately admit minutes late.
+REREVIEW_ACK_GRACE_SECONDS = 10 * 60
+
+# How many times the re-review is re-posted before a human is told. Twelve
+# at the grace above is roughly two hours, which is deliberately longer than
+# a typical GitHub incident: escalation is absorbing, so escalating early
+# permanently strands a pull request that would have recovered on its own.
+REREVIEW_REPOST_ATTEMPTS = 12
+
 # Loops the retry pass leases per tick.
 DUE_LIMIT = 20
 
@@ -345,6 +358,12 @@ HEAD_READ_EXHAUSTED = "head_read_exhausted"
 # GitHub); this says the lane never finished (look at the kanban card, which may
 # be wedged, or may simply be gone).
 LANE_TIMEOUT = "lane_timeout"
+# The re-review was re-posted REREVIEW_REPOST_ATTEMPTS times and boris_intake
+# never showed a request for it. A fourth dead end, and a fourth place to send
+# a human: not the branch, not GitHub, not the kanban card, but the intake
+# gate's own admission log -- whatever it keeps rejecting the post for has
+# outlasted every retry this loop is willing to spend.
+REREVIEW_UNACKNOWLEDGED = "rereview_unacknowledged"
 
 # Written on a lane_timeout settle that finds the lane not confirmed finished
 # by kanban's own account and therefore, deliberately, releases neither the
@@ -377,6 +396,13 @@ EVENT_ORPHAN_SUPERSEDED = "orphan_superseded"
 # can cancel it from here, and it is about to push to a pull request this
 # service has handed back -- so the only thing left is to say where it went.
 EVENT_LANE_ABANDONED = "lane_abandoned"
+# One re-review request re-sent because boris_intake never showed a request for
+# the one already posted. The trail is the ledger here for the same reason it
+# is for the escalation debt and the head-read budget: the row has no column
+# for it, and counting these is what bounds the retry -- so only a landed post
+# writes one, and only a live tick can (a paused tick's decisions go to
+# `_shadow` under a different kind, so a pause spends none of this budget).
+EVENT_REREVIEW_REPOSTED = "rereview_reposted"
 # Written by store.transition() itself, and only when the swap landed.
 EVENT_TRANSITION = "transition"
 
@@ -398,6 +424,12 @@ ROUTE_CLOSE_STALE = "close_stale"
 ROUTE_NOTIFY_READY = "notify_ready"
 ROUTE_REPOST_REREVIEW = "repost_rereview"
 ROUTE_LANE_PUSHED = "lane_pushed"
+# A re-review request boris_intake never admitted, re-sent. An action, exactly
+# like ROUTE_LANE_PUSHED and deliberately NOT one of the _OBSERVATIONS below:
+# routing it there would hand it to `_note_standing`, whose dedup would record
+# the first attempt and then perform nothing on every later tick -- reproducing
+# the exact silent stall this route exists to end.
+ROUTE_REREVIEW_UNACKNOWLEDGED = "rereview_unacknowledged"
 ROUTE_AWAIT_HEAD_MOVE = "await_head_move"
 # A round still in flight, well past STILL_RUNNING_THRESHOLD_SECONDS. Not an
 # observation (_OBSERVATIONS below): unlike those, a live tick does something
@@ -1026,6 +1058,55 @@ def _lane_pushed(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     return _transition(deps, loop, LoopState.REREVIEW_POSTED, head_sha=head)
 
 
+def _repost_unacknowledged(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
+                           attempt: int) -> bool:
+    """Send the re-review request again, because the gate never took the first.
+
+    `post_rereview`, deliberately -- NOT `repost_rereview`, which `_repost`
+    uses. A remediation lane genuinely ran and genuinely pushed, so "Round N of
+    M -- remediation pushed" is a true claim and there is a round to name;
+    `repost_rereview` says the opposite ("no remediation round was spent"), and
+    a human scanning the thread would be unable to tell which of the two
+    actually happened. What was lost was the request, not the work.
+
+    The round is not spent, for the same reason: this re-sends a message that
+    never arrived, it does not start a new round. `round_count` is unchanged and
+    the post names the round that already ran.
+
+    Posted before the row is moved on, the ordering `_lane_pushed` uses and for
+    the same reason: a post that failed leaves the loop exactly where it was and
+    immediately due, so the next tick tries again rather than re-arming a window
+    for a request nobody received and spending an attempt on nothing.
+
+    The self-edge into REREVIEW_POSTED is what re-arms that window -- the wait
+    is measured from `updated_at`, and only a real transition moves it (see
+    `_route_rereview_ack`). It is already in the store's transition table; this
+    adds no edge.
+
+    Nothing guards against the request having been admitted after all between
+    the routing read and this post, and nothing needs to: the gate keys
+    admission on the head sha, so a re-post landing on top of an admitted
+    request is rejected as a duplicate. That asymmetry -- a needless re-post
+    costs a rejected message, a needless escalation costs the pull request --
+    is the whole reason this route re-posts rather than escalating.
+    """
+    # root_thread_ts, not status_message_ts -- the same split `_repost` and
+    # `_lane_pushed` observe, for the same reason.
+    if deps.slack.post_rereview(verdict, loop.root_thread_ts,
+                                loop.round_count) is None:
+        # Standing, like `_lane_pushed`'s: the due pass rediscovers this on
+        # every tick for as long as Slack keeps refusing, and the detail is
+        # stable across those ticks (the attempt only moves when a post lands),
+        # so the dedup holds. `attempt` is carried all the same -- it is what
+        # distinguishes this failure from the original post's in the trail.
+        _note_standing(deps, loop, "rereview_post_failed",
+                       {"round": loop.round_count, "attempt": attempt})
+        return False
+    deps.store.record_note(loop.loop_id, EVENT_REREVIEW_REPOSTED,
+                           {"attempt": attempt}, deps.now())
+    return _transition(deps, loop, LoopState.REREVIEW_POSTED)
+
+
 def _await_head_move(deps: LoopDeps, loop: LoopRequest) -> bool:
     """The lane exited without a visible push. Give that push one window.
 
@@ -1452,6 +1533,80 @@ def _head_read_attempts(deps: LoopDeps, loop: LoopRequest, lane_id: str) -> int:
     return attempts
 
 
+def _rereview_repost_attempts(deps: LoopDeps, loop: LoopRequest) -> int:
+    """How many times this loop's re-review has already been re-sent.
+
+    Counted off the trail rather than kept in a column, the same way the
+    escalation debt and the head-read budget are, and for the same reason:
+    `transition()` writes a fixed set of columns and there is no room in the row
+    for a counter. Not scoped to the head the way `_head_read_attempts` is
+    scoped to the lane, and that is not an oversight -- a head that moves ends
+    this wait outright, because moving it takes a lane, a lane takes a round,
+    and a round leaves `rereview_posted` for `remediating`. So every one of
+    these notes belongs to the request currently outstanding.
+
+    Like `_head_read_attempts`, this counts what a live tick actually wrote, so
+    a pause spends none of the budget: a paused tick's decisions are recorded by
+    `_shadow` under `shadow_decision` and never as this kind.
+    """
+    return sum(1 for event in deps.store.events(loop.loop_id)
+               if event["kind"] == EVENT_REREVIEW_REPOSTED)
+
+
+def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
+    """Did the re-review request this loop posted ever reach boris_intake?
+
+    `rereview_posted` is left only by an arriving verdict, and the verdict comes
+    only if the intake gate admitted the post. That gate reads GitHub
+    synchronously while admitting, and a failed read is indistinguishable from a
+    missing pull request -- so a GitHub outage rejects the post outright
+    (`pr_not_found`, `gate_snapshot_unavailable`). Three loops parked that way in
+    one afternoon: nothing recorded, no alarm, and no rescue from pr_discovery
+    either, which treats this loop's own ownership label as a kill switch.
+
+    The check is a local sqlite read, like the trail replays above it in
+    `_route_due` and unlike the lane and GitHub reads below -- which is why it
+    sits where it does and needs no `_observes` gate of its own. It decides and
+    performs nothing; `_perform` re-posts and `_rehearse` records.
+
+    The four ways this is asked to do nothing are all deliberate, and three of
+    them are worth more than the tick they cost:
+
+    None -- the intake database could not be read at all. Not False: waiting
+    costs a tick, guessing costs a duplicate review on a PR whose review may
+    well be live.
+
+    True -- a request exists at this exact head, whatever workflow_state it is
+    in. The verdict is coming (or is being worked on right now), so re-posting
+    would be noise on top of a live review.
+
+    Inside the grace window -- see REREVIEW_ACK_GRACE_SECONDS. Measured from
+    `updated_at`, which is when the loop entered `rereview_posted` or last
+    re-sent (the self-edge is what re-arms it), and which `store.defer`
+    deliberately leaves alone, so a due-pass visit does not push the deadline
+    out.
+
+    At the attempt bound -- escalate rather than go on re-posting forever. The
+    reason is its own (REREVIEW_UNACKNOWLEDGED) because the place to go and look
+    is its own: not the branch, not GitHub, not the kanban card, but whatever
+    the gate keeps rejecting the post for.
+    """
+    admitted = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
+                                          loop.head_sha)
+    if admitted is None:
+        return None
+    if admitted is True:
+        return None
+    if deps.now() < loop.updated_at + REREVIEW_ACK_GRACE_SECONDS:
+        return None
+    attempts = _rereview_repost_attempts(deps, loop)
+    if attempts >= REREVIEW_REPOST_ATTEMPTS:
+        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
+                     standing=True)
+    return Route(ROUTE_REREVIEW_UNACKNOWLEDGED, {"attempt": attempts + 1},
+                 standing=True)
+
+
 def _route_due(deps: LoopDeps, loop: LoopRequest,
                lane: LaneFacts | None) -> Route | None:
     """Decide what a live tick owes a loop no verdict is going to arrive for.
@@ -1490,6 +1645,20 @@ def _route_due(deps: LoopDeps, loop: LoopRequest,
         # verdict is consumed whatever is done with it, so the verdict path
         # routes past a stale claim rather than stopping to tidy it.
         return Route(ROUTE_DROP_ORPHAN, dict(orphan), standing=True)
+
+    if loop.state is LoopState.REREVIEW_POSTED:
+        # Ahead of the `lane is None` return below, because that return is
+        # exactly what strands these loops: `_lane_pending` excludes
+        # `rereview_posted` (correctly -- `lane_id` outlives the round that ran,
+        # and reading it back as a fresh completion would post the re-review
+        # twice and then call the unmoved head a no-op), so `_observe_lane`
+        # answers None here and every tick fell straight through it.
+        #
+        # Behind the two above, because both concern writes already owed. A
+        # stopped loop's escalation debt outranks a request there is no longer
+        # anyone waiting on, and a lost lane-recording write must be settled
+        # before a route that moves the row.
+        return _route_rereview_ack(deps, loop)
 
     if lane is None:
         # This loop waits on no lane at all, so there is nothing to decide and
@@ -1606,6 +1775,9 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
         return _repost(deps, loop, verdict)
     if route.action == ROUTE_LANE_PUSHED:
         return _lane_pushed(deps, loop, verdict, str(route.detail["head_sha"]))
+    if route.action == ROUTE_REREVIEW_UNACKNOWLEDGED:
+        return _repost_unacknowledged(deps, loop, verdict,
+                                      int(route.detail["attempt"]))
     if route.action == ROUTE_AWAIT_HEAD_MOVE:
         return _await_head_move(deps, loop)
     if route.action == ROUTE_STILL_RUNNING:
