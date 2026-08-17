@@ -3551,6 +3551,42 @@ def test_a_review_that_never_completes_escalates_on_the_absolute_deadline(tmp_pa
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
+def test_a_wait_older_than_the_deadline_still_gets_its_retries(tmp_path):
+    """The deadline and the budget answer different questions, and the backlog
+    is where applying one to the other's case shows.
+
+    Every loop this guard was written to rescue is already hours into its wait
+    when the guard first runs, and a loop parked overnight is a day into it. A
+    deadline measured from when the wait began, applied to a request the gate
+    never admitted, escalates all of them on the first tick that ever looks --
+    with not one retry -- so whether a given pull request is recovered or
+    permanently stranded turns on when this service happened to be deployed.
+    The retry budget already bounds this case, at twelve attempts a window
+    apart, counted from the first tick that finds it and not from whenever the
+    row was last touched.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.source.admitted = False
+    deps.now.advance(2 * 24 * 60 * 60)  # parked since the day before yesterday
+
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [], \
+        "nothing has been retried even once, so nothing is owed to a human"
+    assert reposts(deps, loop_id) == [{"attempt": 1}]
+
+    for _ in range(20):
+        deps.now.advance(10 * 60)
+        tick(deps)
+        if deps.store.get(loop_id).state is LoopState.ESCALATED:
+            break
+    assert len(reposts(deps, loop_id)) == 12, "the whole budget, however old"
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+
+
 def test_the_absolute_deadline_covers_an_unreadable_intake_too(tmp_path):
     """The `admitted is None` branch needs no attempt bound of its own: it
     cannot be retried into an answer, and this deadline ends its wait like

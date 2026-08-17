@@ -319,24 +319,30 @@ REREVIEW_ACK_GRACE_SECONDS = 10 * 60
 # permanently strands a pull request that would have recovered on its own.
 REREVIEW_REPOST_ATTEMPTS = 12
 
-# How long a loop may sit in `rereview_posted` at all, measured from when the
-# wait began, before a human is told regardless of what boris_intake's own
-# tables say. The backstop the retry budget above cannot be: that budget is
-# only ever spent when the intake read comes back False, and the read coming
-# back True is not a promise of a verdict. `slack_unavailable` is a second
-# terminal state in boris_intake (its store.py gives it an empty transition
-# set), and a request that ends there is never `complete` -- so `new_verdicts`
-# never returns it, `request_exists` goes on answering True at this loop's
-# head, and the loop parks exactly as it did before this guard existed. A
-# request wedged in `reviewing` does the same.
+# How long a loop may sit in `rereview_posted` waiting on a request the intake
+# gate DID take, measured from when the wait began, before a human is told
+# regardless of what boris_intake's own tables say. The backstop the retry
+# budget above cannot be: that budget is only ever spent when the intake read
+# comes back False, and the read coming back True is not a promise of a verdict.
+# `slack_unavailable` is a second terminal state in boris_intake (its store.py
+# gives it an empty transition set), and a request that ends there is never
+# `complete` -- so `new_verdicts` never returns it, `request_exists` goes on
+# answering True at this loop's head, and the loop parks exactly as it did
+# before this guard existed. A request wedged in `reviewing` does the same. No
+# re-post is owed on that path, which is why nothing but elapsed time can bound
+# it -- and why this is deliberately not applied to the path where a re-post IS
+# owed (see `_route_rereview_ack`): there the budget is the bound, and this one,
+# measured from a wait that may have begun long before this code first ran,
+# would escalate a whole backlog with no retry at all.
 #
-# Four hours, and both halves of that matter. It must exceed the re-post
-# budget's own span so it never preempts the ordinary path: twelve attempts one
-# grace window apart, plus the first window, is 130 minutes. And it must
-# comfortably exceed boris_intake's REVIEW_WAIT_SECONDS (90 minutes, in its
-# reconciler.py), which is that service's own bound on how long an admitted
-# review may legitimately take -- so any wait this one ends is a wait the
-# review path had already given up on.
+# Four hours, because it must comfortably exceed boris_intake's
+# REVIEW_WAIT_SECONDS (90 minutes, in its reconciler.py), which is that
+# service's own bound on how long an admitted review may legitimately take --
+# so any wait this one ends is a wait the review path had already given up on.
+# It also exceeds the re-post budget's own span (twelve attempts one grace
+# window apart, plus the first window, is 130 minutes), so a wait that spends
+# its budget and only then gets admitted still has headroom to be reviewed
+# rather than escalating the moment the gate relents.
 REREVIEW_ABSOLUTE_DEADLINE_SECONDS = 4 * 60 * 60
 
 # Loops the retry pass leases per tick.
@@ -1771,30 +1777,41 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     production does today. On `_lane_pushed`'s route it changes nothing
     observable, the head being new.
 
-    The absolute deadline is asked first and answered regardless of anything
-    below it -- see REREVIEW_ABSOLUTE_DEADLINE_SECONDS. It is the only check
-    here that does not depend on the intake read, which is exactly why it is
-    the one that closes the wait a True read can otherwise hold open forever.
+    The grace window is asked before the read on purpose: it is a comparison of
+    two numbers already in hand, the read is a database this process does not
+    own, and inside the window the answer changes nothing. So the ordinary case
+    -- a loop waiting out its window, and a loop admitted and simply waiting for
+    its verdict -- costs no read at all.
 
-    Then the grace window, and it is asked before the read on purpose: it is a
-    comparison of two numbers already in hand, the read is a database this
-    process does not own, and inside the window the answer changes nothing. So
-    the ordinary case -- a loop waiting out its window, and a loop admitted and
-    simply waiting for its verdict -- costs no read at all.
+    What the read comes back with then decides which bound applies, because the
+    two bounds here answer different questions and each is wrong for the other's
+    case:
 
-    The two ways this is then asked to do nothing are both deliberate:
+    False -- the gate never admitted this request, so nobody is reviewing
+    anything and the re-post budget governs. Twelve attempts a window apart
+    already bounds this at 130 minutes, counted from the first tick that finds
+    it, so the absolute deadline is deliberately NOT consulted: measured from
+    when the wait began, it would escalate every loop already older than four
+    hours on the first tick that ever looked at it, without one retry. That is
+    the entire existing backlog -- the loops this guard was written to rescue
+    are hours old before it first runs -- and it would make each one's fate
+    depend on when this service happened to be deployed.
 
     None -- the intake database could not be read. Not False: waiting costs a
     tick, guessing costs a duplicate review on a PR whose review may well be
     live. Unlike the other do-nothings it is *recorded*, because it is the one
     that can repeat indefinitely on an external fault, and a branch that
     repeats indefinitely writing nothing is the shape this whole route exists
-    to remove. Standing, so an outage lasting a day leaves one sentence.
+    to remove. Standing, so an outage lasting a day leaves one sentence. The
+    deadline does apply here: nothing about an unreadable intake can be retried
+    into an answer, so there is no budget for it to have and no bound but time.
 
     True -- a request for this episode is on record, whatever workflow_state it
     is in, so re-posting would be noise on top of a review that already exists.
-    It does NOT promise a verdict is coming, which is what the deadline above
-    is for.
+    It does NOT promise a verdict is coming, and this is the case the deadline
+    exists for: a request that ends in `slack_unavailable`, or wedges in
+    `reviewing`, holds this wait open for good. No re-post is owed on this path,
+    so the budget can bound nothing here and only elapsed time can.
 
     The grace window is measured from `updated_at`, which is when the loop
     entered `rereview_posted` or last re-sent (the self-edge is what re-arms
@@ -1810,27 +1827,29 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     the gate keeps rejecting the post for.
     """
     episode = _rereview_episode(deps, loop)
-    if deps.now() >= episode.started_at + REREVIEW_ABSOLUTE_DEADLINE_SECONDS:
-        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
-                     standing=True)
     if deps.now() < loop.updated_at + REREVIEW_ACK_GRACE_SECONDS:
         return None
     admitted = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
                                           loop.head_sha, episode.started_at)
+    if admitted is False:
+        # The gate never took it, so the budget governs and the deadline above
+        # does not apply -- see REREVIEW_ABSOLUTE_DEADLINE_SECONDS.
+        if episode.attempts >= REREVIEW_REPOST_ATTEMPTS:
+            return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
+                         standing=True)
+        # `origin` rides along so the act can pick the message this episode can
+        # truthfully carry without replaying the trail a second time -- see
+        # `_repost_unacknowledged`.
+        return Route(ROUTE_REREVIEW_UNACKNOWLEDGED,
+                     {"attempt": episode.attempts + 1, "origin": episode.origin},
+                     standing=True)
+    if deps.now() >= episode.started_at + REREVIEW_ABSOLUTE_DEADLINE_SECONDS:
+        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
+                     standing=True)
     if admitted is None:
         return Route(ROUTE_INTAKE_UNREADABLE, {"head_sha": loop.head_sha},
                      standing=True)
-    if admitted is True:
-        return None
-    if episode.attempts >= REREVIEW_REPOST_ATTEMPTS:
-        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
-                     standing=True)
-    # `origin` rides along so the act can pick the message this episode can
-    # truthfully carry without replaying the trail a second time -- see
-    # `_repost_unacknowledged`.
-    return Route(ROUTE_REREVIEW_UNACKNOWLEDGED,
-                 {"attempt": episode.attempts + 1, "origin": episode.origin},
-                 standing=True)
+    return None
 
 
 def _route_due(deps: LoopDeps, loop: LoopRequest,
