@@ -631,3 +631,121 @@ def test_a_noncore_gap_alongside_a_core_gap_is_worth_publishing(tmp_path):
     )
 
     assert assembled.derived.presentation == "INCOMPLETE_WITH_FINDINGS"
+
+
+# --- gate door markers must never survive into the Slack verdict ------------
+#
+# `gate.py::_is_loop_repost` and `_is_discovery_post` admit a message from
+# Boris's OWN bot user as a Chad-attributed review request whenever it carries
+# the configured marker, and `grammar.parse_request` then harvests every PR URL
+# out of whatever is admitted. This message is the one thing Boris composes out
+# of model-authored text about an untrusted pull request, so the marker has to
+# be defused here as well as at the gate -- either half alone is one careless
+# edit from failing.
+#
+# The two literals below are the real deployed markers, restated rather than
+# imported: `render_slack` takes them from its caller, so a test that read them
+# from the same place production does would assert a constant against itself.
+
+LOOP_MARKER = "[fixed it. probably. v1]"
+DISCOVERY_MARKER = "[swept this one up. v1]"
+BOTH_MARKERS = (LOOP_MARKER, DISCOVERY_MARKER)
+
+
+def marker_issue(marker):
+    return issue(f"Reviewer quoted {marker} verbatim from the branch name")
+
+
+def test_an_issue_title_quoting_the_loop_marker_is_neutralized(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(
+        valid_payload(blocking_issues=[marker_issue(LOOP_MARKER)])
+    )
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+
+    text = module.render_slack(assembled, None, BOTH_MARKERS)
+
+    assert assembled.derived.outcome == "ISSUES_FOUND"
+    assert LOOP_MARKER not in text
+    assert module.MARKER_REDACTION in text
+    # Neutralised, not dropped: a human still reads what the issue said.
+    assert "Reviewer quoted" in text
+    assert "verbatim from the branch name" in text
+
+
+def test_an_issue_title_quoting_the_discovery_marker_is_neutralized(tmp_path):
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    judgment = module.validate_judgment(
+        valid_payload(blocking_issues=[marker_issue(DISCOVERY_MARKER)])
+    )
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+
+    text = module.render_slack(assembled, None, BOTH_MARKERS)
+
+    assert DISCOVERY_MARKER not in text
+    assert module.MARKER_REDACTION in text
+
+
+def test_an_incomplete_reason_quoting_a_marker_is_neutralized(tmp_path):
+    """`incomplete.detail` and `retry_guidance` are model-authored too --
+    `_model_incomplete` builds both out of the reviewer's own verification-gap
+    prose, and neither goes through the issue path above."""
+    module = result_module()
+    request = lifecycle_request(tmp_path)
+    core = gap(core=True)
+    core["unassessed_claim"] = f"The branch claims {LOOP_MARKER} in its title."
+    core["next_step"] = f"Re-run once {DISCOVERY_MARKER} is gone."
+    judgment = module.validate_judgment(valid_payload(verification_gaps=[core]))
+    assembled = module.assemble_result(
+        request, judgment, request.gate_snapshot, None, "2026-08-14T12:01:00Z"
+    )
+
+    text = module.render_slack(assembled, None, BOTH_MARKERS)
+
+    assert assembled.derived.outcome == "REVIEW_INCOMPLETE"
+    assert LOOP_MARKER not in text
+    assert DISCOVERY_MARKER not in text
+    assert "The branch claims" in text
+    assert "is gone." in text
+
+
+def test_the_marker_is_defused_even_where_a_redaction_cannot_be_substituted():
+    """A marker containing the redaction literal cannot be neutralised by
+    substituting that literal for it -- the replacement would carry the marker
+    straight back in. Such a marker is deleted outright instead. Nothing
+    deployed is shaped like this; the point is that the function's promise
+    holds for whatever literal a future config names, not just for today's."""
+    module = result_module()
+    pathological = f"<<{module.MARKER_REDACTION}>>"
+
+    out = module.neutralize_door_markers(f"a {pathological} b", (pathological,))
+
+    assert pathological not in out
+    assert out.startswith("a ") and out.endswith(" b")
+
+
+def test_a_marker_spliced_out_of_a_replacement_seam_is_defused_too():
+    """`str.replace` works on the input, so a substitution can leave two halves
+    of a marker adjacent in the output. Whatever survives one readable pass is
+    removed rather than shipped."""
+    module = result_module()
+
+    out = module.neutralize_door_markers("[[MARK]MARK]", ("[MARK]",))
+
+    assert "[MARK]" not in out
+
+
+def test_an_unconfigured_marker_neutralizes_nothing():
+    """An empty marker is trivially "in" every string, and an unconfigured door
+    is a closed door -- so a blank entry must be skipped, not treated as a hit
+    that shreds the whole message."""
+    module = result_module()
+
+    assert module.neutralize_door_markers("untouched text", ("", "")) == "untouched text"
+    assert module.neutralize_door_markers("untouched text", ()) == "untouched text"

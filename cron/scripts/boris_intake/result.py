@@ -824,7 +824,70 @@ def render_github(result: StructuredResult) -> str:
     return "\n\n".join(line for line in lines if line != "") + "\n"
 
 
-def render_slack(result: StructuredResult, github_url: str | None) -> str:
+#: What a quoted door marker is replaced with. Visible on purpose: a human
+#: reading the thread must be able to tell that something was taken out of the
+#: sentence, rather than silently reading a doctored one.
+MARKER_REDACTION = "[marker redacted]"
+
+
+def neutralize_door_markers(text: str, door_markers: Sequence[str]) -> str:
+    """`text` with every occurrence of every gate door marker defused.
+
+    `door_markers` are the literals `gate.py`'s `_is_loop_repost` and
+    `_is_discovery_post` key on (`Config.loop_marker`,
+    `Config.discovery_marker`). Those two predicates admit a message from
+    Boris's OWN bot user as a Chad-attributed review request, and
+    `grammar.parse_request` then harvests every PR URL out of whatever is
+    admitted -- so a marker reaching Slack inside a verdict is a laundering
+    channel, not a cosmetic problem. `pr_discovery/post.py`'s module docstring
+    is the long-form statement of that hazard; this is the same discipline
+    applied to the one message Boris composes out of model-authored text about
+    an untrusted pull request.
+
+    Neutralises rather than drops: only the marker literal is replaced, so a
+    human still reads what the issue said. An empty marker is skipped -- an
+    unconfigured door is a closed door, and `""` is trivially "in" every
+    string.
+
+    Two passes, and the second one is not decoration. Substituting a fixed
+    literal can (a) splice a fresh marker out of the seam a replacement leaves
+    behind, and (b) do nothing at all if a marker were ever configured to
+    contain `MARKER_REDACTION` itself. Neither is reachable with today's
+    markers, but neither is ruled out by anything this function controls, so
+    whatever survives the readable substitution is deleted outright. That loop
+    terminates: every pass through it removes at least one occurrence, so the
+    text strictly shortens.
+    """
+    live = tuple(m for m in door_markers if m)
+    if not live or not any(m in text for m in live):
+        return text
+    for marker in live:
+        text = text.replace(marker, MARKER_REDACTION)
+    while any(m in text for m in live):
+        for marker in live:
+            text = text.replace(marker, "")
+    return text
+
+
+def render_slack(result: StructuredResult, github_url: str | None,
+                 door_markers: Sequence[str] = ()) -> str:
+    """The verdict as one Slack message.
+
+    `door_markers` names the gate marker literals this text must never carry --
+    see `neutralize_door_markers`, and `gate.py::_is_loop_repost` for why a
+    verdict that carries one is a security problem rather than a typo. The
+    caller supplies them because this module renders, it does not read
+    deployment configuration; `reconciler._door_markers` is the one production
+    caller and `()` is the honest default for a caller that has no gate (no
+    configured marker, no door to launder through).
+
+    The neutralisation is applied to the finished text rather than to the three
+    model-authored fields that reach it today (issue titles,
+    `incomplete.detail`, `incomplete.retry_guidance`). Deliberately: the next
+    field somebody adds to this renderer is covered without anybody
+    remembering to cover it, and nothing this function composes itself has any
+    business containing a door marker either.
+    """
     short_sha = result.target.head_sha[:7]
     target = f"{result.target.owner}/{result.target.repo}#{result.target.pr_number} @ {short_sha}"
     if result.derived.outcome == "REVIEW_INCOMPLETE":
@@ -868,4 +931,4 @@ def render_slack(result: StructuredResult, github_url: str | None) -> str:
         lines.extend(f"{name}: {count}" for name, count in counts if count)
     if github_url:
         lines.append(f"GitHub review: {github_url}")
-    return "\n".join(lines)
+    return neutralize_door_markers("\n".join(lines), door_markers)

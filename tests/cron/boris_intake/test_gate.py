@@ -337,6 +337,24 @@ def test_loop_repost_with_a_subtype_is_rejected():
     assert reasons(evaluate(edited, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
 
 
+def test_a_message_that_merely_quotes_the_marker_is_rejected():
+    """The loop always OPENS its re-review with the marker
+    (`pr_remediation/slack_io.py::post_rereview`). A message that quotes it
+    somewhere in the middle is somebody else's text -- and the somebody else
+    with the most access is Boris itself, whose verdict renders model-authored
+    issue titles about an untrusted pull request under this same bot user, in
+    this same thread. Admitting it hands every PR URL in it Chad's trust.
+    See test_integration.py for the same property driven end to end through the
+    real renderer."""
+    quoted = ev(
+        user_id=BOT, is_bot=True, thread_ts="0.9",
+        text=f"ISSUES FOUND — Ylopo/repo#5 @ fffffff\n"
+             f"• Reviewer quoted {MARKER} from the branch name\n"
+             f"https://github.com/Ylopo/repo/pull/5",
+    )
+    assert reasons(evaluate(quoted, LOOP_CFG, deps())) == {ReasonCode.NOT_HUMAN}
+
+
 # --- discovery cron's marked top-level request (Task 3) ----------------------
 #
 # A second, narrower door: discovery posts are top-level (the loop's are always

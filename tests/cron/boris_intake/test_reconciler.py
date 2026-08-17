@@ -1686,3 +1686,73 @@ def test_slack_only_routing_sends_findings_to_github_and_bare_incompletes_to_sla
     assert _slack_only(bare) is True
     assert _slack_only(with_findings) is False
     assert _slack_only(assemble()) is False
+
+
+def test_the_delivered_verdict_carries_no_gate_door_marker(tmp_path):
+    """`cfg` reaches `_reconcile_delivery` for exactly one reason: the terminal
+    Slack text is the one message this service composes out of model-authored
+    text about an untrusted pull request, and it is posted into a thread under
+    the same bot user `gate.py::_is_loop_repost` admits as Chad. Stop threading
+    `cfg` -- the state this code was in -- and the marker rides out into the
+    channel with every PR URL the reviewer wrote next to it.
+
+    Drives the real `tick` with a real `Config`, so it pins the wiring and not
+    just `render_slack`'s own behaviour (which `test_result.py` covers)."""
+    from boris_intake.config import Config
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    loop_marker = "[fixed it. probably. v1]"
+    discovery_marker = "[swept this one up. v1]"
+    cfg = Config(
+        mode="live",
+        channels=("C1",),
+        passive_channels=("C1",),
+        loop_bot_user_id="U0B9TK6B41M",
+        loop_marker=loop_marker,
+        loop_attributed_user_id="U07E3AHV686",
+        discovery_bot_user_id="U0B9TK6B41M",
+        discovery_marker=discovery_marker,
+    )
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    deps = ReconcilerDeps(
+        slack=slack,
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+    finding = {
+        "title": f"Branch name quotes {loop_marker} and {discovery_marker}",
+        "expected_behavior": "Only the owner may update the record.",
+        "changed_mechanism": "The ownership predicate was removed.",
+        "trigger": "A signed-in non-owner submits the update endpoint.",
+        "consequence": "The non-owner changes another user's record.",
+        "impact_scope": "Any record addressable by ID.",
+        "evidence_anchors": [{"kind": "diff", "reference": "src/update.py:42"}],
+        "action": "Restore the ownership predicate before the write.",
+    }
+
+    for _ in range(12):
+        tick(store, deps, cfg)
+        request = store.get_request(admitted.request_id)
+        if (
+            request.workflow_state is WorkflowState.REVIEWING
+            and store.judgment_for_request(request.request_id) is None
+        ):
+            judgment = validate_judgment(valid_payload(blocking_issues=[finding]))
+            store.submit_judgment(
+                request.request_id, canonicalize_judgment(judgment), clock()
+            )
+        if request.workflow_state is WorkflowState.COMPLETE:
+            break
+        clock.advance()
+
+    completed = store.get_request(admitted.request_id)
+    assert completed.workflow_state is WorkflowState.COMPLETE
+    delivered = slack.messages[admitted.request_id][1]
+    assert "ISSUES FOUND" in delivered
+    assert loop_marker not in delivered
+    assert discovery_marker not in delivered
+    # Neutralised, not dropped: the finding is still readable.
+    assert "Branch name quotes" in delivered

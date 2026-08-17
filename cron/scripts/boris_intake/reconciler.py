@@ -691,14 +691,37 @@ def _reconcile_publication(
     )
 
 
+def _door_markers(cfg: Config | None) -> tuple[str, ...]:
+    """Every marker literal `gate.py` admits a bot message on.
+
+    One list, because the thing that makes a marker dangerous in a verdict is
+    that the gate keys a door on it -- so anything `_is_loop_repost` or
+    `_is_discovery_post` tests against belongs here, and a new door added to
+    the gate without a line here is a door Boris's own text can knock on. See
+    `result.neutralize_door_markers`.
+
+    `None` yields `()`: a caller with no configuration has no configured
+    marker, hence no door, hence nothing to neutralise.
+    """
+    if cfg is None:
+        return ()
+    return (cfg.loop_marker, cfg.discovery_marker)
+
+
 def _reconcile_delivery(
-    store: Store, request: LifecycleRequest, deps: ReconcilerDeps
+    store: Store, request: LifecycleRequest, deps: ReconcilerDeps,
+    cfg: Config | None = None,
 ) -> None:
     result = _load_result(request)
     if result.derived.outcome != SemanticOutcome.REVIEW_INCOMPLETE.value:
         if not request.github_review_url:
             raise ValueError("judgment-bearing delivery has no confirmed GitHub review")
-    terminal_text = render_slack(result, request.github_review_url)
+    # The one message this service composes out of model-authored text about an
+    # untrusted pull request, posted into a thread by the same bot user the
+    # gate's loop door admits. `cfg` is threaded this far for that reason
+    # alone -- see `_door_markers`.
+    terminal_text = render_slack(result, request.github_review_url,
+                                 _door_markers(cfg))
     try:
         status = deps.slack.find_status(request)
         if status is None:
@@ -768,7 +791,6 @@ def reconcile_one(
     deps: ReconcilerDeps,
     cfg: Config | None = None,
 ) -> None:
-    del cfg
     request = store.get_request(request_id)
     if request is None:
         return
@@ -792,7 +814,7 @@ def reconcile_one(
     elif request.workflow_state is WorkflowState.PUBLICATION_PENDING:
         _reconcile_publication(store, request, deps)
     elif request.workflow_state is WorkflowState.DELIVERY_PENDING:
-        _reconcile_delivery(store, request, deps)
+        _reconcile_delivery(store, request, deps, cfg)
     if delivery:
         return
     updated = store.get_request(request_id)

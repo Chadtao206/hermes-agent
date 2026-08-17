@@ -44,6 +44,29 @@ def _is_loop_repost(event: NormalizedEvent, cfg: Config) -> bool:
     parseable PR URL, so identity alone cannot separate the two. The marker is
     what does: the loop emits it, Boris never does. Requiring a thread reply and
     no subtype keeps a stray top-level or edited message from qualifying.
+
+    "Boris never does" is an enforced property now, not an assumption, and it
+    takes both of these to hold:
+
+    * **Here: the marker must OPEN the text, not merely appear in it.** Both
+      producers (`pr_remediation/slack_io.py::post_rereview` and
+      `repost_rereview`) put `cfg.marker` on the first line, so `startswith` is
+      the exact shape the loop emits. A substring test additionally admits any
+      message that merely *quotes* the marker somewhere, and Boris's own
+      verdict is exactly such a message: `result.render_slack` renders
+      model-authored issue titles about an untrusted pull request, and
+      `grammar.parse_request` then harvests every `Ylopo/*/pull/N` URL out of
+      whatever is admitted, up to `Limits.max_prs_per_message`, all attributed
+      to `loop_attributed_user_id`. That is the same laundering hazard
+      `pr_discovery/post.py`'s module docstring is devoted to.
+    * **There: `render_slack` neutralises the marker** so a verdict cannot
+      carry it at all, whatever position it would land in. Deliberately
+      belt-and-braces: either half alone is one careless edit from failing.
+
+    `_is_discovery_post` deliberately does NOT get the same tightening --
+    `pr_discovery/post.py::_message` composes the URL first and the marker
+    second, so its producer's real messages do not start with it. Checked
+    against that function, not assumed.
     """
     if not (cfg.loop_marker and cfg.loop_bot_user_id and cfg.loop_attributed_user_id):
         return False
@@ -51,7 +74,7 @@ def _is_loop_repost(event: NormalizedEvent, cfg: Config) -> bool:
         event.is_bot
         and event.user_id == cfg.loop_bot_user_id
         and not event.subtype
-        and cfg.loop_marker in (event.text or "")
+        and (event.text or "").startswith(cfg.loop_marker)
         and bool(event.thread_ts)
         and event.thread_ts != event.ts
     )
@@ -64,6 +87,14 @@ def _is_discovery_post(event: NormalizedEvent, cfg: Config) -> bool:
     top-level, reposts are replies. Its own marker, not the loop's, is what
     separates it from Boris's own top-level messages, which carry parseable
     PR URLs and post as this same bot user.
+
+    Still a substring test, unlike its mirror: `pr_discovery/post.py::_message`
+    composes the PR URL first and the marker second, so a real discovery post
+    does not start with the marker and `startswith` here would close the door
+    on every one of them. What keeps Boris's own text from satisfying it is the
+    other half of the loop door's defence -- `result.render_slack` neutralises
+    both configured markers, so a verdict cannot carry either one at any
+    position. See `_is_loop_repost`.
     """
     if not (cfg.discovery_marker and cfg.discovery_bot_user_id
             and cfg.loop_attributed_user_id):
