@@ -362,6 +362,31 @@ REREVIEW_REPOST_ATTEMPTS = 12
 # rather than escalating the moment the gate relents.
 REREVIEW_ABSOLUTE_DEADLINE_SECONDS = 4 * 60 * 60
 
+# How many times a system-origin REVIEW_INCOMPLETE may send the review back to
+# boris_intake before a human is told instead.
+#
+# The one budget here counted over the loop's whole trail rather than over the
+# wait it belongs to, and that is the point of it. `_repost` spends no round,
+# so `round_cap` cannot bound it; it opens a fresh episode by design (a
+# genuinely new request deserves a fresh wait, which is what
+# EVENT_REPOST_REREVIEW_SENT exists to say), so REREVIEW_ABSOLUTE_DEADLINE_
+# SECONDS restarts on every one and can never fire on this path -- boris_intake
+# gives a review lane ninety minutes and this deadline is four hours. Nothing
+# else looked at the pair at all: forty cycles over sixty simulated hours
+# dispatched forty full Boris review lanes, spent no round, escalated nothing
+# and told nobody, with the trail growing the whole time.
+#
+# Three, in the spirit of `round_cap` rather than of REREVIEW_REPOST_ATTEMPTS,
+# because of what is being counted. That budget's twelve are retries of a
+# message the gate never took -- cheap, and a lost message deserves patience.
+# These are *completed Boris reviews that came back incomplete*: each one is a
+# review lane that ran for up to ninety minutes and produced nothing, so the
+# third one arriving is already strong evidence that re-asking is not what is
+# missing. It is also the reason the escalation carries REVIEW_NEVER_COMPLETES
+# rather than either re-review reason: the place to go and look is the review
+# lane, not the gate's admission log and not that request's own row.
+SYSTEM_REPOST_ATTEMPTS = 3
+
 # Loops the retry pass leases per tick.
 DUE_LIMIT = 20
 
@@ -418,6 +443,15 @@ REREVIEW_UNACKNOWLEDGED = "rereview_unacknowledged"
 # verdict is ever produced. The reason is what the notice names, so one literal
 # for both would send every one of these to the wrong place.
 REREVIEW_VERDICT_OVERDUE = "rereview_verdict_overdue"
+# SYSTEM_REPOST_ATTEMPTS completed Boris reviews came back system-incomplete on
+# this one loop. A sixth dead end, and a sixth place to send a human: not the
+# branch, not GitHub, not the kanban card, not the intake gate's admission log
+# and not one request's own row -- the review lane itself, which keeps being
+# dispatched, keeps running, and keeps failing to produce a judgement. Its own
+# reason for the reason every other one here has its own: the reason is what
+# the notice names, and the two re-review reasons above would send whoever
+# reads it to a gate that took every one of these requests without complaint.
+REVIEW_NEVER_COMPLETES = "review_never_completes"
 
 # Written on a lane_timeout settle that finds the lane not confirmed finished
 # by kanban's own account and therefore, deliberately, releases neither the
@@ -1722,7 +1756,19 @@ def _route(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
             # silently drops such a message. No thread means no route back into
             # review, ever -- that is permanent, so escalate rather than retry.
             return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNPOSTABLE})
-        return Route(ROUTE_REPOST_REREVIEW, {"round": loop.round_count + 1})
+        sent = _system_reposts(deps, loop)
+        if sent >= SYSTEM_REPOST_ATTEMPTS:
+            # Read off the loop's whole trail, deliberately, and not off the
+            # episode this verdict is about to end: `_repost` opens a new
+            # episode every time it sends, which is correct (a new request
+            # deserves a fresh wait) and is exactly why the episode's own
+            # budget and deadline can bound nothing here. This is the only
+            # bound on how many times that may happen at all -- no round is
+            # spent, so `round_cap` never sees it either.
+            return Route(ROUTE_ESCALATE,
+                         {"reason": REVIEW_NEVER_COMPLETES, "sent": sent})
+        return Route(ROUTE_REPOST_REREVIEW, {"round": loop.round_count + 1,
+                                             "sent": sent + 1})
     if verdict.outcome != "ISSUES_FOUND":
         return Route(ROUTE_UNKNOWN_OUTCOME, {"outcome": verdict.outcome})
 
@@ -1774,6 +1820,30 @@ def _head_read_attempts(deps: LoopDeps, loop: LoopRequest, lane_id: str) -> int:
                 detail.get("to") == LoopState.AWAITING_HEAD_MOVE.value:
             attempts = 0
     return attempts
+
+
+def _system_reposts(deps: LoopDeps, loop: LoopRequest) -> int:
+    """How many times this loop has already sent the review back to Boris.
+
+    Counted over the whole trail and never reset, unlike every other budget
+    replayed here. `_head_read_attempts` resets on a landed read and
+    `_rereview_episode` resets on a new request, both because what those budgets
+    bound is a *retry* and a retry that finally succeeded is not evidence about
+    the next one. This bounds something else: the number of completed Boris
+    reviews that came back with no judgement at all. Each one is its own
+    success -- the gate took the request, a review lane ran, it finished -- so
+    there is no event here that could honestly reset it, and any reset would be
+    the very thing that left this unbounded, since the marker that would do the
+    resetting is the marker being counted.
+
+    Counts the sends a live tick actually made (EVENT_REPOST_REREVIEW_SENT is
+    written only by `_repost`, and only once the post has landed), so a paused
+    tick spends none of this budget and a Slack that refused the send costs
+    none of it either -- the same property `_head_read_attempts` and
+    `_rereview_episode` have, for the same reason.
+    """
+    return sum(1 for event in deps.store.events(loop.loop_id)
+               if event["kind"] == EVENT_REPOST_REREVIEW_SENT)
 
 
 def _rereview_episode(deps: LoopDeps, loop: LoopRequest) -> RereviewEpisode:

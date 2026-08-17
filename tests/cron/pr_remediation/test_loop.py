@@ -880,6 +880,118 @@ def test_system_incomplete_reposts_without_burning_a_round(tmp_path):
     assert loop.state is LoopState.REREVIEW_POSTED
 
 
+def system_incomplete(deps, rid, head="a" * 40):
+    """One completed Boris review that came back with no judgement.
+
+    boris_intake gives a review lane REVIEW_WAIT_SECONDS (90 minutes) and emits
+    a system-origin REVIEW_INCOMPLETE when it gives up, so this is what a cycle
+    of the re-post ping-pong actually costs in wall-clock terms.
+    """
+    from pr_remediation.loop import tick
+
+    deps.now.advance(90 * 60)
+    deps.source.verdicts = [verdict(rid=rid, head=head,
+                                    outcome="REVIEW_INCOMPLETE", origin="system")]
+    result = tick(deps)
+    deps.source.verdicts = []
+    return result
+
+
+def test_a_review_that_never_completes_stops_being_asked_again(tmp_path):
+    """`_repost` spends no round, so `round_cap` cannot bound it, and it opens
+    a fresh episode every time it sends -- correctly, a new request deserves a
+    new wait -- so the episode's own budget and four-hour deadline both restart
+    on every cycle and neither can ever fire. Nothing else looked at the pair:
+    forty cycles over sixty simulated hours dispatched forty full Boris review
+    lanes, spent no round, escalated nothing and told nobody.
+
+    A review that keeps failing to complete is a real thing a human should see,
+    and it points somewhere none of the other dead ends do -- at the review lane
+    itself, which keeps being dispatched and keeps producing nothing.
+    """
+    from pr_remediation.loop import (REVIEW_NEVER_COMPLETES,
+                                     SYSTEM_REPOST_ATTEMPTS)
+
+    deps = build(tmp_path, SourceFake([]))
+    for n in range(SYSTEM_REPOST_ATTEMPTS):
+        assert system_incomplete(deps, f"sys_{n}") == 1
+    assert len(deps.slack.repost_retries) == SYSTEM_REPOST_ATTEMPTS
+    loop = only_loop(deps)
+    assert loop.state is LoopState.REREVIEW_POSTED
+    assert loop.round_count == 0, "none of this ever spent a round"
+
+    loop_id = loop.loop_id
+    assert system_incomplete(deps, "sys_last") == 1
+    assert len(deps.slack.repost_retries) == SYSTEM_REPOST_ATTEMPTS, \
+        "the review is not asked for a fourth time"
+    assert deps.slack.escalations == \
+        [("Ylopo/example#42", 0, REVIEW_NEVER_COMPLETES)]
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
+def test_the_system_repost_budget_survives_a_round_that_really_ran(tmp_path):
+    """Counted over the loop's whole trail, and never reset -- which is the
+    whole of what makes it a bound at all.
+
+    Every other budget replayed off the trail here resets on the event that
+    proves the thing it was waiting for arrived: a landed head read, a new
+    request. This one cannot, because each of these sends *is* such an event --
+    the gate took the request, a review lane ran, it finished -- and the marker
+    that would do the resetting is the marker being counted. Counting it inside
+    the episode instead puts the count back to zero on every cycle and makes the
+    cap unreachable, which is the state this fix found the loop in.
+    """
+    from pr_remediation.loop import REVIEW_NEVER_COMPLETES, tick
+
+    deps = build(tmp_path, SourceFake([]))
+    assert system_incomplete(deps, "sys_0") == 1
+    loop_id = only_loop(deps).loop_id
+
+    # A real round in between: a verdict with issues, a lane, a push, and the
+    # re-review that earns the next verdict. It leaves `rereview_posted` and
+    # comes back to it, which is what ends an episode.
+    deps.lanes._status = "done"
+    deps.source.verdicts = [verdict(rid="issues", head="a" * 40)]
+    deps.now.advance()
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.REMEDIATING
+    deps.source.verdicts = []
+    deps.github.head = "b" * 40
+    deps.now.advance(60)
+    assert tick(deps) == 1
+    assert deps.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+
+    assert system_incomplete(deps, "sys_1", head="b" * 40) == 1
+    assert system_incomplete(deps, "sys_2", head="b" * 40) == 1
+    assert len(deps.slack.repost_retries) == 3
+    assert system_incomplete(deps, "sys_3", head="b" * 40) == 1
+    assert len(deps.slack.repost_retries) == 3, \
+        "the round in between is not a reason to ask three more times"
+    assert deps.slack.escalations[-1][2] == REVIEW_NEVER_COMPLETES
+
+
+def test_a_paused_tick_spends_none_of_the_system_repost_budget(tmp_path):
+    """The marker is written by `_repost`, which only a live tick reaches, so
+    a pause of any length leaves this budget exactly where it was -- the same
+    property the head-read budget and the re-post budget have, and for the same
+    reason: what is counted is what a live tick actually did."""
+    from pr_remediation.loop import SYSTEM_REPOST_ATTEMPTS
+
+    deps = build(tmp_path, SourceFake([]))
+    assert system_incomplete(deps, "sys_0") == 1
+
+    paused = in_mode(deps, "shadow")
+    for n in range(SYSTEM_REPOST_ATTEMPTS + 2):
+        assert system_incomplete(paused, f"paused_{n}") == 0
+    assert len(deps.slack.repost_retries) == 1, "a pause sends nothing"
+
+    for n in range(SYSTEM_REPOST_ATTEMPTS - 1):
+        assert system_incomplete(deps, f"live_{n}") == 1
+    assert len(deps.slack.repost_retries) == SYSTEM_REPOST_ATTEMPTS, \
+        "the pause spent none of the budget the live ticks are still holding"
+    assert deps.slack.escalations == []
+
+
 def test_model_incomplete_escalates(tmp_path):
     from pr_remediation.loop import tick
 
