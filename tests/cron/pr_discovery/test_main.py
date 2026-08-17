@@ -1,0 +1,630 @@
+"""Tests for one discovery tick: what it selects, what it posts, and what it
+refuses to say nothing about.
+
+Two invariants dominate this file.
+
+*A paused tick is structurally incapable of posting.* Shadow does not branch
+around the post call -- it never reaches the code that holds one. That is
+pinned three ways: by behaviour (`test_shadow_mode_posts_nothing`), by a
+poster that detonates if it is so much as touched
+(`test_shadow_never_reaches_the_poster_at_all`), and by the single place the
+mode is asked (`test_the_mode_is_asked_in_exactly_one_place`).
+
+*An empty tick is not automatically a healthy one.* `candidates == () and
+complete` is the only shape that means "nothing to post"; a failed org, a
+truncated listing, a config error or a refused post all mean this tick did
+not see, or did not do, what it was for -- and each has to reach a human.
+
+Nothing here touches the network, Slack, `gh` or the real config file: the
+Slack transport is a recording double, the ledger is either an in-memory
+double or a real SQLite ledger under `tmp_path`, and every selftest path is
+pointed at `tmp_path` files.
+"""
+from __future__ import annotations
+
+import pytest
+
+from pr_discovery.discover import Candidate, DiscoveryResult
+from pr_discovery.main import (
+    MAX_POSTS_PER_TICK,
+    DiscoveryConfig,
+    DiscoveryDeps,
+    RunResult,
+    _consumer,
+    _perform,
+    _rehearse,
+    banned_repos,
+    load_config,
+    run,
+    run_selftest,
+)
+from pr_discovery.post import DISCOVERY_MARKER, Poster
+from pr_discovery.state import Ledger
+
+MARKER = "[swept this one up. v1]"
+
+
+def _c(number=1, *, owner="Ylopo", repo="x", head_sha="abc123"):
+    return Candidate(owner=owner, repo=repo, number=number, head_sha=head_sha,
+                     merge_state="CLEAN", checks_state="SUCCESS",
+                     has_hold=False)
+
+
+class _Slack:
+    """The real `Poster`, wired to a recording transport.
+
+    Deliberately not a hand-written fake poster: composing the message is the
+    thing most worth not faking, so the double replaces only `slack_call`.
+    `posted` is the text of every message that actually reached the
+    transport, which is what the shadow assertions read.
+    """
+
+    def __init__(self, *, fails=False, fail_calls=()):
+        self.calls: list[tuple[str, str, dict]] = []
+        self.posted: list[str] = []
+        self._fails = fails
+        self._fail_calls = set(fail_calls)
+        self._poster = Poster("tok", self._call)
+
+    def _call(self, token, method, **params):
+        self.calls.append((token, method, params))
+        self.posted.append(params["text"])
+        if self._fails or len(self.calls) in self._fail_calls:
+            return {"ok": False, "error": "not_in_channel"}
+        return {"ok": True, "ts": f"{len(self.calls)}.0"}
+
+    def post(self, candidate):
+        return self._poster.post(candidate)
+
+
+class _ExplodingSlack:
+    posted: list[str] = []
+
+    def post(self, candidate):
+        raise AssertionError("a paused tick reached the poster")
+
+
+class _FakeLedger:
+    """Mirrors `state.Ledger`'s two methods, including `record_posted`'s
+    keyword-only `now` (see `test_the_real_ledger_answers_the_same_calls`,
+    which runs the same tick against the real one so this double cannot
+    drift into a shape production does not have)."""
+
+    def __init__(self, has=()):
+        self._has = {tuple(row) for row in has}
+        self.records: list[tuple] = []
+
+    def already_posted(self, owner, repo, number, head_sha):
+        return (owner, repo, number, head_sha) in self._has
+
+    def record_posted(self, owner, repo, number, head_sha, *, now):
+        self.records.append((owner, repo, number, head_sha, now))
+        self._has.add((owner, repo, number, head_sha))
+        return True
+
+
+class _Discovery:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.result
+
+
+def _deps(*, candidates=(), ledger_has=(), slack_fails=False, fail_calls=(),
+          result=None, slack=None):
+    """One tick's dependencies.
+
+    `mode` is deliberately NOT a field here -- it is `run`'s own keyword, so
+    there is exactly one place a tick's mode can come from and no way for a
+    deps-borne mode to disagree with the one the caller asked for.
+    """
+    return DiscoveryDeps(
+        discover=_Discovery(result if result is not None
+                            else DiscoveryResult(candidates=tuple(candidates))),
+        ledger=_FakeLedger(ledger_has),
+        slack=slack if slack is not None else _Slack(fails=slack_fails,
+                                                     fail_calls=fail_calls),
+        now=lambda: 1000.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode discipline
+# ---------------------------------------------------------------------------
+
+def test_shadow_mode_posts_nothing():
+    deps = _deps(candidates=[_c(1), _c(2)])
+    run(deps, mode="shadow")
+    assert deps.slack.posted == []
+
+
+def test_shadow_never_reaches_the_poster_at_all():
+    """Not "posts nothing" but "never touches the thing that could post":
+    a poster that raises on any use survives a whole shadow tick."""
+    deps = _deps(candidates=[_c(1)], slack=_ExplodingSlack())
+    result = run(deps, mode="shadow")
+    assert result.selected == ("Ylopo/x#1@abc123",)
+
+
+def test_shadow_does_not_record_to_the_ledger():
+    deps = _deps(candidates=[_c(1)])
+    run(deps, mode="shadow")
+    assert deps.ledger.records == []
+
+
+def test_shadow_reports_what_a_live_tick_would_have_posted():
+    deps = _deps(candidates=[_c(1), _c(2)])
+    result = run(deps, mode="shadow")
+    assert result.selected == ("Ylopo/x#1@abc123", "Ylopo/x#2@abc123")
+    assert result.posted == ()
+    assert "would post 2" in result.summary()
+
+
+def test_the_mode_is_asked_in_exactly_one_place():
+    """`_consumer` is the whole of this module's mode-awareness, exactly as
+    `pr_remediation/loop.py::_consumer` is for the loop: a branch added to
+    `_perform` cannot leak into a paused tick, because a paused tick never
+    reaches `_perform`."""
+    assert _consumer("live") is _perform
+    assert _consumer("shadow") is _rehearse
+    assert _consumer("off") is _rehearse
+
+
+def test_off_does_not_even_enumerate():
+    """`off` is the hard kill switch: it stops the work, not merely the
+    writes, so it costs no GitHub reads at all."""
+    deps = _deps(candidates=[_c(1)])
+    result = run(deps, mode="off")
+    assert deps.discover.calls == 0
+    assert deps.slack.posted == [] and deps.ledger.records == []
+    assert result.enumerated is False
+
+
+def test_shadow_and_live_both_enumerate():
+    for mode in ("shadow", "live"):
+        deps = _deps(candidates=[_c(1)])
+        assert run(deps, mode=mode).enumerated is True
+        assert deps.discover.calls == 1
+
+
+def test_an_unknown_mode_refuses_to_run():
+    deps = _deps(candidates=[_c(1)])
+    with pytest.raises(ValueError):
+        run(deps, mode="Live")
+    assert deps.discover.calls == 0
+    assert deps.slack.posted == [] and deps.ledger.records == []
+
+
+# ---------------------------------------------------------------------------
+# Posting
+# ---------------------------------------------------------------------------
+
+def test_live_posts_one_message_per_pr():
+    deps = _deps(candidates=[_c(1), _c(2)])
+    run(deps, mode="live")
+    assert len(deps.slack.posted) == 2
+
+
+def test_message_carries_link_and_marker():
+    deps = _deps(candidates=[_c(1)])
+    run(deps, mode="live")
+    text = deps.slack.posted[0]
+    assert "https://github.com/Ylopo/x/pull/1" in text
+    assert DISCOVERY_MARKER in text
+
+
+def test_already_posted_head_is_skipped():
+    deps = _deps(candidates=[_c(1)], ledger_has=[("Ylopo", "x", 1, "abc123")])
+    result = run(deps, mode="live")
+    assert deps.slack.posted == []
+    assert result.skipped == ("Ylopo/x#1@abc123",)
+
+
+def test_a_moved_head_re_qualifies():
+    """The ledger keys on the head, not the PR: a PR that has moved since we
+    posted it is a new identity and gets a fresh review."""
+    deps = _deps(candidates=[_c(1, head_sha="def456")],
+                 ledger_has=[("Ylopo", "x", 1, "abc123")])
+    run(deps, mode="live")
+    assert len(deps.slack.posted) == 1
+
+
+def test_ledger_records_only_after_a_successful_post():
+    """A failed post must re-queue, not be recorded as done."""
+    deps = _deps(candidates=[_c(1)], slack_fails=True)
+    result = run(deps, mode="live")
+    assert deps.ledger.records == []
+    assert result.failed_posts == ("Ylopo/x#1@abc123",)
+    assert result.posted == ()
+
+
+def test_a_successful_post_is_recorded_with_the_ticks_clock():
+    deps = _deps(candidates=[_c(1)])
+    run(deps, mode="live")
+    assert deps.ledger.records == [("Ylopo", "x", 1, "abc123", 1000.0)]
+
+
+def test_a_failed_post_does_not_stop_the_next_pr():
+    """One message per PR means one PR's failure is one PR's failure."""
+    deps = _deps(candidates=[_c(1), _c(2)], fail_calls=(1,))
+    result = run(deps, mode="live")
+    assert result.failed_posts == ("Ylopo/x#1@abc123",)
+    assert result.posted == ("Ylopo/x#2@abc123",)
+    assert deps.ledger.records == [("Ylopo", "x", 2, "abc123", 1000.0)]
+
+
+def test_the_per_tick_cap_defers_the_rest_rather_than_dropping_them():
+    over = MAX_POSTS_PER_TICK + 2
+    deps = _deps(candidates=[_c(n) for n in range(1, over + 1)])
+    result = run(deps, mode="live")
+    assert len(result.posted) == MAX_POSTS_PER_TICK
+    assert len(result.deferred) == 2
+    assert len(deps.ledger.records) == MAX_POSTS_PER_TICK
+    assert "deferred" in result.summary()
+
+
+def test_a_deferred_pr_is_not_recorded_so_it_comes_back_next_tick():
+    over = MAX_POSTS_PER_TICK + 1
+    deps = _deps(candidates=[_c(n) for n in range(1, over + 1)])
+    result = run(deps, mode="live")
+    assert result.deferred == (f"Ylopo/x#{over}@abc123",)
+    assert not deps.ledger.already_posted("Ylopo", "x", over, "abc123")
+
+
+def test_the_real_ledger_answers_the_same_calls(tmp_path):
+    """The doubles above could drift from `state.Ledger`'s real signature, so
+    one whole tick runs against the real one."""
+    ledger = Ledger(tmp_path / "discovery.db")
+    slack = _Slack()
+    deps = DiscoveryDeps(
+        discover=_Discovery(DiscoveryResult(candidates=(_c(1),))),
+        ledger=ledger, slack=slack, now=lambda: 1000.0)
+    assert run(deps, mode="live").posted == ("Ylopo/x#1@abc123",)
+    assert ledger.already_posted("Ylopo", "x", 1, "abc123") is True
+
+    again = DiscoveryDeps(
+        discover=_Discovery(DiscoveryResult(candidates=(_c(1),))),
+        ledger=ledger, slack=slack, now=lambda: 2000.0)
+    assert run(again, mode="live").skipped == ("Ylopo/x#1@abc123",)
+    assert len(slack.posted) == 1
+
+
+# ---------------------------------------------------------------------------
+# The three failure channels, and the silence rule
+# ---------------------------------------------------------------------------
+
+def test_a_clean_empty_tick_is_the_only_silent_one():
+    result = run(_deps(), mode="live")
+    assert result.complete is True
+    assert result.summary() == ""
+
+
+def test_a_tick_that_had_already_posted_everything_is_silent_too():
+    """The steady state, not news: every candidate is already in the ledger
+    at this head, nothing failed, and the enumeration was complete."""
+    deps = _deps(candidates=[_c(1)], ledger_has=[("Ylopo", "x", 1, "abc123")])
+    result = run(deps, mode="live")
+    assert result.skipped == ("Ylopo/x#1@abc123",)
+    assert result.summary() == ""
+
+
+def test_an_org_that_could_not_be_enumerated_is_never_silent():
+    deps = _deps(result=DiscoveryResult(failed_orgs=("Ylopo",)))
+    result = run(deps, mode="live")
+    assert result.failed_orgs == ("Ylopo",)
+    assert result.complete is False
+    assert "Ylopo" in result.summary()
+
+
+def test_a_truncated_listing_is_never_silent():
+    deps = _deps(result=DiscoveryResult(candidates=(_c(1),),
+                                        truncated_orgs=("Ylopo",)))
+    result = run(deps, mode="live")
+    assert result.truncated_orgs == ("Ylopo",)
+    assert result.complete is False
+    assert "truncat" in result.summary()
+
+
+def test_a_config_error_is_never_silent():
+    deps = _deps(result=DiscoveryResult(config_errors=("orgs is empty",)))
+    result = run(deps, mode="live")
+    assert result.config_errors == ("orgs is empty",)
+    assert result.complete is False
+    assert "orgs is empty" in result.summary()
+
+
+def test_a_config_error_stops_the_tick_from_posting_anything():
+    """An untrustworthy parameter means we do not know what we are allowed to
+    post, so we post nothing -- even if the same result somehow carried
+    candidates."""
+    deps = _deps(result=DiscoveryResult(candidates=(_c(1),),
+                                        config_errors=("banned_repos is a str",)))
+    result = run(deps, mode="live")
+    assert deps.slack.posted == []
+    assert result.selected == ()
+
+
+def test_a_failed_post_is_never_silent():
+    deps = _deps(candidates=[_c(1)], slack_fails=True)
+    assert "Ylopo/x#1@abc123" in run(deps, mode="live").summary()
+
+
+def test_a_result_that_is_not_a_discoveryresult_is_a_fault_not_a_quiet_tick():
+    """The shape `candidates()` returned before `5fa528f23d`. A tick that
+    accepted it would post nothing and report a healthy run forever."""
+    deps = _deps(result=[])
+    result = run(deps, mode="live")
+    assert deps.slack.posted == []
+    assert result.config_errors and result.complete is False
+    assert result.summary() != ""
+
+
+def test_the_summary_names_every_channel_at_once():
+    deps = _deps(result=DiscoveryResult(candidates=(_c(1),),
+                                        failed_orgs=("Foo",),
+                                        truncated_orgs=("Bar",),
+                                        config_errors=("baz is wrong",)))
+    summary = run(deps, mode="live").summary()
+    assert "Foo" in summary and "Bar" in summary and "baz is wrong" in summary
+
+
+def test_run_result_defaults_are_a_complete_quiet_tick():
+    assert RunResult(mode="live").complete is True
+    assert RunResult(mode="live").summary() == ""
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def test_config_reads_the_mode_from_its_own_block(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("pr_discovery:\n  mode: live\n")
+    assert load_config(path) == DiscoveryConfig(mode="live")
+
+
+def test_config_fails_safe_to_shadow(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("pr_discovery:\n  mode: LIVE-ish\n")
+    assert load_config(path).mode == "shadow"
+    (tmp_path / "empty.yaml").write_text("")
+    assert load_config(tmp_path / "empty.yaml").mode == "shadow"
+    assert load_config(tmp_path / "nope.yaml").mode == "shadow"
+
+
+def test_the_excluded_repo_list_is_split_not_handed_over_as_a_string(monkeypatch):
+    """`candidates()` names this trap in its own docstring: a bare string
+    turns the exact-membership ban into a substring match, so `Ylopo/ylopo-inf`
+    would be "banned" for being a substring of `Ylopo/ylopo-infra`."""
+    monkeypatch.setenv("PR_REVIEW_EXCLUDED_REPOS", "Ylopo/a Ylopo/b")
+    assert banned_repos() == ("Ylopo/a", "Ylopo/b")
+
+
+def test_the_default_ban_list_has_not_drifted_from_lanes(monkeypatch):
+    """Discovery must never post a pull request the lane dispatcher would
+    then refuse -- that strands a review Boris has already paid for."""
+    from pr_remediation import lanes
+
+    monkeypatch.delenv("PR_REVIEW_EXCLUDED_REPOS", raising=False)
+    assert frozenset(banned_repos()) == lanes._excluded_repos()
+
+
+# ---------------------------------------------------------------------------
+# The entry point
+# ---------------------------------------------------------------------------
+
+def _boom(*args, **kwargs):
+    raise AssertionError("a tick was built after a precondition failed")
+
+
+def test_main_runs_no_tick_when_a_precondition_fails(monkeypatch):
+    import pr_discovery.main as module
+
+    monkeypatch.setattr(module, "load_config",
+                        lambda *a, **k: DiscoveryConfig(mode="live"))
+    monkeypatch.setattr(module, "run_selftest", lambda **k: ["token missing"])
+    monkeypatch.setattr(module, "slack_token", _boom)
+    monkeypatch.setattr(module, "build_deps", _boom)
+    assert module.main() == 1
+
+
+def test_main_runs_no_tick_when_a_precondition_check_crashes(monkeypatch):
+    """Under a cron, an exploding check has to fail closed like any other
+    precondition rather than escaping as a traceback."""
+    import pr_discovery.main as module
+
+    monkeypatch.setattr(module, "load_config",
+                        lambda *a, **k: DiscoveryConfig(mode="live"))
+    monkeypatch.setattr(module, "run_selftest", _boom)
+    monkeypatch.setattr(module, "slack_token", _boom)
+    monkeypatch.setattr(module, "build_deps", _boom)
+    assert module.main() == 1
+
+
+def test_main_refuses_a_live_tick_without_the_bot_token(monkeypatch):
+    import pr_discovery.main as module
+
+    monkeypatch.setattr(module, "load_config",
+                        lambda *a, **k: DiscoveryConfig(mode="live"))
+    monkeypatch.setattr(module, "run_selftest", lambda **k: [])
+    monkeypatch.setattr(module, "slack_token", lambda: "")
+    monkeypatch.setattr(module, "build_deps", _boom)
+    assert module.main() == 1
+
+
+def test_main_reports_the_tick_on_stdout_and_exits_zero(monkeypatch, capsys):
+    import pr_discovery.main as module
+
+    monkeypatch.setattr(module, "load_config",
+                        lambda *a, **k: DiscoveryConfig(mode="live"))
+    monkeypatch.setattr(module, "run_selftest", lambda **k: [])
+    monkeypatch.setattr(module, "slack_token", lambda: "tok")
+    monkeypatch.setattr(module, "build_deps", lambda token, **k: token)
+    monkeypatch.setattr(module, "run", lambda deps, *, mode: RunResult(
+        mode=mode, posted=("Ylopo/x#1@abc123",)))
+    assert module.main() == 0
+    assert "posted 1: Ylopo/x#1@abc123" in capsys.readouterr().out
+
+
+def test_main_says_nothing_at_all_on_a_quiet_healthy_tick(monkeypatch, capsys):
+    """Empty stdout is what makes the deterministic cron silent."""
+    import pr_discovery.main as module
+
+    monkeypatch.setattr(module, "load_config",
+                        lambda *a, **k: DiscoveryConfig(mode="shadow"))
+    monkeypatch.setattr(module, "run_selftest", lambda **k: [])
+    monkeypatch.setattr(module, "slack_token", lambda: "")
+    monkeypatch.setattr(module, "build_deps", lambda token, **k: token)
+    monkeypatch.setattr(module, "run",
+                        lambda deps, *, mode: RunResult(mode=mode))
+    assert module.main() == 0
+    assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# Selftest
+# ---------------------------------------------------------------------------
+
+def _intake_config(tmp_path, **overrides):
+    block = {
+        "discovery_marker": MARKER,
+        "discovery_bot_user_id": "U0B9TK6B41M",
+        "loop_bot_user_id": "U0B9TK6B41M",
+        "loop_attributed_user_id": "U07E3AHV686",
+        "channels": ["C0BPCKPEFCG"],
+        "passive_channels": ["C0BPCKPEFCG"],
+    }
+    block.update(overrides)
+    lines = ["boris_intake:"]
+    for key, value in block.items():
+        if isinstance(value, list):
+            lines.append(f"  {key}:")
+            lines.extend(f"    - {item}" for item in value)
+        else:
+            lines.append(f"  {key}: '{value}'")
+    path = tmp_path / "intake.yaml"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _token(tmp_path, mode=0o600):
+    path = tmp_path / ".gh_token"
+    path.write_text("ghp_xxx\n")
+    path.chmod(mode)
+    return path
+
+
+def test_selftest_passes_on_a_correctly_deployed_tick(tmp_path):
+    assert run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path),
+        config_path=tmp_path / "absent.yaml") == []
+
+
+def test_selftest_fails_closed_on_a_missing_token(tmp_path):
+    failures = run_selftest(
+        mode="shadow", token_path=tmp_path / "nope",
+        intake_config_path=_intake_config(tmp_path),
+        config_path=tmp_path / "absent.yaml")
+    assert any("missing" in f for f in failures)
+
+
+def test_selftest_fails_closed_on_a_world_readable_token(tmp_path):
+    failures = run_selftest(
+        mode="shadow", token_path=_token(tmp_path, 0o644),
+        intake_config_path=_intake_config(tmp_path),
+        config_path=tmp_path / "absent.yaml")
+    assert any("0o644" in f for f in failures)
+
+
+def test_selftest_catches_a_marker_drift(tmp_path):
+    """boris_intake's marker is YAML-deployed and this one is a literal, so
+    nothing but this check keeps them equal -- and a drift makes every post
+    land in the channel and be silently dropped by the gate."""
+    failures = run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path,
+                                          discovery_marker="[swept it. v2]"),
+        config_path=tmp_path / "absent.yaml")
+    assert any("marker" in f for f in failures)
+
+
+def test_selftest_catches_an_inert_discovery_door(tmp_path):
+    for override in ({"discovery_bot_user_id": ""},
+                     {"loop_attributed_user_id": ""}):
+        failures = run_selftest(
+            mode="live", token_path=_token(tmp_path),
+            intake_config_path=_intake_config(tmp_path, **override),
+            config_path=tmp_path / "absent.yaml")
+        assert failures, override
+
+
+def test_selftest_catches_a_discovery_identity_that_is_not_the_posting_one(tmp_path):
+    """This cron posts with the loop's token, so the two configured bot ids
+    name one Slack user; a disagreement means every post is dropped."""
+    failures = run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path,
+                                          discovery_bot_user_id="U0SOMEONE"),
+        config_path=tmp_path / "absent.yaml")
+    assert any("loop_bot_user_id" in f for f in failures)
+
+
+def test_selftest_catches_a_channel_the_gate_would_reject(tmp_path):
+    failures = run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path, channels=["C0000000000"],
+                                          passive_channels=["C0000000000"]),
+        config_path=tmp_path / "absent.yaml")
+    assert any("C0BPCKPEFCG" in f and "CHANNEL_NOT_ALLOWED" in f
+               for f in failures)
+
+
+def test_selftest_catches_a_channel_that_is_allowed_but_not_passive(tmp_path):
+    """A non-passive channel demands an @mention this cron deliberately does
+    not send, so every post would be rejected with MENTION_REQUIRED."""
+    failures = run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(
+            tmp_path, channels=["C0BPCKPEFCG", "C0BANB70BHR"],
+            passive_channels=["C0BANB70BHR"]),
+        config_path=tmp_path / "absent.yaml")
+    assert any("passive" in f for f in failures)
+
+
+def test_a_shadow_tick_is_not_blocked_by_gate_configuration(tmp_path):
+    """Shadow posts nothing, so a gate that would reject our posts has no
+    bearing on a shadow soak -- and refusing to run one would block the very
+    comparison shadow exists for. Same mode-scoping as pr_remediation's
+    autofix and reachability checks."""
+    assert run_selftest(
+        mode="shadow", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path, discovery_marker="drifted",
+                                          discovery_bot_user_id=""),
+        config_path=tmp_path / "absent.yaml") == []
+
+
+def test_selftest_catches_a_config_key_that_looks_configurable_but_is_not(tmp_path):
+    """`channel` and `marker` are module constants, not YAML settings. An
+    operator who writes a different value into the block would otherwise get
+    silence and no effect."""
+    config = tmp_path / "config.yaml"
+    config.write_text("pr_discovery:\n  mode: live\n  channel: C0DIFFERENT\n")
+    failures = run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path), config_path=config)
+    assert any("C0DIFFERENT" in f for f in failures)
+
+
+def test_selftest_accepts_a_config_block_that_restates_the_constants(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("pr_discovery:\n  mode: live\n"
+                      "  channel: C0BPCKPEFCG\n"
+                      f"  marker: '{MARKER}'\n"
+                      "  interval_minutes: 30\n")
+    assert run_selftest(
+        mode="live", token_path=_token(tmp_path),
+        intake_config_path=_intake_config(tmp_path), config_path=config) == []
