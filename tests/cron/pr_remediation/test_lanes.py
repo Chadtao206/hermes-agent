@@ -1051,6 +1051,59 @@ def test_create_refuses_a_repo_name_with_a_disallowed_character(tmp_path, monkey
     assert calls == [], "a repo name outside A-Za-z0-9._- must never reach the runner"
 
 
+# --- Gap 3: case-insensitivity ----------------------------------------------
+#
+# GitHub resolves repo names case-insensitively: `Ylopo/YLOPO-INFRA` IS
+# `Ylopo/ylopo-infra`, the same repository the explicit list and the suffix
+# rule already ban. Both halves of the ban -- exact-set membership and the
+# suffix check -- must casefold, or an upper-cased PR sails straight through.
+
+
+def test_create_refuses_the_excluded_repo_regardless_of_case(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="YLOPO-INFRA")
+    _valid_anchor(tmp_path, monkeypatch, repo="YLOPO-INFRA")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the explicit-list ban must be case-insensitive"
+
+
+def test_create_refuses_a_mixed_case_infra_suffix_match(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="Platform-Infra")
+    _valid_anchor(tmp_path, monkeypatch, repo="Platform-Infra")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the -infra suffix ban must be case-insensitive too"
+
+
+def test_create_refuses_a_mixed_case_infrastructure_suffix_match(tmp_path, monkeypatch):
+    verdict = replace(VERDICT, repo="Billing-INFRASTRUCTURE")
+    _valid_anchor(tmp_path, monkeypatch, repo="Billing-INFRASTRUCTURE")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "the -infrastructure suffix ban must be case-insensitive too"
+
+
+def test_create_env_override_matches_regardless_of_the_operators_casing(tmp_path, monkeypatch):
+    """PR_REVIEW_EXCLUDED_REPOS is operator-typed; an entry banning
+    "Ylopo/Custom-Banned" must still refuse a verdict spelled
+    "ylopo/custom-banned" (or any other casing) -- the configured value is
+    casefolded exactly like the computed one is."""
+    monkeypatch.setenv("PR_REVIEW_EXCLUDED_REPOS", "Ylopo/Custom-Banned")
+    verdict = replace(VERDICT, repo="custom-banned")
+    _valid_anchor(tmp_path, monkeypatch, repo="custom-banned")
+    calls = []
+
+    result = LaneIO(tmp_path / "kanban.db", runner=_tracking_runner(calls)).create(verdict, 1)
+    assert result is None
+    assert calls == [], "an override-listed repo must be refused regardless of casing"
+
+
 def test_create_still_dispatches_an_ordinary_repo(tmp_path, monkeypatch):
     _valid_anchor(tmp_path, monkeypatch)
     calls = []

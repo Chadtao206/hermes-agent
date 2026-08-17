@@ -441,11 +441,18 @@ def test_the_excluded_repo_list_is_split_not_handed_over_as_a_string(monkeypatch
 
 def test_the_default_ban_list_has_not_drifted_from_lanes(monkeypatch):
     """Discovery must never post a pull request the lane dispatcher would
-    then refuse -- that strands a review Boris has already paid for."""
+    then refuse -- that strands a review Boris has already paid for.
+
+    `banned_repos()` deliberately returns the SPLIT list as-typed (its
+    caller, `candidates()`, casefolds internally -- see `discover.py`), while
+    `lanes._excluded_repos()` casefolds its own entries directly. Casefold
+    here too so this drift guard compares the same two ban lists
+    case-insensitively rather than tripping on a formatting difference
+    neither side's actual matching behaviour cares about."""
     from pr_remediation import lanes
 
     monkeypatch.delenv("PR_REVIEW_EXCLUDED_REPOS", raising=False)
-    assert frozenset(banned_repos()) == lanes._excluded_repos()
+    assert frozenset(r.casefold() for r in banned_repos()) == lanes._excluded_repos()
 
 
 # ---------------------------------------------------------------------------

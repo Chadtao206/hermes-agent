@@ -100,9 +100,13 @@ OWNER_LABEL = "hermes-owner-andrej"
 # the other unnoticed -- the same test-side-import / runtime-side-literal
 # arrangement `lanes.MAX_BRIEF_CHARS` uses against `_CTX_MAX_BODY_BYTES`.
 #
-# Matching is exact and case-SENSITIVE, here and in `lanes.py` alike:
-# `Ylopo/YLOPO-INFRA` bypasses both bans. That is recorded, asserted parity
-# (see the drift-guard test), not an accident of this implementation.
+# Matching is exact but case-INsensitive, here and in `lanes.py` alike:
+# `Ylopo/YLOPO-INFRA` is refused by both, the same as `Ylopo/ylopo-infra` --
+# GitHub resolves repo names case-insensitively, so they are the same
+# repository and must be banned identically. That parity is asserted by the
+# drift-guard test, not an accident of this implementation. (`_evaluate`
+# casefolds before comparing; this tuple stays lowercase-literal and relies
+# on that.)
 BANNED_REPO_SUFFIXES = ("-infra", "-infrastructure")
 
 
@@ -254,7 +258,22 @@ def candidates(gh, *, orgs, author, banned_repos,
         # nothing -- and say why, loudly enough for a reporter to surface.
         return DiscoveryResult(config_errors=tuple(config_errors))
 
-    banned = frozenset(banned_list)
+    # `banned` is casefolded -- not just lower()'d, to match
+    # `lanes._excluded_repos()` and to be correct beyond ASCII -- because
+    # `banned_repos` is operator-typed configuration (mirrors
+    # PR_REVIEW_EXCLUDED_REPOS on the lanes.py side) and GitHub resolves repo
+    # names case-insensitively: `Ylopo/YLOPO-INFRA` IS `Ylopo/ylopo-infra`, so
+    # an entry spelled either way must ban both. `_evaluate` casefolds the
+    # record's own `owner/repo` (`full`) to match against this set.
+    #
+    # `suffixes` is left as typed. Unlike `banned_repos` it is not read from
+    # an operator-facing env var -- the one production caller always passes
+    # the module-level `BANNED_REPO_SUFFIXES` default, which
+    # `test_suffix_constant_has_not_drifted_from_lanes` pins as a
+    # lowercase-literal match of `lanes._EXCLUDED_REPO_SUFFIXES` byte-for-byte
+    # -- so `full.endswith(suffixes)` is already case-insensitive because
+    # `full` alone is casefolded before the comparison.
+    banned = frozenset(entry.casefold() for entry in banned_list)
     suffixes = tuple(suffix_list)
     found: list[Candidate] = []
     failed: list[str] = []
@@ -339,12 +358,18 @@ def _evaluate(raw: object, *, org: str, author: str,
 
     # --- banned repo -------------------------------------------------------
     # The FULL signature of `pr_remediation/lanes.py`'s `_repo_is_excluded`:
-    # exact, case-sensitive membership OR a banned name suffix. Both halves
+    # exact, case-INsensitive membership OR a banned name suffix. Both halves
     # are needed for the two independent enforcement points to agree --
     # exact match alone admits `Ylopo/platform-infra` and
     # `Ylopo/billing-infrastructure`, which the lane dispatcher then refuses,
-    # stranding the verdict a Boris review already paid for.
-    full = f"{owner}/{repo}"
+    # stranding the verdict a Boris review already paid for. Casefolded
+    # because GitHub resolves repo names case-insensitively: `Ylopo/YLOPO-INFRA`
+    # IS `Ylopo/ylopo-infra`, the same repo the exact-match ban above already
+    # names. `banned_repos` arrives pre-casefolded from `candidates()`;
+    # `banned_repo_suffixes` is already lowercase-literal (see
+    # `BANNED_REPO_SUFFIXES` above), so casefolding `full` alone is enough
+    # for both halves.
+    full = f"{owner}/{repo}".casefold()
     if full in banned_repos or full.endswith(banned_repo_suffixes):
         return None
 

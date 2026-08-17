@@ -125,6 +125,30 @@ def test_excludes_infra_repo():
     assert candidates(_gh(repo="ylopo-infra"), **_args()).candidates == ()
 
 
+def test_excludes_infra_repo_regardless_of_case():
+    """GitHub resolves repo names case-insensitively -- `Ylopo/YLOPO-INFRA`
+    IS `Ylopo/ylopo-infra`, the exact-match ban lanes.py already refuses."""
+    assert candidates(_gh(repo="YLOPO-INFRA"), **_args()).candidates == ()
+
+
+def test_excludes_mixed_case_infra_suffix_match():
+    assert candidates(_gh(repo="Platform-Infra"), **_args()).candidates == ()
+
+
+def test_excludes_mixed_case_infrastructure_suffix_match():
+    assert candidates(_gh(repo="Billing-INFRASTRUCTURE"), **_args()).candidates == ()
+
+
+def test_banned_repos_parameter_matches_regardless_of_operator_casing():
+    """`banned_repos` is operator-typed configuration (mirrors
+    PR_REVIEW_EXCLUDED_REPOS on the lanes.py side); an entry spelled
+    "Ylopo/Custom-Banned" must still match a PR record spelled
+    "ylopo/custom-banned"."""
+    args = _args()
+    args["banned_repos"] = frozenset({"Ylopo/Custom-Banned"})
+    assert candidates(_gh(repo="custom-banned"), **args).candidates == ()
+
+
 def test_excludes_draft_and_non_chad_author():
     assert candidates(_gh(draft=True), **_args()).candidates == ()
     assert candidates(_gh(author="someone-else"), **_args()).candidates == ()
@@ -315,7 +339,9 @@ def test_suffix_ban_can_be_disabled_explicitly():
 # ---------------------------------------------------------------------------
 
 # Every row the review measured a gap on, plus a control that must be
-# admitted by both and the case-sensitivity hole both share.
+# admitted by both and mixed-case variants proving the ban is
+# case-insensitive on both sides (GitHub resolves repo names
+# case-insensitively, so `Ylopo/YLOPO-INFRA` IS `Ylopo/ylopo-infra`).
 _PARITY_REPOS = [
     "Ylopo/ylopo-infra",                      # banned: exact + suffix
     "Ylopo/ylopo-github-actions-workflows",   # banned: exact only
@@ -323,12 +349,19 @@ _PARITY_REPOS = [
     "Ylopo/billing-infrastructure",           # banned: suffix only
     "Ylopo/million-stars",                    # admitted by both
     "Ylopo/infra-tools",                      # suffix is a SUFFIX, not a prefix
-    "Ylopo/YLOPO-INFRA",                      # bypasses BOTH (case-sensitive)
+    "Ylopo/YLOPO-INFRA",                      # banned: exact + suffix, mixed case
+    "Ylopo/YLOPO-GITHUB-ACTIONS-WORKFLOWS",   # banned: exact only, mixed case
+    "Ylopo/Platform-Infra",                   # banned: suffix only, mixed case
 ]
 
 
 def _lanes_excludes(full: str) -> bool:
     from pr_remediation import lanes
+    # Mirrors `lanes._repo_is_excluded` exactly, including its casefold --
+    # `_excluded_repos()` now returns casefolded entries, so `full` must be
+    # casefolded here too or this helper stops matching the real function it
+    # exists to shadow.
+    full = full.casefold()
     return (full in lanes._excluded_repos()
             or full.endswith(lanes._EXCLUDED_REPO_SUFFIXES))
 
@@ -352,12 +385,16 @@ def test_suffix_constant_has_not_drifted_from_lanes():
     assert BANNED_REPO_SUFFIXES == lanes._EXCLUDED_REPO_SUFFIXES
 
 
-def test_case_sensitivity_hole_is_shared_recorded_behaviour():
-    """Recorded, not endorsed: an upper-cased repo name bypasses BOTH bans.
-    Asserted so it stays a known shared property rather than a coincidence
-    -- if `lanes.py` ever case-folds, this fails and discovery follows."""
-    assert _lanes_excludes("Ylopo/YLOPO-INFRA") is False
-    assert _discovery_excludes("Ylopo/YLOPO-INFRA") is False
+def test_case_insensitive_ban_is_shared_behaviour():
+    """The former case-sensitivity hole is closed on both sides: GitHub
+    resolves repo names case-insensitively, so an upper-cased infra repo
+    must be refused by both implementations, not merely agreed upon (the
+    parametrized parity test above would also pass if both sides still
+    admitted it -- False == False agrees too). Asserted explicitly so a
+    regression on either side that reintroduces the hole fails loudly here,
+    not just as a silent parity match."""
+    assert _lanes_excludes("Ylopo/YLOPO-INFRA") is True
+    assert _discovery_excludes("Ylopo/YLOPO-INFRA") is True
 
 
 # ---------------------------------------------------------------------------

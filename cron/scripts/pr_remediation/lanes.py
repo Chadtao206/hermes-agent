@@ -74,13 +74,23 @@ def _excluded_repos() -> frozenset[str]:
     """Space-separated `owner/name` entries. Read live off the environment
     (not cached at import) so a live override -- or a test's monkeypatch.setenv
     -- takes effect without a module reload, matching how ANCHOR_ROOT below is
-    read live off the module global."""
+    read live off the module global.
+
+    Casefolded on the way in: GitHub resolves repo names case-insensitively
+    (`Ylopo/YLOPO-INFRA` IS `Ylopo/ylopo-infra`), and an operator typing
+    `PR_REVIEW_EXCLUDED_REPOS` should not have to match the exact case the
+    default list happens to use for the ban to take effect."""
     raw = os.environ.get("PR_REVIEW_EXCLUDED_REPOS") or _DEFAULT_EXCLUDED_REPOS
-    return frozenset(raw.split())
+    return frozenset(entry.casefold() for entry in raw.split())
 
 
 def _repo_is_excluded(verdict: Verdict) -> bool:
-    full = f"{verdict.owner}/{verdict.repo}"
+    # Casefolded, not just lower()'d, to match _excluded_repos() above and to
+    # be correct beyond ASCII. _EXCLUDED_REPO_SUFFIXES is already
+    # lowercase-only, so casefolding `full` alone is enough for the suffix
+    # half; the set half relies on _excluded_repos() casefolding its own
+    # entries.
+    full = f"{verdict.owner}/{verdict.repo}".casefold()
     return full in _excluded_repos() or full.endswith(_EXCLUDED_REPO_SUFFIXES)
 
 
