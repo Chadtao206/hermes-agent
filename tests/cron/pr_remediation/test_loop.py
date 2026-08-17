@@ -3547,7 +3547,9 @@ def test_a_review_that_never_completes_escalates_on_the_absolute_deadline(tmp_pa
     deps.now.advance(60 * 60 + 60)
     assert tick(deps) == 1
     assert deps.slack.escalations == [
-        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
+        "and the notice says which of the two ways this wait can end happened: " \
+        "the gate took this request, so the place to look is that request's row"
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
@@ -3599,7 +3601,7 @@ def test_the_absolute_deadline_covers_an_unreadable_intake_too(tmp_path):
     deps.now.advance(4 * 60 * 60 + 60)
     assert tick(deps) == 1
     assert deps.slack.escalations == [
-        ("Ylopo/example#42", 1, "rereview_unacknowledged")]
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")]
     assert deps.store.get(loop_id).state is LoopState.ESCALATED
 
 
@@ -4127,3 +4129,32 @@ def test_a_paused_tick_at_the_attempt_bound_records_the_escalation_once(tmp_path
                  if e["kind"] == "shadow_decision"]
     assert decisions == [{"would": "escalate",
                           "reason": "rereview_unacknowledged"}]
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_a_paused_tick_past_the_deadline_records_the_escalation_once(tmp_path, mode):
+    """The third route out of this state, under the same rule again.
+
+    Nothing settles a decision in a paused mode, so this one is retaken on
+    every tick for as long as the pause lasts -- four a minute, appended to a
+    trail every later tick reads back in full, which is the growth this
+    module's standing-note dedup exists to prevent. The two routes above were
+    pinned; this one was reached only by a test that ticked once, where a
+    missing `standing` looks exactly like a present one.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)  # admitted, and it stays admitted
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(4 * 60 * 60 + 60)
+
+    paused = in_mode(deps, mode)
+    assert tick(paused) == 0
+    paused.now.advance(30.0)
+    assert tick(paused) == 0
+    assert paused.slack.escalations == [], "a pause escalates nothing"
+    assert paused.store.get(loop_id).state is LoopState.REREVIEW_POSTED
+    decisions = [e["detail"] for e in paused.store.events(loop_id)
+                 if e["kind"] == "shadow_decision"]
+    assert decisions == [{"would": "escalate",
+                          "reason": "rereview_verdict_overdue"}]

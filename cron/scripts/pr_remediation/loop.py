@@ -390,6 +390,17 @@ LANE_TIMEOUT = "lane_timeout"
 # gate's own admission log -- whatever it keeps rejecting the post for has
 # outlasted every retry this loop is willing to spend.
 REREVIEW_UNACKNOWLEDGED = "rereview_unacknowledged"
+# The gate DID take the request (or would not say), and no verdict arrived
+# inside REREVIEW_ABSOLUTE_DEADLINE_SECONDS. A fifth dead end, and it must not
+# share the fourth's reason even though both end the same wait: they mean
+# opposite things and send a human to opposite places. `rereview_unacknowledged`
+# says twelve posts were refused -- go and read why the gate keeps rejecting
+# them. This says one was accepted and then nothing came of it -- go and read
+# that request's own row, which is either still `reviewing` or has ended in
+# `slack_unavailable`, boris_intake's second terminal state, from which no
+# verdict is ever produced. The reason is what the notice names, so one literal
+# for both would send every one of these to the wrong place.
+REREVIEW_VERDICT_OVERDUE = "rereview_verdict_overdue"
 
 # Written on a lane_timeout settle that finds the lane not confirmed finished
 # by kanban's own account and therefore, deliberately, releases neither the
@@ -1824,7 +1835,11 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
     At the attempt bound -- escalate rather than go on re-posting forever. The
     reason is its own (REREVIEW_UNACKNOWLEDGED) because the place to go and look
     is its own: not the branch, not GitHub, not the kanban card, but whatever
-    the gate keeps rejecting the post for.
+    the gate keeps rejecting the post for. The deadline's escalation carries a
+    different reason again (REREVIEW_VERDICT_OVERDUE) for exactly the same
+    reason: it means a request was accepted and produced nothing, which is a
+    different thing to go and read -- that request's own row -- and the reason
+    is what the notice names.
     """
     episode = _rereview_episode(deps, loop)
     if deps.now() < loop.updated_at + REREVIEW_ACK_GRACE_SECONDS:
@@ -1844,7 +1859,7 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest) -> Route | None:
                      {"attempt": episode.attempts + 1, "origin": episode.origin},
                      standing=True)
     if deps.now() >= episode.started_at + REREVIEW_ABSOLUTE_DEADLINE_SECONDS:
-        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
+        return Route(ROUTE_ESCALATE, {"reason": REREVIEW_VERDICT_OVERDUE},
                      standing=True)
     if admitted is None:
         return Route(ROUTE_INTAKE_UNREADABLE, {"head_sha": loop.head_sha},
