@@ -125,3 +125,57 @@ def test_db_directory_is_created_if_missing(tmp_path):
     nested = tmp_path / "does" / "not" / "exist" / "ledger.db"
     Ledger(nested)
     assert nested.exists()
+
+
+def test_the_intake_backstop_does_not_hold_across_a_ci_rerun(tmp_path):
+    """Pins this module's docstring, which used to claim the intake gate
+    "already dedups on (repo, pr, head_sha)" -- half true, and the wrong half
+    for anyone reasoning about what happens if `state/pr_discovery.db` is lost.
+
+    boris_intake's durable key is `(review_identity, gate_fingerprint)`, and
+    the fingerprint hashes each CI check's run URL. A CI re-run at an unchanged
+    head therefore admits as a NEW review, not a duplicate -- so the backstop
+    underneath this ledger is narrower than per-head. Driven through
+    boris_intake's real Store and its real snapshot builder rather than
+    restated, so the claim cannot quietly stop being true."""
+    from pathlib import Path
+
+    from boris_intake.models import NormalizedEvent, ReviewCommand, ReviewPolicy
+    from boris_intake.result import build_gate_snapshot, load_gate_registry
+    from boris_intake.store import Store
+
+    registry = load_gate_registry(
+        Path(__file__).resolve().parents[3]
+        / "cron" / "scripts" / "boris_intake" / "gate_registry.json")
+
+    def snapshot(run_id):
+        return build_gate_snapshot(
+            [{"name": "unit-tests", "state": "SUCCESS",
+              "link": f"https://ci.example/runs/{run_id}", "required": True}],
+            "2026-08-14T12:00:00Z", registry)
+
+    command = ReviewCommand(
+        owner="Ylopo", repo="million-stars", pr_number=42, head_sha="a" * 40,
+        pr_author="Chadtao206", requester_user_id="U1",
+        requester_email="a@ylopo.com", channel_id="C1", message_ts="1.0",
+        root_thread_ts="1.0",
+        permalink="https://ylopo.slack.com/archives/C1/p10",
+        policy=ReviewPolicy(ignore_ci=False, rubric_version="2"))
+
+    def event(ts):
+        return NormalizedEvent("C1", "channel", "U1", ts, None,
+                               "https://github.com/Ylopo/million-stars/pull/42",
+                               False, None)
+
+    store = Store(tmp_path / "intake.db")
+    first = store.admit_event(event("1.0"), (command,), (snapshot(1),), 1_000_000.0)
+    # Same head, same policy, so the same review_identity -- only CI moved.
+    rerun = store.admit_event(event("2.0"), (command,), (snapshot(2),), 1_000_100.0)
+    # And the control: identical CI really does dedup.
+    repost = store.admit_event(event("3.0"), (command,), (snapshot(1),), 1_000_200.0)
+
+    assert len(first.admitted) == 1 and first.duplicates == ()
+    assert len(rerun.admitted) == 1, (
+        "a CI re-run at an unchanged head is a new review, not a duplicate")
+    assert rerun.duplicates == ()
+    assert repost.admitted == () and len(repost.duplicates) == 1

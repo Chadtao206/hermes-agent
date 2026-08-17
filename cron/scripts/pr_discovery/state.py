@@ -1,15 +1,26 @@
 """The discovery ledger: durable, per-head idempotency for "did we already
 post this".
 
-The intake gate (`boris_intake`) already dedups on
-`borisslack:{owner}/{repo}#{pr}@{head_sha}:policy={fp}` -- a re-post at an
-unchanged head is admitted there as a *duplicate*, not a new review request.
-That is the backstop, not the mechanism: a duplicate still costs a real Slack
-message and a reject reply, i.e. noise a human reads. This ledger is what
-actually prevents the noise, by letting the poster (a later task) ask "have
-we already posted this exact (owner, repo, number, head_sha)" BEFORE it ever
+`boris_intake` dedups too, but on a NARROWER key than a per-head one, and
+the difference is the reason this ledger exists rather than being belt and
+braces. Its durable key is `(review_identity, gate_fingerprint)`
+(`store.py::admit_event`): `review_identity` is
+`borisslack:{owner}/{repo}#{pr}@{head_sha}:policy={fp}`, per-head as the name
+suggests -- but `gate_fingerprint` is a sha256 over the PR's whole CI check
+list, INCLUDING each check's run URL (`result.py::build_gate_snapshot`).
+A CI re-run at an unchanged head changes those URLs, so it changes the
+fingerprint, so the same head admits as a NEW review rather than a duplicate.
+
+So the intake gate is a backstop that holds for a re-post in the same CI
+state and not otherwise, and even where it holds a duplicate still costs a
+real Slack message and a reject reply, i.e. noise a human reads. This ledger
+is what actually prevents the noise, by letting the poster ask "have we
+already posted this exact (owner, repo, number, head_sha)" BEFORE it ever
 sends anything, the same way `pr_remediation/store.py`'s `mark_verdict_seen`
-guards its own send path.
+guards its own send path. It follows that losing `state/pr_discovery.db`
+does not merely cost a round of duplicate messages: it can cost a round of
+duplicate REVIEWS, one per pull request whose CI has moved since it was
+posted.
 
 Deliberately does not gate on `candidates()`'s output -- `discover.py` stays
 pure with respect to persistent state; only the poster consults this ledger.

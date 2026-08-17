@@ -25,10 +25,14 @@ not the absence of a code path.
 
 *The ledger is written only after Slack accepts.* A post that failed must
 come back on the next tick, so the row goes in after the `ts` comes back and
-never before. The intake gate's own `(repo, pr, head_sha)` dedup is the
-backstop underneath that, not the mechanism: a duplicate post is admitted as
-a duplicate rather than a second review, but it still costs a real message and
-a reject reply that a human reads.
+never before. The intake gate's own dedup sits underneath that as a partial
+backstop, not as the mechanism, and it is narrower than a per-head one: its
+durable key is `(review_identity, gate_fingerprint)`, and the fingerprint is
+a hash of the pull request's whole CI check list including each check's run
+URL, so a CI re-run at an unchanged head admits as a NEW review rather than a
+duplicate (see `pr_discovery/state.py`'s module docstring). Where it does hold
+it only downgrades a second post to a duplicate, which still costs a real
+message and a reject reply that a human reads.
 
 Nothing in the posted message comes from this module -- see `post.py`, whose
 docstring carries the security argument for why the message is a URL and a
