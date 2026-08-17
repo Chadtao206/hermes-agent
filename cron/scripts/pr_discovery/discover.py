@@ -44,21 +44,35 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-GHX_RO = "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"
+# Every GitHub read this module makes goes through this command-allowlisted
+# wrapper -- `search prs`, `pr view` and `pr checks` scoped to one org via
+# `DISCOVERY_ORG_SCOPE`, everything else refused with exit 3. There is no bare
+# `gh` invocation left in this file, and a test pins argv[0] of all three
+# calls.
+#
+# What that is worth, stated exactly, because it is easy to overclaim: this
+# cron is `no_agent: true` deterministic Python whose argv are the constants
+# below, so there is no model here that could be induced into a write, and no
+# attacker is stopped who can already run commands as this user. The wrapper
+# stops a FUTURE EDIT to this file from adding a write call silently. That is
+# the whole claim.
+GHX_DISCOVERY = "/Users/ctao/.hermes/scripts/pr/ghx_discovery.sh"
 HOME = "/Users/ctao"
-# The read-only machine credential `ghx_ro.sh` itself defaults to
-# (`BORIS_GH_TOKEN_PATH`), 0600 on disk. Discovery only ever reads, so it
-# deliberately does NOT reach for `pr_remediation`'s `.gh_write_token`: the two
-# halves of this adapter's two-step read (a bare `gh search`, then a scoped
-# `ghx_ro.sh pr view`/`pr checks`) then run on one and the same credential.
+# The read-only machine credential, 0600 on disk -- the same file `ghx_ro.sh`
+# defaults to, and the file `ghx_discovery.sh` reads once `_run` points it here
+# via `DISCOVERY_GH_TOKEN_PATH`. Discovery only ever reads, so it deliberately
+# does NOT reach for `pr_remediation`'s `.gh_write_token`: all three of this
+# adapter's reads run on this one credential.
 DEFAULT_TOKEN_PATH = Path("/Users/ctao/.hermes/state/.gh_token")
 # `subprocess.run(env=...)` REPLACES the environment rather than extending it,
-# so anything `gh` needs has to be named here explicitly. `HOME` is not
-# optional decoration: without it `gh` writes `.local/state/gh/device-id` into
-# whatever directory the cron happens to be running in (fixed for the sibling
-# adapter in `pr_remediation/github_io.py` by commit 203c17b0a6, and pinned by
-# a test there and here so it cannot regress a third time). The credential
-# itself is added per-call in `_run`, never stored in this dict.
+# so anything the wrapper and `gh` need has to be named here explicitly. `HOME`
+# is not optional decoration: without it `gh` writes
+# `.local/state/gh/device-id` into whatever directory the cron happens to be
+# running in (fixed for the sibling adapter in `pr_remediation/github_io.py` by
+# commit 203c17b0a6, and pinned by a test there and here so it cannot regress a
+# third time). The org scope and the credential's PATH are added per-call in
+# `_run`; the credential's VALUE appears in neither this dict nor argv, because
+# the wrapper reads it from the 0600 file itself.
 _RUN_ENV = {"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
             "HOME": HOME}
 TIMEOUT = 30
@@ -398,33 +412,36 @@ def _evaluate(raw: object, *, org: str, author: str,
 # Production `gh` adapter
 # ---------------------------------------------------------------------------
 #
-# `candidates()` above depends only on `open_prs(org, author) -> list[dict] |
-# None` -- it does not care how that list is produced. `GhClient` is the
+# `candidates()` above depends only on `open_prs(org, author) -> Listing |
+# None` -- it does not care how that listing is produced. `GhClient` is the
 # concrete, network-touching implementation the live discovery cron wires in;
 # every test in this package's suite uses a fake instead (see
 # `test_discover.py`), so nothing here is on that suite's hot path.
 #
-# A KNOWN GAP, flagged rather than silently worked around: `ghx_ro.sh` --
-# named in this task's brief as "the" read-only wrapper -- is scoped to a
-# single already-known pull request (`BORIS_PR_SCOPE=owner/repo#number`; its
-# `pr` verb allows only `view|diff|checks|status`, each require-scoped to
-# that one PR). It has no `search`/`list` verb and cannot enumerate PRs across
-# an org -- confirmed by reading the script, not assumed. That makes it
-# structurally unable to answer "what are Chad's open PRs in this org", which
-# is the very first question discovery has to ask.
+# Why this is a two-step read. `gh search prs --json` is narrower than it
+# looks: GitHub's search API backs it, and that API does not expose
+# `headRefOid`, `mergeStateStatus` or CI conclusions at all -- only `pr view`
+# and `pr checks` (single-PR GraphQL/REST calls) do. So enumeration and detail
+# are genuinely two different calls: `search prs` gives the PR numbers in an
+# org, then one `pr view` and one `pr checks` per number fill in the rest.
 #
-# `gh search prs --json` is ALSO narrower than it looks: GitHub's search API
-# backs it, and that API does not expose `headRefOid`, `mergeStateStatus`, or
-# CI conclusions at all -- only `pr view`/`pr checks` (single-PR GraphQL/REST
-# calls) do. So `GhClient` below is a genuine two-step adapter: a single
-# directly-invoked, read-only `gh search prs` call enumerates PR numbers per
-# org (the step no wrapper supports), and `ghx_ro.sh` -- scoped per PR via
-# `BORIS_PR_SCOPE`, exactly as it is designed to be used -- supplies the head
-# SHA, merge state and CI conclusion for each one found. This is a deliberate,
-# reported deviation from "reached through a wrapper, not bare" for the one
-# operation (enumeration) no existing wrapper supports; see this task's report
-# for the full reasoning and the two ways to close the gap (extend
-# `ghx_ro.sh` with an org-scoped search verb, or accept this hybrid).
+# Why all three go through `ghx_discovery.sh` and not `ghx_ro.sh`. The latter
+# pins every read to a single already-known pull request
+# (`BORIS_PR_SCOPE=owner/repo#number`, `pr` verb limited to
+# `view|diff|checks|status`, each require-scoped to that PR). That is exactly
+# the property a Boris review lane needs, and exactly the property that makes
+# enumeration impossible to express -- it has no `search` verb and could not
+# usefully gain one without widening the review-lane boundary for a different
+# consumer's benefit. `ghx_discovery.sh` is its sibling, scoped to an org
+# instead of a PR.
+#
+# The cost of that, stated rather than buried: the two detail reads used to
+# inherit `ghx_ro.sh`'s per-PR pin and now carry a per-org one. Nothing that
+# was doing work is lost -- this module chooses those PR numbers itself, out
+# of an enumeration already scoped to the same org, so the tighter pin was
+# restating a decision made a few lines earlier in this same file. What it
+# buys is one wrapper to audit for the whole module, and no bare `gh` left in
+# it to grow a write call.
 #
 # `gh search prs` defaults to `--limit 30`. Chad runs 22-23 open PRs in scope
 # today, so the default is already close enough to bite, and it bites
@@ -474,10 +491,11 @@ class GhClient:
         Read per call, not cached at construction, so a rotated token is
         picked up by the next tick without a restart. Any failure (missing
         file, permissions, non-UTF-8 bytes) and an empty-after-strip file are
-        both `None`: `_run` then refuses to spawn `gh` at all, exactly as
-        `pr_remediation/github_io.py::_run` does, rather than making the
+        both `None`: `_run` then refuses to spawn the wrapper at all, exactly
+        as `pr_remediation/github_io.py::_run` does, rather than making the
         fail-closed guarantee depend on how `gh` reacts to an empty
-        `GH_TOKEN`.
+        `GH_TOKEN`. The wrapper checks the same file again for itself, so the
+        guarantee does not depend on this adapter being the only caller.
         """
         try:
             token = self._token_path.read_text(encoding="utf-8").strip()
@@ -485,30 +503,33 @@ class GhClient:
             return None
         return token or None
 
-    def _run(self, argv: list[str], *, scope: str | None = None) -> str | None:
+    def _run(self, argv: list[str], *, org: str) -> str | None:
+        """One `ghx_discovery.sh` call's stdout, or `None` if it cannot be
+        trusted to have answered.
+
+        Two things ride in the environment, and neither is optional. The org
+        scope is what the wrapper checks `--owner=`/`-R` against; without it
+        the wrapper refuses every verb, so a missing scope is a dead tick, not
+        a wide one. The credential travels as a PATH, never as a value: the
+        wrapper reads that 0600 file itself and exports `GH_TOKEN` immediately
+        before `exec gh`, so a `GH_TOKEN` set here would be overwritten by it
+        anyway. Passing the path (rather than relying on the wrapper's own
+        default) keeps a test's or a deployment's token override applying to
+        all three reads instead of silently to none.
+
+        The credential is still read locally first: a missing, unreadable or
+        empty token file refuses to spawn anything at all, exactly as
+        `pr_remediation/github_io.py::_run` does. The wrapper refuses that same
+        case a second time (exit 1) rather than letting `gh` run
+        unauthenticated -- where a search would answer an empty result set
+        indistinguishable from "this org has no open PRs". Both refusals are
+        tested; neither depends on the other.
+        """
+        if self._token() is None:
+            return None
         env = dict(_RUN_ENV)
-        if scope is not None:
-            # `ghx_ro.sh` sources its own credential from
-            # `BORIS_GH_TOKEN_PATH` (defaulting to the same file this adapter
-            # reads); pointing it explicitly at `self._token_path` keeps both
-            # halves of the two-step read on one credential even when a test
-            # or a deployment overrides it. It needs no `GH_TOKEN` and would
-            # overwrite one anyway.
-            env["BORIS_PR_SCOPE"] = scope
-            env["BORIS_GH_TOKEN_PATH"] = str(self._token_path)
-        else:
-            # The bare `gh search` call -- the one operation no read-only
-            # wrapper can perform (see the block comment above) -- carries the
-            # credential itself. `subprocess.run(env=...)` REPLACES the
-            # environment, so without this line `gh` runs unauthenticated and
-            # exits 4 ("To get started with GitHub CLI, please run: gh auth
-            # login") on every single tick, making discovery permanently
-            # inert. Passed by environment, never in argv, where it could be
-            # logged or land in a `ps` listing.
-            token = self._token()
-            if token is None:
-                return None
-            env["GH_TOKEN"] = token
+        env["DISCOVERY_ORG_SCOPE"] = org
+        env["DISCOVERY_GH_TOKEN_PATH"] = str(self._token_path)
         try:
             proc = self._runner(argv, capture_output=True, text=True,
                                 timeout=TIMEOUT, env=env)
@@ -519,8 +540,12 @@ class GhClient:
         return proc.stdout or ""
 
     def _search(self, org: str, author: str) -> list[dict] | None:
-        out = self._run(["gh", *_SEARCH_ARGS, f"--owner={org}",
-                         f"--author={author}"])
+        # `--owner=` is load-bearing twice over: it is the qualifier that
+        # keeps the search inside this org, AND it is what the wrapper
+        # compares `DISCOVERY_ORG_SCOPE` against -- a search that lost it is
+        # refused rather than quietly widened to all of GitHub.
+        out = self._run([GHX_DISCOVERY, *_SEARCH_ARGS, f"--owner={org}",
+                         f"--author={author}"], org=org)
         if out is None or not out.strip():
             return None
         try:
@@ -531,9 +556,9 @@ class GhClient:
 
     def _view(self, owner: str, repo: str, number: int) -> dict | None:
         out = self._run(
-            [GHX_RO, "pr", "view", str(number), "-R", f"{owner}/{repo}",
+            [GHX_DISCOVERY, "pr", "view", str(number), "-R", f"{owner}/{repo}",
              "--json", "headRefOid,mergeStateStatus"],
-            scope=f"{owner}/{repo}#{number}",
+            org=owner,
         )
         if out is None or not out.strip():
             return None
@@ -545,9 +570,9 @@ class GhClient:
 
     def _checks(self, owner: str, repo: str, number: int) -> list | None:
         out = self._run(
-            [GHX_RO, "pr", "checks", str(number), "-R", f"{owner}/{repo}",
-             "--json", "name,state"],
-            scope=f"{owner}/{repo}#{number}",
+            [GHX_DISCOVERY, "pr", "checks", str(number), "-R",
+             f"{owner}/{repo}", "--json", "name,state"],
+            org=owner,
         )
         if out is None or not out.strip():
             # `gh pr checks` exits 8 while checks are pending, 1 when any

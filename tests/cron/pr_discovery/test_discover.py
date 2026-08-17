@@ -397,11 +397,24 @@ class _Proc:
         self.stderr = ""
 
 
+# The wrapper every read is routed through, spelled out rather than imported
+# from `discover`: a test that compared argv[0] against the same constant the
+# production code builds argv[0] from would pass no matter which script that
+# constant named, including `gh` itself.
+GHX_DISCOVERY_PATH = "/Users/ctao/.hermes/scripts/pr/ghx_discovery.sh"
+
+
 class _ScriptedRunner:
-    """Routes a `gh`/`ghx_ro.sh` invocation to a canned response keyed by
+    """Routes a `ghx_discovery.sh` invocation to a canned response keyed by
     which verb it is (search / pr view / pr checks), and records every call
-    made so a test can assert on scoping (BORIS_PR_SCOPE) and on the
-    environment the credential rides in."""
+    made so a test can assert on scoping (DISCOVERY_ORG_SCOPE) and on the
+    environment the credential rides in.
+
+    Keyed on the SUBCOMMAND, never on argv[0], so that the tests asserting
+    which program is executed are the only place that fact is checked -- a
+    router that dispatched on argv[0] would quietly stop matching (and raise
+    "unscripted call") if the wrapper were swapped out, instead of letting the
+    dedicated test report it."""
 
     def __init__(self, *, search=None, view=None, checks=None):
         self._search = search if search is not None else _Proc(1)
@@ -411,10 +424,10 @@ class _ScriptedRunner:
 
     def __call__(self, argv, **kwargs):
         self.calls.append((list(argv), dict(kwargs.get("env") or {})))
-        if argv[:2] == ["gh", "search"]:
+        if argv[1:3] == ["search", "prs"]:
             return self._search
         if len(argv) >= 6 and argv[1:3] == ["pr", "view"]:
-            key = argv[5]  # argv = [ghx_ro, "pr", "view", num, "-R", "<owner>/<repo>", ...]
+            key = argv[5]  # argv = [wrapper, "pr", "view", num, "-R", "<owner>/<repo>", ...]
             return self._view.get(key, _Proc(1))
         if len(argv) >= 6 and argv[1:3] == ["pr", "checks"]:
             key = argv[5]
@@ -468,12 +481,11 @@ def test_ghclient_merges_search_and_detail_into_one_open_pr_record(tmp_path):
         "merge_state": "CLEAN", "checks_state": "SUCCESS",
     },)
     assert listing.truncated is False
-    # BORIS_PR_SCOPE must pin exactly the PR the per-PR calls concern.
-    scoped_envs = [env for argv, env in runner.calls
-                   if argv[0] == "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"]
-    assert all(env.get("BORIS_PR_SCOPE") == "Ylopo/million-stars#7"
-               for env in scoped_envs)
-    assert len(scoped_envs) == 2  # one `pr view`, one `pr checks`
+    # The per-PR reads name the PR in argv and stay inside the scoped org.
+    pr_calls = [argv for argv, _ in runner.calls if argv[1] == "pr"]
+    assert len(pr_calls) == 2  # one `pr view`, one `pr checks`
+    for argv in pr_calls:
+        assert argv[3:6] == ["7", "-R", "Ylopo/million-stars"], argv
 
 
 def test_ghclient_search_failure_returns_none(tmp_path):
@@ -677,16 +689,60 @@ def test_candidates_end_to_end_through_ghclient(tmp_path):
 # ---------------------------------------------------------------------------
 
 def _search_call(runner):
-    return next((argv, env) for argv, env in runner.calls if argv[0] == "gh")
+    return next((argv, env) for argv, env in runner.calls
+                if argv[1:3] == ["search", "prs"])
 
 
-def test_search_call_carries_the_credential_in_its_environment(tmp_path):
-    """Without this the bare `gh search` runs unauthenticated and exits 4 on
-    every tick, so `candidates()` returns nothing, forever, silently."""
+def test_every_github_read_goes_through_the_command_allowlisted_wrapper(tmp_path):
+    """No bare `gh` anywhere in this adapter -- enumeration included, which
+    was the last one left. The wrapper refuses every verb but `search prs`,
+    `pr view` and `pr checks`, so a future edit here cannot add a write call
+    without also editing (and re-testing) the wrapper."""
+    search_out = json.dumps([_hit()])
+    view_out = json.dumps({"headRefOid": "cafebabe", "mergeStateStatus": "CLEAN"})
+    checks_out = json.dumps([{"name": "build", "state": "SUCCESS"}])
+    runner = _ScriptedRunner(
+        search=_Proc(0, search_out),
+        view={"Ylopo/repo-a": _Proc(0, view_out)},
+        checks={"Ylopo/repo-a": _Proc(0, checks_out)},
+    )
+    _client(runner, tmp_path).open_prs("Ylopo", "Chadtao206")
+    assert len(runner.calls) == 3  # search + pr view + pr checks
+    for argv, _ in runner.calls:
+        assert argv[0] == GHX_DISCOVERY_PATH, argv
+
+
+def test_every_call_is_scoped_to_the_org_being_enumerated(tmp_path):
+    """`DISCOVERY_ORG_SCOPE` is what the wrapper checks `--owner=` and `-R`
+    against; unset, it refuses every verb, so this env line is the difference
+    between a working tick and a dead one."""
+    search_out = json.dumps([_hit()])
+    view_out = json.dumps({"headRefOid": "cafebabe", "mergeStateStatus": "CLEAN"})
+    checks_out = json.dumps([{"name": "build", "state": "SUCCESS"}])
+    runner = _ScriptedRunner(
+        search=_Proc(0, search_out),
+        view={"Ylopo/repo-a": _Proc(0, view_out)},
+        checks={"Ylopo/repo-a": _Proc(0, checks_out)},
+    )
+    _client(runner, tmp_path).open_prs("Ylopo", "Chadtao206")
+    assert len(runner.calls) == 3
+    for argv, env in runner.calls:
+        assert env.get("DISCOVERY_ORG_SCOPE") == "Ylopo", argv
+
+
+def test_the_credential_travels_to_the_wrapper_as_a_path(tmp_path):
+    """The wrapper reads the 0600 file itself and exports `GH_TOKEN` just
+    before `exec gh`, so what this adapter has to get right is the PATH: point
+    it at the wrong file (or at nothing, leaving the wrapper's own default) and
+    a configured token override applies to none of the three reads. The token's
+    VALUE is deliberately absent from the environment -- the wrapper would
+    overwrite it anyway."""
     runner = _ScriptedRunner(search=_Proc(0, "[]"))
-    _client(runner, tmp_path, token="ghp_secret_value").open_prs("Ylopo", "Chadtao206")
-    _, env = _search_call(runner)
-    assert env.get("GH_TOKEN") == "ghp_secret_value"
+    path = _token_file(tmp_path, "ghp_secret_value")
+    GhClient(runner=runner, token_path=path).open_prs("Ylopo", "Chadtao206")
+    argv, env = _search_call(runner)
+    assert env.get("DISCOVERY_GH_TOKEN_PATH") == str(path)
+    assert "ghp_secret_value" not in str(env)
 
 
 def test_credential_never_appears_in_argv(tmp_path):
@@ -717,9 +773,10 @@ def test_missing_token_file_fails_the_search_closed(tmp_path):
 def test_every_subprocess_environment_carries_home(tmp_path):
     """With HOME unset, `gh` writes `.local/state/gh/device-id` into whatever
     directory the cron happens to be running in. Fixed once already on this
-    branch for `pr_remediation/github_io.py` (203c17b0a6); pinned here for
-    both the bare `gh search` and the two `ghx_ro.sh` calls so it cannot
-    regress a third time."""
+    branch for `pr_remediation/github_io.py` (203c17b0a6); pinned here for all
+    three wrapper calls -- the wrapper `exec`s `gh`, so it inherits whatever
+    environment this adapter assembles -- so it cannot regress a third
+    time."""
     search_out = json.dumps([_hit()])
     view_out = json.dumps({"headRefOid": "cafebabe", "mergeStateStatus": "CLEAN"})
     checks_out = json.dumps([{"name": "build", "state": "SUCCESS"}])
@@ -734,10 +791,10 @@ def test_every_subprocess_environment_carries_home(tmp_path):
         assert env.get("HOME") == "/Users/ctao", argv
 
 
-def test_ghx_calls_are_pointed_at_the_same_token_file(tmp_path):
-    """`ghx_ro.sh` sources its own credential from BORIS_GH_TOKEN_PATH; both
-    halves of the two-step read must use one and the same file, or a
-    configured token path silently applies to only half the adapter."""
+def test_every_call_is_pointed_at_the_same_token_file(tmp_path):
+    """`ghx_discovery.sh` sources its credential from
+    DISCOVERY_GH_TOKEN_PATH; all three reads must name one and the same file,
+    or a configured token path silently applies to part of the adapter."""
     search_out = json.dumps([_hit()])
     view_out = json.dumps({"headRefOid": "cafebabe", "mergeStateStatus": "CLEAN"})
     checks_out = json.dumps([{"name": "build", "state": "SUCCESS"}])
@@ -748,10 +805,9 @@ def test_ghx_calls_are_pointed_at_the_same_token_file(tmp_path):
     )
     path = _token_file(tmp_path)
     GhClient(runner=runner, token_path=path).open_prs("Ylopo", "Chadtao206")
-    ghx_envs = [env for argv, env in runner.calls
-                if argv[0] == "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"]
-    assert ghx_envs and all(env.get("BORIS_GH_TOKEN_PATH") == str(path)
-                            for env in ghx_envs)
+    assert len(runner.calls) == 3
+    assert all(env.get("DISCOVERY_GH_TOKEN_PATH") == str(path)
+               for _, env in runner.calls)
 
 
 # ---------------------------------------------------------------------------
