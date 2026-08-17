@@ -111,6 +111,79 @@ def test_the_source_never_writes_to_the_boris_database(tmp_path):
     assert db.execute("SELECT COUNT(*) FROM review_requests").fetchone()[0] == 1
 
 
+# --- request_exists: did a re-review request this loop posted ever get in? ---
+#
+# boris_intake's gate reads GitHub synchronously while admitting a message and
+# cannot tell a failed read from a missing pull request, so a GitHub outage
+# rejects the loop's re-review post outright. The loop has already moved to
+# `rereview_posted` by then, a state only an arriving verdict leaves, so it is
+# parked forever with nothing recorded. This read is how it finds out.
+
+
+def test_a_request_at_exactly_this_head_is_admitted(tmp_path):
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is True
+
+
+def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
+    """The whole point of the head term, and the mutation that matters most.
+
+    A remediation round always leaves an *older* request behind: the one whose
+    verdict started the round, admitted at the head the lane has since moved
+    off. Without `head_sha` in the WHERE clause that stale row answers "already
+    admitted" for every later head, so a re-review the gate rejected looks
+    admitted and the loop strands exactly as it does today -- silently, which
+    is the failure mode this whole read exists to end.
+    """
+    source = BorisSource(boris_db(tmp_path, head_sha="a" * 40),
+                         RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "b" * 40) is False
+
+
+@pytest.mark.parametrize(
+    "owner,repo,pr_number",
+    [("Someone", "example", 42), ("Ylopo", "other", 42), ("Ylopo", "example", 43)],
+    ids=["owner", "repo", "pr_number"],
+)
+def test_a_request_for_a_different_pull_request_does_not_count(
+        tmp_path, owner, repo, pr_number):
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    assert source.request_exists(owner, repo, pr_number, "a" * 40) is False
+
+
+def test_a_review_still_under_way_counts_as_admitted(tmp_path):
+    """Any workflow_state counts, deliberately -- unlike `new_verdicts`, which
+    selects completed reviews. A request that is `reviewing` will produce a
+    verdict on its own, so re-posting under it would be pointless noise and a
+    duplicate review."""
+    source = BorisSource(
+        boris_db(tmp_path, workflow_state="reviewing", semantic_outcome=None),
+        RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is True
+
+
+def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
+    """`new_verdicts` filters on requester_user_id and pr_author to select the
+    verdicts this loop owns. This question is only "does a review already exist
+    at this head" -- a narrower query would answer False for a review somebody
+    else requested and re-post on top of it."""
+    source = BorisSource(
+        boris_db(tmp_path, pr_author="jacobmaurer", requester_user_id="U5GB9F75Z"),
+        RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is True
+
+
+def test_a_read_that_fails_answers_none_rather_than_raising(tmp_path):
+    """Three-way, the same contract shape `github_io.unresolved_bot_threads`
+    uses: True / False / None-for-unreadable. This runs inside a routing pass,
+    where a raise would abort the loop's whole settle -- and where False would
+    be worse still, provoking a duplicate re-review post off a database we
+    simply could not read."""
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    source.close()  # the read now raises ProgrammingError from sqlite3
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40) is None
+
+
 # --- defensive parsing: boris_intake owns validated_result_json's shape and
 # evolves it independently of this reader, so a row whose JSON parses fine
 # but into an unexpected shape must degrade, not take the poller down. ---

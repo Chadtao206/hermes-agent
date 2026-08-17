@@ -163,6 +163,50 @@ class BorisSource:
         )
         return tuple(self._verdict(row) for row in cur.fetchall())
 
+    def request_exists(self, owner: str, repo: str, pr_number: int,
+                       head_sha: str) -> bool | None:
+        """Is there a review request at exactly this head? None if unreadable.
+
+        Three-way, the same contract shape `github_io.unresolved_bot_threads`
+        uses, and for the same reason: the caller
+        (`loop._route_rereview_ack`) has a genuinely different act for each
+        of the three, and folding the unreadable case into either answer
+        would pick one of those acts on no evidence. `False` there re-posts a
+        re-review; taking it on a database this process merely could not open
+        buys a duplicate review for nothing.
+
+        `head_sha` is in the WHERE clause and is the whole point of the
+        query. A remediation round always leaves an older request behind --
+        the one whose verdict started the round, admitted at the head the
+        lane has since moved off -- so a query without it answers "already
+        admitted" from that stale row for every head after it, and the loop
+        this read exists to rescue strands exactly as it does today.
+
+        Any `workflow_state` counts. A request that is still `reviewing` will
+        produce a verdict on its own, so re-posting under it would be
+        pointless noise; only `new_verdicts` needs the completed ones,
+        because only it is looking for something to route.
+
+        Deliberately NOT filtered by `requester_user_id` / `pr_author` the
+        way `new_verdicts` is. Those filters are there to select the verdicts
+        this loop owns; the question here is only whether a review already
+        exists at this head, whoever asked for it, and a narrower query would
+        answer False for a live review and re-post on top of it.
+
+        Wrapped rather than allowed to raise: this runs inside a routing
+        pass, where an exception would abort the whole settle for a loop that
+        may owe other writes.
+        """
+        try:
+            row = self._db.execute(
+                "SELECT 1 FROM review_requests "
+                "WHERE owner=? AND repo=? AND pr_number=? AND head_sha=? LIMIT 1",
+                (owner, repo, pr_number, head_sha),
+            ).fetchone()
+        except Exception:
+            return None
+        return row is not None
+
     def _verdict(self, row: sqlite3.Row) -> Verdict:
         try:
             payload = json.loads(row["validated_result_json"] or "{}")
