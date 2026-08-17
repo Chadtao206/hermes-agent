@@ -24,6 +24,15 @@ quiet tick forever. See `DiscoveryResult` for the three ways a result can be
 incomplete and why each is reported per-org rather than collapsed into one
 bit.
 
+One clause degrades the OTHER way, and it is the only one that does. "Has
+Boris already been asked about this exact head?" is answered from
+`boris_intake`'s own database (`IntakeSource`), and an unreadable answer there
+ADMITS the pull request instead of excluding it -- because skipping would deny
+it a review with nothing underneath to notice, while posting costs at most a
+duplicate message the intake idempotency key already dedups. It is reported
+either way (`DiscoveryResult.unverified_heads`). The full argument for the
+asymmetry is in `candidates()`, at the clause itself.
+
 Readiness filter -- a PR is only admitted when ALL of these hold (see
 `_evaluate`): state is OPEN, not draft, author is the configured `author`,
 the record's owner matches the org it was fetched under (the allowlist is
@@ -39,6 +48,7 @@ not "not (yet) failing".
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -177,6 +187,14 @@ class DiscoveryResult:
       are allowed to post, and "assume the worst" is the same discipline
       `pr_remediation/github_io.py::has_hold` applies to an unreadable label
       response.
+    * `unverified_heads` -- one sentence naming how many pull requests were
+      admitted WITHOUT the "has Boris already been asked about this head?"
+      clause being applied, because the review database could not be read.
+      The odd one out in two ways, both deliberate: it withholds nothing (the
+      candidates are in `candidates`, ready to post), and it is not per-org,
+      because an unreadable database is one condition for the whole tick
+      rather than a property of any one org. See `candidates()` for why
+      unreadable admits here when it excludes everywhere else.
 
     Deliberately NOT iterable and NOT a list subclass. A caller that treats
     a result as the candidate list (`for c in candidates(...)`) fails loudly
@@ -189,15 +207,23 @@ class DiscoveryResult:
     failed_orgs: tuple[str, ...] = ()
     truncated_orgs: tuple[str, ...] = ()
     config_errors: tuple[str, ...] = ()
+    unverified_heads: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
-        """True iff every configured org was enumerated in full."""
+        """True iff every configured org was enumerated in full AND every
+        filter clause could actually be applied to what came back.
+
+        `unverified_heads` counts against completeness even though it
+        withheld nothing: a tick that posted without being able to check
+        whether Boris had already reviewed that head is not the whole truth
+        about what it did, which is the only thing this property claims.
+        """
         return not (self.failed_orgs or self.truncated_orgs
-                    or self.config_errors)
+                    or self.config_errors or self.unverified_heads)
 
 
-def candidates(gh, *, orgs, author, banned_repos,
+def candidates(gh, *, orgs, author, banned_repos, reviewed,
                banned_repo_suffixes=BANNED_REPO_SUFFIXES) -> DiscoveryResult:
     """Chad's open pull requests across `orgs` that pass the readiness filter.
 
@@ -210,6 +236,14 @@ def candidates(gh, *, orgs, author, banned_repos,
     transient failure against one org must not stop the other orgs from
     being discovered. It is equally never allowed to surface as a plain
     empty list, which a caller cannot tell apart from a genuinely quiet org.
+
+    `reviewed` is a dependency implementing
+    `already_requested(owner, repo, number, head_sha) -> bool | None` (see
+    `IntakeSource` below for the production adapter). It is a REQUIRED
+    keyword, not a defaulted one: a caller that forgets to wire it raises
+    here, where a default would instead have silently reverted this service to
+    the behaviour a live shadow tick caught -- asking Boris to review heads
+    Boris had already reviewed.
 
     `banned_repos` is an exact-match collection of `owner/name` strings and
     `banned_repo_suffixes` a tuple of repo-name suffixes; together they
@@ -278,6 +312,7 @@ def candidates(gh, *, orgs, author, banned_repos,
     found: list[Candidate] = []
     failed: list[str] = []
     truncated: list[str] = []
+    unverified = 0
     for org in org_list:
         listing = gh.open_prs(org, author)
         if not isinstance(listing, Listing) or not isinstance(
@@ -294,10 +329,60 @@ def candidates(gh, *, orgs, author, banned_repos,
             candidate = _evaluate(raw, org=org, author=author,
                                    banned_repos=banned,
                                    banned_repo_suffixes=suffixes)
-            if candidate is not None:
-                found.append(candidate)
+            if candidate is None:
+                continue
+            # --- has Boris already been asked about this exact head? --------
+            # The cron this service retires carried this clause in its SOP
+            # ("no Boris verdict for head") and discovery shipped without it.
+            # A live shadow tick caught the consequence: two of the five pull
+            # requests it selected were already in `boris_intake.db` at those
+            # exact heads. Asked here rather than in `_evaluate` because it is
+            # the one clause that needs an injected dependency and the one
+            # that can report a degradation -- and asked LAST, so a pull
+            # request the cheap local clauses already excluded costs no
+            # database read at all.
+            #
+            # THE DEGRADATION DIRECTION IS THE OPPOSITE OF EVERY OTHER
+            # UNREADABLE ANSWER IN THIS MODULE, AND THAT IS DELIBERATE. An
+            # unreadable `labels` value EXCLUDES (see `_evaluate`), because
+            # otherwise one unreadable read silently disables the
+            # `hermes-hold` kill switch. An unreadable review database ADMITS,
+            # because the two harms here are not symmetric:
+            #
+            #   * skip on unreadable -> this pull request is silently never
+            #     reviewed. Nothing downstream notices a review that was never
+            #     requested, so the loss is invisible and permanent: an
+            #     availability failure with no backstop underneath it.
+            #   * post on unreadable -> at worst one duplicate message.
+            #     boris_intake's own idempotency key
+            #     (`borisslack:{owner}/{repo}#{pr}@{head_sha}:policy={fp}`)
+            #     admits it as a duplicate rather than as a second review, and
+            #     the discovery ledger stops it recurring, so the cost is
+            #     bounded at one message per (pull request, head) ever.
+            #
+            # A silent permanent loss is worse than a bounded duplicate, so
+            # `None` proceeds. It is COUNTED, though, and reported below:
+            # "proceed" is only defensible while it is also visible, and a
+            # filter that had quietly stopped filtering is precisely what
+            # `DiscoveryResult` exists to make impossible.
+            requested = _already_requested(reviewed, candidate)
+            if requested:
+                continue
+            if requested is None:
+                unverified += 1
+            found.append(candidate)
+    # One sentence, built from this module's own literals and a count.
+    # Deliberately names no owner, repo, number or head: this string reaches a
+    # human through the cron's stdout, the surface `post.py`'s docstring is
+    # about, and every one of those fields is text written by whoever opened
+    # the pull request.
+    unverified_heads = () if not unverified else (
+        f"{unverified} pull request(s) were posted without checking whether "
+        "Boris has already reviewed that head, because the intake review "
+        "database could not be read",)
     return DiscoveryResult(candidates=tuple(found), failed_orgs=tuple(failed),
-                           truncated_orgs=tuple(truncated))
+                           truncated_orgs=tuple(truncated),
+                           unverified_heads=unverified_heads)
 
 
 def _string_seq(value) -> tuple[str, ...] | None:
@@ -320,6 +405,26 @@ def _string_seq(value) -> tuple[str, ...] | None:
     if any(not isinstance(item, str) or not item for item in items):
         return None
     return tuple(items)
+
+
+def _already_requested(reviewed, candidate: Candidate) -> bool | None:
+    """`reviewed`'s answer for one candidate, or `None` if it could not answer.
+
+    A dependency that RAISES, or answers something that is not a `bool`, is
+    treated exactly like one that answered `None`: this module's promise is
+    that a bad answer costs one record's precision and never the tick.
+    `IntakeSource` below already answers `None` for every failure it knows
+    about, so this is defense in depth against a failure mode it does not --
+    and against a non-conforming `reviewed` implementation, the same way
+    `candidates()` refuses to trust the shape `gh` hands back.
+    """
+    try:
+        answer = reviewed.already_requested(
+            candidate.owner, candidate.repo, candidate.number,
+            candidate.head_sha)
+    except Exception:
+        return None
+    return answer if isinstance(answer, bool) else None
 
 
 def _evaluate(raw: object, *, org: str, author: str,
@@ -431,6 +536,113 @@ def _evaluate(raw: object, *, org: str, author: str,
     return Candidate(owner=owner, repo=repo, number=number, head_sha=head_sha,
                       merge_state=merge_state, checks_state=checks_state,
                       has_hold=False)
+
+
+class IntakeSource:
+    """Production `reviewed` adapter: a read-only view of the heads
+    `boris_intake` already holds a review request for.
+
+    Opened with SQLite's read-only URI, exactly as
+    `pr_remediation/boris_source.py` opens this same database from its own
+    separate service, and for the same reason: the review path's integrity
+    must not depend on an outside reader behaving. There is no write method
+    here and no connection this class could write through.
+
+    Imports nothing from `boris_intake`. The table and column names are
+    literals, and `tests/cron/pr_discovery/test_discover.py` builds its
+    fixture database from `boris_intake.store`'s REAL schema -- so a rename
+    there breaks a test rather than silently making this query match nothing
+    forever, which is the failure mode a literal invites. Same
+    test-side-import / runtime-side-literal arrangement as
+    `BANNED_REPO_SUFFIXES` against `lanes._EXCLUDED_REPO_SUFFIXES`, and for
+    the same deployment reason: this package also runs from its copy under
+    `~/.hermes/scripts/`.
+
+    Two departures from `BorisSource`, both because of where this one is
+    constructed. It connects LAZILY and never raises: `BorisSource` connects
+    in its constructor because its daemon can afford to die and be restarted,
+    whereas this reader is built inside one unattended tick's wiring, where a
+    missing database file raising out of `build_deps` would cost the entire
+    tick -- including every pull request this filter has nothing to say about.
+    """
+
+    def __init__(self, db_path: Path):
+        self.path = Path(db_path)
+        self._db: sqlite3.Connection | None = None
+
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
+            self._db = None
+
+    def _connect(self) -> sqlite3.Connection | None:
+        """The read-only connection, or `None` if it cannot be opened.
+
+        Cached on success only. A failure is deliberately not remembered, so
+        nothing is left behind that a later call could mistake for a working
+        connection, and a database that only appears later is picked up
+        without a restart.
+        """
+        if self._db is not None:
+            return self._db
+        try:
+            db = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        except Exception:
+            # A missing file is the common case (URI `mode=ro` refuses to
+            # create one, which is exactly what makes it read-only) and it is
+            # not distinguished from any other reason the open failed: every
+            # one of them answers the same "could not read", which
+            # `candidates()` turns into "post anyway, and say so".
+            return None
+        self._db = db
+        return db
+
+    def already_requested(self, owner: str, repo: str, number: int,
+                          head_sha: str) -> bool | None:
+        """Has boris_intake ever been asked to review this exact head?
+        `None` means the question could not be answered at all.
+
+        Matched on `(owner, repo, pr_number, head_sha)` and NOTHING ELSE. Two
+        omissions are deliberate, and both WIDEN the match -- which is the
+        only direction that cannot cause duplicate review work:
+
+        * `workflow_state` is ignored. An in-flight request means a review is
+          already running; a complete one means the verdict already exists.
+          A fresh post is redundant either way, so ignoring the state is both
+          simpler and strictly broader than enumerating the states that
+          count.
+        * `policy_fingerprint` is ignored, even though it is part of the
+          intake idempotency key
+          (`borisslack:{owner}/{repo}#{pr}@{head_sha}:policy={fp}`).
+          Reproducing it would mean reproducing boris_intake's policy
+          defaults and its hashing from outside, with nothing able to catch a
+          drift; and matching without it is the broader side -- it skips a
+          head reviewed under ANY policy, not just the default one discovery
+          posts with.
+
+        `COLLATE NOCASE` on the three text columns for the same reason the
+        infra ban casefolds: GitHub resolves owner and repo names
+        case-insensitively, and a commit SHA is case-insensitive hex. The
+        alternative would let `Ylopo/Million-Stars` and `Ylopo/million-stars`
+        -- one repository -- disagree about whether it had been reviewed.
+        """
+        db = self._connect()
+        if db is None:
+            return None
+        try:
+            row = db.execute(
+                "SELECT 1 FROM review_requests "
+                "WHERE owner=? COLLATE NOCASE AND repo=? COLLATE NOCASE "
+                "AND pr_number=? AND head_sha=? COLLATE NOCASE LIMIT 1",
+                (owner, repo, number, head_sha),
+            ).fetchone()
+        except Exception:
+            # A schema this reader does not recognise, a corrupt file, a
+            # locking failure: all "could not read", never a raise out of an
+            # unattended tick and never a False that would read as "Boris has
+            # never seen this head".
+            return None
+        return row is not None
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ stops the work rather than merely the writes -- `_observes` is why an `off`
 tick costs no GitHub reads at all.
 
 *An empty tick is not automatically a healthy one.* `DiscoveryResult` reports
-three separate incompleteness channels and this module surfaces all three,
+four separate incompleteness channels and this module surfaces all four,
 because the shipped code this service replaces returned `[]` for a permanent
 credential outage, which read exactly like a clean run for as long as anyone
 cared to look. Only "nothing selected, nothing deferred, nothing failed, and
@@ -58,7 +58,7 @@ if _PACKAGE_ROOT not in sys.path:
 import yaml  # noqa: E402
 
 from pr_discovery.discover import (  # noqa: E402
-    DEFAULT_TOKEN_PATH, DiscoveryResult, GhClient, candidates,
+    DEFAULT_TOKEN_PATH, DiscoveryResult, GhClient, IntakeSource, candidates,
 )
 from pr_discovery.post import (  # noqa: E402
     DISCOVERY_MARKER, INTAKE_CHANNEL, Poster, slug,
@@ -67,6 +67,13 @@ from pr_discovery.state import Ledger  # noqa: E402
 
 DEFAULT_CONFIG = Path("/Users/ctao/.hermes/config.yaml")
 DEFAULT_LEDGER_DB = Path("/Users/ctao/.hermes/state/pr_discovery.db")
+#: `boris_intake`'s own database, read read-only by `IntakeSource` so this cron
+#: never asks Boris to review a head Boris was already asked about. A path
+#: pointing anywhere else would open fine and answer "never reviewed" for every
+#: head forever -- the clause silently disabled with no degradation reported --
+#: so `tests/cron/pr_discovery/test_main.py` pins it against `boris_intake`'s
+#: own constant rather than a restated literal.
+DEFAULT_INTAKE_DB = Path("/Users/ctao/.hermes/state/boris_intake.db")
 #: `slack_read` (the deployed Slack transport) lives only here.
 DEPLOYED_SCRIPTS = "/Users/ctao/.hermes/scripts"
 VALID_MODES = ("off", "shadow", "live")
@@ -145,6 +152,7 @@ class Plan:
     failed_orgs: tuple[str, ...] = ()
     truncated_orgs: tuple[str, ...] = ()
     config_errors: tuple[str, ...] = ()
+    unverified_heads: tuple[str, ...] = ()
     enumerated: bool = False
 
 
@@ -161,6 +169,7 @@ class RunResult:
     failed_orgs: tuple[str, ...] = ()
     truncated_orgs: tuple[str, ...] = ()
     config_errors: tuple[str, ...] = ()
+    unverified_heads: tuple[str, ...] = ()
     enumerated: bool = False
 
     @property
@@ -172,7 +181,7 @@ class RunResult:
         in what we SAW. Both reach a human through `summary`.
         """
         return not (self.failed_orgs or self.truncated_orgs
-                    or self.config_errors)
+                    or self.config_errors or self.unverified_heads)
 
     @property
     def faults(self) -> tuple[str, ...]:
@@ -198,6 +207,14 @@ class RunResult:
                 "⚠️ listing truncated at the search limit for: "
                 + ", ".join(self.truncated_orgs)
                 + " — an unknown number of pull requests were never seen")
+        if self.unverified_heads:
+            # Reported like every other channel, but it did NOT withhold
+            # anything -- these pull requests went out. Worded so a reader is
+            # not left looking for pull requests that were held back.
+            out.append(
+                "⚠️ the already-reviewed check could not be applied, so this "
+                "tick may repeat a review Boris has already done: "
+                + "; ".join(self.unverified_heads))
         if self.config_errors:
             out.append(
                 "⚠️ discovery could not be trusted, so nothing was posted: "
@@ -245,7 +262,8 @@ def _plan(deps: DiscoveryDeps) -> Plan:
         # to post, so we post nothing -- even if candidates came back anyway.
         return Plan(enumerated=True, config_errors=result.config_errors,
                     failed_orgs=result.failed_orgs,
-                    truncated_orgs=result.truncated_orgs)
+                    truncated_orgs=result.truncated_orgs,
+                    unverified_heads=result.unverified_heads)
 
     selected: list = []
     skipped: list[str] = []
@@ -264,7 +282,8 @@ def _plan(deps: DiscoveryDeps) -> Plan:
             selected.append(candidate)
     return Plan(selected=tuple(selected), skipped=tuple(skipped),
                 deferred=tuple(deferred), failed_orgs=result.failed_orgs,
-                truncated_orgs=result.truncated_orgs, enumerated=True)
+                truncated_orgs=result.truncated_orgs,
+                unverified_heads=result.unverified_heads, enumerated=True)
 
 
 def _from_plan(mode: str, plan: Plan, *, posted: tuple[str, ...] = (),
@@ -275,7 +294,7 @@ def _from_plan(mode: str, plan: Plan, *, posted: tuple[str, ...] = (),
         posted=posted, skipped=plan.skipped, failed_posts=failed_posts,
         deferred=plan.deferred, failed_orgs=plan.failed_orgs,
         truncated_orgs=plan.truncated_orgs, config_errors=plan.config_errors,
-        enumerated=plan.enumerated)
+        unverified_heads=plan.unverified_heads, enumerated=plan.enumerated)
 
 
 def _perform(deps: DiscoveryDeps, plan: Plan, mode: str) -> RunResult:
@@ -542,12 +561,15 @@ def slack_token() -> str:
 
 def build_deps(token: str, *, ledger_db: Path = DEFAULT_LEDGER_DB,
                token_path: Path = DEFAULT_TOKEN_PATH,
+               intake_db: Path = DEFAULT_INTAKE_DB,
                caller=None) -> DiscoveryDeps:
     """Wire the real adapters. A seam so tests wire fakes instead."""
     gh = GhClient(token_path=token_path)
+    reviewed = IntakeSource(intake_db)
     return DiscoveryDeps(
         discover=lambda: candidates(gh, orgs=ORGS, author=AUTHOR,
-                                    banned_repos=banned_repos()),
+                                    banned_repos=banned_repos(),
+                                    reviewed=reviewed),
         ledger=Ledger(ledger_db),
         slack=Poster(token, caller if caller is not None else slack_caller),
         now=time.time,

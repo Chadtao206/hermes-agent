@@ -22,10 +22,14 @@ pointed at `tmp_path` files.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from pr_discovery.discover import Candidate, DiscoveryResult
+from pr_discovery import main as main_module
+from pr_discovery.discover import Candidate, DiscoveryResult, IntakeSource
 from pr_discovery.main import (
+    DEFAULT_INTAKE_DB,
     MAX_POSTS_PER_TICK,
     DiscoveryConfig,
     DiscoveryDeps,
@@ -34,6 +38,7 @@ from pr_discovery.main import (
     _perform,
     _rehearse,
     banned_repos,
+    build_deps,
     load_config,
     run,
     run_selftest,
@@ -398,13 +403,53 @@ def test_a_result_that_is_not_a_discoveryresult_is_a_fault_not_a_quiet_tick():
     assert result.summary() != ""
 
 
+def test_a_tick_that_could_not_check_the_intake_database_is_never_silent():
+    """The fourth incompleteness channel. Proceeding past an unreadable review
+    database is only safe if it is also visible: a filter that quietly stopped
+    filtering is exactly what a silent empty channel would hide."""
+    deps = _deps(result=DiscoveryResult(
+        candidates=(_c(1),),
+        unverified_heads=("1 pull request(s) went unchecked",)))
+    result = run(deps, mode="live")
+    assert result.unverified_heads == ("1 pull request(s) went unchecked",)
+    assert result.complete is False
+    assert "went unchecked" in result.summary()
+
+
+def test_an_unreadable_intake_database_does_not_stop_the_post():
+    """The asymmetry at tick level. A config error stops the tick dead (see
+    `test_a_config_error_stops_the_tick_from_posting_anything`); an unreadable
+    review database must NOT, because skipping would leave the pull request
+    silently unreviewed with no backstop, while posting costs at most a
+    duplicate message the intake idempotency key already dedups."""
+    deps = _deps(result=DiscoveryResult(
+        candidates=(_c(1),), unverified_heads=("could not be checked",)))
+    result = run(deps, mode="live")
+    assert result.posted == ("Ylopo/x#1@abc123",)
+    assert deps.slack.posted != []
+
+
+def test_a_config_error_still_reports_the_unchecked_heads_alongside_it():
+    """A config error takes the early exit out of `_plan`, which has to carry
+    every other channel out with it -- one degradation must not swallow the
+    report of another."""
+    deps = _deps(result=DiscoveryResult(
+        config_errors=("banned_repos is a str",),
+        unverified_heads=("2 pull request(s) went unchecked",)))
+    summary = run(deps, mode="live").summary()
+    assert "banned_repos is a str" in summary
+    assert "2 pull request(s) went unchecked" in summary
+
+
 def test_the_summary_names_every_channel_at_once():
     deps = _deps(result=DiscoveryResult(candidates=(_c(1),),
                                         failed_orgs=("Foo",),
                                         truncated_orgs=("Bar",),
+                                        unverified_heads=("quux went unchecked",),
                                         config_errors=("baz is wrong",)))
     summary = run(deps, mode="live").summary()
     assert "Foo" in summary and "Bar" in summary and "baz is wrong" in summary
+    assert "quux went unchecked" in summary
 
 
 def test_run_result_defaults_are_a_complete_quiet_tick():
@@ -453,6 +498,35 @@ def test_the_default_ban_list_has_not_drifted_from_lanes(monkeypatch):
 
     monkeypatch.delenv("PR_REVIEW_EXCLUDED_REPOS", raising=False)
     assert frozenset(r.casefold() for r in banned_repos()) == lanes._excluded_repos()
+
+
+def test_build_deps_wires_the_already_reviewed_clause(tmp_path, monkeypatch):
+    """`candidates()` takes `reviewed` as a REQUIRED keyword, so a tick that
+    forgot it raises -- but nothing except this test pins that the production
+    wiring supplies a real `IntakeSource`, rather than something that answers
+    "never reviewed" to everything."""
+    seen: dict = {}
+
+    def _record_call(gh, **kwargs):
+        seen.update(kwargs)
+        return DiscoveryResult()
+
+    monkeypatch.setattr(main_module, "candidates", _record_call)
+    deps = build_deps("tok", ledger_db=tmp_path / "ledger.db",
+                      token_path=tmp_path / "token")
+    deps.discover()
+    assert isinstance(seen["reviewed"], IntakeSource)
+    assert seen["reviewed"].path == DEFAULT_INTAKE_DB
+
+
+def test_the_wired_review_database_is_the_one_boris_intake_writes():
+    """A path that pointed anywhere else would answer "never reviewed" for
+    every head forever -- the clause silently disabled, with no degradation
+    reported because the file would open perfectly well. Compared against
+    `boris_intake`'s own constant rather than a restated literal."""
+    from boris_intake.selftest import DB_PATH
+
+    assert DEFAULT_INTAKE_DB == Path(DB_PATH)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ Two properties this file exists to pin, both of which shipped broken:
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -28,6 +29,7 @@ from pr_discovery.discover import (
     SEARCH_LIMIT,
     Candidate,
     GhClient,
+    IntakeSource,
     Listing,
     _aggregate_checks,
     candidates,
@@ -65,6 +67,30 @@ class _FailingGh:
         return None
 
 
+class _FakeReviewed:
+    """`already_requested(owner, repo, number, head_sha) -> bool | None`, the
+    one method `candidates()`'s `reviewed` dependency has to have.
+
+    `heads` is the set of `(owner, repo, number, head_sha)` identities
+    boris_intake already holds a review request for. `unreadable=True` makes
+    every answer `None`, which is "the review database could not be read" --
+    and the case whose degradation direction is the OPPOSITE of every other
+    unreadable answer in this module, on purpose (see
+    `test_an_unreadable_intake_database_admits_the_pull_request`).
+    """
+
+    def __init__(self, heads=(), *, unreadable=False):
+        self._heads = {tuple(head) for head in heads}
+        self._unreadable = unreadable
+        self.calls: list[tuple] = []
+
+    def already_requested(self, owner, repo, number, head_sha):
+        self.calls.append((owner, repo, number, head_sha))
+        if self._unreadable:
+            return None
+        return (owner, repo, number, head_sha) in self._heads
+
+
 def _record(**overrides):
     checks = overrides.pop("checks", "SUCCESS")
     record = {
@@ -93,7 +119,8 @@ def _gh(**overrides):
 
 def _args():
     return dict(orgs=["Ylopo"], author="Chadtao206",
-               banned_repos=frozenset({"Ylopo/ylopo-infra"}))
+               banned_repos=frozenset({"Ylopo/ylopo-infra"}),
+               reviewed=_FakeReviewed())
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +270,8 @@ def test_one_failing_org_does_not_block_a_healthy_one():
             return Listing(records=(_record(owner=org),))
 
     result = candidates(_MixedGh(), orgs=["Ylopo", "OtherOrg"],
-                        author="Chadtao206", banned_repos=frozenset())
+                        author="Chadtao206", banned_repos=frozenset(),
+                        reviewed=_FakeReviewed())
     assert len(result.candidates) == 1
     assert result.candidates[0].owner == "OtherOrg"
     # The healthy org's PRs are still returned -- and the failure is still
@@ -371,7 +399,8 @@ def _discovery_excludes(full: str) -> bool:
     owner, _, repo = full.partition("/")
     result = candidates(_FakeGh([_record(owner=owner, repo=repo)]),
                         orgs=[owner], author="Chadtao206",
-                        banned_repos=lanes._excluded_repos())
+                        banned_repos=lanes._excluded_repos(),
+                        reviewed=_FakeReviewed())
     return result.candidates == ()
 
 
@@ -408,7 +437,8 @@ def test_aggregates_admitted_prs_across_orgs():
                                             number=1),))
 
     result = candidates(_TwoOrgGh(), orgs=["Ylopo", "AcmeCo"],
-                        author="Chadtao206", banned_repos=frozenset())
+                        author="Chadtao206", banned_repos=frozenset(),
+                        reviewed=_FakeReviewed())
     assert {c.owner for c in result.candidates} == {"Ylopo", "AcmeCo"}
 
 
@@ -919,3 +949,269 @@ def test_a_short_listing_is_not_reported_as_truncated(tmp_path):
     )
     assert _client(runner, tmp_path).open_prs(
         "Ylopo", "Chadtao206").truncated is False
+
+
+# ---------------------------------------------------------------------------
+# "Boris was already asked about this head" -- the clause, and the one place
+# in this package where an unreadable answer ADMITS instead of excluding.
+#
+# The retiring cron's SOP had this clause ("no Boris verdict for head") and
+# discovery did not, which a live shadow tick caught: two of the five pull
+# requests it selected were already in `boris_intake.db` at those exact heads.
+# ---------------------------------------------------------------------------
+
+#: `_record()`'s own identity, which is what a candidate built from it carries.
+_DEFAULT_HEAD = ("Ylopo", "million-stars", 42, "abc123")
+
+
+def _reviewed_args(reviewed):
+    args = _args()
+    args["reviewed"] = reviewed
+    return args
+
+
+def test_excludes_a_head_boris_has_already_been_asked_about():
+    result = candidates(_gh(), **_reviewed_args(_FakeReviewed([_DEFAULT_HEAD])))
+    assert result.candidates == ()
+    # Skipping a head that was genuinely already requested is the steady
+    # state, not a degradation -- nothing about this tick is incomplete.
+    assert result.unverified_heads == ()
+    assert result.complete is True
+
+
+def test_a_moved_head_on_the_same_pull_request_is_admitted():
+    """The whole reason the match includes `head_sha`: new commits are new
+    work and are owed a new review."""
+    reviewed = _FakeReviewed([("Ylopo", "million-stars", 42, "def456")])
+    assert len(candidates(_gh(), **_reviewed_args(reviewed)).candidates) == 1
+
+
+def test_another_pull_request_number_in_the_same_repo_is_admitted():
+    reviewed = _FakeReviewed([("Ylopo", "million-stars", 43, "abc123")])
+    assert len(candidates(_gh(), **_reviewed_args(reviewed)).candidates) == 1
+
+
+def test_the_same_head_in_another_repo_is_admitted():
+    reviewed = _FakeReviewed([("Ylopo", "other-repo", 42, "abc123")])
+    assert len(candidates(_gh(), **_reviewed_args(reviewed)).candidates) == 1
+
+
+def test_the_clause_asks_about_the_candidates_own_identity():
+    """Four fields, in this order -- a transposed pair would answer False for
+    every real head and silently disable the clause."""
+    reviewed = _FakeReviewed()
+    candidates(_gh(), **_reviewed_args(reviewed))
+    assert reviewed.calls == [_DEFAULT_HEAD]
+
+
+def test_an_excluded_pull_request_is_never_asked_about():
+    """The clause runs after the readiness filter, so a held or red-CI pull
+    request costs no database read at all."""
+    reviewed = _FakeReviewed()
+    candidates(_gh(labels=["hermes-hold"]), **_reviewed_args(reviewed))
+    assert reviewed.calls == []
+
+
+def test_an_unreadable_intake_database_admits_the_pull_request():
+    """The degradation direction here is the OPPOSITE of the `labels` case,
+    deliberately: skipping would leave this pull request silently unreviewed
+    with no backstop, while posting costs at most a duplicate message that the
+    intake idempotency key already dedups.
+
+    The fake is seeded WITH this exact head, so the only way the pull request
+    survives is the unreadable answer being treated as "proceed".
+    """
+    reviewed = _FakeReviewed([_DEFAULT_HEAD], unreadable=True)
+    assert len(candidates(_gh(), **_reviewed_args(reviewed)).candidates) == 1
+
+
+def test_an_unreadable_intake_database_is_reported_not_silent():
+    """Proceeding is only safe if it is also VISIBLE: a filter that quietly
+    stopped filtering is the defect `DiscoveryResult` exists to prevent."""
+    result = candidates(_gh(), **_reviewed_args(_FakeReviewed(unreadable=True)))
+    assert result.unverified_heads != ()
+    assert result.complete is False
+
+
+def test_the_degradation_report_counts_every_pull_request_it_covers():
+    gh = _FakeGh([_record(number=1), _record(number=2), _record(number=3)])
+    result = candidates(gh, **_reviewed_args(_FakeReviewed(unreadable=True)))
+    assert len(result.candidates) == 3
+    assert len(result.unverified_heads) == 1
+    assert "3 pull request" in result.unverified_heads[0]
+
+
+def test_the_degradation_report_carries_no_github_authored_text():
+    """`unverified_heads` reaches a human through the cron's stdout, the same
+    surface `post.py`'s docstring is about. The sentence is composed of this
+    module's own literals and a count -- never of a record's own fields, which
+    are written by whoever opened the pull request."""
+    gh = _FakeGh([_record(repo="million-stars", number=42)])
+    result = candidates(gh, **_reviewed_args(_FakeReviewed(unreadable=True)))
+    assert "million-stars" not in result.unverified_heads[0]
+    assert "42" not in result.unverified_heads[0]
+
+
+def test_a_readable_intake_database_reports_no_degradation():
+    result = candidates(_gh(), **_args())
+    assert result.unverified_heads == ()
+    assert result.complete is True
+
+
+class _ExplodingReviewed:
+    def already_requested(self, owner, repo, number, head_sha):
+        raise RuntimeError("the review database detonated")
+
+
+class _WrongShapeReviewed:
+    """Answers a truthy non-bool. Without the shape check it would read as
+    "already reviewed" and EXCLUDE -- the wrong degradation direction, reached
+    by a dependency that is merely non-conforming."""
+
+    def already_requested(self, owner, repo, number, head_sha):
+        return "yes"
+
+
+@pytest.mark.parametrize("reviewed", [_ExplodingReviewed(), _WrongShapeReviewed()],
+                         ids=["raises", "answers a non-bool"])
+def test_a_non_conforming_reviewed_dependency_admits_and_is_reported(reviewed):
+    """`IntakeSource` answers `None` for every failure it knows about; this is
+    the defense in depth against the ones it does not. Either way the cost is
+    one pull request's precision, never the tick -- and never silence."""
+    result = candidates(_gh(), **_reviewed_args(reviewed))
+    assert len(result.candidates) == 1
+    assert result.unverified_heads != ()
+    assert result.complete is False
+
+
+def test_the_reviewed_dependency_is_required_not_defaulted():
+    """A required keyword, so a caller that forgets to wire the clause fails
+    loudly instead of quietly reposting heads Boris has already reviewed --
+    the same reason `DiscoveryResult` refuses to be iterable."""
+    args = _args()
+    del args["reviewed"]
+    with pytest.raises(TypeError):
+        candidates(_gh(), **args)
+
+
+# ---------------------------------------------------------------------------
+# IntakeSource: the production reader over `boris_intake.db`.
+#
+# Read-only URI mode, no import of `boris_intake` in production, and every
+# failure answers `None` (= "proceed, and report it"). The fixture below is
+# built from `boris_intake`'s OWN schema so a column rename there breaks these
+# tests instead of silently making the production query match nothing.
+# ---------------------------------------------------------------------------
+
+_INTAKE_COLUMNS = (
+    "request_id", "review_identity", "gate_fingerprint", "owner", "repo",
+    "pr_number", "head_sha", "pr_author", "policy_json", "policy_fingerprint",
+    "gate_snapshot_json", "requester_user_id", "requester_email",
+    "source_channel", "source_message_ts", "root_thread_ts", "permalink",
+    "workflow_state", "created_at", "updated_at",
+)
+
+
+def _intake_db(tmp_path, rows=((*_DEFAULT_HEAD, "complete"),), *,
+               fingerprint="sha256:defaultpolicy"):
+    from boris_intake.store import _SCHEMA
+
+    path = tmp_path / "boris_intake.db"
+    db = sqlite3.connect(str(path))
+    db.executescript(_SCHEMA)
+    placeholders = ",".join("?" * len(_INTAKE_COLUMNS))
+    for index, (owner, repo, number, head_sha, state) in enumerate(rows):
+        db.execute(
+            f"INSERT INTO review_requests ({','.join(_INTAKE_COLUMNS)}) "
+            f"VALUES ({placeholders})",
+            (f"br_{index}", f"identity_{index}", "gate_fp", owner, repo,
+             number, head_sha, "Chadtao206", "{}", fingerprint, "{}",
+             "U07E3AHV686", "chad@example.com", "C0BPCKPEFCG", "1.0", "1.0",
+             "https://github.com/x", state, 1.0, 1.0),
+        )
+    db.commit()
+    db.close()
+    return path
+
+
+def test_intake_source_finds_a_head_a_review_was_already_requested_for(tmp_path):
+    source = IntakeSource(_intake_db(tmp_path))
+    assert source.already_requested(*_DEFAULT_HEAD) is True
+
+
+@pytest.mark.parametrize("head", [
+    ("Ylopo", "million-stars", 42, "zzz999"),   # same PR, later head
+    ("Ylopo", "million-stars", 43, "abc123"),   # different PR number
+    ("Ylopo", "other-repo", 42, "abc123"),      # different repo
+    ("OtherOrg", "million-stars", 42, "abc123"),  # different owner
+])
+def test_intake_source_answers_false_for_a_head_it_has_never_seen(tmp_path, head):
+    assert IntakeSource(_intake_db(tmp_path)).already_requested(*head) is False
+
+
+@pytest.mark.parametrize("state", ["awaiting_gate", "reviewing", "complete",
+                                   "slack_unavailable"])
+def test_intake_source_ignores_the_workflow_state(tmp_path, state):
+    """An in-flight request means a review is already running; a complete one
+    means the verdict exists. Ignoring the state is strictly broader, and
+    broader skips more -- the direction that cannot cause duplicate work."""
+    path = _intake_db(tmp_path, rows=[(*_DEFAULT_HEAD, state)])
+    assert IntakeSource(path).already_requested(*_DEFAULT_HEAD) is True
+
+
+def test_intake_source_matches_whatever_policy_the_review_ran_under(tmp_path):
+    """The policy fingerprint is deliberately NOT part of the match: it is
+    part of the intake idempotency key, but discovery always posts with the
+    default policy and matching without it is the broader, safer side."""
+    path = _intake_db(tmp_path, fingerprint="sha256:some-other-policy")
+    assert IntakeSource(path).already_requested(*_DEFAULT_HEAD) is True
+
+
+def test_intake_source_matches_regardless_of_case(tmp_path):
+    """GitHub resolves owner/repo case-insensitively (the same argument the
+    infra ban casefolds for) and a commit SHA is case-insensitive hex, so this
+    names the same head -- and matching it skips more, the safe direction."""
+    source = IntakeSource(_intake_db(tmp_path))
+    assert source.already_requested("ylopo", "Million-Stars", 42, "ABC123") is True
+
+
+def test_intake_source_answers_none_for_a_missing_database(tmp_path):
+    assert IntakeSource(tmp_path / "not-there.db").already_requested(
+        *_DEFAULT_HEAD) is None
+
+
+def test_intake_source_answers_none_when_the_table_is_missing(tmp_path):
+    path = tmp_path / "boris_intake.db"
+    sqlite3.connect(str(path)).close()
+    assert IntakeSource(path).already_requested(*_DEFAULT_HEAD) is None
+
+
+def test_intake_source_answers_none_for_a_file_that_is_not_a_database(tmp_path):
+    path = tmp_path / "boris_intake.db"
+    path.write_text("this is not a SQLite database")
+    assert IntakeSource(path).already_requested(*_DEFAULT_HEAD) is None
+
+
+def test_intake_source_cannot_write_to_the_review_database(tmp_path):
+    """Read-only URI mode, exactly as `pr_remediation/boris_source.py` opens
+    the same database: the review path's integrity does not depend on this
+    reader behaving."""
+    source = IntakeSource(_intake_db(tmp_path))
+    assert source.already_requested(*_DEFAULT_HEAD) is True
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        source._db.execute("DELETE FROM review_requests")
+
+
+def test_candidates_excludes_a_head_the_real_intake_database_holds(tmp_path):
+    """The whole pipe, `candidates()` driving the real reader against a real
+    SQLite file -- no fake reviewed-heads shortcut."""
+    args = _reviewed_args(IntakeSource(_intake_db(tmp_path)))
+    assert candidates(_gh(), **args).candidates == ()
+
+
+def test_candidates_admits_everything_when_the_real_database_is_missing(tmp_path):
+    args = _reviewed_args(IntakeSource(tmp_path / "not-there.db"))
+    result = candidates(_gh(), **args)
+    assert len(result.candidates) == 1
+    assert result.unverified_heads != ()
+    assert result.complete is False
