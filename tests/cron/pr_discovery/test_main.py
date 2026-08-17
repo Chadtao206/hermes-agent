@@ -29,6 +29,7 @@ import pytest
 from pr_discovery import main as main_module
 from pr_discovery.discover import Candidate, DiscoveryResult, IntakeSource
 from pr_discovery.main import (
+    AUTHOR,
     DEFAULT_INTAKE_DB,
     MAX_POSTS_PER_TICK,
     DiscoveryConfig,
@@ -556,6 +557,25 @@ def test_build_deps_wires_the_already_reviewed_clause(tmp_path, monkeypatch):
     deps.discover()
     assert isinstance(seen["reviewed"], IntakeSource)
     assert seen["reviewed"].path == DEFAULT_INTAKE_DB
+
+
+def test_the_discovered_author_has_not_drifted_from_pr_remediation():
+    """`discover._evaluate` compares `AUTHOR` against GitHub's canonical
+    `author.login` case-SENSITIVELY, so a case typo -- `chadtao206` for
+    `Chadtao206` -- excludes every record ever enumerated and produces
+    clean-looking empty ticks forever, with nothing failed and nothing
+    deferred to say otherwise. The other shared constants (the ban list, the
+    marker, the intake database) all have a drift guard; this one had none,
+    and mutating it survived the whole suite.
+
+    Pinned against `pr_remediation`'s own login, which is the same person's
+    GitHub identity read by the loop that picks up whatever this cron's posts
+    turn into. Compared case-sensitively on purpose: a case-insensitive
+    comparison here would pass under exactly the mutation this exists to
+    catch."""
+    from pr_remediation.config import RemediationConfig
+
+    assert AUTHOR == RemediationConfig().chad_github_login
 
 
 def test_the_wired_review_database_is_the_one_boris_intake_writes():
