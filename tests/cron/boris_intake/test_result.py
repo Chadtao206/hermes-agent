@@ -749,3 +749,28 @@ def test_an_unconfigured_marker_neutralizes_nothing():
 
     assert module.neutralize_door_markers("untouched text", ("", "")) == "untouched text"
     assert module.neutralize_door_markers("untouched text", ()) == "untouched text"
+
+
+def test_neutralization_always_terminates():
+    """This runs inside a reconciler under a KeepAlive supervisor, where a
+    wedged process is a worse failure than a marker that slips through, so the
+    removal loop is bounded by `len(text)` rather than run to a fixpoint. An
+    empty marker is the case that would spin: it is "in" every string and
+    `replace("", "")` changes nothing. The `if m` filter keeps one out today
+    and the bound is what makes the hang unreachable if that filter is ever
+    edited away -- verified by deleting the filter and confirming this suite
+    still completes rather than hanging.
+
+    A timeout rather than a plain call, so a regression here fails the run
+    instead of wedging it."""
+    import threading
+
+    module = result_module()
+    done = threading.Event()
+
+    def call():
+        module.neutralize_door_markers("some text with x in it", ("", "x"))
+        done.set()
+
+    threading.Thread(target=call, daemon=True).start()
+    assert done.wait(timeout=5.0), "neutralize_door_markers did not terminate"

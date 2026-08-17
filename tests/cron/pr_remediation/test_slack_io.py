@@ -555,3 +555,26 @@ def test_a_raising_callers_exception_message_never_leaks_the_token(
     result = invoke(io)
 
     assert token not in str(result)
+
+
+@pytest.mark.parametrize("post", ("post_rereview", "repost_rereview"))
+def test_both_rereview_posts_open_with_the_marker(post):
+    """boris_intake's gate no longer accepts the marker ANYWHERE in the text --
+    `_is_loop_repost` requires it to open the message, because a substring test
+    also admits Boris's own verdict quoting it (see that predicate's
+    docstring). That makes the ORDER of these lines load-bearing, not
+    cosmetic: put the PR URL first and every re-review this loop posts is
+    silently dropped as NOT_HUMAN, with a `ts` still coming back so nothing
+    here notices.
+
+    The marker literal is read off `RemediationConfig` rather than restated
+    because what is under test is the position, not the value -- the value has
+    its own drift guard in `selftest.py`."""
+    call, calls = caller_for()
+    cfg = RemediationConfig()
+    io = SlackIO(cfg, TOK, TOK, call)
+    args = (VERDICT, "1.0", 2) if post == "post_rereview" else (VERDICT, "1.0")
+
+    getattr(io, post)(*args)
+
+    assert calls[0][2]["text"].startswith(cfg.marker)

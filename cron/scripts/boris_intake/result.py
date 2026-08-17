@@ -854,16 +854,26 @@ def neutralize_door_markers(text: str, door_markers: Sequence[str]) -> str:
     behind, and (b) do nothing at all if a marker were ever configured to
     contain `MARKER_REDACTION` itself. Neither is reachable with today's
     markers, but neither is ruled out by anything this function controls, so
-    whatever survives the readable substitution is deleted outright. That loop
-    terminates: every pass through it removes at least one occurrence, so the
-    text strictly shortens.
+    whatever survives the readable substitution is deleted outright.
+
+    That second pass is bounded by `len(text)` rather than run to a fixpoint,
+    and the bound is a real guard rather than paranoia. Each pass that removes
+    anything removes at least one character, so `len(text)` passes always
+    suffice for a non-empty marker -- while an EMPTY marker is "in" every
+    string and `str.replace("", "")` changes nothing, so a fixpoint loop would
+    spin forever on one. The `if m` filter above is what keeps an empty marker
+    out, but this runs inside a reconciler under a KeepAlive supervisor, where
+    a wedged process is a far worse failure than a marker that slips through:
+    a bound makes the hang unreachable rather than merely unlikely.
     """
     live = tuple(m for m in door_markers if m)
     if not live or not any(m in text for m in live):
         return text
     for marker in live:
         text = text.replace(marker, MARKER_REDACTION)
-    while any(m in text for m in live):
+    for _ in range(len(text)):
+        if not any(m in text for m in live):
+            break
         for marker in live:
             text = text.replace(marker, "")
     return text
