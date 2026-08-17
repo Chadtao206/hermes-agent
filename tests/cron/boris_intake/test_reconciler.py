@@ -1756,3 +1756,79 @@ def test_the_delivered_verdict_carries_no_gate_door_marker(tmp_path):
     assert discovery_marker not in delivered
     # Neutralised, not dropped: the finding is still readable.
     assert "Branch name quotes" in delivered
+
+
+@pytest.mark.parametrize("module", ("reconciler", "daemon", "replay"))
+def test_importing_these_modules_does_not_rebind_sibling_packages(module):
+    """All three reach DEPLOYED_SCRIPTS for `slack_read`, which lives only
+    there. Each must APPEND that root, never prepend it: all three are imported
+    at collection time by this suite, so a prepend puts the whole deployed tree
+    ahead of the repo checkout for the rest of the process and every sibling
+    package not yet imported resolves from `~/.hermes/scripts`. That silently
+    disabled pr_discovery's regression tests in a combined
+    `tests/cron/boris_intake/ tests/cron/pr_discovery/` run -- mutating
+    `pr_discovery/main.py::AUTHOR` survived it and failed a solo run.
+
+    The identical mistake is documented at length in
+    `pr_remediation/daemon.py::_bootstrap_sys_path`, which made it against
+    boris_intake and fixed it the same way.
+
+    Parametrized because one fixed module does not help if a sibling still
+    prepends -- fixing `reconciler` alone left the AUTHOR mutation invisible,
+    because `daemon` and `replay` were doing it too.
+
+    Run in a subprocess: the damage is to a process-wide import table, so it
+    cannot be observed from inside a session that has already imported both."""
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo_scripts = Path(__file__).resolve().parents[3] / "cron" / "scripts"
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(repo_scripts)!r})\n"
+        f"import boris_intake.{module}\n"
+        "import pr_discovery.main\n"
+        "print(pr_discovery.main.__file__)\n"
+    )
+    done = subprocess.run([_sys.executable, "-B", "-c", code],
+                          capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip().startswith(str(repo_scripts)), (
+        f"importing boris_intake.{module} rebound pr_discovery to the "
+        f"deployed tree: {done.stdout.strip()}")
+
+
+@pytest.mark.parametrize("module", ("reconciler", "daemon", "replay"))
+def test_these_modules_still_reach_the_deployed_slack_transport(module):
+    """The other direction, so the isolation fix above cannot be "fixed" into
+    three modules that no longer start. `slack_read` lives ONLY under
+    `/Users/ctao/.hermes/scripts` and each of these imports it at module scope,
+    so the appended root has to actually supply it -- appending is sufficient
+    precisely because nothing earlier on the path provides that name, which is
+    the same property that makes it unable to rebind anything else."""
+    import json
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo_scripts = Path(__file__).resolve().parents[3] / "cron" / "scripts"
+    code = (
+        "import json, sys\n"
+        f"sys.path[:] = [{str(repo_scripts)!r}] + [p for p in sys.path if p]\n"
+        f"import boris_intake.{module} as m\n"
+        "import slack_read\n"
+        "print(json.dumps({'module': m.__file__,\n"
+        "                  'slack_read': slack_read.__file__}))\n"
+    )
+    done = subprocess.run([_sys.executable, "-B", "-c", code],
+                          capture_output=True, text=True, timeout=60)
+
+    assert done.returncode == 0, done.stderr
+    seen = json.loads(done.stdout)
+    assert seen["module"].startswith(str(repo_scripts)), (
+        "the module under test must be the repo copy")
+    assert seen["slack_read"].startswith("/Users/ctao/.hermes/scripts"), (
+        "the appended root no longer supplies slack_read, so this module "
+        "would fail to start")

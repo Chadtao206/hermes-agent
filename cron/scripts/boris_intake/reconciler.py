@@ -12,7 +12,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 
-sys.path.insert(0, "/Users/ctao/.hermes/scripts")
+# APPENDED, never prepended. `slack_read` lives only under this directory and
+# nowhere in the repo, so appending is enough to find it -- while prepending
+# put the whole DEPLOYED tree ahead of the repo checkout for the rest of the
+# process, and this module is imported at collection time by the boris_intake
+# suite. Every sibling package not yet imported at that moment then resolved
+# from `~/.hermes/scripts` instead of `cron/scripts`: in a combined
+# `tests/cron/boris_intake/ tests/cron/pr_discovery/` run, pr_discovery's
+# tests were exercising the DEPLOYED copy, and a defect introduced in the
+# repo's copy could not fail them (verified: mutating
+# `pr_discovery/main.py::AUTHOR` survived that run and failed a solo one).
+# That is the identical mistake `pr_remediation/daemon.py::_bootstrap_sys_path`
+# documents at length after it silently disabled boris_intake's own regression
+# tests the same way. An appended entry can only supply a module nothing
+# earlier on the path already provides, so it can never rebind a package a
+# test runner has pointed somewhere else.
+sys.path.append("/Users/ctao/.hermes/scripts")
 
 from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
 

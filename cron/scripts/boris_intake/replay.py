@@ -14,7 +14,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, "/Users/ctao/.hermes/scripts")
+# APPENDED, never prepended -- `slack_read` lives only under this directory
+# and nowhere in the repo, so appending is enough to find it, while
+# prepending put the whole DEPLOYED tree ahead of the repo checkout for the
+# rest of the process and rebound every sibling package not yet imported.
+# See `reconciler.py`'s copy of this note for the run that proved it, and
+# `pr_remediation/daemon.py::_bootstrap_sys_path` for the first time this
+# exact mistake was made and fixed.
+sys.path.append("/Users/ctao/.hermes/scripts")
 
 from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
 
