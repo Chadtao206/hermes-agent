@@ -360,3 +360,149 @@ def test_the_renderer_defuses_a_verdict_the_gate_would_otherwise_admit(tmp_path)
     assert LOOP_MARKER not in defused
     assert not evaluate(
         bot_thread_reply(defused.split("• ", 1)[1]), DOOR_CFG, gate_deps()).accepted
+
+
+def test_replay_gives_each_message_its_own_real_retry_window(monkeypatch, tmp_path):
+    """`replay.py` builds the same deps as the daemon and must bound its GitHub
+    reads the same way: one real window per replayed MESSAGE, shared by that
+    message's PR reads and snapshot captures.
+
+    `budget = None` there survived every existing test, because they only pinned
+    that a `budget` kwarg was passed -- and a preflight run against a bad GitHub
+    window would then report a different rejection mix than the daemon would
+    produce from the same history, which is the one thing a preflight is for.
+    """
+    from boris_intake import replay
+    from boris_intake.github import GitHubRetryBudget
+
+    pr_budgets = []
+    capture_budgets = []
+    token_path = tmp_path / "replay-token"
+
+    def slack_call(token, method, **kwargs):
+        return {
+            "ok": True,
+            "messages": [
+                {
+                    "channel": "C1", "channel_type": "channel", "user": "U1",
+                    "ts": "1.0", "text": "https://github.com/Ylopo/one/pull/1",
+                },
+                {
+                    "channel": "C1", "channel_type": "channel", "user": "U1",
+                    "ts": "2.0", "text": "https://github.com/Ylopo/one/pull/2",
+                },
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    monkeypatch.setattr(replay, "load_config", lambda: Config(
+        mode="shadow",
+        channels=("C1",),
+        passive_channels=("C1",),
+        github_token_path=token_path,
+    ))
+    monkeypatch.setattr(
+        replay, "parse_env", lambda path: {"TICKET_HUB_SLACK_BOT_TOKEN": "token"}
+    )
+    monkeypatch.setattr(replay, "slack_call", slack_call)
+    monkeypatch.setattr(
+        replay,
+        "IdentityResolver",
+        lambda call, token: SimpleNamespace(resolve=lambda user_id: Identity(
+            user_id, "reviewer@ylopo.com", "T02PND103", False, False, False, False
+        )),
+    )
+
+    def fetch_pr_info(owner, repo, number, *, token_path, budget):
+        pr_budgets.append(budget)
+        return PRLookup(
+            GitHubReadStatus.FOUND, info=PRInfo(f"{number:040x}", "author", "OPEN")
+        )
+
+    def capture(owner, repo, number, head_sha, captured_at, *, token_path, budget):
+        capture_budgets.append(budget)
+        return GateSnapshotLookup(
+            SnapshotStatus.CAPTURED,
+            snapshot=GateSnapshot("sha256:" + "a" * 64, captured_at, ()),
+        )
+
+    monkeypatch.setattr(replay, "fetch_pr", fetch_pr_info)
+    monkeypatch.setattr(replay, "fetch_gate_snapshot", capture, raising=False)
+    monkeypatch.setattr(replay.sys, "argv", [
+        "replay.py", "--days", "1", "--channel", "C1",
+        "--audit-path", str(tmp_path / "replay-audit.jsonl"),
+    ])
+
+    assert replay.main() == 0
+
+    assert len(pr_budgets) == 2 and len(capture_budgets) == 2
+    assert all(isinstance(budget, GitHubRetryBudget) for budget in pr_budgets)
+    assert all(isinstance(budget, GitHubRetryBudget) for budget in capture_budgets)
+    # One window per message: shared within a message, never across two.
+    assert pr_budgets[0] is capture_budgets[0]
+    assert pr_budgets[1] is capture_budgets[1]
+    assert pr_budgets[0] is not pr_budgets[1]
+
+
+def test_replay_reports_a_no_checks_pull_request_the_way_the_daemon_does(
+    monkeypatch, capsys, tmp_path
+):
+    """The preflight's whole value is that its rejection mix matches the
+    daemon's, so every reason code the daemon can produce has to exist here too.
+    `github_unavailable` for a pull request with no CI would overstate an outage
+    in exactly the run someone reads to decide whether to go live."""
+    from boris_intake import replay
+
+    audit_path = tmp_path / "replay-audit.jsonl"
+    token_path = tmp_path / "replay-token"
+
+    def slack_call(token, method, **kwargs):
+        return {
+            "ok": True,
+            "messages": [{
+                "channel": "C1", "channel_type": "channel", "user": "U1",
+                "ts": "1.0", "text": "https://github.com/Ylopo/one/pull/1",
+            }],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    monkeypatch.setattr(replay, "load_config", lambda: Config(
+        mode="shadow",
+        channels=("C1",),
+        passive_channels=("C1",),
+        github_token_path=token_path,
+    ))
+    monkeypatch.setattr(
+        replay, "parse_env", lambda path: {"TICKET_HUB_SLACK_BOT_TOKEN": "token"}
+    )
+    monkeypatch.setattr(replay, "slack_call", slack_call)
+    monkeypatch.setattr(
+        replay,
+        "IdentityResolver",
+        lambda call, token: SimpleNamespace(resolve=lambda user_id: Identity(
+            user_id, "reviewer@ylopo.com", "T02PND103", False, False, False, False
+        )),
+    )
+    monkeypatch.setattr(replay, "fetch_pr", lambda owner, repo, number, **kwargs: (
+        PRLookup(GitHubReadStatus.FOUND, info=PRInfo("1" * 40, "author", "OPEN"))
+    ))
+    monkeypatch.setattr(replay, "fetch_gate_snapshot", lambda *args, **kwargs: (
+        GateSnapshotLookup(
+            SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
+        )
+    ), raising=False)
+    monkeypatch.setattr(replay.sys, "argv", [
+        "replay.py", "--days", "1", "--channel", "C1",
+        "--audit-path", str(audit_path),
+    ])
+
+    assert replay.main() == 0
+
+    output = capsys.readouterr().out
+    assert "REJECT Ylopo/one#1" in output
+    assert "pr_no_checks" in output
+    assert "github_unavailable" not in output
+    record = json.loads(audit_path.read_text().splitlines()[0])
+    assert record["decision"] == "reject"
+    assert record["reasons"] == ["pr_no_checks"]
+    assert record["details"] == ["Ylopo/one#1 — the PR has no CI checks to capture"]

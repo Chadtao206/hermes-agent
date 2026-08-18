@@ -361,3 +361,22 @@ def test_the_missing_pr_reply_is_unchanged():
     assert calls[0][1]["text"] == (
         "I couldn't find that PR (or I can't see it). (Ylopo/repo#5)"
     )
+
+
+def test_the_no_checks_reply_says_what_is_true_and_does_not_invite_a_retry():
+    """GitHub answered, so this reply must not blame GitHub, must not claim the
+    PR is missing, and must not tell the reader to post the link again -- nothing
+    about posting it again would change the answer."""
+    calls, call = recorder()
+
+    SlackIO(call, "t", dry_run=False).reply_rejection(
+        "C1", "1.0", Rejection(
+            ReasonCode.PR_NO_CHECKS, "Ylopo/repo#5 — the PR has no CI checks to capture"
+        )
+    )
+
+    text = calls[0][1]["text"]
+    assert "no CI checks" in text
+    assert "Ylopo/repo#5" in text
+    for wrong in ("couldn't find", "reach GitHub", "try again", "post the link again"):
+        assert wrong not in text, f"{wrong!r} should not be in: {text!r}"

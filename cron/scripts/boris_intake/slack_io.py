@@ -51,6 +51,13 @@ REASON_TEXT = {
     "gate_snapshot_unavailable": (
         "I couldn't capture the required PR check state just now — try again."
     ),
+    # Not a failure and not "try again": GitHub answered, and the answer is that
+    # this PR has no CI at all. Says what is true and stops there, because
+    # whether a CI-less repo should be reviewable is not this reply's call.
+    "pr_no_checks": (
+        "That PR has no CI checks, so I can't capture the check state I review "
+        "against."
+    ),
     "pr_not_open": "That PR isn't open.",
     "duplicate": "Already reviewed or in progress at that head.",
     "rate_limited": "Rate limited.",

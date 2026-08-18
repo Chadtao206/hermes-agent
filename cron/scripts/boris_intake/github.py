@@ -47,12 +47,18 @@ TIMEOUT = 30
 # not transfer, and the two differences are the whole reason:
 #
 # (a) The window is per MESSAGE, not per call. `pr_discovery` opens its deadline
-#     on a per-tick adapter. Here one Slack message can carry up to
-#     `Limits.max_prs_per_message` refs (deployed: 40), each costing one
-#     `fetch_pr`, plus two more calls for every admitted command. A per-call
-#     window would let one message spend forty of them, so the budget object is
-#     threaded from `daemon.Pipeline.handle` through both the gate's `pr_info`
-#     and `capture_gate_snapshot` and all of one message's reads share it.
+#     on a per-tick adapter. Here one Slack message can carry MORE refs than
+#     `Limits.max_prs_per_message` (deployed: 40) -- that cap is NOT a bound on
+#     the reads. `grammar.extract_pr_refs` applies no cap at all, and
+#     `gate.evaluate` applies the burst cap only AFTER each ref's `fetch_pr`
+#     (`gate.py`: the read, then the cap), so the real bound is the number of
+#     distinct Ylopo pull-request URLs one Slack message can hold -- of the order
+#     of 10**3 at Slack's 40k-character limit (~800 for realistic repo names).
+#     Each costs one `fetch_pr`, plus two more calls for every admitted command.
+#     That does not break the arithmetic below, and sharing the window is
+#     precisely why: the budget object is threaded from `daemon.Pipeline.handle`
+#     through both the gate's `pr_info` and `capture_gate_snapshot`, so a
+#     thousand refs still add one window's worth of retry, not a thousand.
 #
 # (b) The budget is far tighter, because this blocks a live event loop.
 #     `Pipeline.handle` is called synchronously from `daemon.on_request` inside
@@ -71,7 +77,8 @@ TIMEOUT = 30
 #
 # and that number is per MESSAGE however many pull requests it names, which is
 # the property (a) buys: a 40-ref message with a per-call window would add
-# 40 * 54 = 2160s = 36 minutes of retry to one handler call.
+# 40 * 54 = 2160s = 36 minutes of retry to one handler call, and nothing stops a
+# message naming twenty times that many.
 #
 # Realistically nothing is near that. The common message names one pull request
 # and costs 3 calls (one `pr view` in the gate, then `pr view` + two
@@ -122,6 +129,36 @@ _NOT_FOUND_SHAPES = (
 #: pointless-to-retry.
 _WRAPPER_PREFIX = "ghx_ro:"
 
+#: GitHub's own "this branch has no checks" shape, and the ONLY positive
+#: evidence that a pull request has no CI to snapshot. Probed 2026-08-18 through
+#: `ghx_ro.sh` (gh 2.95.0) against real pull requests, not remembered:
+#:
+#:   $ BORIS_PR_SCOPE=Ylopo/ylopo-infra#1 ghx_ro.sh pr checks 1 \
+#:         -R Ylopo/ylopo-infra --json name,state,link
+#:   exit 1, stdout "", stderr: no checks reported on the
+#:                              'DEVOPS-163-vail-pylib' branch
+#:
+#:   $ ... -R Ylopo/maverickre-monorepo 1 ...
+#:   exit 1, stdout "", stderr: no checks reported on the
+#:                              'RET-198-eslint-first-pass-auto-fixes' branch
+#:
+#: For contrast, `Ylopo/Gary-Ashton#1` (11 checks) answered exit 0 with the JSON
+#: array, and its `--required` read answered exit 1 with `no required checks
+#: reported on the 'feat/homepage-rebuild' branch` -- which is where
+#: `empty_stderr_prefix` below comes from. Note the two wordings are different
+#: strings and neither is a prefix of the other: `--required` on a zero-check
+#: pull request emits the PLAIN wording, so that variant's allowance can only
+#: fire when checks exist and none of them are required.
+#:
+#: Matched positively, the same way ABSENT is: a non-zero exit AND empty stdout
+#: AND this exact prefix. Bare empty stdout is NOT this case -- that is the
+#: fail-closed guard an empty rollup depends on, and widening it to plain
+#: `not stdout` would admit a pull request whose required checks were failing.
+#:
+#: Deliberately not FOUND, and deliberately not GITHUB_UNAVAILABLE. See
+#: `models.SnapshotStatus.NO_CHECKS` for both halves of that decision.
+_NO_CHECKS_PREFIX = "no checks reported on the "
+
 
 class GitHubRetryBudget:
     """One Slack message's shared retry window.
@@ -165,7 +202,13 @@ class GitHubRetryBudget:
 
 @dataclass(frozen=True)
 class _Read:
-    """One classified wrapper call. `value` is the parsed JSON when FOUND."""
+    """One classified wrapper call. `value` is the parsed JSON when FOUND.
+
+    `retryable` is the second axis of A.1's classification, and this private type
+    is the ONLY place it lives: `_read_json` is its one consumer, and it is the
+    one place a retry can still be started. The public lookups deliberately do
+    not restate it -- see `models.PRLookup`.
+    """
 
     status: GitHubReadStatus
     value: Any = None
@@ -179,6 +222,7 @@ def _attempt(
     runner,
     allowed_codes: tuple[int, ...],
     empty_stderr_prefix: str | None,
+    no_checks_prefix: str | None = None,
 ) -> _Read:
     """One actual spawn, classified.
 
@@ -188,6 +232,18 @@ def _attempt(
     not-found match and not a local wiring refusal is unavailable-and-retryable,
     including answers that arrive but cannot be trusted (not JSON, wrong shape),
     because a truncated body is a symptom of the same faults.
+
+    EVERY `detail` this returns is a fixed literal, and that is a boundary, not a
+    style: `_Read.detail` reaches `PRLookup.detail`, then the gate's rejection,
+    then `slack_io.reply_rejection`, then `chat.postMessage` -- and a
+    GITHUB_UNAVAILABLE reply is delivered on every post, cooldown or not. `gh`
+    stderr carries author-controlled text (`no checks reported on the
+    '<branch>' branch`, and the branch name is the pull request author's), so
+    interpolating stderr, or a caught exception's message, into a detail would
+    put text an outsider chose into a guaranteed-delivered Slack message. That
+    is the prompt-injection boundary this package's docstrings claim; see
+    `gate.py`. `test_github.py` drives these functions with a hostile branch name
+    and fails if any detail is not drawn from the closed vocabulary.
     """
     try:
         proc = runner(
@@ -209,28 +265,53 @@ def _attempt(
         # about something else, and absent is the one classification that must
         # never be reached by accident.
         return _Read(GitHubReadStatus.ABSENT, detail="GitHub reports no such PR")
-    if proc.returncode == 3 or stderr.lstrip().startswith(_WRAPPER_PREFIX):
+    if proc.returncode == 3 or (
+        proc.returncode != 0 and stderr.lstrip().startswith(_WRAPPER_PREFIX)
+    ):
         # A scope/verb refusal or an unreadable credential. Retrying either
         # cannot succeed -- it is a wiring bug, not an outage, and it will still
         # be one a second from now.
+        #
+        # The non-zero exit is required for the same reason the ABSENT branch
+        # above requires one: a body that arrived is not a refusal. `ghx_ro.sh`
+        # writes nothing to stderr on the success path today, but that wrapper
+        # deploys separately from this package, so one added log line there would
+        # otherwise discard every successful read and blame GitHub for it.
         detail = (
             "the GitHub wrapper refused the call"
             if proc.returncode == 3
             else "the GitHub credential could not be read"
         )
         return _Read(GitHubReadStatus.UNAVAILABLE, detail=detail)
+    stdout = str(getattr(proc, "stdout", "") or "")
+    if (
+        no_checks_prefix
+        and proc.returncode != 0
+        and not stdout.strip()
+        and stderr.strip().startswith(no_checks_prefix)
+    ):
+        # GitHub answered, and the answer is "this branch has no checks". Not a
+        # failure, not an empty rollup: terminal, never retried, and never
+        # FOUND. Checked before the allowed-exit-code test below so tightening
+        # `allowed_codes` could not turn this truthful answer back into a lie.
+        return _Read(GitHubReadStatus.NO_CHECKS, detail="the PR has no CI checks")
     if proc.returncode not in allowed_codes:
         return _Read(
             GitHubReadStatus.UNAVAILABLE,
             detail="GitHub answered with an error",
             retryable=True,
         )
-    stdout = str(getattr(proc, "stdout", "") or "")
     if (
         empty_stderr_prefix
         and not stdout.strip()
         and stderr.strip().startswith(empty_stderr_prefix)
     ):
+        # Three parts, all required. Empty stdout ALONE must never answer `[]`:
+        # an allowed exit with a truncated body would then build a snapshot with
+        # zero checks, `apply_gate_policy` would find nothing blocking and
+        # nothing pending, and a pull request whose required checks were failing
+        # would be publishable as READY_FOR_HUMAN_REVIEW. Both check reads
+        # depend on this guard; see `test_github.py`.
         return _Read(GitHubReadStatus.FOUND, value=[])
     try:
         return _Read(GitHubReadStatus.FOUND, value=json.loads(stdout))
@@ -252,6 +333,7 @@ def _read_json(
     budget: GitHubRetryBudget | None,
     allowed_codes: tuple[int, ...] = (0,),
     empty_stderr_prefix: str | None = None,
+    no_checks_prefix: str | None = None,
 ) -> _Read:
     """One wrapper read, retried up to `attempts` times inside `budget`.
 
@@ -268,10 +350,19 @@ def _read_json(
         budget.open_window()
     read = _Read(GitHubReadStatus.UNAVAILABLE, detail="no attempt was made")
     for attempt in range(1, attempts + 1):
-        read = _attempt(command, env, runner, allowed_codes, empty_stderr_prefix)
+        read = _attempt(
+            command,
+            env,
+            runner,
+            allowed_codes,
+            empty_stderr_prefix,
+            no_checks_prefix,
+        )
         # `retryable` is only ever set on an UNAVAILABLE read, so this one test
-        # returns every found, every absent, and every unavailable-but-
-        # pointless-to-retry answer without a second attempt.
+        # returns every found, every absent, every no-checks and every
+        # unavailable-but-pointless-to-retry answer without a second attempt --
+        # and a no-checks answer therefore costs one spawn and none of the
+        # message's window.
         if not read.retryable:
             return read
         if attempt >= attempts or budget is None or budget.window_closed():
@@ -319,17 +410,12 @@ def fetch_pr(
     if read.status is GitHubReadStatus.ABSENT:
         return PRLookup(GitHubReadStatus.ABSENT, detail=read.detail)
     if read.status is GitHubReadStatus.UNAVAILABLE:
-        return PRLookup(
-            GitHubReadStatus.UNAVAILABLE,
-            detail=read.detail,
-            retryable=read.retryable,
-        )
+        return PRLookup(GitHubReadStatus.UNAVAILABLE, detail=read.detail)
     data = read.value
     if not isinstance(data, dict):
         return PRLookup(
             GitHubReadStatus.UNAVAILABLE,
             detail="GitHub's answer was not a pull request object",
-            retryable=True,
         )
     sha = str(data.get("headRefOid") or "").lower()
     if not _SHA.match(sha):
@@ -339,7 +425,6 @@ def fetch_pr(
         return PRLookup(
             GitHubReadStatus.UNAVAILABLE,
             detail="GitHub's answer had no usable head SHA",
-            retryable=True,
         )
     return PRLookup(
         GitHubReadStatus.FOUND,
@@ -356,15 +441,15 @@ def fetch_pr(
 def _unreadable_snapshot(read: _Read, what: str) -> GateSnapshotLookup:
     """A failed read, restated as a failed capture.
 
-    An ABSENT read lands here too, non-retryable: the gate proved this pull
-    request existed moments ago, so GitHub answering "no such pull request" now
-    is a race (or a repository that has just become invisible), and the honest
-    thing to report is still that the snapshot could not be captured.
+    An ABSENT read lands here too: the gate proved this pull request existed
+    moments ago, so GitHub answering "no such pull request" now is a race (or a
+    repository that has just become invisible), and the honest thing to report is
+    still that the snapshot could not be captured. A NO_CHECKS read does NOT land
+    here -- it is an answer, not a failure, and has its own state.
     """
     return GateSnapshotLookup(
         SnapshotStatus.UNAVAILABLE,
         detail=f"{what}: {read.detail}" if read.detail else what,
-        retryable=read.retryable,
     )
 
 
@@ -378,9 +463,10 @@ def fetch_gate_snapshot(
     token_path: Path | None = None,
     budget: GitHubRetryBudget | None = None,
 ) -> GateSnapshotLookup:
-    """Capture the exact-head Gate Snapshot, in three states.
+    """Capture the exact-head Gate Snapshot, in four states.
 
-    HEAD_MOVED is not a failure and is never retried: see `SnapshotStatus`.
+    HEAD_MOVED and NO_CHECKS are not failures and neither is ever retried: see
+    `SnapshotStatus`.
     """
     scope = f"{owner}/{repo}#{number}"
     repository = f"{owner}/{repo}"
@@ -400,7 +486,6 @@ def fetch_gate_snapshot(
         return GateSnapshotLookup(
             SnapshotStatus.UNAVAILABLE,
             detail="GitHub's answer had no usable head SHA",
-            retryable=True,
         )
     if current_head != expected_head_sha.lower():
         # Terminal and correct: the pull request moved under the request. A
@@ -428,7 +513,17 @@ def fetch_gate_snapshot(
         attempts=attempts,
         budget=budget,
         allowed_codes=(0, 1),
+        no_checks_prefix=_NO_CHECKS_PREFIX,
     )
+    if checks.status is GitHubReadStatus.NO_CHECKS:
+        # GitHub answered, and there is nothing to snapshot. Terminal, and the
+        # request stays rejected: a zero-check snapshot would have nothing
+        # blocking and nothing pending, so a pull request whose CI never ran
+        # could be published READY_FOR_HUMAN_REVIEW. Whether a CI-less repository
+        # should be reviewable is Chad's decision to make deliberately.
+        return GateSnapshotLookup(
+            SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
+        )
     if checks.status is not GitHubReadStatus.FOUND:
         return _unreadable_snapshot(checks, "the PR checks could not be read")
     required = _read_json(
@@ -459,13 +554,11 @@ def fetch_gate_snapshot(
         return GateSnapshotLookup(
             SnapshotStatus.UNAVAILABLE,
             detail="GitHub's check rollup was not a list",
-            retryable=True,
         )
     if not all(isinstance(item, dict) for item in checks.value + required.value):
         return GateSnapshotLookup(
             SnapshotStatus.UNAVAILABLE,
             detail="GitHub's check rollup held a non-object row",
-            retryable=True,
         )
     required_names = {str(item.get("name") or "") for item in required.value}
     all_names = {str(item.get("name") or "") for item in checks.value}
@@ -475,7 +568,6 @@ def fetch_gate_snapshot(
         return GateSnapshotLookup(
             SnapshotStatus.UNAVAILABLE,
             detail="a required check is missing from GitHub's rollup",
-            retryable=True,
         )
     rows = [
         dict(item, required=str(item.get("name") or "") in required_names)
@@ -488,10 +580,15 @@ def fetch_gate_snapshot(
                 rows, captured_at, load_gate_registry(_GATE_REGISTRY)
             ),
         )
-    except ValidationError as error:
+    except ValidationError:
         return GateSnapshotLookup(
             SnapshotStatus.UNAVAILABLE,
-            detail=f"the check rollup did not validate: {str(error)[:120]}",
+            # The validation message is deliberately NOT interpolated. It is
+            # composed from the rollup GitHub returned, so its wording is not
+            # ours to promise, and this detail is delivered into Slack. Closed
+            # vocabulary wins over a better error message on the one path where
+            # the two conflict.
+            detail="the check rollup did not validate",
         )
 
 

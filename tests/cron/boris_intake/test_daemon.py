@@ -341,7 +341,6 @@ def test_an_unreadable_snapshot_is_reported_as_github_unavailable(tmp_path):
     p.capture_gate_snapshot = lambda command, at, budget: GateSnapshotLookup(
         SnapshotStatus.UNAVAILABLE,
         detail="the PR checks could not be read: GitHub answered with an error",
-        retryable=True,
     )
 
     p.handle(normalize(msg()))
@@ -386,7 +385,6 @@ DOOR_LIVE = Config(
 ABSENT_PR = PRLookup(GitHubReadStatus.ABSENT, detail="GitHub reports no such PR")
 UNREADABLE_PR = PRLookup(
     GitHubReadStatus.UNAVAILABLE, detail="GitHub answered with an error",
-    retryable=True,
 )
 
 
@@ -512,3 +510,78 @@ def test_the_infrastructure_rejection_is_the_one_reported(tmp_path):
 
     assert len(replies(calls)) == 1
     assert "couldn't reach GitHub" in replies(calls)[0]
+
+
+# ---------------------------------------------------------------------------
+# A pull request with no CI checks: truthful, terminal, and throttled like any
+# other ordinary rejection.
+# ---------------------------------------------------------------------------
+
+NO_CHECKS = GateSnapshotLookup(
+    SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
+)
+
+
+def test_a_pull_request_with_no_checks_is_not_reported_as_an_outage(tmp_path):
+    """GitHub answered perfectly, so GITHUB_UNAVAILABLE would be exactly the lie
+    this classification exists to remove -- and it would be an un-throttled
+    "I couldn't reach GitHub" on every post, forever."""
+    p, store, calls, captures = _pipeline(tmp_path)
+    p.capture_gate_snapshot = lambda command, at, budget: NO_CHECKS
+
+    p.handle(normalize(msg()))
+
+    assert store.requests_for_event("C1", "1.0") == ()
+    record = records(tmp_path)[0]
+    assert record["reasons"] == ["pr_no_checks"]
+    assert record["details"] == ["Ylopo/repo#5 — the PR has no CI checks to capture"]
+    assert len(replies(calls)) == 1
+    assert "no CI checks" in replies(calls)[0]
+    assert "reach GitHub" not in replies(calls)[0]
+
+
+def test_the_no_checks_rejection_is_throttled_like_an_ordinary_one(tmp_path):
+    """An ordinary rejection, not an infrastructure failure: it is deterministic,
+    so repeating it on every post would be pure noise (P3)."""
+    p, store, calls, captures = _pipeline(tmp_path)
+    p.capture_gate_snapshot = lambda command, at, budget: NO_CHECKS
+
+    p.handle(normalize(msg(ts="1.0")))
+    p.handle(normalize(msg(ts="2.0", text="https://github.com/Ylopo/repo/pull/6")))
+
+    assert len(replies(calls)) == 1
+
+
+def test_a_moved_head_reply_is_throttled_not_guaranteed(tmp_path):
+    """`GATE_SNAPSHOT_UNAVAILABLE`'s only remaining producer is the moved-head
+    refusal, and a moved head is "your request was wrong": the requester pushed
+    while requesting. Bypassing the cooldown for that would hand anyone racing a
+    push against their own link an un-throttled reply on every post."""
+    p, store, calls, captures = _pipeline(tmp_path)
+    p.capture_gate_snapshot = lambda command, at, budget: GateSnapshotLookup(
+        SnapshotStatus.HEAD_MOVED, detail="the head moved to abc1234 after the request"
+    )
+
+    p.handle(normalize(msg(ts="1.0")))
+    p.handle(normalize(msg(ts="2.0", text="https://github.com/Ylopo/repo/pull/6")))
+
+    assert [record["reasons"] for record in records(tmp_path)] == [
+        ["gate_snapshot_unavailable"], ["gate_snapshot_unavailable"],
+    ]
+    assert len(replies(calls)) == 1
+
+
+def test_the_gate_rejection_audit_row_carries_its_details(tmp_path):
+    """That row is the forensic record of the new classification -- the thing the
+    next incident is read from -- and `"details": []` survived."""
+    from dataclasses import replace as replace_field
+
+    p, store, calls, captures = _pipeline(tmp_path)
+    p.deps = replace_field(p.deps, pr_info=lambda o, r, n, budget: UNREADABLE_PR)
+
+    p.handle(normalize(msg()))
+
+    record = records(tmp_path)[0]
+    assert record["decision"] == "reject"
+    assert record["reasons"] == ["github_unavailable"]
+    assert record["details"] == ["Ylopo/repo#5 — GitHub answered with an error"]

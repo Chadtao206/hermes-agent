@@ -28,7 +28,6 @@ ABSENT = PRLookup(GitHubReadStatus.ABSENT, detail="GitHub reports no such PR")
 UNAVAILABLE = PRLookup(
     GitHubReadStatus.UNAVAILABLE,
     detail="GitHub answered with an error",
-    retryable=True,
 )
 
 
@@ -639,3 +638,54 @@ def test_an_accepted_message_carries_the_same_attribution():
 
     assert r.accepted
     assert r.reply_cooldown_key == "human:U1"
+
+
+# ---------------------------------------------------------------------------
+# Which rejections bypass the reply cooldown, pinned in BOTH directions.
+#
+# Two mutations proved this membership was untested either way: dropping
+# GITHUB_UNAVAILABLE from the set survived, and so did narrowing the bypass to
+# it alone. The set's own docstring says these mean "the machinery failed, not
+# your request was wrong", so the membership is a claim about MEANING, and every
+# requester-caused rejection has to stay outside it -- an un-throttled reply on
+# every post for a self-inflicted mistake is the noise this cooldown exists to
+# stop (P3).
+# ---------------------------------------------------------------------------
+
+
+def test_only_an_infrastructure_failure_bypasses_the_reply_cooldown():
+    from boris_intake.models import ALWAYS_REPLY_REASONS
+
+    # Fails if the infrastructure reason is dropped: nobody can act on an outage
+    # they never see, which is how three remediation loops were stranded.
+    assert ReasonCode.GITHUB_UNAVAILABLE in ALWAYS_REPLY_REASONS
+    # Fails if anything else is added. Written as the exact set, at a literal
+    # boundary, because the interesting mutations go in both directions.
+    assert ALWAYS_REPLY_REASONS == frozenset({ReasonCode.GITHUB_UNAVAILABLE})
+
+
+def test_no_requester_caused_rejection_is_ever_delivered_unthrottled():
+    """Enumerated rather than derived, so adding a reason code forces a decision
+    about which side of this line it belongs on.
+
+    GATE_SNAPSHOT_UNAVAILABLE is on this list, and its presence is the fix: after
+    the three-state capture split the two meanings apart, its ONLY producer is
+    the moved-head refusal -- the requester pushed while requesting. That is
+    "your request was wrong" in the most literal way this service sees one, so
+    someone racing a push against their own link is throttled like anyone else.
+    """
+    from boris_intake.models import ALWAYS_REPLY_REASONS
+
+    requester_caused = frozenset({
+        ReasonCode.PR_NOT_FOUND,
+        ReasonCode.PR_NOT_OPEN,
+        ReasonCode.PR_NO_CHECKS,
+        ReasonCode.GATE_SNAPSHOT_UNAVAILABLE,
+        ReasonCode.ORG_NOT_ALLOWED,
+        ReasonCode.IDENTITY_NOT_TRUSTED,
+        ReasonCode.UNKNOWN_FLAG,
+        ReasonCode.DUPLICATE,
+        ReasonCode.RATE_LIMITED,
+    })
+
+    assert not (ALWAYS_REPLY_REASONS & requester_caused)

@@ -158,12 +158,18 @@ class Pipeline:
         for command in result.commands:
             capture = self.capture_gate_snapshot(command, captured_at, budget)
             if not capture.captured:
-                # Two different refusals, and only one of them is an outage. A
+                # Three different refusals, and only one of them is an outage. A
                 # moved head keeps GATE_SNAPSHOT_UNAVAILABLE: it is terminal,
-                # correct, and about this request rather than about GitHub.
+                # correct, and about this request rather than about GitHub. A
+                # pull request with no CI checks gets its own truthful terminal
+                # reason for the same reason -- GitHub answered, so calling it an
+                # outage would be the lie this whole classification removes, and
+                # it would be an un-throttled reply on every post forever.
                 rejections.append(Rejection(
                     ReasonCode.GATE_SNAPSHOT_UNAVAILABLE
                     if capture.head_moved
+                    else ReasonCode.PR_NO_CHECKS
+                    if capture.no_checks
                     else ReasonCode.GITHUB_UNAVAILABLE,
                     f"{command.slug} — {capture.detail}" if capture.detail
                     else f"{command.slug} — exact-head Gate Snapshot unavailable",
