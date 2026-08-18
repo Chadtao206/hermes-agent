@@ -40,6 +40,14 @@ REASON_TEXT = {
     "identity_lookup_failed": "I couldn't verify your Slack account just now — try again.",
     "org_not_allowed": "I only review PRs in the Ylopo GitHub org.",
     "pr_not_found": "I couldn't find that PR (or I can't see it).",
+    # Deliberately says all three things a reader needs: GitHub was the problem,
+    # nothing was accepted, and re-posting the link is the fix. This is the
+    # rejection that was invisible during the 2026-08-17 outage, so it is the one
+    # that most has to be actionable.
+    "github_unavailable": (
+        "I couldn't reach GitHub to check that PR, so I haven't taken the "
+        "request — post the link again and I'll retry."
+    ),
     "gate_snapshot_unavailable": (
         "I couldn't capture the required PR check state just now — try again."
     ),

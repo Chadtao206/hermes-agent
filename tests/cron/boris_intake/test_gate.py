@@ -6,19 +6,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from boris_intake.config import Config
 from boris_intake.gate import GateDeps, evaluate
-from boris_intake.models import Identity, NormalizedEvent, PRInfo, ReasonCode
+from boris_intake.models import (
+    GitHubReadStatus,
+    Identity,
+    NormalizedEvent,
+    PRInfo,
+    PRLookup,
+    ReasonCode,
+    RequestOrigin,
+)
 
 BOT = "U0B9TK6B41M"
 CFG = Config(mode="live", channels=("C1", "C2"), passive_channels=("C1",),
              bot_user_id=BOT)
 GOOD = Identity("U1", "a@ylopo.com", "T02PND103", False, False, False, False)
 OPEN_PR = PRInfo("f" * 40, "zjenkins", "OPEN")
+FOUND = PRLookup(GitHubReadStatus.FOUND, info=OPEN_PR)
+#: GitHub answered, authoritatively, that there is no such pull request.
+ABSENT = PRLookup(GitHubReadStatus.ABSENT, detail="GitHub reports no such PR")
+#: No answer was obtained. Not the same thing, and the difference is the task.
+UNAVAILABLE = PRLookup(
+    GitHubReadStatus.UNAVAILABLE,
+    detail="GitHub answered with an error",
+    retryable=True,
+)
 
 
-def deps(identity=GOOD, pr=OPEN_PR, rate="ok"):
+def deps(identity=GOOD, pr=FOUND, rate="ok"):
     return GateDeps(
         identity=lambda uid: identity,
-        pr_info=lambda o, r, n: pr,
+        pr_info=lambda o, r, n, budget: pr,
         rate_verdict=lambda uid: rate,
         now=lambda: 1_000_000.0,
     )
@@ -142,12 +159,13 @@ def test_no_pr_url_rejected_silently():
 
 
 def test_closed_pr_rejected():
-    r = evaluate(ev(), CFG, deps(pr=PRInfo("f" * 40, "x", "MERGED")))
+    r = evaluate(ev(), CFG, deps(
+        pr=PRLookup(GitHubReadStatus.FOUND, info=PRInfo("f" * 40, "x", "MERGED"))))
     assert ReasonCode.PR_NOT_OPEN in reasons(r)
 
 
 def test_missing_pr_rejected():
-    r = evaluate(ev(), CFG, deps(pr=None))
+    r = evaluate(ev(), CFG, deps(pr=ABSENT))
     assert ReasonCode.PR_NOT_FOUND in reasons(r)
 
 
@@ -195,7 +213,7 @@ def test_unknown_flag_rejects_entire_message_before_remote_lookups():
     calls = []
     guarded = GateDeps(
         identity=lambda uid: calls.append("identity"),
-        pr_info=lambda o, r, n: calls.append("pr"),
+        pr_info=lambda o, r, n, budget: calls.append("pr"),
         rate_verdict=lambda uid: calls.append("rate"),
         now=lambda: 1_000_000.0,
     )
@@ -490,3 +508,134 @@ def test_discovery_branch_inert_when_attribution_is_unset():
     post = ev(user_id=BOT, is_bot=True, thread_ts=None,
               text=f"https://github.com/Ylopo/repo/pull/5 {DISCOVERY_MARKER}")
     assert reasons(evaluate(post, cfg, deps())) == {ReasonCode.NOT_HUMAN}
+
+
+# ---------------------------------------------------------------------------
+# "GitHub was unreachable" is a different rejection from "that PR does not
+# exist" -- the 2026-08-17 conflation, at the gate.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreadable_pr_read_is_github_unavailable_not_pr_not_found():
+    """The defect, at the line that caused it. PR_NOT_FOUND is terminal and
+    asserts the pull request does not exist; asserting that about an open one
+    stranded `Ylopo/forge-content-service#111` for hours."""
+    r = evaluate(ev(), CFG, deps(pr=UNAVAILABLE))
+
+    assert reasons(r) == {ReasonCode.GITHUB_UNAVAILABLE}
+    assert ReasonCode.PR_NOT_FOUND not in reasons(r)
+    assert "Ylopo/repo#5" in r.rejections[0].detail
+    assert not r.accepted
+
+
+def test_the_outage_rejection_is_never_silent():
+    """It is precisely the rejection that has to be visible: the one channel that
+    would have shown the 2026-08-17 lie was the in-thread reply."""
+    from boris_intake.models import ALWAYS_REPLY_REASONS, SILENT_REASONS, Rejection
+
+    assert ReasonCode.GITHUB_UNAVAILABLE not in SILENT_REASONS
+    assert Rejection(ReasonCode.GITHUB_UNAVAILABLE).silent is False
+    # An always-delivered reason that was also silent would be a contradiction.
+    assert not (ALWAYS_REPLY_REASONS & SILENT_REASONS)
+
+
+def test_one_unreadable_pr_does_not_lose_the_others_in_the_message():
+    lookups = {
+        5: UNAVAILABLE,
+        6: FOUND,
+        7: ABSENT,
+    }
+    d = GateDeps(
+        identity=lambda uid: GOOD,
+        pr_info=lambda o, r, n, budget: lookups[n],
+        rate_verdict=lambda uid: "ok",
+        now=lambda: 1_000_000.0,
+    )
+
+    r = evaluate(ev(text=(
+        "https://github.com/Ylopo/repo/pull/5 "
+        "https://github.com/Ylopo/repo/pull/6 "
+        "https://github.com/Ylopo/repo/pull/7"
+    )), CFG, d)
+
+    assert [c.pr_number for c in r.commands] == [6]
+    assert reasons(r) == {ReasonCode.GITHUB_UNAVAILABLE, ReasonCode.PR_NOT_FOUND}
+
+
+def test_every_pr_read_in_one_message_gets_the_same_retry_budget():
+    """One window per message, not per call. `daemon.Pipeline.handle` owns the
+    object; the gate only forwards it."""
+    seen = []
+
+    def pr_info(owner, repo, number, budget):
+        seen.append(budget)
+        return FOUND
+
+    d = GateDeps(
+        identity=lambda uid: GOOD,
+        pr_info=pr_info,
+        rate_verdict=lambda uid: "ok",
+        now=lambda: 1_000_000.0,
+    )
+    marker = object()
+
+    evaluate(ev(text=(
+        "https://github.com/Ylopo/repo/pull/5 "
+        "https://github.com/Ylopo/repo/pull/6"
+    )), CFG, d, marker)
+
+    assert seen == [marker, marker]
+
+
+# ---------------------------------------------------------------------------
+# Attribution on the result: who the request is FOR, and which door it came
+# through. The rejection-reply cooldown is keyed on both -- see
+# GateResult.reply_cooldown_key and daemon._maybe_reply_rejections.
+# ---------------------------------------------------------------------------
+
+
+def test_a_human_rejection_is_attributed_to_the_human():
+    r = evaluate(ev(), CFG, deps(pr=UNAVAILABLE))
+
+    assert r.origin is RequestOrigin.HUMAN
+    assert r.requester_user_id == "U1"
+    assert r.reply_cooldown_key == "human:U1"
+
+
+def test_a_loop_repost_rejection_is_attributed_to_chad_through_the_loop_door():
+    repost = ev(
+        user_id=BOT, is_bot=True, thread_ts="0.9",
+        text=f"{MARKER}\nhttps://github.com/Ylopo/repo/pull/5",
+    )
+
+    r = evaluate(repost, LOOP_CFG, deps(identity=CHAD, pr=UNAVAILABLE))
+
+    assert reasons(r) == {ReasonCode.GITHUB_UNAVAILABLE}
+    assert r.origin is RequestOrigin.LOOP
+    assert r.requester_user_id == "U07E3AHV686"
+    # NOT the bot that posted it, which is what shared one cooldown row with
+    # every other bot rejection, and NOT bare "U07E3AHV686", which would share
+    # Chad's own row so one bad link he pasted could silence the loop.
+    assert r.reply_cooldown_key == "loop:U07E3AHV686"
+
+
+def test_a_discovery_post_rejection_keys_apart_from_the_loops():
+    discovery_cfg = replace(
+        LOOP_CFG, discovery_bot_user_id=BOT, discovery_marker="[swept. v1]"
+    )
+    post = ev(
+        user_id=BOT, is_bot=True,
+        text="https://github.com/Ylopo/repo/pull/5 [swept. v1]",
+    )
+
+    r = evaluate(post, discovery_cfg, deps(identity=CHAD, pr=UNAVAILABLE))
+
+    assert r.origin is RequestOrigin.DISCOVERY
+    assert r.reply_cooldown_key == "discovery:U07E3AHV686"
+
+
+def test_an_accepted_message_carries_the_same_attribution():
+    r = evaluate(ev(), CFG, deps())
+
+    assert r.accepted
+    assert r.reply_cooldown_key == "human:U1"

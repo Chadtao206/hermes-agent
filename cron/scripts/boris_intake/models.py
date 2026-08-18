@@ -25,6 +25,11 @@ class ReasonCode(str, Enum):
     IDENTITY_NOT_TRUSTED = "identity_not_trusted"
     ORG_NOT_ALLOWED = "org_not_allowed"
     PR_NOT_FOUND = "pr_not_found"
+    #: A GitHub read did not answer. Distinct from PR_NOT_FOUND on purpose: that
+    #: one asserts the pull request does not exist, which is terminal, and
+    #: asserting it about a PR that is open strands whoever asked (see
+    #: GitHubReadStatus).
+    GITHUB_UNAVAILABLE = "github_unavailable"
     GATE_SNAPSHOT_UNAVAILABLE = "gate_snapshot_unavailable"
     PR_NOT_OPEN = "pr_not_open"
     UNKNOWN_FLAG = "unknown_flag"
@@ -43,6 +48,37 @@ SILENT_REASONS = frozenset({
     ReasonCode.MENTION_REQUIRED,
     ReasonCode.MODE_OFF,
 })
+
+#: Rejections that must be delivered even inside the reply cooldown window.
+#:
+#: These say "the machinery failed", not "your request was wrong", and nobody
+#: can act on one they never see: on 2026-08-17 a GitHub partial outage rejected
+#: a live re-review request and the one reply that would have shown it was
+#: swallowed by a cooldown row keyed on the bot's own user id, so three
+#: remediation loops sat waiting for a verdict for hours. They are self-limiting
+#: -- they only occur while GitHub is failing, and the loop's own re-post budget
+#: is 12 attempts 10 minutes apart -- so bypassing the throttle cannot turn into
+#: a spam channel the way a human pasting bad links could.
+ALWAYS_REPLY_REASONS = frozenset({
+    ReasonCode.GITHUB_UNAVAILABLE,
+    ReasonCode.GATE_SNAPSHOT_UNAVAILABLE,
+})
+
+
+class RequestOrigin(str, Enum):
+    """Who a message is admitted AS -- not who posted it.
+
+    The remediation loop and the discovery cron both post as the same bot user
+    and are both attributed to `cfg.loop_attributed_user_id` (Chad) for quotas
+    and audit. That attribution alone cannot key the rejection-reply cooldown:
+    it would put the loop's outage rejections in the same row as Chad's own
+    typos, so one bad link he pastes would silence the loop for an hour. The
+    origin is the other half of that key.
+    """
+
+    HUMAN = "human"
+    LOOP = "loop"
+    DISCOVERY = "discovery"
 
 
 @dataclass(frozen=True)
@@ -77,6 +113,65 @@ class PRInfo:
     # stay optional: an older caller that omits them just finds no ticket.
     title: str = ""
     head_ref: str = ""
+
+
+class GitHubReadStatus(str, Enum):
+    """Why a GitHub read answered the way it did. Total and distinct.
+
+    The whole point of this type is the difference between the last two. Before
+    it existed, every failure of `github.fetch_pr` -- a 503, a 30s timeout, a
+    wrapper refusal, unparseable JSON -- collapsed into the same `None` the gate
+    then reported as `PR_NOT_FOUND`, i.e. "that pull request does not exist". On
+    2026-08-17 GitHub answered 503 on roughly half of all calls for several
+    hours and that is exactly what happened to `Ylopo/forge-content-service#111`
+    while it was open: a terminal rejection asserting something false about the
+    world, which stranded the remediation loop waiting for a verdict that could
+    never arrive.
+
+    ABSENT is therefore reserved for a POSITIVE match on GitHub's own not-found
+    shape, and everything unclassifiable is UNAVAILABLE. A false UNAVAILABLE
+    only says "could not check" -- honest, non-terminal, recoverable by
+    re-posting the link. A false ABSENT lies and strands. When in doubt, be
+    UNAVAILABLE; do not tidy this the other way.
+    """
+
+    FOUND = "found"
+    ABSENT = "absent"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class PRLookup:
+    """The three-state result of one `pr view` read.
+
+    `retryable` is a SECOND axis, not a restatement of the status: a wrapper
+    scope refusal and an unreadable credential are both UNAVAILABLE (they
+    obtained no answer) yet retrying either cannot succeed -- they are wiring
+    bugs, not outages, and will still be wiring bugs one second later.
+    """
+
+    status: GitHubReadStatus
+    info: PRInfo | None = None
+    detail: str = ""
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.info is not None) is not (self.status is GitHubReadStatus.FOUND):
+            raise ValueError("a PRLookup carries a PRInfo exactly when it is FOUND")
+        if self.retryable and self.status is not GitHubReadStatus.UNAVAILABLE:
+            raise ValueError("only an UNAVAILABLE read can be retryable")
+
+    @property
+    def found(self) -> bool:
+        return self.status is GitHubReadStatus.FOUND
+
+    @property
+    def absent(self) -> bool:
+        return self.status is GitHubReadStatus.ABSENT
+
+    @property
+    def unavailable(self) -> bool:
+        return self.status is GitHubReadStatus.UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -151,6 +246,56 @@ class GateSnapshot:
             captured_at=str(raw["captured_at"]),
             checks=tuple(GateCheck.from_dict(check) for check in raw["checks"]),
         )
+
+
+class SnapshotStatus(str, Enum):
+    """Why a Gate Snapshot capture answered the way it did.
+
+    HEAD_MOVED is its own state because it is the one `None` in
+    `github.fetch_gate_snapshot` that was never an outage: the pull request
+    moved under the request, which is terminal, correct, retry-proof, and the
+    commonest legitimate reason a capture refuses. Reporting it as GitHub being
+    unavailable would be a fresh lie pointing the opposite way, and retrying it
+    would slow the loop's commonest legitimate path down for nothing.
+    """
+
+    CAPTURED = "captured"
+    HEAD_MOVED = "head_moved"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class GateSnapshotLookup:
+    """The three-state result of one exact-head Gate Snapshot capture.
+
+    Same two axes as `PRLookup`, same reason: a wrapper refusal obtained no
+    answer yet retrying it cannot help.
+    """
+
+    status: SnapshotStatus
+    snapshot: GateSnapshot | None = None
+    detail: str = ""
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.snapshot is not None) is not (self.status is SnapshotStatus.CAPTURED):
+            raise ValueError(
+                "a GateSnapshotLookup carries a snapshot exactly when it is CAPTURED"
+            )
+        if self.retryable and self.status is not SnapshotStatus.UNAVAILABLE:
+            raise ValueError("only an UNAVAILABLE capture can be retryable")
+
+    @property
+    def captured(self) -> bool:
+        return self.status is SnapshotStatus.CAPTURED
+
+    @property
+    def head_moved(self) -> bool:
+        return self.status is SnapshotStatus.HEAD_MOVED
+
+    @property
+    def unavailable(self) -> bool:
+        return self.status is SnapshotStatus.UNAVAILABLE
 
 
 class WorkflowState(str, Enum):
@@ -277,7 +422,39 @@ class Rejection:
 class GateResult:
     commands: tuple[ReviewCommand, ...] = ()
     rejections: tuple[Rejection, ...] = ()
+    #: Who this message is admitted AS, and through which door -- the same
+    #: attribution every audit row and every quota already uses. Surfaced here
+    #: because `daemon._maybe_reply_rejections` needs it to key the
+    #: rejection-reply cooldown on the requester rather than on whichever Slack
+    #: account happened to post (for a loop re-post, that is the bot itself, so
+    #: every loop rejection for every PR shared one row).
+    #:
+    #: Both default to a bare human with no id, which is what the rejections
+    #: raised before attribution is computed (mode, not-human, channel) are --
+    #: all three of which are silent and never reach the throttle.
+    requester_user_id: str = ""
+    origin: RequestOrigin = RequestOrigin.HUMAN
 
     @property
     def accepted(self) -> bool:
         return bool(self.commands)
+
+    @property
+    def reply_cooldown_key(self) -> str:
+        """The row a rejection reply about THIS message throttles against.
+
+        Origin AND requester, because either alone reintroduces cross-talk:
+
+        * `event.user_id` alone was the bug -- the loop posts as the bot, so
+          every loop rejection for every pull request shared one row with every
+          other bot rejection, and one reply silenced them all for an hour.
+        * the attributed requester alone puts the loop in Chad's row, so a bad
+          link he pastes silences the loop's outage rejection instead.
+
+        Deliberately NOT per pull request. Only one reply is sent per message
+        whatever it contains, so a per-PR key would not make a single message
+        louder -- it would let one 40-link paste earn 40 replies an hour, which
+        is the spam this cooldown exists to prevent. Infrastructure rejections
+        do not consult this key at all (see `ALWAYS_REPLY_REASONS`).
+        """
+        return f"{self.origin.value}:{self.requester_user_id}"

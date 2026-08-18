@@ -29,7 +29,11 @@ from boris_intake import audit  # noqa: E402
 from boris_intake.config import load_config  # noqa: E402
 from boris_intake.daemon import normalize  # noqa: E402
 from boris_intake.gate import GateDeps, evaluate  # noqa: E402
-from boris_intake.github import fetch_gate_snapshot, fetch_pr  # noqa: E402
+from boris_intake.github import (  # noqa: E402
+    GitHubRetryBudget,
+    fetch_gate_snapshot,
+    fetch_pr,
+)
 from boris_intake.identity import IdentityResolver  # noqa: E402
 
 
@@ -52,8 +56,8 @@ def main() -> int:
     resolver = IdentityResolver(slack_call, token)
     deps = GateDeps(
         identity=resolver.resolve,
-        pr_info=lambda owner, repo, number: fetch_pr(
-            owner, repo, number, token_path=cfg.github_token_path
+        pr_info=lambda owner, repo, number, budget: fetch_pr(
+            owner, repo, number, token_path=cfg.github_token_path, budget=budget
         ),
         rate_verdict=lambda uid: "ok",    # rate limits are time-dependent; skip
         now=time.time,
@@ -81,7 +85,12 @@ def main() -> int:
                 ev = normalize(raw)
                 if ev is None:
                     continue
-                result = evaluate(ev, cfg, deps)
+                # One retry window per replayed message, exactly as the live
+                # pipeline does it -- otherwise a preflight run against a bad
+                # GitHub window would report a different rejection mix than the
+                # daemon would produce from the same history.
+                budget = GitHubRetryBudget()
+                result = evaluate(ev, cfg, deps, budget)
                 proposals = []
                 snapshot_rejections = []
                 if result.accepted:
@@ -89,22 +98,32 @@ def main() -> int:
                         deps.now(), timezone.utc
                     ).isoformat().replace("+00:00", "Z")
                     for c in result.commands:
-                        snapshot = fetch_gate_snapshot(
+                        capture = fetch_gate_snapshot(
                             c.owner,
                             c.repo,
                             c.pr_number,
                             c.head_sha,
                             captured_at,
                             token_path=cfg.github_token_path,
+                            budget=budget,
                         )
-                        if snapshot is None:
-                            tally["gate_snapshot_unavailable"] += 1
+                        if not capture.captured:
+                            reason = (
+                                "gate_snapshot_unavailable" if capture.head_moved
+                                else "github_unavailable"
+                            )
+                            tally[reason] += 1
                             snapshot_rejections.append((
-                                "gate_snapshot_unavailable",
-                                f"{c.slug} — exact-head Gate Snapshot unavailable",
+                                reason,
+                                f"{c.slug} — {capture.detail}" if capture.detail
+                                else f"{c.slug} — exact-head Gate Snapshot unavailable",
                             ))
-                            print(f"REJECT {c.slug} @ {c.head_sha[:7]} gate unavailable")
+                            print(
+                                f"REJECT {c.slug} @ {c.head_sha[:7]} "
+                                f"{reason}: {capture.detail}"
+                            )
                             continue
+                        snapshot = capture.snapshot
                         accepted += 1
                         requesters[c.requester_email] += 1
                         proposals.append({

@@ -330,3 +330,34 @@ def test_lifecycle_reaction_failures_are_typed_and_stop_reconciliation(failure_m
 
     if failure_method == "reactions.add":
         assert calls == ["reactions.add"]
+
+
+def test_the_outage_reply_says_what_a_reader_can_do_about_it():
+    """The reply that was invisible during the 2026-08-17 outage. It has to say
+    all three things: GitHub was the problem, nothing was accepted, re-post."""
+    calls, call = recorder()
+    SlackIO(call, "t", dry_run=False).reply_rejection(
+        "C1", "1.0",
+        Rejection(ReasonCode.GITHUB_UNAVAILABLE,
+                  "Ylopo/repo#5 — GitHub answered with an error"),
+    )
+    text = calls[0][1]["text"]
+
+    assert "GitHub" in text
+    assert "haven't taken the request" in text
+    assert "post the link again" in text
+    assert "Ylopo/repo#5" in text
+
+
+def test_the_missing_pr_reply_is_unchanged():
+    """`pr_not_found` still means the pull request does not exist, and its text
+    must keep saying exactly that -- the new reason is what took over the
+    "couldn't check" case."""
+    calls, call = recorder()
+    SlackIO(call, "t", dry_run=False).reply_rejection(
+        "C1", "1.0", Rejection(ReasonCode.PR_NOT_FOUND, "Ylopo/repo#5")
+    )
+
+    assert calls[0][1]["text"] == (
+        "I couldn't find that PR (or I can't see it). (Ylopo/repo#5)"
+    )

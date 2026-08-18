@@ -982,14 +982,23 @@ class Store:
         self._db.commit()
 
     # --- rejection reply throttle ----------------------------------------
-    def should_reply_rejection(self, user_id: str, now: float, cooldown: int) -> bool:
+    def should_reply_rejection(self, key: str, now: float, cooldown: int) -> bool:
+        """Claim the one reply this key is allowed inside `cooldown`.
+
+        `key` is `GateResult.reply_cooldown_key` -- an origin-scoped attributed
+        requester (`human:U123`, `loop:U123`), not a Slack user id, even though
+        the column is still called `user_id`. The column keeps its name because
+        this table is a throttle in a live database and nothing reads it but
+        this method; rows written under the old bare-user-id keys simply stop
+        being consulted and age out on their own.
+        """
         cur = self._db.execute(
-            "SELECT at FROM reject_replies WHERE user_id=?", (user_id,))
+            "SELECT at FROM reject_replies WHERE user_id=?", (key,))
         row = cur.fetchone()
         if row and now - float(row[0]) < cooldown:
             return False
         self._db.execute(
             "INSERT OR REPLACE INTO reject_replies (user_id, at) VALUES (?,?)",
-            (user_id, now))
+            (key, now))
         self._db.commit()
         return True

@@ -4,7 +4,15 @@ from types import SimpleNamespace
 from boris_intake.config import Config
 from boris_intake.daemon import Pipeline, normalize
 from boris_intake.gate import GateDeps
-from boris_intake.models import GateSnapshot, Identity, PRInfo
+from boris_intake.models import (
+    GateSnapshot,
+    GateSnapshotLookup,
+    GitHubReadStatus,
+    Identity,
+    PRInfo,
+    PRLookup,
+    SnapshotStatus,
+)
 from boris_intake.slack_io import SlackIO
 from boris_intake.store import Store
 
@@ -21,8 +29,9 @@ def pipeline(tmp_path, *, mode="live"):
         identity=lambda user_id: Identity(
             user_id, "reviewer@ylopo.com", "T02PND103", False, False, False, False
         ),
-        pr_info=lambda owner, repo, number: PRInfo(
-            f"{number:040x}", "author", "OPEN"
+        pr_info=lambda owner, repo, number, budget: PRLookup(
+            GitHubReadStatus.FOUND,
+            info=PRInfo(f"{number:040x}", "author", "OPEN"),
         ),
         rate_verdict=lambda user_id: "ok",
         now=lambda: 1_000_000.0,
@@ -32,9 +41,12 @@ def pipeline(tmp_path, *, mode="live"):
         slack_calls.append((method, kwargs))
         return {"ok": True}
 
-    def capture(command, captured_at):
-        return GateSnapshot(
-            f"sha256:{command.pr_number:064x}", captured_at, ()
+    def capture(command, captured_at, budget):
+        return GateSnapshotLookup(
+            SnapshotStatus.CAPTURED,
+            snapshot=GateSnapshot(
+                f"sha256:{command.pr_number:064x}", captured_at, ()
+            ),
         )
 
     return (
@@ -140,15 +152,20 @@ def test_shadow_replay_audits_gate_snapshot_proposals_without_external_mutation(
             user_id, "reviewer@ylopo.com", "T02PND103", False, False, False, False
         )),
     )
-    def fetch_pr_info(owner, repo, number, *, token_path):
+    def fetch_pr_info(owner, repo, number, *, token_path, budget):
         github_calls.append((owner, repo, number, token_path))
-        return PRInfo("1" * 40, "author", "OPEN")
+        return PRLookup(
+            GitHubReadStatus.FOUND, info=PRInfo("1" * 40, "author", "OPEN")
+        )
 
     monkeypatch.setattr(replay, "fetch_pr", fetch_pr_info)
 
-    def capture(owner, repo, number, head_sha, captured_at, *, token_path):
+    def capture(owner, repo, number, head_sha, captured_at, *, token_path, budget):
         captures.append((owner, repo, number, head_sha, captured_at, token_path))
-        return GateSnapshot("sha256:" + "a" * 64, captured_at, ())
+        return GateSnapshotLookup(
+            SnapshotStatus.CAPTURED,
+            snapshot=GateSnapshot("sha256:" + "a" * 64, captured_at, ()),
+        )
 
     monkeypatch.setattr(replay, "fetch_gate_snapshot", capture, raising=False)
     monkeypatch.setattr(replay.sys, "argv", [
@@ -271,7 +288,9 @@ def gate_deps():
     return GateDeps(
         identity=lambda user_id: Identity(
             user_id, "ctao@ylopo.com", "T02PND103", False, False, False, False),
-        pr_info=lambda owner, repo, number: PRInfo("f" * 40, "Chadtao206", "OPEN"),
+        pr_info=lambda owner, repo, number, budget: PRLookup(
+            GitHubReadStatus.FOUND, info=PRInfo("f" * 40, "Chadtao206", "OPEN")
+        ),
         rate_verdict=lambda user_id: "ok",
         now=lambda: 1_000_000.0,
     )

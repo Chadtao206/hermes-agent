@@ -32,10 +32,17 @@ from boris_intake import audit  # noqa: E402
 from boris_intake.config import Config, load_config  # noqa: E402
 from boris_intake.dispatch import active_lane_count  # noqa: E402
 from boris_intake.gate import GateDeps, evaluate  # noqa: E402
-from boris_intake.github import fetch_gate_snapshot, fetch_pr  # noqa: E402
+from boris_intake.github import (  # noqa: E402
+    GitHubRetryBudget,
+    fetch_gate_snapshot,
+    fetch_pr,
+)
 from boris_intake.identity import IdentityResolver  # noqa: E402
 from boris_intake.models import (  # noqa: E402
+    ALWAYS_REPLY_REASONS,
+    GateResult,
     GateSnapshot,
+    GateSnapshotLookup,
     NormalizedEvent,
     ReasonCode,
     Rejection,
@@ -84,8 +91,9 @@ class Pipeline:
         slack: SlackIO,
         audit_path: Path,
         capture_gate_snapshot: Callable[
-            [ReviewCommand, str], GateSnapshot | None
+            [ReviewCommand, str, GitHubRetryBudget], GateSnapshotLookup
         ],
+        new_budget: Callable[[], GitHubRetryBudget] = GitHubRetryBudget,
     ):
         self.cfg = cfg
         self.deps = deps
@@ -93,6 +101,10 @@ class Pipeline:
         self.slack = slack
         self.audit_path = Path(audit_path)
         self.capture_gate_snapshot = capture_gate_snapshot
+        # One budget per message, built here rather than passed in: the window it
+        # opens has to bound one `handle` call. Injected only so tests can drive
+        # its clock and sleep by hand.
+        self.new_budget = new_budget
 
     def handle(self, event: NormalizedEvent | None) -> None:
         if event is None:
@@ -121,7 +133,13 @@ class Pipeline:
             })
             return
 
-        result = evaluate(event, self.cfg, self.deps)
+        # One retry window for this whole message: up to
+        # `max_prs_per_message` PR reads in the gate plus two more per admitted
+        # command, all sharing it. Per-call windows would multiply the worst-case
+        # delay to this synchronous handler by the number of links pasted --
+        # see `github.RETRY_DEADLINE`.
+        budget = self.new_budget()
+        result = evaluate(event, self.cfg, self.deps, budget)
 
         if not result.accepted:
             audit.write(self.audit_path, {
@@ -130,7 +148,7 @@ class Pipeline:
                 "details": [r.detail for r in result.rejections],
             })
             if live:
-                self._maybe_reply_rejections(event, result.rejections)
+                self._maybe_reply_rejections(event, result.rejections, result)
             return
 
         commands: list[ReviewCommand] = []
@@ -138,15 +156,21 @@ class Pipeline:
         rejections = list(result.rejections)
         captured_at = _timestamp(now)
         for command in result.commands:
-            snapshot = self.capture_gate_snapshot(command, captured_at)
-            if snapshot is None:
+            capture = self.capture_gate_snapshot(command, captured_at, budget)
+            if not capture.captured:
+                # Two different refusals, and only one of them is an outage. A
+                # moved head keeps GATE_SNAPSHOT_UNAVAILABLE: it is terminal,
+                # correct, and about this request rather than about GitHub.
                 rejections.append(Rejection(
-                    ReasonCode.GATE_SNAPSHOT_UNAVAILABLE,
-                    f"{command.slug} — exact-head Gate Snapshot unavailable",
+                    ReasonCode.GATE_SNAPSHOT_UNAVAILABLE
+                    if capture.head_moved
+                    else ReasonCode.GITHUB_UNAVAILABLE,
+                    f"{command.slug} — {capture.detail}" if capture.detail
+                    else f"{command.slug} — exact-head Gate Snapshot unavailable",
                 ))
                 continue
             commands.append(command)
-            snapshots.append(snapshot)
+            snapshots.append(capture.snapshot)
 
         if not commands:
             audit.write(self.audit_path, {
@@ -156,7 +180,7 @@ class Pipeline:
                 "details": [rejection.detail for rejection in rejections],
             })
             if live:
-                self._maybe_reply_rejections(event, tuple(rejections))
+                self._maybe_reply_rejections(event, tuple(rejections), result)
             return
 
         if not live:
@@ -207,18 +231,56 @@ class Pipeline:
             "reasons": [rejection.reason.value for rejection in rejections],
             "details": [rejection.detail for rejection in rejections],
         })
-        self._maybe_reply_rejections(event, tuple(rejections))
+        self._maybe_reply_rejections(event, tuple(rejections), result)
 
-    def _maybe_reply_rejections(self, event, rejections) -> None:
+    def _maybe_reply_rejections(
+        self, event, rejections, result: GateResult
+    ) -> None:
+        """At most one in-thread explanation per message, throttled per requester.
+
+        Two things changed here after the 2026-08-17 outage stranded three
+        remediation loops:
+
+        * the throttle is keyed on WHO the request is attributed to and through
+          which door (`GateResult.reply_cooldown_key`), not on whichever Slack
+          account posted. The loop re-posts as the bot, so `event.user_id` put
+          every loop rejection -- for every pull request -- in one row shared
+          with every other bot rejection, and one reply silenced the lot for an
+          hour. Measured on `Ylopo/forge-content-service#111`: last bot reply
+          08:50:15, rejection 09:46:23, nothing posted.
+        * an infrastructure failure is never throttled at all, and is the
+          rejection that gets said when a message produced several. Nobody can
+          act on "GitHub could not be read" unless they see it, and it cannot
+          become noise: it only happens while GitHub is failing, and the loop's
+          own re-post budget is 12 attempts 10 minutes apart. Note it does not
+          stamp the cooldown row either, so it cannot silence the NEXT ordinary
+          rejection about a genuinely bad link.
+
+        `not event.user_id` is gone from the guard, and could not have fired for
+        anything that matters: a message with no user id can only be rejected
+        NOT_HUMAN, which is silent, unless it came through the loop or discovery
+        door -- and both of those require `event.user_id` to equal a configured
+        bot id. The cooldown key's own emptiness is what is guarded now.
+        """
         loud = [rejection for rejection in rejections if not rejection.silent]
-        if not loud or not event.user_id:
+        if not loud:
             return
-        if not self.store.should_reply_rejection(
-                event.user_id, self.deps.now(),
-                self.cfg.limits.reject_reply_cooldown_seconds):
-            return
+        infrastructure = [
+            rejection for rejection in loud
+            if rejection.reason in ALWAYS_REPLY_REASONS
+        ]
+        if not infrastructure:
+            if not result.requester_user_id:
+                return
+            if not self.store.should_reply_rejection(
+                    result.reply_cooldown_key, self.deps.now(),
+                    self.cfg.limits.reject_reply_cooldown_seconds):
+                return
         try:
-            self.slack.reply_rejection(event.channel_id, event.ts, loud[0])
+            self.slack.reply_rejection(
+                event.channel_id, event.ts,
+                infrastructure[0] if infrastructure else loud[0],
+            )
         except Exception as error:
             audit.write(self.audit_path, {
                 "mode": self.cfg.mode,
@@ -269,14 +331,16 @@ def build_pipeline(cfg: Config, token: str) -> Pipeline:
 
     deps = GateDeps(
         identity=resolver.resolve,
-        pr_info=lambda owner, repo, number: fetch_pr(
-            owner, repo, number, token_path=cfg.github_token_path
+        pr_info=lambda owner, repo, number, budget: fetch_pr(
+            owner, repo, number, token_path=cfg.github_token_path, budget=budget
         ),
         rate_verdict=rate_verdict,
         now=time.time,
     )
 
-    def capture(command: ReviewCommand, captured_at: str) -> GateSnapshot | None:
+    def capture(
+        command: ReviewCommand, captured_at: str, budget: GitHubRetryBudget
+    ) -> GateSnapshotLookup:
         return fetch_gate_snapshot(
             command.owner,
             command.repo,
@@ -284,6 +348,7 @@ def build_pipeline(cfg: Config, token: str) -> Pipeline:
             command.head_sha,
             captured_at,
             token_path=cfg.github_token_path,
+            budget=budget,
         )
 
     return Pipeline(

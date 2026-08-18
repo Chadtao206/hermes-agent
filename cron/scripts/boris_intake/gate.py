@@ -10,21 +10,27 @@ injection via the request message structurally impossible — see the spec.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from boris_intake.config import Config
 from boris_intake.grammar import mentions_bot, parse_request
 from boris_intake.identity import is_trusted
 from boris_intake.models import (
-    GateResult, Identity, NormalizedEvent, PRInfo, ReasonCode, Rejection,
-    ReviewCommand, ReviewPolicy,
+    GateResult, Identity, NormalizedEvent, PRLookup, ReasonCode, Rejection,
+    RequestOrigin, ReviewCommand, ReviewPolicy,
 )
+
+if TYPE_CHECKING:  # a type only -- the pure gate imports no subprocess machinery
+    from boris_intake.github import GitHubRetryBudget
 
 
 @dataclass(frozen=True)
 class GateDeps:
     identity: Callable[[str], Identity | None]
-    pr_info: Callable[[str, str, int], PRInfo | None]
+    #: Takes the message's shared retry budget as its last argument, so all of
+    #: one message's PR reads spend one window between them. See
+    #: `github.GitHubRetryBudget`.
+    pr_info: Callable[[str, str, int, "GitHubRetryBudget"], PRLookup]
     rate_verdict: Callable[[str], str]
     now: Callable[[], float]
 
@@ -111,7 +117,18 @@ def _is_discovery_post(event: NormalizedEvent, cfg: Config) -> bool:
     )
 
 
-def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
+def evaluate(
+    event: NormalizedEvent,
+    cfg: Config,
+    deps: GateDeps,
+    budget: "GitHubRetryBudget | None" = None,
+) -> GateResult:
+    """Decide one message. `budget` is the retry window its PR reads share.
+
+    A `None` budget makes every read single-shot, which is what this did before
+    the retry existed -- so the live wiring passing one is a property in its own
+    right, pinned by `test_daemon`, not something to assume from here.
+    """
     # Mode gate first — cheapest possible check.
     if cfg.mode == "off":
         return _reject(ReasonCode.MODE_OFF)
@@ -120,12 +137,35 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
     #    or the discovery cron's own marked top-level request
     loop_repost = _is_loop_repost(event, cfg)
     discovery = _is_discovery_post(event, cfg)
+
+    # Attribution, resolved once and carried on every result from here down. A
+    # loop repost or discovery post resolves as Chad so every downstream
+    # predicate, quota and audit row reads as his request; the ORIGIN is kept
+    # alongside because the rejection-reply cooldown must not let one door's
+    # rejections silence another's (see `GateResult.reply_cooldown_key`).
+    origin = (
+        RequestOrigin.LOOP if loop_repost
+        else RequestOrigin.DISCOVERY if discovery
+        else RequestOrigin.HUMAN
+    )
+    requester_user_id = (
+        cfg.loop_attributed_user_id if (loop_repost or discovery)
+        else (event.user_id or "")
+    )
+
+    def reject(reason: ReasonCode, detail: str = "") -> GateResult:
+        return GateResult(
+            rejections=(Rejection(reason, detail),),
+            requester_user_id=requester_user_id,
+            origin=origin,
+        )
+
     if not (loop_repost or discovery) and (event.is_bot or not event.user_id or event.subtype):
-        return _reject(ReasonCode.NOT_HUMAN, event.subtype or "no user id")
+        return reject(ReasonCode.NOT_HUMAN, event.subtype or "no user id")
 
     # 2: channel allowlist (also excludes DMs — no im channel is ever listed)
     if event.channel_id not in cfg.channels:
-        return _reject(ReasonCode.CHANNEL_NOT_ALLOWED, event.channel_id)
+        return reject(ReasonCode.CHANNEL_NOT_ALLOWED, event.channel_id)
 
     mentioned = mentions_bot(event.text, cfg.bot_user_id)
     is_passive = event.channel_id in cfg.passive_channels
@@ -140,37 +180,32 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
     # into an ordinary engineering discussion never starts a review.
     if (event.thread_ts and event.thread_ts != event.ts
             and not mentioned and not is_passive):
-        return _reject(ReasonCode.THREAD_REPLY_NO_MENTION)
+        return reject(ReasonCode.THREAD_REPLY_NO_MENTION)
 
     # 4: grammar. Everything not matched here is discarded.
     parsed = parse_request(event.text)
     if not parsed.refs:
-        return _reject(ReasonCode.NO_PR_URL)
+        return reject(ReasonCode.NO_PR_URL)
     if not is_passive and not mentioned:
-        return _reject(ReasonCode.MENTION_REQUIRED)
+        return reject(ReasonCode.MENTION_REQUIRED)
     if parsed.unknown_flags:
-        return _reject(
+        return reject(
             ReasonCode.UNKNOWN_FLAG,
             f"Unknown review flag: {parsed.unknown_flags[0]}. "
             "Supported flags: --ignore-ci",
         )
 
-    # 3: identity. Fail closed on lookup failure. A loop repost or discovery
-    #    post resolves as Chad so every downstream predicate, quota and audit
-    #    row reads as his request.
-    requester_user_id = (
-        cfg.loop_attributed_user_id if (loop_repost or discovery) else event.user_id
-    )
+    # 3: identity. Fail closed on lookup failure.
     identity = deps.identity(requester_user_id)
     if identity is None:
-        return _reject(ReasonCode.IDENTITY_LOOKUP_FAILED, requester_user_id)
+        return reject(ReasonCode.IDENTITY_LOOKUP_FAILED, requester_user_id)
     if not is_trusted(identity, cfg):
-        return _reject(ReasonCode.IDENTITY_NOT_TRUSTED, identity.email or requester_user_id)
+        return reject(ReasonCode.IDENTITY_NOT_TRUSTED, identity.email or requester_user_id)
 
     # 8: rate limits, evaluated once per message
     verdict = deps.rate_verdict(requester_user_id)
     if verdict != "ok":
-        return _reject(ReasonCode.RATE_LIMITED, verdict)
+        return reject(ReasonCode.RATE_LIMITED, verdict)
 
     allowed_orgs = {o.lower() for o in cfg.orgs}
     policy = ReviewPolicy(
@@ -188,11 +223,24 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
             rejections.append(Rejection(ReasonCode.ORG_NOT_ALLOWED, slug))
             continue
 
-        # 6: PR validation — head SHA is authoritative, never from Slack
-        info = deps.pr_info(ref.owner, ref.repo, ref.number)
-        if info is None:
-            rejections.append(Rejection(ReasonCode.PR_NOT_FOUND, slug))
+        # 6: PR validation — head SHA is authoritative, never from Slack.
+        # Three states, not two: only GitHub's own not-found answer justifies
+        # PR_NOT_FOUND, which is terminal and asserts the pull request does not
+        # exist. A read that failed is GITHUB_UNAVAILABLE, which says only
+        # "could not check" and invites a re-post. Getting this backwards is the
+        # 2026-08-17 incident; see `models.GitHubReadStatus`.
+        lookup = deps.pr_info(ref.owner, ref.repo, ref.number, budget)
+        if not lookup.found:
+            rejections.append(
+                Rejection(ReasonCode.PR_NOT_FOUND, slug)
+                if lookup.absent
+                else Rejection(
+                    ReasonCode.GITHUB_UNAVAILABLE,
+                    f"{slug} — {lookup.detail}" if lookup.detail else slug,
+                )
+            )
             continue
+        info = lookup.info
         if info.state != "OPEN":
             rejections.append(Rejection(ReasonCode.PR_NOT_OPEN, f"{slug} is {info.state}"))
             continue
@@ -218,4 +266,9 @@ def evaluate(event: NormalizedEvent, cfg: Config, deps: GateDeps) -> GateResult:
 
         commands.append(cmd)
 
-    return GateResult(commands=tuple(commands), rejections=tuple(rejections))
+    return GateResult(
+        commands=tuple(commands),
+        rejections=tuple(rejections),
+        requester_user_id=requester_user_id,
+        origin=origin,
+    )
