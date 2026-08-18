@@ -385,14 +385,14 @@ REREVIEW_ACK_GRACE_SECONDS = 10 * 60
 REREVIEW_REPOST_ATTEMPTS = 12
 
 # How long a loop may sit in `rereview_posted` waiting on a request the intake
-# gate DID take, measured from when the wait began, before a human is told
+# gate DID take, measured from when the gate took it, before a human is told
 # regardless of what boris_intake's own tables say. The backstop the retry
 # budget above cannot be: that budget is only ever spent when the intake read
-# comes back False, and the read coming back True is not a promise of a verdict.
-# `slack_unavailable` is a second terminal state in boris_intake (its store.py
-# gives it an empty transition set), and a request that ends there is never
-# `complete` -- so `new_verdicts` never returns it, `request_exists` goes on
-# answering True at this loop's head, and the loop parks exactly as it did
+# comes back NOT_ADMITTED, and the read coming back ADMITTED is not a promise of
+# a verdict. `slack_unavailable` is a second terminal state in boris_intake (its
+# store.py gives it an empty transition set), and a request that ends there is
+# never `complete` -- so `new_verdicts` never returns it, `request_exists` goes
+# on answering ADMITTED at this loop's head, and the loop parks exactly as it did
 # before this guard existed. A request wedged in `reviewing` does the same. No
 # re-post is owed on that path, which is why nothing but elapsed time can bound
 # it -- and why this is deliberately not applied to the path where a re-post IS
@@ -400,14 +400,24 @@ REREVIEW_REPOST_ATTEMPTS = 12
 # measured from a wait that may have begun long before this code first ran,
 # would escalate a whole backlog with no retry at all.
 #
+# From the admission and not from the wait, because the wait is not evidence
+# about the review. An admission can land at any point inside an episode -- it is
+# the thing the loop is waiting for -- so a re-review admitted at 3h50m of a
+# four-hour wait got ten minutes before this fired, on a review that had barely
+# started. Anchoring here is also what makes the comparison below with
+# boris_intake's own REVIEW_WAIT_SECONDS an honest one: that bound runs from the
+# admission too, so the two are finally measured from the same instant.
+#
 # Four hours, because it must comfortably exceed boris_intake's
 # REVIEW_WAIT_SECONDS (90 minutes, in its reconciler.py), which is that
 # service's own bound on how long an admitted review may legitimately take --
 # so any wait this one ends is a wait the review path had already given up on.
 # It also exceeds the re-post budget's own span (twelve attempts one grace
-# window apart, plus the first window, is 130 minutes), so a wait that spends
-# its budget and only then gets admitted still has headroom to be reviewed
-# rather than escalating the moment the gate relents.
+# window apart, plus the first window, is 130 minutes), which used to be the only
+# thing standing between a wait that spent its whole budget before the gate
+# relented and an escalation the moment it did. The anchor above is what
+# guarantees that now -- a late admission gets four hours of its own, however
+# long the budget took -- and this margin is no longer load-bearing for it.
 REREVIEW_ABSOLUTE_DEADLINE_SECONDS = 4 * 60 * 60
 
 # How many times a system-origin REVIEW_INCOMPLETE may send the review back to
@@ -481,8 +491,9 @@ LANE_TIMEOUT = "lane_timeout"
 # outlasted every retry this loop is willing to spend.
 REREVIEW_UNACKNOWLEDGED = "rereview_unacknowledged"
 # The gate DID take the request (or would not say), and no verdict arrived
-# inside REREVIEW_ABSOLUTE_DEADLINE_SECONDS. A fifth dead end, and it must not
-# share the fourth's reason even though both end the same wait: they mean
+# inside REREVIEW_ABSOLUTE_DEADLINE_SECONDS of it doing so -- of the wait
+# beginning, in the one case where it would not say. A fifth dead end, and it
+# must not share the fourth's reason even though both end the same wait: they mean
 # opposite things and send a human to opposite places. `rereview_unacknowledged`
 # says twelve posts were refused -- go and read why the gate keeps rejecting
 # them. This says one was accepted and then nothing came of it -- go and read
@@ -2059,9 +2070,12 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest,
 
     What the read comes back with then decides which bound applies, because the
     two bounds here answer different questions and each is wrong for the other's
-    case:
+    case. The read answers with an `AdmissionLookup` rather than a `bool | None`
+    -- three states still, and the same three, but ADMITTED now carries the epoch
+    the gate took the request at, which is what the deadline below is anchored
+    on:
 
-    False -- the gate never admitted this request, so nobody is reviewing
+    NOT_ADMITTED -- the gate never admitted this request, so nobody is reviewing
     anything and the re-post budget governs. This is the branch that writes, so
     it is the branch that reads GitHub: a hold stops it (Chad has taken the pull
     request back, and boris_intake's own gate has no hold check to stop the
@@ -2076,45 +2090,57 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest,
     are hours old before it first runs -- and it would make each one's fate
     depend on when this service happened to be deployed.
 
-    None -- the intake database could not be read. Not False: waiting costs a
-    tick, guessing costs a duplicate review on a PR whose review may well be
-    live. Unlike the other do-nothings it is *recorded*, because it is the one
-    that can repeat indefinitely on an external fault, and a branch that
-    repeats indefinitely writing nothing is the shape this whole route exists
-    to remove. Standing, so an outage lasting a day leaves one sentence. The
-    deadline does apply here: nothing about an unreadable intake can be retried
-    into an answer, so there is no budget for it to have and no bound but time.
+    UNREADABLE -- the intake database could not be read. Not NOT_ADMITTED:
+    waiting costs a tick, guessing costs a duplicate review on a PR whose review
+    may well be live. Unlike the other do-nothings it is *recorded*, because it
+    is the one that can repeat indefinitely on an external fault, and a branch
+    that repeats indefinitely writing nothing is the shape this whole route
+    exists to remove. Standing, so an outage lasting a day leaves one sentence.
+    The deadline does apply here: nothing about an unreadable intake can be
+    retried into an answer, so there is no budget for it to have and no bound
+    but time. It carries no admission time -- there is nothing to carry -- so the
+    deadline falls back to the episode start and this branch keeps exactly the
+    bound it has always had.
 
-    True -- a request for this episode is on record, whatever workflow_state it
-    is in, so re-posting would be noise on top of a review that already exists.
-    It does NOT promise a verdict is coming, and this is the case the deadline
-    exists for: a request that ends in `slack_unavailable`, or wedges in
+    ADMITTED -- a request for this episode is on record, whatever workflow_state
+    it is in, so re-posting would be noise on top of a review that already
+    exists. It does NOT promise a verdict is coming, and this is the case the
+    deadline exists for: a request that ends in `slack_unavailable`, or wedges in
     `reviewing`, holds this wait open for good. No re-post is owed on this path,
-    so the budget can bound nothing here and only elapsed time can.
+    so the budget can bound nothing here and only elapsed time can -- elapsed
+    since the *admission*, which is the one thing on this path that says how long
+    the review has actually had.
 
-    The grace window is measured from `updated_at`, which is when the loop
-    entered `rereview_posted` or last re-sent (the self-edge is what re-arms
-    it), and which `store.defer` deliberately leaves alone, so a due-pass visit
-    does not push the deadline out. Deliberately NOT measured from the episode
-    start, which does not move on a re-send and would fire this route on every
-    tick after the first. A *refused* re-send moves neither, and waits the same
-    interval out through the due time instead -- see `_repost_unacknowledged`.
+    Three anchors, then, and they are three on purpose; unifying any two of them
+    is a regression each way. The grace window is measured from `updated_at`,
+    which is when the loop entered `rereview_posted` or last re-sent (the
+    self-edge is what re-arms it), and which `store.defer` deliberately leaves
+    alone, so a due-pass visit does not push it out. Deliberately NOT measured
+    from the episode start, which does not move on a re-send and would fire this
+    route on every tick after the first. A *refused* re-send moves neither, and
+    waits the same interval out through the due time instead -- see
+    `_repost_unacknowledged`. The admission question is asked from the episode
+    start, because that is what makes it this wait's own request and not a
+    predecessor's. The deadline is anchored later still, at the admission itself
+    -- see the comment on `anchor` below.
 
     At the attempt bound -- escalate rather than go on re-posting forever. The
     reason is its own (REREVIEW_UNACKNOWLEDGED) because the place to go and look
     is its own: not the branch, not GitHub, not the kanban card, but whatever
     the gate keeps rejecting the post for. The deadline's escalation carries a
     different reason again (REREVIEW_VERDICT_OVERDUE) for exactly the same
-    reason: it means a request was accepted and produced nothing, which is a
-    different thing to go and read -- that request's own row -- and the reason
-    is what the notice names.
+    reason: it means a request was accepted and then had four full hours from
+    its own admission and produced nothing, which is a different thing to go and
+    read -- that request's own row -- and the reason is what the notice names.
+    Anchored at the wait instead, that notice could name a row whose review had
+    barely begun, which is the same lie in the opposite direction.
     """
     episode = _rereview_episode(deps, loop)
     if deps.now() < loop.updated_at + REREVIEW_ACK_GRACE_SECONDS:
         return None
-    admitted = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
-                                          loop.head_sha, episode.started_at)
-    if admitted is False:
+    admission = deps.source.request_exists(loop.owner, loop.repo, loop.pr_number,
+                                           loop.head_sha, episode.started_at)
+    if admission.not_admitted:
         # The gate never took it, so this pass is about to write -- and every
         # other writing route in this module reads GitHub first. This one is
         # where that read has to live rather than in `_observe_lane` with the
@@ -2145,7 +2171,10 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest,
                          standing=True)
         # The budget governs this path, and it returns ahead of the deadline
         # below rather than being bounded by it -- see
-        # REREVIEW_ABSOLUTE_DEADLINE_SECONDS.
+        # REREVIEW_ABSOLUTE_DEADLINE_SECONDS. There is nothing to anchor a
+        # deadline to here in any case: the gate took no request, so the only
+        # timestamp on offer is the wait's own, which is what made that
+        # deadline the wrong bound for this branch.
         if episode.attempts >= REREVIEW_REPOST_ATTEMPTS:
             return Route(ROUTE_ESCALATE, {"reason": REREVIEW_UNACKNOWLEDGED},
                          standing=True)
@@ -2155,10 +2184,52 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest,
         return Route(ROUTE_REREVIEW_UNACKNOWLEDGED,
                      {"attempt": episode.attempts + 1, "origin": episode.origin},
                      standing=True)
-    if deps.now() >= episode.started_at + REREVIEW_ABSOLUTE_DEADLINE_SECONDS:
+    # The deadline's anchor, and the whole reason this read answers with a time.
+    #
+    # `episode.started_at` is the fallback, not the anchor: it is what an
+    # UNREADABLE intake gets, because with no admission time available there is
+    # nothing else to anchor to and this branch must stay bounded -- it is the
+    # one that can repeat indefinitely on an external fault, and it has no
+    # retry budget of its own. It is also what a caller with no `admitted_at`
+    # at all would get, so this cannot become unbounded by omission.
+    #
+    # An ADMITTED request is anchored at its own admission instead. Anchored at
+    # the wait, a request admitted at 3h50m of a four-hour wait got ten minutes
+    # before this escalated it, carrying REREVIEW_VERDICT_OVERDUE -- which sends
+    # a human to read that request's own row and find a review that started
+    # moments ago and is running perfectly. The deadline is meant to catch "a
+    # request was accepted and produced nothing", never "was accepted and has
+    # barely begun". A manual re-kick of a long-stranded pull request lands
+    # exactly there, which is how this was found.
+    #
+    # `max` is defence in depth and cannot fire today: the read is windowed on
+    # `created_at >= since` with `since` = `episode.started_at`, so every
+    # admission it can return is already at or after the episode start. It
+    # stands against a future caller that windows on something else, and is
+    # deliberately not tested -- there is no live path that reaches it.
+    #
+    # `<= deps.now()` is the clamp, and it is load-bearing rather than
+    # defensive: `created_at` is another process's epoch column, and a row from
+    # the future -- clock skew, a manual repair, a bad migration -- would push
+    # this bound out by exactly that skew, so one bad row would disable the
+    # backstop for the life of the loop. A timestamp that has not happened yet
+    # evidences nothing about how long a review has been running, so it buys no
+    # window at all and the wait keeps the bound it would have had anyway.
+    #
+    # A guard and NOT `min(deps.now(), max(...))`, which is the tidier-looking
+    # form and does nothing whatever: `deps.now() >= min(deps.now(), X) + D` is
+    # the same predicate as `deps.now() >= X + D` for every positive D -- below
+    # the clock the `min` picks X, and above it both sides are false -- so that
+    # form leaves the bound disabled for exactly as long as the bad row is
+    # dated into the future, which is the failure it appears to prevent. It is
+    # also untestable, being a no-op. Do not tidy this into it.
+    anchor = episode.started_at
+    if admission.admitted_at is not None and admission.admitted_at <= deps.now():
+        anchor = max(anchor, admission.admitted_at)
+    if deps.now() >= anchor + REREVIEW_ABSOLUTE_DEADLINE_SECONDS:
         return Route(ROUTE_ESCALATE, {"reason": REREVIEW_VERDICT_OVERDUE},
                      standing=True)
-    if admitted is None:
+    if admission.unreadable:
         return Route(ROUTE_INTAKE_UNREADABLE, {"head_sha": loop.head_sha},
                      standing=True)
     return None

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from pr_remediation.config import RemediationConfig
@@ -77,6 +78,65 @@ class Verdict:
     @property
     def slug(self) -> str:
         return f"{self.owner}/{self.repo}#{self.pr_number}"
+
+
+class AdmissionStatus(str, Enum):
+    """Why an admission read answered the way it did. Total and distinct.
+
+    Modelled the way `boris_intake.models` models its own lookups
+    (`GitHubReadStatus`, `SnapshotStatus`) rather than as the `bool | None` this
+    read used to answer, because the answer now carries a *time* as well as a
+    verdict and the two cannot share one value. A float for "admitted at t"
+    beside `False` and `None` for the other two is one `if not admitted:` away
+    from reading an epoch `0.0` -- or any falsy timestamp a bad row could carry
+    -- as "never admitted", which is the reading that re-posts a re-review on
+    top of a live review. An `AdmissionLookup` is always truthy, so that
+    mistake cannot be written here at all.
+
+    UNREADABLE is NOT_ADMITTED's opposite and must never be folded into it:
+    `loop._route_rereview_ack` re-posts on NOT_ADMITTED, and taking that act on
+    a database this process merely could not open buys a duplicate review for
+    nothing. Every unclassifiable failure is UNREADABLE, the same way
+    `GitHubReadStatus` reserves ABSENT for a positive match and calls everything
+    else UNAVAILABLE.
+    """
+
+    ADMITTED = "admitted"
+    NOT_ADMITTED = "not_admitted"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class AdmissionLookup:
+    """The three-state result of one `request_exists` read.
+
+    `admitted_at` is the epoch of the LATEST matching admission (see
+    `request_exists`), and it is present on exactly one of the three states --
+    the other two have no time to report, and `__post_init__` makes that an
+    invariant rather than a convention, so a caller that reaches for the
+    timestamp on the strength of the status is right by construction.
+    """
+
+    status: AdmissionStatus
+    admitted_at: float | None = None
+
+    def __post_init__(self) -> None:
+        carries_a_time = self.admitted_at is not None
+        if carries_a_time is not (self.status is AdmissionStatus.ADMITTED):
+            raise ValueError("an AdmissionLookup carries an admitted_at "
+                             "exactly when it is ADMITTED")
+
+    @property
+    def admitted(self) -> bool:
+        return self.status is AdmissionStatus.ADMITTED
+
+    @property
+    def not_admitted(self) -> bool:
+        return self.status is AdmissionStatus.NOT_ADMITTED
+
+    @property
+    def unreadable(self) -> bool:
+        return self.status is AdmissionStatus.UNREADABLE
 
 
 class BorisSource:
@@ -208,17 +268,27 @@ class BorisSource:
         return tuple(self._verdict(row) for row in cur.fetchall())
 
     def request_exists(self, owner: str, repo: str, pr_number: int,
-                       head_sha: str, since: float) -> bool | None:
-        """Has a review request been admitted at this head since `since`?
-        None if the database could not be read.
+                       head_sha: str, since: float) -> AdmissionLookup:
+        """Has a review request been admitted at this head since `since`, and
+        when? UNREADABLE if the database could not be read.
 
         Three-way, the same contract shape `github_io.unresolved_bot_threads`
         uses, and for the same reason: the caller
         (`loop._route_rereview_ack`) has a genuinely different act for each
         of the three, and folding the unreadable case into either answer
-        would pick one of those acts on no evidence. `False` there re-posts a
-        re-review; taking it on a database this process merely could not open
-        buys a duplicate review for nothing.
+        would pick one of those acts on no evidence. NOT_ADMITTED there
+        re-posts a re-review; taking it on a database this process merely could
+        not open buys a duplicate review for nothing.
+
+        The answer carries *when*, not only *whether*, because the caller's
+        absolute deadline has to be anchored at the admission and not at the
+        wait: a request admitted late in a long wait was getting whatever was
+        left of four hours, so a re-review admitted at 3h50m had ten minutes
+        before that guard escalated a review that was running perfectly. The
+        state and the time therefore travel together in an `AdmissionLookup`
+        rather than as a `float | False | None` -- see `AdmissionStatus` for why
+        that shape and not the cheaper one. The name still asks the same
+        question it always did; only the answer got richer.
 
         The question is deliberately "admitted *since* this wait began", not
         "exists at all", and both terms are load-bearing because each catches a
@@ -234,7 +304,7 @@ class BorisSource:
         the head never moves. `loop._repost` re-sends a re-review after a
         system-origin incomplete without touching `head_sha`, so the request
         that produced *that very verdict* is still sitting at the loop's head:
-        a head-only query answers True unconditionally there, the guard is
+        a head-only query answers ADMITTED unconditionally there, the guard is
         inert, and a rejected re-post strands the loop silently. `created_at`
         is boris_intake's REAL epoch column and the caller's timestamp comes
         off this same machine's clock, so the two are directly comparable.
@@ -252,7 +322,7 @@ class BorisSource:
         way `new_verdicts` is. Those filters are there to select the verdicts
         this loop owns; the question here is only whether a review already
         exists at this head, whoever asked for it, and a narrower query would
-        answer False for a live review and re-post on top of it.
+        answer NOT_ADMITTED for a live review and re-post on top of it.
 
         `COLLATE NOCASE` on the three text columns, matching
         `pr_discovery/discover.py::IntakeSource.already_requested`, which
@@ -264,7 +334,35 @@ class BorisSource:
         `owner`/`repo`/`head_sha` come off the very row it is asking about --
         but that is an accident of the caller, not a property of the query, and
         the invariant was documented in one module and not honoured in its
-        sibling. A False here re-posts a re-review on top of a live one.
+        sibling. A NOT_ADMITTED here re-posts a re-review on top of a live one.
+
+        `MAX(created_at)` picks among the rows those terms match, and it is
+        deliberately not `MIN`: the LATEST admission is the one the deadline is
+        about. That deadline means "a request was accepted and produced
+        nothing"; if an older admission produced nothing but a newer one is in
+        flight, the loop is not stuck, and anchoring on the older one would
+        escalate out from under a live review -- exactly the bug this shape
+        exists to fix. `MIN` is the reading someone will "fix" this to later; it
+        is the wrong one.
+
+        An aggregate with no GROUP BY returns exactly one row even when nothing
+        matches, so the *row* is never `None` here and `row is not None` would
+        answer ADMITTED unconditionally, for every head, forever -- the same
+        strand the `head_sha` term above exists to prevent, rebuilt in the
+        result handling. NULL in that one row is what "no matching request"
+        looks like. (A row whose `created_at` is NULL cannot reach the
+        aggregate: `NULL >= since` is NULL, so the `since` term never matches
+        it. That was true of the old `SELECT 1` too, so nothing changes there.)
+
+        `float(...)` on the way out, mirroring `boris_intake.store`'s own
+        `float(row["created_at"])`: this is the first value from a column this
+        reader does not own to reach arithmetic, and the caller compares it
+        against a clock. The column is `REAL NOT NULL` over there, so a value
+        that will not convert takes a hand-edit or a bad migration -- and when
+        one does, it raises inside the `try` below and lands as UNREADABLE,
+        which is honest ("could not tell when") and already bounded by the
+        caller's deadline. It must never reach the caller as a string, where
+        `admitted_at <= now` raises a TypeError that aborts the whole settle.
 
         Wrapped rather than allowed to raise: this runs inside a routing
         pass, where an exception would abort the whole settle for a loop that
@@ -272,15 +370,18 @@ class BorisSource:
         """
         try:
             row = self._db.execute(
-                "SELECT 1 FROM review_requests "
+                "SELECT MAX(created_at) FROM review_requests "
                 "WHERE owner=? COLLATE NOCASE AND repo=? COLLATE NOCASE "
                 "AND pr_number=? AND head_sha=? COLLATE NOCASE "
-                "AND created_at>=? LIMIT 1",
+                "AND created_at>=?",
                 (owner, repo, pr_number, head_sha, since),
             ).fetchone()
+            if row[0] is None:
+                return AdmissionLookup(AdmissionStatus.NOT_ADMITTED)
+            return AdmissionLookup(AdmissionStatus.ADMITTED,
+                                   admitted_at=float(row[0]))
         except Exception:
-            return None
-        return row is not None
+            return AdmissionLookup(AdmissionStatus.UNREADABLE)
 
     def _verdict(self, row: sqlite3.Row) -> Verdict:
         try:

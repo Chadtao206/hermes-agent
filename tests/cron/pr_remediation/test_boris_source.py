@@ -3,7 +3,9 @@ import sqlite3
 
 import pytest
 
-from pr_remediation.boris_source import BorisSource, EvidenceAnchor, Issue, Verdict
+from pr_remediation.boris_source import (AdmissionLookup, AdmissionStatus,
+                                         BorisSource, EvidenceAnchor, Issue,
+                                         Verdict)
 from pr_remediation.config import RemediationConfig
 
 # `created_at` is boris_intake's own REAL epoch column (see its store.py's
@@ -198,7 +200,7 @@ def test_the_source_never_writes_to_the_boris_database(tmp_path):
 def test_a_request_at_exactly_this_head_is_admitted(tmp_path):
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60) is True
+                                 ADMITTED_AT - 60).admitted
 
 
 def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
@@ -214,7 +216,7 @@ def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
     source = BorisSource(boris_db(tmp_path, head_sha="a" * 40),
                          RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "b" * 40,
-                                 ADMITTED_AT - 60) is False
+                                 ADMITTED_AT - 60).not_admitted
 
 
 @pytest.mark.parametrize(
@@ -235,7 +237,7 @@ def test_case_alone_never_makes_a_request_look_absent(tmp_path, owner, repo,
     re-review on top of a live one."""
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists(owner, repo, 42, head_sha,
-                                 ADMITTED_AT - 60) is True
+                                 ADMITTED_AT - 60).admitted
 
 
 @pytest.mark.parametrize(
@@ -247,7 +249,7 @@ def test_a_request_for_a_different_pull_request_does_not_count(
         tmp_path, owner, repo, pr_number):
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists(owner, repo, pr_number, "a" * 40,
-                                 ADMITTED_AT - 60) is False
+                                 ADMITTED_AT - 60).not_admitted
 
 
 def test_a_review_still_under_way_counts_as_admitted(tmp_path):
@@ -259,7 +261,7 @@ def test_a_review_still_under_way_counts_as_admitted(tmp_path):
         boris_db(tmp_path, workflow_state="reviewing", semantic_outcome=None),
         RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60) is True
+                                 ADMITTED_AT - 60).admitted
 
 
 def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
@@ -271,7 +273,7 @@ def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
         boris_db(tmp_path, pr_author="jacobmaurer", requester_user_id="U5GB9F75Z"),
         RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60) is True
+                                 ADMITTED_AT - 60).admitted
 
 
 def test_a_request_admitted_before_this_wait_began_does_not_count(tmp_path):
@@ -287,7 +289,7 @@ def test_a_request_admitted_before_this_wait_began_does_not_count(tmp_path):
     """
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT + 1) is False
+                                 ADMITTED_AT + 1).not_admitted
 
 
 def test_a_request_admitted_at_the_instant_the_wait_began_counts(tmp_path):
@@ -297,19 +299,113 @@ def test_a_request_admitted_at_the_instant_the_wait_began_counts(tmp_path):
     would drop the very request this read exists to find."""
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT) is True
+                                 ADMITTED_AT).admitted
 
 
 def test_a_read_that_fails_answers_none_rather_than_raising(tmp_path):
     """Three-way, the same contract shape `github_io.unresolved_bot_threads`
-    uses: True / False / None-for-unreadable. This runs inside a routing pass,
-    where a raise would abort the loop's whole settle -- and where False would
-    be worse still, provoking a duplicate re-review post off a database we
+    uses: ADMITTED / NOT_ADMITTED / UNREADABLE. This runs inside a routing pass,
+    where a raise would abort the loop's whole settle -- and where NOT_ADMITTED
+    would be worse still, provoking a duplicate re-review post off a database we
     simply could not read."""
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     source.close()  # the read now raises ProgrammingError from sqlite3
-    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60) is None
+    lookup = source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                   ADMITTED_AT - 60)
+    assert lookup.unreadable
+    assert lookup.admitted_at is None, \
+        "nothing to anchor a deadline to, and the caller falls back accordingly"
+
+
+# --- and *when* it was admitted, which is what the caller's absolute deadline
+# is anchored on. Anchored at the wait instead, a request admitted late in a
+# long wait got whatever was left of four hours -- ten minutes, for one admitted
+# at 3h50m -- and REREVIEW_VERDICT_OVERDUE then sent a human to read a row whose
+# review had barely begun. ---
+
+
+def test_an_admitted_request_reports_when_the_gate_took_it(tmp_path):
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    lookup = source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                   ADMITTED_AT - 60)
+    assert lookup.status is AdmissionStatus.ADMITTED
+    assert lookup.admitted_at == ADMITTED_AT
+
+
+def test_several_requests_at_this_head_report_the_latest_admission(tmp_path):
+    """`MAX(created_at)`, and the mutation to `MIN` is the one to fear here.
+
+    The deadline this feeds means "a request was accepted and produced nothing".
+    If an older admission produced nothing but a newer one is in flight, the loop
+    is not stuck -- so anchoring on the older one escalates out from under a
+    review that is running perfectly, which is the whole defect this shape
+    exists to fix. `MIN` is the reading someone will "fix" this to later.
+    """
+    path = boris_db(tmp_path)
+    db = sqlite3.connect(str(path))
+    db.execute(
+        "INSERT INTO review_requests (request_id, owner, repo, pr_number, "
+        "head_sha, created_at) VALUES ('br_2','Ylopo','example',42,?,?)",
+        ("a" * 40, ADMITTED_AT + 3600.0))
+    db.commit()
+    db.close()
+
+    lookup = BorisSource(path, RemediationConfig()).request_exists(
+        "Ylopo", "example", 42, "a" * 40, ADMITTED_AT - 60)
+    assert lookup.admitted_at == ADMITTED_AT + 3600.0, \
+        "the newest admission at this head, not the oldest"
+
+
+def test_a_request_that_was_never_admitted_reports_no_time(tmp_path):
+    """And the aggregate is why this matters more than it looks.
+
+    `SELECT MAX(...)` with no GROUP BY returns exactly one row even when nothing
+    matches, so `row is not None` -- what the `SELECT 1` shape correctly used --
+    would now read ADMITTED for every head, forever: the strand the `head_sha`
+    term exists to prevent, rebuilt in the result handling. NULL in that one row
+    is what "no such request" looks like.
+    """
+    source = BorisSource(boris_db(tmp_path), RemediationConfig())
+    lookup = source.request_exists("Ylopo", "example", 42, "b" * 40,
+                                   ADMITTED_AT - 60)
+    assert lookup.status is AdmissionStatus.NOT_ADMITTED
+    assert lookup.admitted_at is None
+
+
+def test_a_created_at_that_is_not_a_number_reads_as_unreadable(tmp_path):
+    """`created_at` is `REAL NOT NULL` in boris_intake's schema, so this takes a
+    hand-repair or a bad migration -- but it is the first value from a column
+    this reader does not own to reach arithmetic, and the caller compares it
+    against a clock. Reaching the caller as a string, `admitted_at <= now()`
+    raises a TypeError that aborts a routing pass which may owe other writes.
+    UNREADABLE is the honest answer ("a row is there, but not when"), and the
+    caller already bounds that case by the episode start.
+    """
+    source = BorisSource(boris_db(tmp_path, created_at="whenever"),
+                         RemediationConfig())
+    lookup = source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                   ADMITTED_AT - 60)
+    assert lookup.unreadable
+    assert lookup.admitted_at is None
+
+
+def test_a_lookup_carries_a_time_exactly_when_it_is_admitted(tmp_path):
+    """The invariant that keeps the falsy-timestamp trap unwritable.
+
+    A design where a float means "admitted at t" and False/None mean the other
+    two states is one `if not admitted:` away from reading an epoch `0.0` as
+    "never admitted" -- and that reading re-posts a re-review on top of a live
+    review. An `AdmissionLookup` is always truthy, and these four raises are
+    what stop the timestamp and the state from ever disagreeing.
+    """
+    with pytest.raises(ValueError):
+        AdmissionLookup(AdmissionStatus.ADMITTED)
+    with pytest.raises(ValueError):
+        AdmissionLookup(AdmissionStatus.NOT_ADMITTED, admitted_at=0.0)
+    with pytest.raises(ValueError):
+        AdmissionLookup(AdmissionStatus.UNREADABLE, admitted_at=ADMITTED_AT)
+    assert AdmissionLookup(AdmissionStatus.ADMITTED, admitted_at=0.0).admitted, \
+        "an epoch 0.0 is an admission like any other, which is the point"
 
 
 # --- defensive parsing: boris_intake owns validated_result_json's shape and

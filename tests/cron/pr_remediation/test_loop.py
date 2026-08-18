@@ -7,7 +7,8 @@ are checking.
 """
 import pytest
 
-from pr_remediation.boris_source import Issue, Verdict
+from pr_remediation.boris_source import (AdmissionLookup, AdmissionStatus,
+                                         Issue, Verdict)
 from pr_remediation.config import RemediationConfig
 from pr_remediation.models import LoopState
 from pr_remediation.store import Store
@@ -33,14 +34,27 @@ class SourceFake:
         # post) and the one every test that is not about the acknowledgement
         # check assumes: an admitted request has a verdict coming, so the loop
         # owes nothing. False is a rejected post; None is an intake database
-        # this process could not read.
+        # this process could not read. The three map onto the three
+        # `AdmissionStatus` values the real read answers with -- kept as a
+        # tri-state flag here because that is how every existing test spells the
+        # case it is about.
         self.admitted = admitted
         # When the one request in this fake's world was admitted, for the tests
-        # that care that the read is windowed rather than timeless. Set it and
-        # the answer is computed the way the real query computes it
-        # (`created_at >= since`), which is the only way to model the
-        # `_repost` path at all: there the stale request sits at exactly the
-        # head being asked about, so nothing but the timestamp tells it apart.
+        # that care *when* rather than only whether. Set it and the answer is
+        # computed the way the real query computes it (`created_at >= since`),
+        # which is the only way to model the `_repost` path at all: there the
+        # stale request sits at exactly the head being asked about, so nothing
+        # but the timestamp tells it apart. It is also the anchor the absolute
+        # deadline is measured from, so a test that parks a wait and then has
+        # the gate admit late sets this and nothing else.
+        #
+        # Leaving it unset with `admitted=True` means "admitted at the instant
+        # the wait began", which is both the ordinary live case (the gate admits
+        # synchronously, seconds after the post) and the earliest thing the real
+        # query can return -- it windows on `created_at >= since`, so an
+        # admission that predates the episode is invisible to it. This fake
+        # cannot return one either, deliberately: no test should be able to
+        # assert a branch production cannot reach.
         self.admitted_at = admitted_at
         # Every (owner, repo, pr_number, head_sha, since) the loop asked
         # about, so a test can pin that it asks at its *own* head rather than
@@ -53,8 +67,15 @@ class SourceFake:
     def request_exists(self, owner, repo, pr_number, head_sha, since):
         self.exists_calls.append((owner, repo, pr_number, head_sha, since))
         if self.admitted_at is not None:
-            return self.admitted_at >= since
-        return self.admitted
+            if self.admitted_at < since:
+                return AdmissionLookup(AdmissionStatus.NOT_ADMITTED)
+            return AdmissionLookup(AdmissionStatus.ADMITTED,
+                                   admitted_at=self.admitted_at)
+        if self.admitted is None:
+            return AdmissionLookup(AdmissionStatus.UNREADABLE)
+        if self.admitted:
+            return AdmissionLookup(AdmissionStatus.ADMITTED, admitted_at=since)
+        return AdmissionLookup(AdmissionStatus.NOT_ADMITTED)
 
 
 class GitHubFake:
@@ -4244,12 +4265,21 @@ def test_the_admission_question_is_anchored_to_the_wait_not_the_last_move(tmp_pa
     assert deps.slack.escalations == []
 
 
-def test_the_deadline_is_anchored_to_the_wait_not_the_last_move(tmp_path):
+def test_an_unreadable_intake_is_bounded_by_the_wait_not_the_last_move(tmp_path):
     """The same anchor, and the same slide, on the bound that is supposed to be
     absolute. Measured from the row's last move it is re-armed by every landed
     re-post -- a full budget's worth of drift, and a wedged review then never
-    escalates at four hours at all. The constant says "measured from when the
-    wait began" and only this holds it to that.
+    escalates at four hours at all.
+
+    An unreadable intake is where that is still observable, and it is also the
+    branch that most needs it: it has no retry budget, it can repeat for as long
+    as the fault lasts, and with no admission time to anchor to, the wait's own
+    start is the only bound it has. Asked of an *admitted* request the question
+    no longer has two answers -- a re-post that lands is admitted at the moment
+    it lands, so the row's last move and that admission are the same instant, and
+    the anchor that would have to be wrong (`loop.updated_at`) coincides with the
+    one that is right. Which is the whole reason the deadline moved off the wait
+    for admitted requests: see the test below.
     """
     from pr_remediation.loop import tick
 
@@ -4261,15 +4291,82 @@ def test_the_deadline_is_anchored_to_the_wait_not_the_last_move(tmp_path):
     assert deps.store.get(loop_id).updated_at == started + 30 * 60, \
         "half an hour of re-posting has dragged the row's last move with it"
 
-    # The gate takes the third one and the review then wedges -- ends in
-    # `slack_unavailable`, say. No verdict is coming and no re-post is owed, so
-    # the deadline is the only thing left that can end this wait.
-    deps.source.admitted = True
+    # And now boris_intake will not say whether any of them got in. Nothing here
+    # can be retried into an answer and no re-post is owed, so the deadline is
+    # the only thing left that can end this wait.
+    deps.source.admitted = None
     deps.now.advance(4 * 60 * 60 + 60 - 30 * 60)
     assert tick(deps) == 1
     assert deps.slack.escalations == [
         ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
         "four hours after the wait began, not after its last re-post"
+
+
+def test_an_admission_late_in_a_wait_gets_the_whole_deadline_from_there(tmp_path):
+    """The live scenario, and the defect this anchor exists to fix.
+
+    A loop stranded in `rereview_posted` is *hours* old before anything looks at
+    it -- that is what this whole guard was written to rescue, and every loop it
+    rescued on its first day was in exactly that state. So the re-review that
+    finally gets in gets in late: Chad re-kicks the pull request by hand at 3h50m
+    and boris_intake admits it there.
+
+    Anchored at the wait, that review had ten minutes before this guard escalated
+    it as REREVIEW_VERDICT_OVERDUE -- a reason that sends a human to read that
+    request's own row, where they would find a review that started moments ago and
+    is running perfectly. `forge-content-service#111` dodged it only by accident:
+    the manual kick landed on a different head, because commits had been pushed
+    in the meantime, so it flowed through the verdict path instead of this one.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    deps.now.advance(3 * 60 * 60 + 50 * 60)  # parked, and nothing looked at it
+
+    # Re-kicked by hand, and this time the gate takes it.
+    deps.source.admitted_at = deps.now()
+    assert tick(deps) == 0, "the request is in; the review has not begun"
+
+    deps.now.advance(11 * 60)
+    assert tick(deps) == 0
+    assert deps.slack.escalations == [], \
+        "the wait is four hours old and the review it waits on is eleven minutes"
+
+    deps.now.advance(4 * 60 * 60 - 12 * 60)
+    assert tick(deps) == 0
+    assert deps.slack.escalations == [], \
+        "a minute short of four hours from the admission, and still its own"
+
+    deps.now.advance(2 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
+        "and then it has had its four hours and produced nothing"
+    assert deps.store.get(loop_id).state is LoopState.ESCALATED
+
+
+def test_an_admission_dated_in_the_future_buys_no_extra_deadline(tmp_path):
+    """`created_at` is another process's epoch column, and this loop compares it
+    against its own clock.
+
+    A row from the future -- clock skew, a manual repair, a bad migration -- would
+    push this bound out by exactly that skew if the anchor trusted it, and one
+    such row would then disable the backstop for the life of the loop: the very
+    silent park the guard exists to end, reinstated by a single bad timestamp. A
+    timestamp that has not happened yet evidences nothing about how long a review
+    has been running, so it buys no window and the wait keeps the bound it would
+    have had with no admission time at all.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.source.admitted_at = deps.now() + 30 * 60 * 60  # dated tomorrow
+    deps.now.advance(4 * 60 * 60 + 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
+        "four hours after the wait began, as if the row carried no time at all"
 
 
 def test_a_wait_with_no_opening_transition_claims_the_less_of_the_two(tmp_path):
