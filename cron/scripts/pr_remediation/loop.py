@@ -408,6 +408,19 @@ REREVIEW_REPOST_ATTEMPTS = 12
 # boris_intake's own REVIEW_WAIT_SECONDS an honest one: that bound runs from the
 # admission too, so the two are finally measured from the same instant.
 #
+# Renewable, and that is a real property of this bound, not a slip: the read
+# behind it is `MAX(created_at)` with no requester or author filter, so ANY
+# review request admitted at this head -- by this loop's own post, by a human,
+# by anything else that can write that table -- becomes the new anchor the next
+# time this route runs. A wedged loop sitting behind a head that keeps getting
+# re-requested faster than every four hours never reaches this bound at all.
+# That is accepted: a genuinely newer review in flight is real evidence the
+# loop is not stuck, which is the entire reason `MAX` and not `MIN` is correct
+# above. But say what it means plainly, because "absolute" in this constant's
+# own name invites the opposite reading: the bound is four hours since the
+# LAST admission recorded at this head, not four hours since the wait began,
+# and not a backstop nothing can push back out.
+#
 # Four hours, because it must comfortably exceed boris_intake's
 # REVIEW_WAIT_SECONDS (90 minutes, in its reconciler.py), which is that
 # service's own bound on how long an admitted review may legitimately take --
@@ -2202,11 +2215,19 @@ def _route_rereview_ack(deps: LoopDeps, loop: LoopRequest,
     # barely begun". A manual re-kick of a long-stranded pull request lands
     # exactly there, which is how this was found.
     #
-    # `max` is defence in depth and cannot fire today: the read is windowed on
-    # `created_at >= since` with `since` = `episode.started_at`, so every
-    # admission it can return is already at or after the episode start. It
-    # stands against a future caller that windows on something else, and is
-    # deliberately not tested -- there is no live path that reaches it.
+    # `max` is defence in depth and cannot fire today. The single call site
+    # below passes `since = episode.started_at`, and the query above filters
+    # `created_at >= since` -- so every admission it can return already
+    # satisfies `admitted_at >= episode.started_at`, whatever `started_at` is.
+    # That is the whole reason, and it is a property of the query, not of how
+    # `_rereview_episode` arrived at `started_at`: that trail is not even
+    # forward-moving in general (a `repost_rereview_sent` marker overwrites it
+    # unconditionally from that event's own `at`, which can precede an earlier
+    # transition), and the floor still cannot fire, because the same episode
+    # that windows the query is the one the anchor is computed from, in the
+    # same tick. It stands against a future caller that windows on something
+    # else, and is deliberately not tested -- there is no live path that
+    # reaches it.
     #
     # `<= deps.now()` is the clamp, and it is load-bearing rather than
     # defensive: `created_at` is another process's epoch column, and a row from

@@ -127,10 +127,6 @@ class AdmissionLookup:
                              "exactly when it is ADMITTED")
 
     @property
-    def admitted(self) -> bool:
-        return self.status is AdmissionStatus.ADMITTED
-
-    @property
     def not_admitted(self) -> bool:
         return self.status is AdmissionStatus.NOT_ADMITTED
 
@@ -363,6 +359,24 @@ class BorisSource:
         which is honest ("could not tell when") and already bounded by the
         caller's deadline. It must never reach the caller as a string, where
         `admitted_at <= now` raises a TypeError that aborts the whole settle.
+
+        That hand-edited row is worse than merely unreadable on its own,
+        though, because SQLite orders TEXT above INTEGER/REAL when comparing
+        or aggregating mixed types in one column. A non-numeric `created_at`
+        on *any* row at this `(owner, repo, pr_number, head_sha)` therefore
+        both satisfies `created_at>=?` for every `since` -- nothing sorts
+        below it -- and **outranks a genuine REAL admission at the same
+        head**, so `MAX` returns the bad row, not the good one, whenever both
+        exist. A re-review truly admitted at 3h50m of a four-hour wait can sit
+        one row away from a `created_at` some other process wrote as text: the
+        good admission never surfaces, this answers UNREADABLE instead, the
+        anchor falls back to the episode start, and the loop escalates ten
+        minutes later -- the exact defect this read exists to fix, silently
+        un-fixed for that one head. Still fail-safe (never a duplicate post,
+        never a lane, never earlier than the caller's own fallback), which is
+        why the query is unchanged and this is a comment, not a fix -- but the
+        ordering rule belongs here so the next reader does not have to
+        rediscover it by tracing a live incident.
 
         Wrapped rather than allowed to raise: this runs inside a routing
         pass, where an exception would abort the whole settle for a loop that

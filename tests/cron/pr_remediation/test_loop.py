@@ -4369,6 +4369,82 @@ def test_an_admission_dated_in_the_future_buys_no_extra_deadline(tmp_path):
         "four hours after the wait began, as if the row carried no time at all"
 
 
+def test_an_admission_one_second_in_the_future_buys_no_extra_deadline(tmp_path):
+    """The extreme case above (a row dated a day out) cannot see a mutant that
+    grants an hour of skew tolerance before treating a row as future: a day is
+    so far past any such tolerance that both the real clamp and a leaky
+    one-hour one reject it alike. The boundary is what pins the hour: a row
+    dated a single second past the instant of the check must still buy
+    nothing, because the clamp compares against `deps.now()` as read, not
+    against a tolerance band around it.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    started = deps.store.get(loop_id).updated_at
+    deps.source.admitted_at = started + 4 * 60 * 60 + 1  # one second past the
+                                                          # would-be deadline
+    deps.now.advance(4 * 60 * 60)  # now == started + 4h, exactly
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
+        "one second into the future must buy not one second of extra " \
+        "deadline, let alone an hour of it"
+
+
+def test_an_admission_at_this_very_instant_counts_as_admitted_here_and_now(tmp_path):
+    """The clamp's own equality case, and the same argument the query's own
+    inclusive `>=` already makes: a timestamp that IS now evidences an
+    admission that has already happened, not one still to come.
+
+    Parked long enough that an anchor stuck at the episode start would already
+    be overdue, this drives the admission to the exact instant of the check --
+    `admitted_at == deps.now()` -- so a `<` in place of the clamp's `<=`
+    rejects it as though it were still in the future, falls back to the
+    episode start, and escalates a review that in fact just began.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    deps.now.advance(4 * 60 * 60 + 60)  # already past an episode-start deadline
+    deps.source.admitted_at = deps.now()  # admitted at this very instant
+    assert tick(deps) == 0
+    assert deps.slack.escalations == [], \
+        "admitted exactly now, with the whole four hours still to run"
+
+
+def test_the_admitted_deadline_does_not_borrow_the_rows_last_move(tmp_path):
+    """The floor's other operand matters even though the branch that reaches
+    it cannot fire in production (see the comment on `anchor` in
+    `_route_rereview_ack`): `loop.updated_at` drifts forward on every landed
+    re-post the way `episode.started_at` does not, so a floor written against
+    the row's last move instead of the wait's own start would extend a
+    genuinely late admission's deadline by however much re-posting happened
+    first. `test_an_unreadable_intake_is_bounded_by_the_wait_not_the_last_move`
+    pins that same row-drift hazard on the UNREADABLE branch; this pins it on
+    the branch that actually reaches this line.
+    """
+    from pr_remediation.loop import tick
+
+    deps = drive_to_rereview_posted(tmp_path)
+    loop_id = only_loop(deps).loop_id
+    started = deps.store.get(loop_id).updated_at
+    deps.source.admitted = False
+    spend_reposts(deps, loop_id, 3)
+    assert deps.store.get(loop_id).updated_at == started + 30 * 60, \
+        "half an hour of re-posting has dragged the row's last move with it"
+
+    # The gate actually took the very first post, moments into the wait --
+    # long before any of that re-posting happened.
+    deps.source.admitted_at = started + 1
+    deps.now.advance(4 * 60 * 60 + 60 - 30 * 60)
+    assert tick(deps) == 1
+    assert deps.slack.escalations == [
+        ("Ylopo/example#42", 1, "rereview_verdict_overdue")], \
+        "four hours after the admission, not after the row's last move"
+
+
 def test_a_wait_with_no_opening_transition_claims_the_less_of_the_two(tmp_path):
     """A row whose trail cannot say how its wait began -- hand-edited, or older
     than this trail -- still gets a re-send, and it must be the message that

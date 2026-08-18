@@ -200,7 +200,7 @@ def test_the_source_never_writes_to_the_boris_database(tmp_path):
 def test_a_request_at_exactly_this_head_is_admitted(tmp_path):
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60).admitted
+                                 ADMITTED_AT - 60).status is AdmissionStatus.ADMITTED
 
 
 def test_a_request_at_the_previous_head_does_not_count_as_this_one(tmp_path):
@@ -237,7 +237,7 @@ def test_case_alone_never_makes_a_request_look_absent(tmp_path, owner, repo,
     re-review on top of a live one."""
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists(owner, repo, 42, head_sha,
-                                 ADMITTED_AT - 60).admitted
+                                 ADMITTED_AT - 60).status is AdmissionStatus.ADMITTED
 
 
 @pytest.mark.parametrize(
@@ -261,7 +261,7 @@ def test_a_review_still_under_way_counts_as_admitted(tmp_path):
         boris_db(tmp_path, workflow_state="reviewing", semantic_outcome=None),
         RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60).admitted
+                                 ADMITTED_AT - 60).status is AdmissionStatus.ADMITTED
 
 
 def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
@@ -273,7 +273,7 @@ def test_the_requester_and_author_filters_are_not_applied_here(tmp_path):
         boris_db(tmp_path, pr_author="jacobmaurer", requester_user_id="U5GB9F75Z"),
         RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT - 60).admitted
+                                 ADMITTED_AT - 60).status is AdmissionStatus.ADMITTED
 
 
 def test_a_request_admitted_before_this_wait_began_does_not_count(tmp_path):
@@ -299,7 +299,7 @@ def test_a_request_admitted_at_the_instant_the_wait_began_counts(tmp_path):
     would drop the very request this read exists to find."""
     source = BorisSource(boris_db(tmp_path), RemediationConfig())
     assert source.request_exists("Ylopo", "example", 42, "a" * 40,
-                                 ADMITTED_AT).admitted
+                                 ADMITTED_AT).status is AdmissionStatus.ADMITTED
 
 
 def test_a_read_that_fails_answers_none_rather_than_raising(tmp_path):
@@ -404,7 +404,8 @@ def test_a_lookup_carries_a_time_exactly_when_it_is_admitted(tmp_path):
         AdmissionLookup(AdmissionStatus.NOT_ADMITTED, admitted_at=0.0)
     with pytest.raises(ValueError):
         AdmissionLookup(AdmissionStatus.UNREADABLE, admitted_at=ADMITTED_AT)
-    assert AdmissionLookup(AdmissionStatus.ADMITTED, admitted_at=0.0).admitted, \
+    assert AdmissionLookup(AdmissionStatus.ADMITTED,
+                          admitted_at=0.0).status is AdmissionStatus.ADMITTED, \
         "an epoch 0.0 is an admission like any other, which is the point"
 
 
