@@ -200,7 +200,14 @@ def _attempt(
             retryable=True,
         )
     stderr = str(getattr(proc, "stderr", "") or "")
-    if any(shape in stderr.lower() for shape in _NOT_FOUND_SHAPES):
+    if proc.returncode != 0 and any(
+        shape in stderr.lower() for shape in _NOT_FOUND_SHAPES
+    ):
+        # A non-zero exit is required as well as the shape, even though the exit
+        # code cannot identify this case on its own: `gh` never answers a body
+        # AND a resolution error, so a zero exit that mentions one is a warning
+        # about something else, and absent is the one classification that must
+        # never be reached by accident.
         return _Read(GitHubReadStatus.ABSENT, detail="GitHub reports no such PR")
     if proc.returncode == 3 or stderr.lstrip().startswith(_WRAPPER_PREFIX):
         # A scope/verb refusal or an unreadable credential. Retrying either

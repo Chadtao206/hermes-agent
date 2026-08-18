@@ -647,3 +647,14 @@ def test_the_snapshot_reads_share_the_messages_window_too():
 
     assert capture.status is SnapshotStatus.UNAVAILABLE
     assert later.spawns == 1
+
+
+def test_a_successful_read_is_never_absent_whatever_is_on_stderr():
+    """`absent` is the terminal classification, so it must not be reachable by
+    accident: a body arrived, and that settles it."""
+    lookup = fetch_pr(
+        "Ylopo", "repo", 5,
+        runner=Runner(proc(stdout=OPEN_PR_JSON, stderr=NOT_FOUND_STDERR)),
+    )
+
+    assert lookup.found
