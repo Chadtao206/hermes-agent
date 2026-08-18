@@ -187,9 +187,18 @@ class PRLookup:
         if (self.info is not None) is not (self.status is GitHubReadStatus.FOUND):
             raise ValueError("a PRLookup carries a PRInfo exactly when it is FOUND")
         if self.status is GitHubReadStatus.NO_CHECKS:
-            # `pr view` is never asked about checks, so this status cannot be
-            # reached here -- and a PR lookup that claimed it would mean the
-            # no-checks prefix had been wired onto the wrong read.
+            # `pr view` is never asked about checks, so nothing in `github.py`
+            # constructs a NO_CHECKS `PRLookup` today. Correcting a claim an
+            # earlier report made about this raise: it is NOT what would catch
+            # a no-checks prefix mis-wired onto `fetch_pr`'s read. `_Read` only
+            # carries a `value` when its own status is FOUND, so a NO_CHECKS
+            # `_Read` there falls through `fetch_pr` with `data = None`, fails
+            # `isinstance(data, dict)`, and returns `PRLookup(UNAVAILABLE,
+            # "GitHub's answer was not a pull request object")` -- never
+            # reaching this branch. That mis-wiring is behaviour-neutral and
+            # fails closed, but this guard does not see it and is not what
+            # defends against it. It exists only against a hand-constructed
+            # `PRLookup(GitHubReadStatus.NO_CHECKS)`, as `test_github.py` does.
             raise ValueError("a pull request view read is never NO_CHECKS")
 
     @property

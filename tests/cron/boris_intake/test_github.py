@@ -187,6 +187,11 @@ def test_fetch_gate_snapshot_fails_closed_when_head_changed():
 
 
 def test_fetch_gate_snapshot_accepts_check_failure_exit_with_valid_json():
+    """A non-zero exit with a real (non-empty) rollup is still an allowed,
+    trustworthy answer -- `allowed_codes=(0, 1)` exists because `gh pr checks`
+    itself exits 1 when a check failed. The rollup here is deliberately
+    non-empty: F2 now refuses an empty one structurally regardless of exit
+    code, which is a different guard covered by its own test."""
     def run(cmd, **kwargs):
         if "view" in cmd:
             return SimpleNamespace(
@@ -194,11 +199,21 @@ def test_fetch_gate_snapshot_accepts_check_failure_exit_with_valid_json():
                 stdout=json.dumps({"headRefOid": "a" * 40}),
                 stderr="",
             )
-        return SimpleNamespace(returncode=1, stdout="[]", stderr="checks failed")
+        if "--required" in cmd:
+            return SimpleNamespace(returncode=1, stdout="[]", stderr="checks failed")
+        return SimpleNamespace(
+            returncode=1,
+            stdout=json.dumps(
+                [{"name": "unit-tests", "state": "FAILURE", "link": "https://ci/unit"}]
+            ),
+            stderr="checks failed",
+        )
 
-    assert github.fetch_gate_snapshot(
+    capture = github.fetch_gate_snapshot(
         "Ylopo", "repo", 1, "a" * 40, "2026-08-14T12:00:00Z", runner=run
-    ).captured
+    )
+    assert capture.captured
+    assert [check.check_name for check in capture.snapshot.checks] == ["unit-tests"]
 
 
 def test_fetch_gate_snapshot_treats_no_required_checks_exit_as_empty():
@@ -611,12 +626,15 @@ def test_a_moved_head_is_terminal_never_retried_and_never_an_outage():
 
 
 def test_an_unreadable_head_is_an_outage_and_is_retried():
+    """The rollup below is deliberately non-empty: this test's subject is the
+    head-read retry, and an empty rollup would now legitimately answer
+    NO_CHECKS (F2) rather than exercising the retried-and-recovered path."""
     clock = Clock()
     runner = Runner(
         proc(returncode=1, stderr=FAULT_STDERR),
         proc(returncode=1, stderr=FAULT_STDERR),
         proc(stdout=json.dumps({"headRefOid": "a" * 40})),
-        proc(stdout=json.dumps([])),
+        proc(stdout=json.dumps(ROLLUP)),
         proc(stdout=json.dumps([])),
     )
 
@@ -768,6 +786,66 @@ def test_an_empty_plain_checks_body_is_not_an_empty_rollup():
     assert capture.snapshot is None
     # The head read, then three attempts at the checks read.
     assert runner.spawns == 4
+
+
+def test_a_widened_no_checks_prefix_does_not_swallow_an_unrelated_failure():
+    """F1, mutation killer for `_NO_CHECKS_PREFIX = "no "`: that widened prefix
+    passes the whole suite today because nothing drives the plain checks read
+    with a lowercase error that starts with "no " but is not GitHub's actual
+    no-checks wording. Under the widened prefix this would misclassify as
+    NO_CHECKS -- terminal and unretried -- when GitHub in fact answered
+    something else entirely."""
+    clock = Clock()
+    runner = Runner(
+        HEAD_OK,
+        proc(returncode=1, stderr="no such ref matches the given branch\n"),
+    )
+
+    capture = snapshot(runner, budget=budget_on(clock))
+
+    assert capture.status is SnapshotStatus.UNAVAILABLE
+    # The head read, then three attempts at the checks read: an untrustworthy
+    # answer, not a positive no-checks match, so it is retried.
+    assert runner.spawns == 4
+
+
+def test_the_no_checks_match_is_case_insensitive_against_a_gh_reword():
+    """F1: the match was `stderr.strip().startswith(...)` against an
+    all-lowercase prefix, while `_NOT_FOUND_SHAPES` is matched via
+    `stderr.lower()`. A `gh` reword to `No checks reported...` would silently
+    fall through to the untrustworthy-answer branch, spend the message's whole
+    retry window, and answer GITHUB_UNAVAILABLE -- un-throttled -- on a pull
+    request GitHub had already given a terminal answer about."""
+    capture = snapshot(Runner(
+        HEAD_OK,
+        proc(
+            returncode=1,
+            stderr="No checks reported on the 'DEVOPS-163-vail-pylib' branch\n",
+        ),
+    ))
+
+    assert capture.status is SnapshotStatus.NO_CHECKS
+
+
+def test_an_empty_rollup_is_refused_structurally_not_by_relying_on_gh_erroring():
+    """F2: "no path produces a captured snapshot with zero checks" was stated as
+    a binding constraint and does not hold at the code level. An ALLOWED exit
+    code with a well-formed empty JSON array on both the plain and required
+    checks reads passes every guard above it -- `[]` is not empty stdout -- and
+    without this guard would reach `build_gate_snapshot([])`, which succeeds:
+    zero checks means nothing blocking and nothing pending, so a pull request
+    whose CI never ran would publish READY_FOR_HUMAN_REVIEW. The only thing that
+    prevented it before was that real `gh` errors instead of printing `[]` --
+    a behavioural accident of an external tool, not a guarantee."""
+    capture = snapshot(Runner(HEAD_OK, proc(stdout="[]"), proc(stdout="[]")))
+
+    assert capture.status is SnapshotStatus.NO_CHECKS
+    assert capture.snapshot is None
+    assert capture.detail == "the PR has no CI checks to capture"
+
+    # The stderr shape must reach the exact same state.
+    stderr_shape = snapshot(Runner(HEAD_OK, proc(returncode=1, stderr=NO_CHECKS_STDERR)))
+    assert stderr_shape.status is SnapshotStatus.NO_CHECKS
 
 
 def test_a_third_could_not_resolve_shape_is_unavailable_not_absent():
@@ -1063,8 +1141,11 @@ def test_a_lookup_cannot_misrepresent_its_own_payload():
         PRLookup(GitHubReadStatus.UNAVAILABLE, info=info)
     with pytest.raises(ValueError):
         PRLookup(GitHubReadStatus.ABSENT, info=info)
-    # `pr view` is never asked about checks, so a PR lookup claiming NO_CHECKS
-    # would mean the no-checks prefix had been wired onto the wrong read.
+    # `pr view` is never asked about checks. This guard is NOT what would catch
+    # a no-checks prefix mis-wired onto `fetch_pr`'s read -- that read falls
+    # through to UNAVAILABLE before ever building a lookup this shape (see the
+    # corrected comment on this branch in `models.py`). It exists only against
+    # a hand-constructed NO_CHECKS lookup, as here.
     with pytest.raises(ValueError):
         PRLookup(GitHubReadStatus.NO_CHECKS)
 

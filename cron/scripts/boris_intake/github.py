@@ -151,9 +151,13 @@ _WRAPPER_PREFIX = "ghx_ro:"
 #: fire when checks exist and none of them are required.
 #:
 #: Matched positively, the same way ABSENT is: a non-zero exit AND empty stdout
-#: AND this exact prefix. Bare empty stdout is NOT this case -- that is the
-#: fail-closed guard an empty rollup depends on, and widening it to plain
-#: `not stdout` would admit a pull request whose required checks were failing.
+#: AND this exact prefix, case-insensitively -- the same allowance
+#: `_NOT_FOUND_SHAPES` gets, for the same reason: a `gh` reword of casing alone
+#: (`No checks reported...`) must not silently fall through to the
+#: retryable-and-un-throttled branch this replaced. Bare empty stdout is NOT
+#: this case -- that is the fail-closed guard an empty rollup depends on, and
+#: widening it to plain `not stdout` would admit a pull request whose required
+#: checks were failing.
 #:
 #: Deliberately not FOUND, and deliberately not GITHUB_UNAVAILABLE. See
 #: `models.SnapshotStatus.NO_CHECKS` for both halves of that decision.
@@ -288,12 +292,16 @@ def _attempt(
         no_checks_prefix
         and proc.returncode != 0
         and not stdout.strip()
-        and stderr.strip().startswith(no_checks_prefix)
+        and stderr.strip().lower().startswith(no_checks_prefix)
     ):
         # GitHub answered, and the answer is "this branch has no checks". Not a
         # failure, not an empty rollup: terminal, never retried, and never
         # FOUND. Checked before the allowed-exit-code test below so tightening
         # `allowed_codes` could not turn this truthful answer back into a lie.
+        # Matched case-insensitively, like `_NOT_FOUND_SHAPES` above: `_Read`
+        # only ever carries fixed literals into `detail`, so lower-casing the
+        # comparison cannot leak stderr, and skipping it would let a `gh`
+        # reword of casing alone reinstate the pre-fix misclassification.
         return _Read(GitHubReadStatus.NO_CHECKS, detail="the PR has no CI checks")
     if proc.returncode not in allowed_codes:
         return _Read(
@@ -573,6 +581,22 @@ def fetch_gate_snapshot(
         dict(item, required=str(item.get("name") or "") in required_names)
         for item in checks.value
     ]
+    if not rows:
+        # F2: refused STRUCTURALLY, not by relying on how `gh` happens to fail.
+        # The stderr shape above is the ONLY thing that made an empty rollup
+        # unreachable before this guard existed -- real `gh` errors instead of
+        # printing `[]` for a zero-check pull request, but that is a
+        # behavioural accident of an external tool, not a guarantee. An exit 0
+        # `[]` on both checks reads is well-formed JSON, passes every guard
+        # above (empty stdout was already excluded from the FOUND `[]`
+        # allowance, but a genuinely empty JSON array is not empty stdout), and
+        # would otherwise reach `build_gate_snapshot([])`, which succeeds: zero
+        # checks means nothing blocking and nothing pending, so the pull
+        # request would publish READY_FOR_HUMAN_REVIEW with CI that never ran.
+        # This makes the safety property independent of an English string.
+        return GateSnapshotLookup(
+            SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
+        )
     try:
         return GateSnapshotLookup(
             SnapshotStatus.CAPTURED,

@@ -167,7 +167,7 @@ def test_shadow_replay_audits_gate_snapshot_proposals_without_external_mutation(
             snapshot=GateSnapshot("sha256:" + "a" * 64, captured_at, ()),
         )
 
-    monkeypatch.setattr(replay, "fetch_gate_snapshot", capture, raising=False)
+    monkeypatch.setattr(replay, "fetch_gate_snapshot", capture)
     monkeypatch.setattr(replay.sys, "argv", [
         "replay.py",
         "--days", "1",
@@ -427,7 +427,7 @@ def test_replay_gives_each_message_its_own_real_retry_window(monkeypatch, tmp_pa
         )
 
     monkeypatch.setattr(replay, "fetch_pr", fetch_pr_info)
-    monkeypatch.setattr(replay, "fetch_gate_snapshot", capture, raising=False)
+    monkeypatch.setattr(replay, "fetch_gate_snapshot", capture)
     monkeypatch.setattr(replay.sys, "argv", [
         "replay.py", "--days", "1", "--channel", "C1",
         "--audit-path", str(tmp_path / "replay-audit.jsonl"),
@@ -490,7 +490,7 @@ def test_replay_reports_a_no_checks_pull_request_the_way_the_daemon_does(
         GateSnapshotLookup(
             SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
         )
-    ), raising=False)
+    ))
     monkeypatch.setattr(replay.sys, "argv", [
         "replay.py", "--days", "1", "--channel", "C1",
         "--audit-path", str(audit_path),
