@@ -1809,10 +1809,18 @@ def test_a_permanently_unreachable_channel_stops_retrying(tmp_path):
     deps = build(tmp_path, SourceFake([model_incomplete()]), slack=slack)
     tick(deps)
     deps.source.verdicts = []
-    for _ in range(NOTIFY_ATTEMPTS):
+    # Driven well PAST the budget, and the count asserted as a literal. The
+    # earlier version looped `range(NOTIFY_ATTEMPTS)` and then asserted the
+    # count equalled `NOTIFY_ATTEMPTS`, which passes under every value of the
+    # very constant it was supposed to be pinning -- 5 -> 3 and 5 -> 50 both
+    # survived the whole suite.
+    for _ in range(12):
         deps.now.advance(NOTIFY_RETRY_SECONDS)
         tick(deps)
-    assert len(slack.escalations) == NOTIFY_ATTEMPTS
+    assert NOTIFY_ATTEMPTS == 5, \
+        "the literal below is derived from this; re-derive it if the budget moves"
+    assert len(slack.escalations) == 5, \
+        "attempts must stop at the budget however many ticks follow"
     loop_id = _loop_id(deps)
     assert deps.store.get(loop_id).state is LoopState.ESCALATED, \
         "a loop held open forever blocks every later loop on this PR"
@@ -2448,7 +2456,7 @@ def test_a_lane_that_pushed_nothing_gets_one_grace_window_then_escalates(tmp_pat
     before GitHub serves the pushed head. Calling that a no-op on the first
     look escalates a race; never calling it one re-reviews an unchanged PR
     forever."""
-    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+    from pr_remediation.loop import tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
     assert tick(deps) == 1
@@ -2458,7 +2466,7 @@ def test_a_lane_that_pushed_nothing_gets_one_grace_window_then_escalates(tmp_pat
     assert deps.slack.reposts == []
     assert deps.slack.thinkies_removed == ["2.0"], "no round is running now"
 
-    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    deps.now.advance(61.0)  # literal: one second past the 60s window
     assert tick(deps) == 1
     assert deps.slack.escalations[0][2] == "no_op_lane"
     assert deps.slack.reposts == [], "an unchanged PR must never be re-reviewed"
@@ -2467,14 +2475,14 @@ def test_a_lane_that_pushed_nothing_gets_one_grace_window_then_escalates(tmp_pat
 
 
 def test_the_grace_window_catches_a_push_that_landed_late(tmp_path):
-    from pr_remediation.loop import HEAD_MOVE_GRACE_SECONDS, tick
+    from pr_remediation.loop import tick
 
     deps = drive_to_remediating(tmp_path, lanes=LanesFake(status="done"))
     assert tick(deps) == 1
     assert only_loop(deps).state is LoopState.AWAITING_HEAD_MOVE
 
     deps.github.head = "b" * 40  # GitHub was simply behind the lane
-    deps.now.advance(HEAD_MOVE_GRACE_SECONDS + 1)
+    deps.now.advance(61.0)  # literal: one second past the 60s window
     assert tick(deps) == 1
     assert deps.slack.reposts == [("Ylopo/example#42", 1)]
     assert deps.slack.escalations == []
@@ -2499,8 +2507,13 @@ def test_a_tick_inside_the_grace_window_neither_escalates_nor_re_reviews(tmp_pat
     assert deps.store.get(loop_id).state is LoopState.AWAITING_HEAD_MOVE
     before = kinds(deps, loop_id)
 
-    assert HEAD_MOVE_GRACE_SECONDS > 1.0
-    deps.now.advance(1.0)  # nowhere near the window's edge
+    # Pinned against a LITERAL, and it is the pin every other grace-window
+    # literal is derived from. The earlier `> 1.0` guard paired with a 1.0
+    # advance asserted nothing about the window's size: 60 -> 600 survived the
+    # whole suite, so a ten-fold longer race went untested in both directions.
+    assert HEAD_MOVE_GRACE_SECONDS == 60.0, \
+        "re-derive the literal edges in the grace-window tests if this moves"
+    deps.now.advance(59.0)  # one second SHORT of the window's edge
     assert tick(deps) == 0
     assert deps.slack.escalations == []
     assert deps.slack.reposts == []
