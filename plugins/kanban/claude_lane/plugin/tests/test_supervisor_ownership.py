@@ -200,7 +200,7 @@ def _readopt_stubs(monkeypatch, *, card, sidecar):
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    monkeypatch.setattr(wrapper.kdb, "connect_closing", lambda board=None: _Conn())
+    monkeypatch.setattr(wrapper._connect_mod, "connect_closing", lambda board=None: _Conn())
     monkeypatch.setattr(wrapper.kdb, "get_task", lambda conn, tid: card)
     killed, deleted, relaunched, saved = [], [], [], []
     monkeypatch.setattr(wrapper.subprocess, "run",

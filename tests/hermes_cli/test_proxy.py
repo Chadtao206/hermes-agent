@@ -344,9 +344,12 @@ def test_codex_adapter_sets_required_cloudflare_headers(tmp_path, monkeypatch):
 
     headers = CodexAdapter().get_credential().extra_headers
 
+    # Official chatgpt.com endpoint -> Hermes identity (upstream policy since
+    # agent.codex_headers); custom endpoints keep the codex_cli_rs identity.
+    from hermes_cli import __version__
     assert headers == {
-        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
-        "originator": "codex_cli_rs",
+        "User-Agent": f"HermesAgent/{__version__}",
+        "originator": "hermes-agent",
         "ChatGPT-Account-ID": "acct_123",
     }
 
@@ -633,6 +636,139 @@ def test_server_forwards_codex_cloudflare_headers_and_strips_connection_headers(
             assert headers["chatgpt-account-id"] == "acct_123"
             assert "x-client-hop" not in headers
             assert "x-upstream-hop" not in response_headers
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def _build_sse_upstream(
+    frames: list[bytes],
+    *,
+    path: str = "/v1/chat/completions",
+) -> "web.Application":
+    async def sse(request):
+        _ = await request.read()
+        resp = web.StreamResponse(
+            status=200, headers={"Content-Type": "text/event-stream"},
+        )
+        await resp.prepare(request)
+        for chunk in frames:
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_route("*", path, sse)
+    return app
+
+
+def test_proxy_appends_done_when_upstream_omits_sentinel():
+    """#90848: complete Portal-shaped SSE without [DONE] gets one appended."""
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{"content":"LONGCAT_OK"}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: {"choices":[],"lastOne":true,"usage":{"prompt_tokens":1}}\n\n',
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            text = body.decode("utf-8")
+            assert 'data: {"choices":[{"delta":{"content":"LONGCAT_OK"}}]}' in text
+            assert '"finish_reason":"stop"' in text
+            assert '"lastOne":true' in text
+            assert text.count("data: [DONE]") == 1
+            assert text.rstrip().endswith("data: [DONE]")
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_does_not_duplicate_existing_done():
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            assert body.decode("utf-8").count("data: [DONE]") == 1
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_does_not_append_done_after_error_event():
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+            b'data: {"error":{"message":"boom","type":"api_error"}}\n\n',
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            assert "data: [DONE]" not in body.decode("utf-8")
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_does_not_append_done_after_malformed_trailing_frame():
+    async def run():
+        frames = [
+            b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            b'data: {"choices": [MALFORMED]}\n\n',
+        ]
+        upstream_runner, upstream_base = await _start_runner(
+            _build_sse_upstream(frames)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"stream": True},
+                ) as resp:
+                    body = await resp.read()
+            assert "data: [DONE]" not in body.decode("utf-8")
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

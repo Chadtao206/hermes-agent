@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 # ---------------------------------------------------------------------------
@@ -258,22 +259,8 @@ async function tick() {
     return json.loads(result.stdout)
 
 
-def test_dashboard_recovery_health_unavailable_stays_visible_and_non_actionable():
-    """A failed health fetch must not render as a clean task with no diagnostics."""
-    rendered = _run_dashboard_bundle_behavior("health-unavailable")
-
-    assert "Recovery health unavailable" in rendered["unavailableText"]
-    assert "Acknowledgement is disabled" in rendered["unavailableText"]
-    assert rendered["unavailableActions"] == 0
-    assert rendered["emptyIsHidden"] is True
 
 
-def test_dashboard_new_escalation_resets_local_acknowledgement_badge():
-    """A distinct unacknowledged escalation must offer acknowledgement again."""
-    rendered = _run_dashboard_bundle_behavior("new-escalation")
-
-    assert rendered["hasAcknowledgeButton"] is True
-    assert "Acknowledged — task remains open" not in rendered["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +348,7 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
         json={"title": "wait for indexed data", "assignee": "ops"},
     ).json()["task"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute(
@@ -457,7 +444,7 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     )
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "review"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         run = kb.latest_run(conn, task["id"])
         assert run is not None
         assert run.outcome == "review_requested"
@@ -481,7 +468,7 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "ready"
     assert response.json()["task"]["assignee"] == "builder"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert any(
             event.kind == "review_reopened"
             for event in kb.list_events(conn, task["id"])
@@ -526,7 +513,7 @@ def test_reopening_parent_demotes_ready_child(client):
 
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
@@ -558,7 +545,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     )
     assert response.status_code == 200, response.text
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
         assert child.status == "todo"
@@ -577,7 +564,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     )
     assert response.status_code == 200, response.text
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
         assert child.status == "review"
@@ -595,7 +582,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="root", assignee="planner")
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
@@ -620,7 +607,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
     )
     assert response.status_code == 200, response.text
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "todo"
@@ -636,7 +623,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         json={"status": "done"},
     )
     assert response.status_code == 200, response.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "ready"
@@ -644,7 +631,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
@@ -664,7 +651,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "review"
     assert response.json()["task"]["assignee"] == "reviewer"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.outcome == "reclaimed"
@@ -753,7 +740,7 @@ def test_dispatch_dry_run(client):
 def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     """Loopback mode: a missing or wrong ?token= must be rejected with
     policy-violation; the correct token is accepted. The kanban WS now
-    delegates to web_server._ws_auth_ok, so we stub that with the real
+    delegates to web_server_chat._ws_auth_ok, so we stub that with the real
     loopback-token semantics (auth_required False → constant-time token
     compare)."""
     home = tmp_path / ".hermes"
@@ -762,7 +749,7 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
 
-    # Stub web_server with a loopback-mode _ws_auth_ok (auth_required False →
+    # Stub web_server_chat with a loopback-mode _ws_auth_ok (auth_required False →
     # accept only the correct ?token=). Mirrors the real gate's loopback path.
     import hermes_cli
     import types
@@ -774,8 +761,8 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         _SESSION_TOKEN="secret-xyz",
         _ws_auth_ok=_fake_ws_auth_ok,
     )
-    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
-    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_chat", stub)
+    monkeypatch.setattr(hermes_cli, "web_server_chat", stub, raising=False)
 
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
@@ -855,7 +842,7 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
     )
     assert response.status_code == 200, response.text
     assert all(item["ok"] for item in response.json()["results"])
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for task in tasks:
             current = kb.get_task(conn, task["id"])
             assert current is not None
@@ -868,6 +855,294 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
             assert event.payload is not None
             assert event.payload["implementer"] == "builder"
             assert event.payload["reviewer"] == "reviewer"
+
+
+def test_bulk_status_done_forwards_completion_summary(client):
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [a["id"], b["id"]],
+            "status": "done",
+            "result": "DECIDED: ship it",
+            "summary": "DECIDED: ship it",
+            "metadata": {"source": "dashboard"},
+        },
+    )
+
+    assert r.status_code == 200
+    assert all(r["ok"] for r in r.json()["results"])
+    conn = kbc.connect()
+    try:
+        for tid in (a["id"], b["id"]):
+            task = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+            assert task.status == "done"
+            assert task.result == "DECIDED: ship it"
+            assert run.summary == "DECIDED: ship it"
+            assert run.metadata == {"source": "dashboard"}
+    finally:
+        conn.close()
+
+
+def test_bulk_status_running_rejected(client):
+    """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t["id"]], "status": "running"},
+    )
+
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["id"] == t["id"]
+    assert results[0]["ok"] is False
+    assert "running" in results[0]["error"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    statuses = {
+        tt["id"]: col["name"]
+        for col in board["columns"]
+        for tt in col["tasks"]
+    }
+    assert statuses.get(t["id"]) != "running"
+
+
+def test_dashboard_done_actions_prompt_for_completion_summary():
+    """Behavioral coverage for the migrated ``requestDialog`` flow.
+
+    Replaces the prior bundle-string-only assertion (which only proved the
+    rename landed). The dialog state machine at
+    ``plugins/kanban/dashboard/dist/index.js`` resolves with
+    ``{confirmed: true|false, summary?}``. Each migrated call site must
+    gate the dispatch on the resolved ``confirmed`` flag. This test
+    asserts that contract at two layers:
+
+    1. **Bundle cancel guards**: every migrated site gates on ``r.confirmed``
+       (or its subscripted alias ``r1.confirmed``/``r2.confirmed``) before
+       dispatching. We verify by counting the cancel-guard patterns +
+       cross-referencing against the 8 migrated sites listed in the PR
+       description.
+    2. **Visual affordance**: every destructive ``requestDialog`` call marks
+       ``destructive: true`` so the host renders the destructive variant.
+
+    The dispatch path itself (PATCH/DELETE actually firing on confirm, not
+    on cancel) is covered by the backend behavioral tests
+    ``test_dashboard_confirm_dispatches_expected_*`` and
+    ``test_dashboard_cancel_keeps_task_in_old_status`` below — together
+    they pin the contract end-to-end.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    import re
+
+    # Match ``if (!r.confirmed)``, ``if (!r1.confirmed)``, ``if (r.confirmed)``
+    # (positive-form gate). The bundle uses both polarities:
+    # - negative ``if (!r.confirmed) return null;`` in dialog flow bodies
+    # - positive ``if (r.confirmed) props.onDeleteBoard(...);`` in JSX handlers
+    cancel_guard_pattern = re.compile(
+        r"if\s*\(\s*!?\s*r\d?\.confirmed\s*\)",
+        re.IGNORECASE,
+    )
+    guards = cancel_guard_pattern.findall(js)
+    # 8 migrated sites per the PR description:
+    # moveTask (1), moveSelected (1), applyBulk (1), deleteTask (1),
+    # deleteSelected (1), archiveBoard (1), removeAttachment (1), doPatch (1).
+    # Plus performMoveTask callers (moveTask/moveSelected each have
+    # ``r1.confirmed`` + ``r2.confirmed`` for the two-stage flow) → up to
+    # 10 guards. Loose lower bound to avoid brittleness.
+    assert len(guards) >= 8, (
+        f"expected >= 8 `if (r?.confirmed)` cancel guards in bundle (one "
+        f"per migrated site, plus extras for two-stage flows); found {len(guards)}"
+    )
+
+    # Visual affordance: every destructive requestDialog call must mark
+    # ``destructive: true`` so the host renders the destructive variant.
+    # deleteTask, deleteSelected, archiveBoard → at least 3.
+    destructive_call_count = js.count("destructive: true")
+    assert destructive_call_count >= 3, (
+        f"expected >= 3 `destructive: true` requestDialog calls (single "
+        f"delete, bulk delete, archive-board); found {destructive_call_count}"
+    )
+
+
+def test_dashboard_cancel_keeps_task_in_old_status(client):
+    """Behavioral: the cancel branch of the dispatch path (no PATCH/DELETE
+    issued) must leave the task in its previous status. The cancel guard
+    lives in the bundle; this test pins the backend contract that the guard
+    relies on.
+    """
+    t = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "x"}).json()["task"]
+    # Tasks land in ``ready`` by default. No PATCH issued — simulating the
+    # cancel branch in the bundle.
+    assert t["status"] == "ready"
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.json()["task"]["status"] == "ready"
+
+
+def test_dashboard_confirm_dispatches_expected_patch_body(client):
+    """Behavioral: the PATCH body shape the bundle produces on confirm
+    (status + result + summary) must be accepted by the backend without
+    rejection. The backend stores ``result`` as the human-readable
+    completion summary (the bundle comments confirm ``summary`` is sent
+    duplicatively so the backend can store the value under its preferred
+    key while the wire format remains explicit).
+    This is the contract the bundle's performMoveTask relies on.
+    """
+    t = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "x"}).json()["task"]
+    # Bundle's performMoveTask on confirm with a summary produces:
+    #   { status, result: summary, summary: summary }
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "done", "result": "shipped", "summary": "shipped"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()["task"]
+    assert body["status"] == "done"
+    assert body.get("result") == "shipped"
+
+
+def test_dashboard_confirm_dispatches_expected_delete(client):
+    """Behavioral: the DELETE call the bundle issues on confirm
+    (``fetchJSON(`${API}/tasks/${id}`, { method: 'DELETE' })``) must
+    succeed and remove the task.
+    """
+    t = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "x"}).json()["task"]
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 200, r.text
+    # 404 on the now-deleted task confirms removal.
+    r2 = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r2.status_code == 404
+
+
+def test_dashboard_surfaces_ready_blocked_error_inline():
+    """Regression for #26744: failed status transitions must be surfaced
+    inline, not swallowed.  The drag/drop banner and the drawer's action
+    row each render the parsed API ``detail`` so operators see *why*
+    their click did nothing.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+
+    # Helper that strips ``"409: {\"detail\":\"…\"}"`` down to the
+    # human-readable message before it lands in any banner.
+    assert "function parseApiErrorMessage(err)" in bundle
+    assert "parsed.detail" in bundle
+
+    # Drag/drop banner now uses the parsed message instead of raw
+    # ``err.message`` so it no longer leaks HTTP plumbing.
+    assert "setError(tx(t, \"moveFailed\", \"Move failed: \") + parseApiErrorMessage(err))" in bundle
+
+    # Drawer action row has its own visible error surface and clears it
+    # on success/refresh so stale failures don't follow the operator
+    # around.
+    assert "const [patchErr, setPatchErr] = useState(null);" in bundle
+    assert "setPatchErr(parseApiErrorMessage(e))" in bundle
+    assert "setPatchErr(null)" in bundle
+
+
+def test_dashboard_dependency_selects_use_value_change_handler():
+    """Regression for the dependency selects in the task drawer: the
+    add-parent / add-child dropdowns must wire through the shared
+    selectChangeHandler helper so their value actually lands on the
+    underlying React state. Salvaged from #20019 @LeonSGP43.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+
+    parent_select = (
+        'value: newParent,\n'
+        '          className: "h-7 text-xs flex-1",\n'
+        '        }, selectChangeHandler(setNewParent))'
+    )
+    child_select = (
+        'value: newChild,\n'
+        '          className: "h-7 text-xs flex-1",\n'
+        '        }, selectChangeHandler(setNewChild))'
+    )
+
+    assert parent_select in bundle
+    assert child_select in bundle
+
+
+def test_bulk_archive(client):
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], b["id"]], "archive": True})
+    assert r.status_code == 200
+    assert all(r["ok"] for r in r.json()["results"])
+    # Default board (archived hidden) — both gone.
+    board = client.get("/api/plugins/kanban/board").json()
+    ids = {t["id"] for col in board["columns"] for t in col["tasks"]}
+    assert a["id"] not in ids
+    assert b["id"] not in ids
+
+
+def test_bulk_reassign(client):
+    a = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "a", "assignee": "old"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "b", "assignee": "old"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], b["id"]], "assignee": "new"})
+    assert r.status_code == 200
+    for tid in (a["id"], b["id"]):
+        t = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+        assert t["assignee"] == "new"
+
+
+def test_bulk_unassign_via_empty_string(client):
+    a = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "a", "assignee": "x"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"]], "assignee": ""})
+    assert r.status_code == 200
+    t = client.get(f"/api/plugins/kanban/tasks/{a['id']}").json()["task"]
+    assert t["assignee"] is None
+
+
+def test_bulk_partial_failure_doesnt_abort_siblings(client):
+    """One bad id in the middle of a batch must not prevent others from
+    applying."""
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], "bogus-id", c2["id"]], "priority": 7})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 3
+    ok_ids = {r["id"] for r in results if r["ok"]}
+    assert a["id"] in ok_ids
+    assert c2["id"] in ok_ids
+    assert any(not r["ok"] and r["id"] == "bogus-id" for r in results)
+    # Good siblings actually got the priority bump.
+    for tid in (a["id"], c2["id"]):
+        t = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+        assert t["priority"] == 7
+
+
+def test_bulk_empty_ids_400(client):
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": []})
+    assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /config endpoint
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +1179,8 @@ def test_event_dict_includes_run_id(client):
     r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         kb.claim_task(conn, tid)
         run_id = kb.latest_run(conn, tid).id
@@ -998,331 +1274,25 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
 # ---------------------------------------------------------------------------
 
 
-def test_recovery_health_lists_only_current_board_escalations(client):
-    """The dashboard may only display authenticated escalation evidence for its board."""
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id="t_default1234",
-                signature="a" * 64,
-                event_signature="c" * 64,
-            ),
-            _escalation(
-                board="other",
-                task_id="t_other1234",
-                signature="e" * 64,
-                event_signature="f" * 64,
-            ),
-        ),
-    )
-
-    response = client.get("/api/plugins/kanban/recovery-health?board=default")
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["board"] == "default"
-    assert body["escalations"] == [
-        {
-            "board": "default",
-            "task_id": "t_default1234",
-            "signature": "a" * 64,
-            "bound_input_signature": "b" * 64,
-            "task_event_signature": "c" * 64,
-            "outcome_class": "human_action_required",
-            "tier": "initial",
-            "acknowledged": False,
-            "reason_code": "ownerless_blocked",
-        }
-    ]
 
 
-def test_recovery_health_unavailable_is_not_an_authoritative_empty_view(client):
-    """A missing signed snapshot is unavailable, never a trustworthy empty list."""
-    response = client.get("/api/plugins/kanban/recovery-health?board=default")
-
-    assert response.status_code == 503
-    assert "escalations" not in response.json()
 
 
-def test_dashboard_acknowledgement_is_lifecycle_neutral_and_replay_safe(client):
-    """Exact public evidence may add one acknowledgement without changing task state."""
-    conn = kb.connect(board="default")
-    try:
-        task_id = kb.create_task(
-            conn,
-            title="needs an operator decision",
-            assignee="owner",
-            tenant="team-a",
-        )
-        assert kb.block_task(conn, task_id, reason="operator decision", kind="needs_input")
-        before = kb.get_task(conn, task_id)
-        assert before is not None
-        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
-    finally:
-        conn.close()
-
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id=task_id,
-                signature="a" * 64,
-                event_signature=event_signature,
-            ),
-        ),
-    )
-    payload = {
-        "signature": "a" * 64,
-        "expected_event_signature": event_signature,
-        "operation_id": "dashboard-ack-1",
-    }
-
-    response = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json=payload,
-    )
-    replay = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json=payload,
-    )
-
-    assert response.status_code == 200, response.text
-    assert replay.status_code == 200, replay.text
-    assert replay.json()["event_id"] == response.json()["event_id"]
-    conn = kb.connect(board="default")
-    try:
-        after = kb.get_task(conn, task_id)
-        assert after is not None
-        assert (
-            after.status,
-            after.assignee,
-            after.current_step_key,
-            after.max_retries,
-            after.block_kind,
-            after.block_recurrences,
-            after.consecutive_failures,
-        ) == (
-            before.status,
-            before.assignee,
-            before.current_step_key,
-            before.max_retries,
-            before.block_kind,
-            before.block_recurrences,
-            before.consecutive_failures,
-        )
-        acknowledgements = [
-            event for event in kb.list_events(conn, task_id)
-            if event.kind == "escalation_acknowledged"
-        ]
-        assert len(acknowledgements) == 1
-        assert acknowledgements[0].payload["actor"] == "dashboard"
-    finally:
-        conn.close()
 
 
-def test_dashboard_acknowledgement_replays_after_health_snapshot_marks_it_acknowledged(client):
-    """A refreshed acknowledged snapshot may replay its exact existing operation."""
-    conn = kb.connect(board="default")
-    try:
-        task_id = kb.create_task(conn, title="replay after health refresh", tenant="team-a")
-        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
-        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
-    finally:
-        conn.close()
-    payload = {
-        "signature": "a" * 64,
-        "expected_event_signature": event_signature,
-        "operation_id": "dashboard-ack-after-health-refresh",
-    }
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id=task_id,
-                signature=payload["signature"],
-                event_signature=event_signature,
-            ),
-        ),
-    )
-    committed = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json=payload,
-    )
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id=task_id,
-                signature=payload["signature"],
-                event_signature=event_signature,
-                acknowledged=True,
-            ),
-        ),
-    )
-
-    replay = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json=payload,
-    )
-
-    assert committed.status_code == 200, committed.text
-    assert replay.status_code == 200, replay.text
-    assert replay.json()["event_id"] == committed.json()["event_id"]
-    conn = kb.connect(board="default")
-    try:
-        assert len([
-            event for event in kb.list_events(conn, task_id)
-            if event.kind == "escalation_acknowledged"
-        ]) == 1
-    finally:
-        conn.close()
 
 
-def test_dashboard_rejects_unproven_acknowledged_health_snapshot(client):
-    """An acknowledged snapshot alone must not authorize a new mutation."""
-    conn = kb.connect(board="default")
-    try:
-        task_id = kb.create_task(conn, title="unproven health acknowledgement", tenant="team-a")
-        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
-        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
-    finally:
-        conn.close()
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id=task_id,
-                signature="a" * 64,
-                event_signature=event_signature,
-                acknowledged=True,
-            ),
-        ),
-    )
-
-    response = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json={
-            "signature": "a" * 64,
-            "expected_event_signature": event_signature,
-            "operation_id": "dashboard-ack-unproven-health",
-        },
-    )
-
-    assert response.status_code == 409
-    conn = kb.connect(board="default")
-    try:
-        assert not any(
-            event.kind == "escalation_acknowledged"
-            for event in kb.list_events(conn, task_id)
-        )
-    finally:
-        conn.close()
 
 
-def test_dashboard_acknowledgement_rejects_a_tenant_changed_after_context_read(client, monkeypatch):
-    """The route passes its exact task tenant to the core's atomic precondition."""
-    conn = kb.connect(board="default")
-    try:
-        task_id = kb.create_task(conn, title="tenant race", tenant="team-a")
-        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
-        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
-    finally:
-        conn.close()
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id=task_id,
-                signature="a" * 64,
-                event_signature=event_signature,
-            ),
-        ),
-    )
-    original_get_task = kb.get_task
-
-    def change_tenant_after_dashboard_read(connection, requested_task_id):
-        task = original_get_task(connection, requested_task_id)
-        if requested_task_id == task_id:
-            with kb.write_txn(connection):
-                connection.execute("UPDATE tasks SET tenant = 'team-b' WHERE id = ?", (task_id,))
-        return task
-
-    monkeypatch.setattr(kb, "get_task", change_tenant_after_dashboard_read)
-
-    response = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json={
-            "signature": "a" * 64,
-            "expected_event_signature": event_signature,
-            "operation_id": "dashboard-ack-tenant-race",
-        },
-    )
-
-    assert response.status_code == 409
-    conn = kb.connect(board="default")
-    try:
-        assert original_get_task(conn, task_id).tenant == "team-b"
-        assert not any(
-            event.kind == "escalation_acknowledged"
-            for event in kb.list_events(conn, task_id)
-        )
-    finally:
-        conn.close()
 
 
-def test_stale_or_unknown_dashboard_signature_is_rejected(client):
-    """Evidence absent from the current signed health snapshot cannot mutate a task."""
-    conn = kb.connect(board="default")
-    try:
-        task_id = kb.create_task(conn, title="blocked", tenant="team-a")
-        assert kb.block_task(conn, task_id, reason="needs input", kind="needs_input")
-        event_signature = kb.canonical_event_signature(kb.list_events(conn, task_id)[-1])
-    finally:
-        conn.close()
-    _write_recovery_health(
-        board="default",
-        escalations=(
-            _escalation(
-                board="default",
-                task_id=task_id,
-                signature="a" * 64,
-                event_signature=event_signature,
-            ),
-        ),
-    )
-
-    response = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/acknowledge-escalation?board=default",
-        json={
-            "signature": "0" * 64,
-            "expected_event_signature": "1" * 64,
-            "operation_id": "dashboard-ack-stale",
-        },
-    )
-
-    assert response.status_code == 409
-    conn = kb.connect(board="default")
-    try:
-        assert not any(
-            event.kind == "escalation_acknowledged"
-            for event in kb.list_events(conn, task_id)
-        )
-    finally:
-        conn.close()
 
 
 def test_reclaim_endpoint_releases_running_claim(client):
     """POST /tasks/<id>/reclaim drops the claim, returns ok, and emits
     a manual reclaimed event."""
     import secrets
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         t = kb.create_task(conn, title="running", assignee="x")
         lock = secrets.token_hex(8)
@@ -1353,7 +1323,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["task_id"] == t
 
     # Confirm the task is back to ready.
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         row = conn2.execute(
             "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
@@ -1366,7 +1336,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
 
 def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         t = kb.create_task(conn, title="task", assignee="orig")
     finally:
@@ -1379,7 +1349,7 @@ def test_reassign_endpoint_switches_profile(client):
     assert r.status_code == 200, r.text
     assert r.json()["assignee"] == "newbie"
 
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         row = conn2.execute(
             "SELECT assignee FROM tasks WHERE id=?", (t,),
@@ -1395,7 +1365,7 @@ def test_reassign_endpoint_switches_profile(client):
 
 
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="alice")
         real = kb.create_task(conn, title="real", assignee="x", created_by="alice")

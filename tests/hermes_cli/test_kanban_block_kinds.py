@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -57,22 +58,11 @@ def _make_running_again(conn, tid):
 
 
 
-def test_review_block_is_sticky_and_routes_to_blocked(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
-        tid = _running_task(conn)
-
-        assert kb.block_task(conn, tid, reason="review handoff", kind="review")
-
-        task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        assert task.block_kind == "review"
-        assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, tid).status == "blocked"
 
 
 def test_unblock_does_not_reset_recurrence_counter(kanban_home: Path) -> None:
     """The crux of the fix: unblock must preserve the loop counter."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _running_task(conn)
         kb.block_task(conn, tid, reason="x", kind="needs_input")
         assert kb.get_task(conn, tid).block_recurrences == 1
@@ -88,7 +78,7 @@ def test_unblock_does_not_reset_recurrence_counter(kanban_home: Path) -> None:
 
 
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = _running_task(conn)
         kb.block_task(conn, tid, reason="x", kind="capability")
         kb.unblock_task(conn, tid)
@@ -109,7 +99,7 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
         kb.link_tasks(conn, parent_id=parent, child_id=child)

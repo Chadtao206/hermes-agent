@@ -617,8 +617,9 @@ def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> b
         raise ToolError("Kanban run binding is malformed") from error
     from hermes_cli import kanban_db
 
+    from hermes_cli import kanban_db_connect as kbc
     operation_id = f"boris-review-submit:{request_id}:{judgment_hash}"
-    with kanban_db.connect_closing(db_path) as connection:
+    with kbc.connect_closing(db_path) as connection:
         return kanban_db.complete_task(
             connection,
             task_id,

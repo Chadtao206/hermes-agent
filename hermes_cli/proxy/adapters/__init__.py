@@ -1,9 +1,4 @@
-"""Upstream adapter registry for the local proxy server.
-
-Each adapter wraps a provider's OAuth state and exposes a uniform interface
-the proxy server can use to forward requests with a freshly-minted bearer
-token. See :class:`UpstreamAdapter` for the contract.
-"""
+"""Upstream adapter registry for the local proxy server (see :class:`UpstreamAdapter`)."""
 
 from typing import Dict, Type
 
@@ -12,8 +7,7 @@ from hermes_cli.proxy.adapters.codex import CodexAdapter
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
-# Registry of available adapter classes keyed by provider name as used on
-# the ``hermes proxy start --provider <name>`` CLI flag.
+# Keyed by the ``hermes proxy start --provider <name>`` value.
 ADAPTERS: Dict[str, Type[UpstreamAdapter]] = {
     "codex": CodexAdapter,
     "nous": NousPortalAdapter,
@@ -22,17 +16,11 @@ ADAPTERS: Dict[str, Type[UpstreamAdapter]] = {
 
 
 def get_adapter(name: str) -> UpstreamAdapter:
-    """Instantiate an adapter by provider name.
-
-    Raises:
-        ValueError: if ``name`` is not a registered adapter.
-    """
+    """Instantiate an adapter by provider name."""
     key = (name or "").strip().lower()
     if key not in ADAPTERS:
         available = ", ".join(sorted(ADAPTERS)) or "(none)"
-        raise ValueError(
-            f"Unknown proxy upstream provider: {name!r}. Available: {available}"
-        )
+        raise ValueError(f"Unknown proxy upstream provider: {name!r}. Available: {available}")
     return ADAPTERS[key]()
 
 

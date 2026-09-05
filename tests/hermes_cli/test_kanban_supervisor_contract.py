@@ -38,7 +38,10 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_guards as kbg
 from hermes_cli import kanban_supervisor as ks
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 # The source-controlled lane artifacts. They live in the repo (unlike the
@@ -54,7 +57,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
+    kbc.init_db()
     return home
 
 
@@ -175,9 +178,10 @@ def test_supervisor_contract_end_to_end_adopts_and_renews(kanban_home, monkeypat
     now = 9_000_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     supervisor_pid = 60606
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == supervisor_pid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == supervisor_pid)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="lane", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         original_expiry = _card_row(conn, tid)["claim_expires"]
@@ -196,7 +200,7 @@ def test_supervisor_contract_end_to_end_adopts_and_renews(kanban_home, monkeypat
     )
     assert _run_cli(["kanban", *argv]) == 0
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         row = _card_row(conn, tid)
         assert row["worker_pid"] == supervisor_pid
         assert row["claim_expires"] > original_expiry
@@ -218,19 +222,20 @@ def test_stale_supervisor_cannot_heartbeat_or_adopt_the_next_run(
     now = 9_100_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     stale_pid, live_pid = 70707, 80808
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == live_pid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_pid)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="superseded", assignee="alice")
         first = kb.claim_task(conn, tid, ttl_seconds=900)
         kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
         second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
         assert second.claim_lock == first.claim_lock
         # The successor's own supervisor owns the card.
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=live_pid,
             expected_run_id=second.current_run_id,
-        ) == kb._OWNERSHIP_RECORDED
+        ) == kbg._OWNERSHIP_RECORDED
         successor_expiry = _card_row(conn, tid)["claim_expires"]
 
     stale_env = ks.supervisor_shim_env(
@@ -248,7 +253,7 @@ def test_stale_supervisor_cannot_heartbeat_or_adopt_the_next_run(
         ),
     ]) != 0
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         row = _card_row(conn, tid)
         assert row["worker_pid"] == live_pid          # not adopted
         assert row["claim_expires"] == successor_expiry  # not renewed
@@ -258,7 +263,7 @@ def test_stale_supervisor_cannot_heartbeat_or_adopt_the_next_run(
         assert ks.adopt_session_ownership(
             conn, tid, worker_pid=stale_pid,
             expected_run_id=first.current_run_id,
-        ) == kb._OWNERSHIP_FENCED
+        ) == kbg._OWNERSHIP_FENCED
         assert _card_row(conn, tid)["worker_pid"] == live_pid
 
 
@@ -270,41 +275,42 @@ def test_adoption_replaces_a_dead_owner_but_never_a_live_one(
     now = 9_200_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     alive = {90909}
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) in alive)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) in alive)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="readopt", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         run_id = task.current_run_id
 
         # Original supervisor recorded, then died.
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=11011, expected_run_id=run_id,
-        ) == kb._OWNERSHIP_RECORDED
+        ) == kbg._OWNERSHIP_RECORDED
 
         # Replacement adopts over the dead pid.
         assert ks.adopt_session_ownership(
             conn, tid, worker_pid=90909, expected_run_id=run_id,
-        ) == kb._OWNERSHIP_REPLACED_DEAD
+        ) == kbg._OWNERSHIP_REPLACED_DEAD
         assert _card_row(conn, tid)["worker_pid"] == 90909
 
         # A third supervisor finds a LIVE owner and is refused.
         assert ks.adopt_session_ownership(
             conn, tid, worker_pid=12012, expected_run_id=run_id,
-        ) == kb._OWNERSHIP_CONFLICT
+        ) == kbg._OWNERSHIP_CONFLICT
         assert _card_row(conn, tid)["worker_pid"] == 90909
 
         # Re-adopting our own pid is a no-op, not a second ownership event.
         assert ks.adopt_session_ownership(
             conn, tid, worker_pid=90909, expected_run_id=run_id,
-        ) == kb._OWNERSHIP_ALREADY_OURS
+        ) == kbg._OWNERSHIP_ALREADY_OURS
         assert len(_events(conn, tid, "ownership_adopted")) == 2
 
 
 def test_resolve_supervised_run_pins_the_card_s_current_run(kanban_home, monkeypatch):
     now = 9_300_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="pin", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         assert ks.resolve_supervised_run(conn, tid) == task.current_run_id
@@ -333,19 +339,20 @@ def test_acquire_session_ownership_recovers_then_refuses_a_live_foreign_owner(
     now = 9_400_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     foreign_pid = 99999
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == foreign_pid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == foreign_pid)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="readopt-flaky", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         run_id = task.current_run_id
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=foreign_pid, expected_run_id=run_id,
-        ) == kb._OWNERSHIP_RECORDED
+        ) == kbg._OWNERSHIP_RECORDED
         adopt_events = len(_events(conn, tid, "ownership_adopted"))
         expiry = _card_row(conn, tid)["claim_expires"]
 
-    real_cc = kb.connect_closing
+    real_cc = kbc.connect_closing
     calls = {"n": 0}
 
     def flaky_cc(*a, **k):
@@ -354,18 +361,18 @@ def test_acquire_session_ownership_recovers_then_refuses_a_live_foreign_owner(
             raise sqlite3.OperationalError("disk I/O error")
         return real_cc(*a, **k)
 
-    monkeypatch.setattr(kb, "connect_closing", flaky_cc)
+    monkeypatch.setattr(kbc, "connect_closing", flaky_cc)
     slept: list[float] = []
     verdict, outcome = ks.acquire_session_ownership(
         tid, board="default", worker_pid=11111, expected_run_id=run_id,
         sleep_fn=slept.append,
     )
     assert verdict == ks.OWNERSHIP_REFUSED
-    assert outcome == kb._OWNERSHIP_CONFLICT
+    assert outcome == kbg._OWNERSHIP_CONFLICT
     assert calls["n"] == 4        # 3 failures + 1 recovery
     assert len(slept) == 3        # slept between each failure, not after success
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         row = _card_row(conn, tid)
         assert row["worker_pid"] == foreign_pid                       # unchanged
         assert row["claim_expires"] == expiry
@@ -380,7 +387,7 @@ def test_acquire_session_ownership_is_unverified_when_the_db_never_recovers(
     def always_raises(*a, **k):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(kb, "connect_closing", always_raises)
+    monkeypatch.setattr(kbc, "connect_closing", always_raises)
     slept: list[float] = []
     verdict, outcome = ks.acquire_session_ownership(
         "t_x", board="default", worker_pid=4242, expected_run_id=7,
@@ -425,7 +432,7 @@ def test_local_supervisor_heartbeat_owns_the_card_end_to_end(
 
     now = 9_500_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="lane-e2e", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         original_expiry = _card_row(conn, tid)["claim_expires"]
@@ -494,7 +501,7 @@ def test_local_supervisor_heartbeat_owns_the_card_end_to_end(
         assert call["env"]["HERMES_KANBAN_CLAIM_LOCK"] == task.claim_lock
         assert call["env"]["HERMES_KANBAN_TASK"] == tid
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         row = _card_row(conn, tid)
         # The supervisor's own long-lived pid owns the card, and the claim was
         # renewed past the window it was claimed under.
@@ -521,17 +528,18 @@ def test_local_supervisor_stands_down_when_its_run_cannot_be_resolved(
     now = 9_600_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     successor_pid = 424242
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == successor_pid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == successor_pid)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="run-unresolved", assignee="alice")
         first = kb.claim_task(conn, tid, ttl_seconds=900)
         kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
         second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=successor_pid,
             expected_run_id=second.current_run_id,
-        ) == kb._OWNERSHIP_RECORDED
+        ) == kbg._OWNERSHIP_RECORDED
         before = _card_row(conn, tid)
         before_pid = before["worker_pid"]
         before_expiry = before["claim_expires"]
@@ -563,7 +571,7 @@ def test_local_supervisor_stands_down_when_its_run_cannot_be_resolved(
     assert shim_calls == []   # no heartbeat/adopt/block was issued
     assert killed == []       # --adopt: the (maybe-successor's) pane is untouched
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         row = _card_row(conn, tid)  # raw SQL, unaffected by the get_task patch
         assert row["worker_pid"] == before_pid == successor_pid
         assert row["claim_expires"] == before_expiry
@@ -584,17 +592,18 @@ def test_local_supervisor_readopt_refuses_after_db_recovers_to_a_live_owner(
     now = 9_700_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     foreign_pid = 99999
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == foreign_pid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == foreign_pid)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="flaky-readopt", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         run_id = task.current_run_id
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=foreign_pid, expected_run_id=run_id,
-        ) == kb._OWNERSHIP_RECORDED
+        ) == kbg._OWNERSHIP_RECORDED
 
-    real_cc = kb.connect_closing
+    real_cc = kbc.connect_closing
     calls = {"n": 0}
 
     def flaky_cc(*a, **k):
@@ -603,7 +612,7 @@ def test_local_supervisor_readopt_refuses_after_db_recovers_to_a_live_owner(
             raise sqlite3.OperationalError("disk I/O error")
         return real_cc(*a, **k)
 
-    monkeypatch.setattr(kb, "connect_closing", flaky_cc)
+    monkeypatch.setattr(kbc, "connect_closing", flaky_cc)
     monkeypatch.setattr(ks.time, "sleep", lambda _s: None)  # acquire's retry sleep
     killed: list = []
     monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
@@ -621,7 +630,7 @@ def test_local_supervisor_readopt_refuses_after_db_recovers_to_a_live_owner(
     assert calls["n"] == 4     # 3 transient failures + 1 recovery that refused
     assert killed == []        # the live owner's pane is left alone
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert _card_row(conn, tid)["worker_pid"] == foreign_pid
         assert len(_events(conn, tid, "ownership_adopted")) == 1
 
@@ -643,17 +652,18 @@ def test_local_supervisor_readopt_refuses_a_superseded_run(
     now = 9_800_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
     live_pid = 51015
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == live_pid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == live_pid)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="readopt-stale", assignee="alice")
         first = kb.claim_task(conn, tid, ttl_seconds=900)
         kb.reclaim_task(conn, tid, signal_fn=lambda *_: None)
         second = kb.claim_task(conn, tid, ttl_seconds=900, claimer=first.claim_lock)
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=live_pid,
             expected_run_id=second.current_run_id,
-        ) == kb._OWNERSHIP_RECORDED
+        ) == kbg._OWNERSHIP_RECORDED
 
     killed: list = []
     monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
@@ -668,7 +678,7 @@ def test_local_supervisor_readopt_refuses_a_superseded_run(
     assert rc == sup.READOPT_REFUSED_EXIT_CODE
     assert killed == []  # the live successor's pane is untouched
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert _card_row(conn, tid)["worker_pid"] == live_pid
         assert len(_events(conn, tid, "ownership_adopted")) == 1
 
@@ -684,9 +694,10 @@ def test_local_supervisor_stands_down_when_a_foreign_owner_appears_mid_run(
 
     now = 9_900_000
     monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="standdown", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
 
@@ -709,7 +720,7 @@ def test_local_supervisor_stands_down_when_a_foreign_owner_appears_mid_run(
     ]) == 0
     assert killed, "supervisor should have stood down and killed its own pane"
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         # The adoption itself did land first — this is a stand-down, not a
         # refusal to adopt.
         assert len(_events(conn, tid, "ownership_adopted")) == 1
@@ -780,7 +791,7 @@ def test_pin_supervised_run_distinguishes_transient_from_hard_failure(
     readable (retry later, leave the pane); a card with no run never will. The
     old code collapsed both into ``run_id = None`` and carried on unfenced."""
     monkeypatch.setattr(kb.time, "time", lambda: 9_950_000)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="pin", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
 
@@ -792,7 +803,7 @@ def test_pin_supervised_run_distinguishes_transient_from_hard_failure(
     def unopenable(*a, **k):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(kb, "connect_closing", unopenable)
+    monkeypatch.setattr(kbc, "connect_closing", unopenable)
     with pytest.raises(ks.SupervisorRunUnresolved) as ei:
         ks.pin_supervised_run(tid, board="default")
     assert ei.value.transient is True
@@ -806,20 +817,21 @@ def test_acquire_session_ownership_holds_after_replacing_a_dead_owner(
     readopt path exists precisely to take over from the dead original."""
     monkeypatch.setattr(kb.time, "time", lambda: 10_000_000)
     replacement = 90909
+    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: int(pid) == replacement)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == replacement)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="dead-owner", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
-        assert kb.adopt_worker_pid(
+        assert kbg.adopt_worker_pid(
             conn, tid, worker_pid=11011, expected_run_id=task.current_run_id,
-        ) == kb._OWNERSHIP_RECORDED  # the original supervisor, since died
+        ) == kbg._OWNERSHIP_RECORDED  # the original supervisor, since died
 
     verdict, outcome = ks.acquire_session_ownership(
         tid, board="default", worker_pid=replacement,
         expected_run_id=task.current_run_id, sleep_fn=lambda _s: None,
     )
-    assert (verdict, outcome) == (ks.OWNERSHIP_HELD, kb._OWNERSHIP_REPLACED_DEAD)
-    with kb.connect() as conn:
+    assert (verdict, outcome) == (ks.OWNERSHIP_HELD, kbg._OWNERSHIP_REPLACED_DEAD)
+    with kbc.connect() as conn:
         assert _card_row(conn, tid)["worker_pid"] == replacement
 
 
@@ -829,7 +841,7 @@ def test_adoption_itself_refuses_an_unfenced_run(kanban_home, monkeypatch, bad):
     it must never run without a run fence: unfenced, a leftover supervisor
     stamps itself onto whatever run happens to be current."""
     monkeypatch.setattr(kb.time, "time", lambda: 10_050_000)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unfenced-adopt", assignee="alice")
         kb.claim_task(conn, tid, ttl_seconds=900)
         with pytest.raises(ks.SupervisorRunUnresolved):
@@ -878,18 +890,18 @@ def test_local_supervisor_readopt_defers_when_ownership_is_unverifiable(
     sup = _load_script(SC_SUPERVISOR, "sc_supervisor_unverified")
     monkeypatch.setattr(kb.time, "time", lambda: 10_150_000)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unverifiable", assignee="alice")
         task = kb.claim_task(conn, tid, ttl_seconds=900)
         before = _card_row(conn, tid)
         before_pid, before_expiry = before["worker_pid"], before["claim_expires"]
 
-    real_cc = kb.connect_closing
+    real_cc = kbc.connect_closing
 
     def never_opens(*a, **k):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(kb, "connect_closing", never_opens)
+    monkeypatch.setattr(kbc, "connect_closing", never_opens)
     monkeypatch.setattr(ks.time, "sleep", lambda _s: None)  # acquire's retry sleep
     killed, shim_calls = [], []
     monkeypatch.setattr(sup, "_tmux_kill", lambda *a, **k: killed.append(a))
@@ -908,8 +920,8 @@ def test_local_supervisor_readopt_defers_when_ownership_is_unverifiable(
 
     # Restore only the connection factory: monkeypatch.undo() would also revert
     # the kanban_home fixture and point these assertions at the LIVE board.
-    monkeypatch.setattr(kb, "connect_closing", real_cc)
-    with kb.connect() as conn:
+    monkeypatch.setattr(kbc, "connect_closing", real_cc)
+    with kbc.connect() as conn:
         row = _card_row(conn, tid)
         assert row["worker_pid"] == before_pid          # still unowned
         assert row["claim_expires"] == before_expiry

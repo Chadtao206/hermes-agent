@@ -10,6 +10,7 @@ import logging
 import threading
 from typing import FrozenSet, Optional
 
+from agent.codex_headers import codex_cloudflare_headers
 from agent.credential_pool import CredentialPool, PooledCredential, load_pool
 from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
@@ -115,15 +116,10 @@ class CodexAdapter(UpstreamAdapter):
         )
         base_url = str(base_url or DEFAULT_CODEX_BASE_URL).strip().rstrip("/")
 
-        # Lazy import: agent.auxiliary_client is a large (~5800-line) module and
-        # the adapter registry imports every adapter eagerly — importing it at
-        # module load would burden nous/xai-only proxy runs. No import cycle.
-        from agent.auxiliary_client import codex_cloudflare_headers
-
         return UpstreamCredential(
             bearer=bearer,
             base_url=base_url or DEFAULT_CODEX_BASE_URL,
-            extra_headers=codex_cloudflare_headers(bearer),
+            extra_headers=codex_cloudflare_headers(bearer, base_url=base_url or DEFAULT_CODEX_BASE_URL),
             expires_at=getattr(entry, "expires_at", None),
         )
 

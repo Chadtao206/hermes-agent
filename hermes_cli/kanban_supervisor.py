@@ -52,7 +52,10 @@ import time
 from typing import Any, Callable, Mapping, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_guards as kbg
 
+
+from hermes_cli import kanban_db_connect as kbc
 __all__ = [
     "SUPERVISOR_CONTRACT_ENV_KEYS",
     "OWNERSHIP_HELD_OUTCOMES",
@@ -85,9 +88,9 @@ SUPERVISOR_CONTRACT_ENV_KEYS = (
 
 # Adoption outcomes that mean "this pid is the card's recorded owner".
 OWNERSHIP_HELD_OUTCOMES = (
-    kb._OWNERSHIP_RECORDED,
-    kb._OWNERSHIP_REPLACED_DEAD,
-    kb._OWNERSHIP_ALREADY_OURS,
+    kbg._OWNERSHIP_RECORDED,
+    kbg._OWNERSHIP_REPLACED_DEAD,
+    kbg._OWNERSHIP_ALREADY_OURS,
 )
 
 # The three verdicts :func:`acquire_session_ownership` can return. They are
@@ -267,7 +270,7 @@ def pin_supervised_run(
     if run_id is not None:
         return require_run_id(run_id)
     try:
-        with kb.connect_closing(board=board) as conn:
+        with kbc.connect_closing(board=board) as conn:
             return resolve_supervised_run(conn, task_id)
     except SupervisorRunUnresolved:
         raise
@@ -296,7 +299,7 @@ def adopt_session_ownership(
     an adoption that is not run-fenced is how a leftover supervisor stamped
     itself onto a successor run.
     """
-    return kb.adopt_worker_pid(
+    return kbg.adopt_worker_pid(
         conn, task_id,
         worker_pid=int(worker_pid),
         expected_run_id=require_run_id(expected_run_id),
@@ -342,7 +345,7 @@ def acquire_session_ownership(
     tries = max(1, int(attempts))
     for attempt in range(tries):
         try:
-            with kb.connect_closing(board=board) as conn:
+            with kbc.connect_closing(board=board) as conn:
                 outcome = adopt_session_ownership(
                     conn, task_id, worker_pid=pid, expected_run_id=run_id,
                 )

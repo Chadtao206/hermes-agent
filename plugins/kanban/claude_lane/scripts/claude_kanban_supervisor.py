@@ -26,6 +26,33 @@ import subprocess
 import sys
 import time
 
+# Put the checkout root on sys.path OURSELVES before touching the core.
+# The venv's editable finder maps only the top-level modules that existed when
+# it was generated; after an upstream update added ``hermes_state_common`` (and
+# siblings) that ``hermes_state`` imports, ``kanban_db.connect()``'s lazy
+# ``from hermes_state import ...`` raised ModuleNotFoundError inside every
+# gateway-spawned supervisor (no PYTHONPATH, sys.path[0] = ~/.hermes/scripts).
+# ``_read_card`` swallowed it, every tick returned "continue", and ten lanes ran
+# for days on interactive dialogs while heartbeating (2026-09-04). The gateway
+# itself is immune because hermes_cli/main.py does exactly this insert.
+def _bootstrap_checkout_root():
+    candidates = [os.path.dirname(sys.prefix),  # <root>/venv -> <root>
+                  os.path.expanduser("~/.hermes/hermes-agent")]
+    for root in candidates:
+        if (os.path.isfile(os.path.join(root, "hermes_state.py"))
+                and os.path.isdir(os.path.join(root, "hermes_cli"))):
+            if root not in sys.path:
+                # Append, never prepend: the editable finder already maps the
+                # top-level modules it knows, this only has to make the NEW
+                # siblings importable. Prepending would also shadow an explicit
+                # PYTHONPATH/cwd, which the rollout tests rely on to stub the core.
+                sys.path.append(root)
+            return root
+    return None
+
+
+_CHECKOUT_ROOT = _bootstrap_checkout_root()
+
 # The core ownership contract. Imported defensively so this file stays
 # importable — and ``--help``-able, and collectable by pytest — against a core
 # checkout that predates ``hermes_cli.kanban_supervisor``. That combination is
@@ -37,9 +64,11 @@ try:
     from hermes_cli.kanban_db import (
         KANBAN_RATE_LIMIT_EXIT_CODE,
         worker_log_path,
-        connect_closing,
         get_task,
     )
+    # kanban_db split upstream (Sep 2026; shim removed 2026-09-14): connect helpers
+    # moved to kanban_db_connect.
+    from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli.kanban_supervisor import (
         OWNERSHIP_HELD,
         OWNERSHIP_REFUSED,
@@ -155,7 +184,16 @@ def caller_decision(read_ok, card, my_pid, transcript_tail, idle_seconds, elapse
     evidence, and that is what this rejects.
     """
     if not read_ok:
-        return ("continue", None)  # transient read failure: do NOT act this tick
+        # Transient read failure: do NOT act on the card's identity this tick.
+        # But the time budgets do not depend on the card, and a read that fails
+        # for the WHOLE budget (2026-09-04: a ModuleNotFoundError swallowed on
+        # every tick for weeks) must still end the lane — otherwise it runs
+        # forever while its heartbeat keeps the dispatcher's reclaim at bay.
+        if elapsed >= max_runtime:
+            return ("block", f"claude-lane timeout after {int(elapsed)}s (card unreadable)")
+        if idle_seconds >= idle_timeout:
+            return ("block", f"claude-lane idle for {int(idle_seconds)}s with no progress (card unreadable)")
+        return ("continue", None)
     status = getattr(card, "status", "running") if card else None
     if card is None:
         return ("terminal", None)  # genuinely absent
@@ -199,6 +237,16 @@ def _tmux_capture(tmux_bin, socket, session, lines=120):
         return p.stdout if p.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def _append_worker_log(log_path, text):
+    """Best-effort redacted append to the worker log (diagnostics only)."""
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "ab") as f:
+            f.write(redact_sensitive_text(text, force=True).encode("utf-8", "replace"))
+    except Exception:
+        pass
 
 
 def _tmux_alive(tmux_bin, socket, session):
@@ -260,18 +308,29 @@ def _hermes_task_shim(task, board, *args, run_id, claim_lock=None):
     subprocess.run([shim, *args], capture_output=True, env=env)
 
 
+# Last exception swallowed by _read_card (text), or None after a good read. The
+# main loop logs it (rate-limited) so a persistently blind watchdog leaves a
+# trail in the worker log instead of failing silently for weeks.
+LAST_READ_ERROR = None
+
+
 def _read_card(board, task_id):
     """Read the card. Returns (read_ok, card).
 
     read_ok is False ONLY on an exception (e.g. SQLite 'disk I/O error' from
     transient WAL contention) — the caller must NOT treat that as 'card gone'
     and kill the live session. read_ok is True when the read completed, in
-    which case card may be None only if the card is genuinely absent.
+    which case card may be None only if the card is genuinely absent. The
+    exception text is kept in LAST_READ_ERROR for the caller to log.
     """
+    global LAST_READ_ERROR
     try:
         with connect_closing(board=board) as conn:
-            return True, get_task(conn, task_id)
-    except Exception:
+            card = get_task(conn, task_id)
+        LAST_READ_ERROR = None
+        return True, card
+    except Exception as exc:
+        LAST_READ_ERROR = f"{exc.__class__.__name__}: {exc}"
         return False, None
 
 
@@ -421,6 +480,7 @@ def main(argv):
     ever_progressed = False  # has the transcript EVER grown? distinguishes a
     # cold-start flake (claude wrote nothing) from a genuine mid-run pane death.
     last_hb = 0.0
+    last_read_err_log = 0.0
 
     # import state lazily (lives in the plugin dir; supervisor finds it via the path we add)
     sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/claude-kanban-lane"))
@@ -452,6 +512,11 @@ def main(argv):
             ever_progressed = True
 
         read_ok, card = _read_card(board, a.task)
+        if not read_ok and now - last_read_err_log >= 600:
+            _append_worker_log(log_path,
+                               f"\n--- supervisor: card read failed ({LAST_READ_ERROR}); "
+                               f"watchdog is running on time budgets only ---\n")
+            last_read_err_log = now
 
         action, reason = caller_decision(
             read_ok, card, my_pid, transcript_tail=tail,

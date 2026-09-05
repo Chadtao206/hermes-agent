@@ -151,7 +151,7 @@ def _run(deps: LoopDeps, *, should_stop: Callable[[], bool],
         except Exception as error:  # noqa: BLE001 - a bad tick must not kill the loop
             sys.stderr.write(f"pr_remediation: tick error: {error}\n")
             sys.stderr.flush()
-        heartbeat.write_text(f"{time.time():.0f}")
+        heartbeat.write_text(f"{time.time():.0f}", encoding="utf-8")
         sleep(deps.cfg.poll_seconds)
 
 

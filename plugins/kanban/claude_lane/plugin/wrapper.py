@@ -12,6 +12,12 @@ import time
 
 import hermes_cli.kanban_db as kdb
 
+# kanban_db was split upstream (Sep 2026; private-name shim removed 2026-09-14): the
+# dispatcher calls ``_default_spawn`` as a kanban_db_dispatch global, so the wrap must
+# land on that module when it exists, and connect helpers now live in kanban_db_connect.
+from hermes_cli import kanban_db_dispatch as _dispatch_mod
+from hermes_cli import kanban_db_connect as _connect_mod
+
 try:
     from . import config, launcher, router, state
 except ImportError:  # pragma: no cover
@@ -46,8 +52,8 @@ def _signature_ok(fn):
 
 
 def install_wrap():
-    """Wrap kdb._default_spawn once, signature-guarded. Returns True if wrapped/already; False if skipped."""
-    orig = kdb._default_spawn
+    """Wrap _dispatch_mod._default_spawn once, signature-guarded. Returns True if wrapped/already; False if skipped."""
+    orig = _dispatch_mod._default_spawn
     if getattr(orig, "__claude_lane_wrapped__", False):
         return True
     if not _signature_ok(orig):
@@ -70,7 +76,7 @@ def install_wrap():
 
     _wrapped_spawn.__claude_lane_wrapped__ = True
     _wrapped_spawn.__claude_lane_orig__ = orig
-    kdb._default_spawn = _wrapped_spawn
+    _dispatch_mod._default_spawn = _wrapped_spawn
     logger.info("claude-kanban-lane: _default_spawn wrapped")
     return True
 
@@ -229,7 +235,7 @@ def readopt():
         active.add(task_id)
         sidecar = state.session_load(task_id) or {}
         try:
-            with kdb.connect_closing(board=board) as conn:
+            with _connect_mod.connect_closing(board=board) as conn:
                 card = kdb.get_task(conn, task_id)
             read_ok = True  # the query completed (card may be None if absent)
         except Exception:

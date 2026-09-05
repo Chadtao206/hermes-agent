@@ -3,13 +3,16 @@ import inspect
 import types
 import wrapper
 
+# kanban_db split upstream (Sep 2026; no shim for the dispatcher's private names,
+# removed 2026-09-14): _default_spawn is read/patched on the module the dispatcher uses.
+from hermes_cli import kanban_db_dispatch as kdb
+
 
 def _fake_default_spawn(task, workspace, *, board=None):
     return 111  # native pid
 
 
 def test_install_wrap_idempotent_and_signature_preserved(monkeypatch):
-    import hermes_cli.kanban_db as kdb
     monkeypatch.setattr(kdb, "_default_spawn", _fake_default_spawn, raising=True)
     assert wrapper.install_wrap() is True
     assert getattr(kdb._default_spawn, "__claude_lane_wrapped__", False) is True
@@ -20,7 +23,6 @@ def test_install_wrap_idempotent_and_signature_preserved(monkeypatch):
 
 
 def test_wrapper_routes_native_when_not_lane(monkeypatch):
-    import hermes_cli.kanban_db as kdb
     monkeypatch.setattr(kdb, "_default_spawn", _fake_default_spawn, raising=True)
     monkeypatch.setattr(wrapper.router, "should_use_lane", lambda task: False)
     wrapper.install_wrap()
@@ -29,7 +31,6 @@ def test_wrapper_routes_native_when_not_lane(monkeypatch):
 
 
 def test_wrapper_routes_lane_when_eligible(monkeypatch):
-    import hermes_cli.kanban_db as kdb
     monkeypatch.setattr(kdb, "_default_spawn", _fake_default_spawn, raising=True)
     monkeypatch.setattr(wrapper.router, "should_use_lane", lambda task: True)
     monkeypatch.setattr(wrapper.launcher, "launch_lane", lambda task, ws, board: 999)
@@ -39,8 +40,6 @@ def test_wrapper_routes_lane_when_eligible(monkeypatch):
 
 
 def test_install_wrap_bails_on_signature_drift(monkeypatch):
-    import hermes_cli.kanban_db as kdb
-
     def drifted(task, workspace):  # no keyword-only board
         return 1
     monkeypatch.setattr(kdb, "_default_spawn", drifted, raising=True)
@@ -86,7 +85,7 @@ def test_readopt_skips_session_on_read_failure(monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("disk I/O error")
 
-    monkeypatch.setattr(wrapper.kdb, "connect_closing", boom)
+    monkeypatch.setattr(wrapper._connect_mod, "connect_closing", boom)
 
     killed = {"n": 0}
     deleted = {"n": 0}
