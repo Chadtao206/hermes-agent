@@ -679,7 +679,6 @@ def test_no_requester_caused_rejection_is_ever_delivered_unthrottled():
     requester_caused = frozenset({
         ReasonCode.PR_NOT_FOUND,
         ReasonCode.PR_NOT_OPEN,
-        ReasonCode.PR_NO_CHECKS,
         ReasonCode.GATE_SNAPSHOT_UNAVAILABLE,
         ReasonCode.ORG_NOT_ALLOWED,
         ReasonCode.IDENTITY_NOT_TRUSTED,

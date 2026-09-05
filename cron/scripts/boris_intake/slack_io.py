@@ -51,17 +51,6 @@ REASON_TEXT = {
     "gate_snapshot_unavailable": (
         "I couldn't capture the required PR check state just now — try again."
     ),
-    # Not a failure and not "try again": GitHub answered, and the answer is that
-    # no checks have been reported for that commit. That is a narrower claim
-    # than "this PR has no CI" -- `gh pr checks` gives the identical zero-check
-    # answer when CI simply has not registered yet, seconds after a push, as
-    # when the repository truly runs none. Says only the narrower, true thing
-    # and stops there: whether a CI-less or not-yet-registered PR should become
-    # reviewable is not this reply's call.
-    "pr_no_checks": (
-        "No checks have been reported for that PR's commit yet, so I can't "
-        "capture the check state I review against."
-    ),
     "pr_not_open": "That PR isn't open.",
     "duplicate": "Already reviewed or in progress at that head.",
     "rate_limited": "Rate limited.",

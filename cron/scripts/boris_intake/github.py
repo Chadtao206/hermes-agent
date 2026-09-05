@@ -159,8 +159,8 @@ _WRAPPER_PREFIX = "ghx_ro:"
 #: widening it to plain `not stdout` would admit a pull request whose required
 #: checks were failing.
 #:
-#: Deliberately not FOUND, and deliberately not GITHUB_UNAVAILABLE. See
-#: `models.SnapshotStatus.NO_CHECKS` for both halves of that decision.
+#: Deliberately not FOUND and deliberately not GITHUB_UNAVAILABLE. The snapshot
+#: caller turns this positive answer into a captured empty Gate Snapshot.
 _NO_CHECKS_PREFIX = "no checks reported on the "
 
 
@@ -524,13 +524,9 @@ def fetch_gate_snapshot(
         no_checks_prefix=_NO_CHECKS_PREFIX,
     )
     if checks.status is GitHubReadStatus.NO_CHECKS:
-        # GitHub answered, and there is nothing to snapshot. Terminal, and the
-        # request stays rejected: a zero-check snapshot would have nothing
-        # blocking and nothing pending, so a pull request whose CI never ran
-        # could be published READY_FOR_HUMAN_REVIEW. Whether a CI-less repository
-        # should be reviewable is Chad's decision to make deliberately.
         return GateSnapshotLookup(
-            SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
+            SnapshotStatus.CAPTURED,
+            snapshot=build_gate_snapshot((), captured_at, {}),
         )
     if checks.status is not GitHubReadStatus.FOUND:
         return _unreadable_snapshot(checks, "the PR checks could not be read")
@@ -581,22 +577,6 @@ def fetch_gate_snapshot(
         dict(item, required=str(item.get("name") or "") in required_names)
         for item in checks.value
     ]
-    if not rows:
-        # F2: refused STRUCTURALLY, not by relying on how `gh` happens to fail.
-        # The stderr shape above is the ONLY thing that made an empty rollup
-        # unreachable before this guard existed -- real `gh` errors instead of
-        # printing `[]` for a zero-check pull request, but that is a
-        # behavioural accident of an external tool, not a guarantee. An exit 0
-        # `[]` on both checks reads is well-formed JSON, passes every guard
-        # above (empty stdout was already excluded from the FOUND `[]`
-        # allowance, but a genuinely empty JSON array is not empty stdout), and
-        # would otherwise reach `build_gate_snapshot([])`, which succeeds: zero
-        # checks means nothing blocking and nothing pending, so the pull
-        # request would publish READY_FOR_HUMAN_REVIEW with CI that never ran.
-        # This makes the safety property independent of an English string.
-        return GateSnapshotLookup(
-            SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
-        )
     try:
         return GateSnapshotLookup(
             SnapshotStatus.CAPTURED,

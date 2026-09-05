@@ -725,31 +725,18 @@ HEAD_OK = proc(stdout=json.dumps({"headRefOid": "a" * 40}))
 ROLLUP = [{"name": "unit-tests", "state": "SUCCESS", "link": "https://ci/unit"}]
 
 
-def test_a_pull_request_with_no_ci_checks_is_terminal_and_not_an_outage():
+def test_a_pull_request_with_no_ci_checks_captures_an_empty_snapshot():
     clock = Clock()
     runner = Runner(HEAD_OK, proc(returncode=1, stderr=NO_CHECKS_STDERR))
 
     capture = snapshot(runner, budget=budget_on(clock))
 
-    assert capture.status is SnapshotStatus.NO_CHECKS
-    assert capture.snapshot is None
+    assert capture.captured
+    assert capture.snapshot.checks == ()
     # Two spawns: the head read, then one checks read. GitHub answered, so there
     # is nothing to retry -- and none of the message's window is spent on it.
     assert runner.spawns == 2
     assert clock.sleeps == []
-
-
-def test_a_no_checks_answer_is_never_an_empty_rollup():
-    """The tempting fix -- give the plain read the `--required` read's
-    empty-stderr allowance so empty stdout becomes `[]` -- would newly admit
-    pull requests that have never been admissible: a zero-check snapshot has
-    nothing blocking and nothing pending, so a repository whose CI never ran
-    could be published READY_FOR_HUMAN_REVIEW. It stays rejected."""
-    capture = snapshot(Runner(HEAD_OK, proc(returncode=1, stderr=NO_CHECKS_STDERR)))
-
-    assert not capture.captured
-    assert capture.snapshot is None
-    assert capture.detail == "the PR has no CI checks to capture"
 
 
 def test_the_no_checks_match_is_positive_never_a_bare_empty_body():
@@ -824,28 +811,15 @@ def test_the_no_checks_match_is_case_insensitive_against_a_gh_reword():
         ),
     ))
 
-    assert capture.status is SnapshotStatus.NO_CHECKS
+    assert capture.captured
+    assert capture.snapshot.checks == ()
 
 
-def test_an_empty_rollup_is_refused_structurally_not_by_relying_on_gh_erroring():
-    """F2: "no path produces a captured snapshot with zero checks" was stated as
-    a binding constraint and does not hold at the code level. An ALLOWED exit
-    code with a well-formed empty JSON array on both the plain and required
-    checks reads passes every guard above it -- `[]` is not empty stdout -- and
-    without this guard would reach `build_gate_snapshot([])`, which succeeds:
-    zero checks means nothing blocking and nothing pending, so a pull request
-    whose CI never ran would publish READY_FOR_HUMAN_REVIEW. The only thing that
-    prevented it before was that real `gh` errors instead of printing `[]` --
-    a behavioural accident of an external tool, not a guarantee."""
+def test_an_empty_rollup_captures_an_empty_snapshot():
     capture = snapshot(Runner(HEAD_OK, proc(stdout="[]"), proc(stdout="[]")))
 
-    assert capture.status is SnapshotStatus.NO_CHECKS
-    assert capture.snapshot is None
-    assert capture.detail == "the PR has no CI checks to capture"
-
-    # The stderr shape must reach the exact same state.
-    stderr_shape = snapshot(Runner(HEAD_OK, proc(returncode=1, stderr=NO_CHECKS_STDERR)))
-    assert stderr_shape.status is SnapshotStatus.NO_CHECKS
+    assert capture.captured
+    assert capture.snapshot.checks == ()
 
 
 def test_a_third_could_not_resolve_shape_is_unavailable_not_absent():
@@ -1155,8 +1129,6 @@ def test_a_lookup_cannot_misrepresent_its_own_payload():
         GateSnapshotLookup(SnapshotStatus.UNAVAILABLE, snapshot=snap)
     with pytest.raises(ValueError):
         GateSnapshotLookup(SnapshotStatus.HEAD_MOVED, snapshot=snap)
-    with pytest.raises(ValueError):
-        GateSnapshotLookup(SnapshotStatus.NO_CHECKS, snapshot=snap)
 
     assert PRLookup(GitHubReadStatus.FOUND, info=info).found
     assert GateSnapshotLookup(SnapshotStatus.CAPTURED, snapshot=snap).captured

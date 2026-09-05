@@ -513,43 +513,21 @@ def test_the_infrastructure_rejection_is_the_one_reported(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# A pull request with no CI checks: truthful, terminal, and throttled like any
-# other ordinary rejection.
+# A pull request with no CI checks is reviewed with the CI gate waived.
 # ---------------------------------------------------------------------------
 
-NO_CHECKS = GateSnapshotLookup(
-    SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
-)
-
-
-def test_a_pull_request_with_no_checks_is_not_reported_as_an_outage(tmp_path):
-    """GitHub answered perfectly, so GITHUB_UNAVAILABLE would be exactly the lie
-    this classification exists to remove -- and it would be an un-throttled
-    "I couldn't reach GitHub" on every post, forever."""
+def test_a_pull_request_with_no_checks_is_admitted_with_ci_waived(tmp_path):
     p, store, calls, captures = _pipeline(tmp_path)
-    p.capture_gate_snapshot = lambda command, at, budget: NO_CHECKS
+    p.capture_gate_snapshot = lambda command, at, budget: CAPTURED
 
     p.handle(normalize(msg()))
 
-    assert store.requests_for_event("C1", "1.0") == ()
+    request, = store.requests_for_event("C1", "1.0")
+    assert request.policy.ignore_ci
+    assert request.gate_snapshot.checks == ()
     record = records(tmp_path)[0]
-    assert record["reasons"] == ["pr_no_checks"]
-    assert record["details"] == ["Ylopo/repo#5 — the PR has no CI checks to capture"]
-    assert len(replies(calls)) == 1
-    assert "no CI checks" in replies(calls)[0]
-    assert "reach GitHub" not in replies(calls)[0]
-
-
-def test_the_no_checks_rejection_is_throttled_like_an_ordinary_one(tmp_path):
-    """An ordinary rejection, not an infrastructure failure: it is deterministic,
-    so repeating it on every post would be pure noise (P3)."""
-    p, store, calls, captures = _pipeline(tmp_path)
-    p.capture_gate_snapshot = lambda command, at, budget: NO_CHECKS
-
-    p.handle(normalize(msg(ts="1.0")))
-    p.handle(normalize(msg(ts="2.0", text="https://github.com/Ylopo/repo/pull/6")))
-
-    assert len(replies(calls)) == 1
+    assert record["decision"] == "accept"
+    assert calls == []
 
 
 def test_a_moved_head_reply_is_throttled_not_guaranteed(tmp_path):

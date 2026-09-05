@@ -79,6 +79,10 @@ def test_create_lane_uses_dedicated_profile_and_gate_aware_idempotency(tmp_path)
     argv = seen["cmd"]
     assert argv[argv.index("--assignee") + 1] == "boris_on_demand"
     assert argv[argv.index("--created-by") + 1] == "boris-slack-intake"
+    # 2026-09-04: Boris cards are short (~5 min) and human-initiated; they must
+    # not queue FIFO behind long engineer fix lanes when slots are contended.
+    assert argv[argv.index("--priority") + 1] == str(dispatch.LANE_PRIORITY)
+    assert dispatch.LANE_PRIORITY > 0
     assert argv[argv.index("--idempotency-key") + 1] == (
         request.review_identity + ":gate=" + request.gate_snapshot.fingerprint
     )

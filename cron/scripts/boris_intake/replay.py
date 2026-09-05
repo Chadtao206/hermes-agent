@@ -110,7 +110,6 @@ def main() -> int:
                         if not capture.captured:
                             reason = (
                                 "gate_snapshot_unavailable" if capture.head_moved
-                                else "pr_no_checks" if capture.no_checks
                                 else "github_unavailable"
                             )
                             tally[reason] += 1

@@ -444,13 +444,9 @@ def test_replay_gives_each_message_its_own_real_retry_window(monkeypatch, tmp_pa
     assert pr_budgets[0] is not pr_budgets[1]
 
 
-def test_replay_reports_a_no_checks_pull_request_the_way_the_daemon_does(
+def test_replay_proposes_a_no_checks_pull_request_the_way_the_daemon_does(
     monkeypatch, capsys, tmp_path
 ):
-    """The preflight's whole value is that its rejection mix matches the
-    daemon's, so every reason code the daemon can produce has to exist here too.
-    `github_unavailable` for a pull request with no CI would overstate an outage
-    in exactly the run someone reads to decide whether to go live."""
     from boris_intake import replay
 
     audit_path = tmp_path / "replay-audit.jsonl"
@@ -488,7 +484,10 @@ def test_replay_reports_a_no_checks_pull_request_the_way_the_daemon_does(
     ))
     monkeypatch.setattr(replay, "fetch_gate_snapshot", lambda *args, **kwargs: (
         GateSnapshotLookup(
-            SnapshotStatus.NO_CHECKS, detail="the PR has no CI checks to capture"
+            SnapshotStatus.CAPTURED,
+            snapshot=GateSnapshot(
+                "sha256:empty", "2026-08-18T00:00:00Z", ()
+            ),
         )
     ))
     monkeypatch.setattr(replay.sys, "argv", [
@@ -499,10 +498,12 @@ def test_replay_reports_a_no_checks_pull_request_the_way_the_daemon_does(
     assert replay.main() == 0
 
     output = capsys.readouterr().out
-    assert "REJECT Ylopo/one#1" in output
-    assert "pr_no_checks" in output
-    assert "github_unavailable" not in output
+    assert "PROPOSE Ylopo/one#1" in output
     record = json.loads(audit_path.read_text().splitlines()[0])
-    assert record["decision"] == "reject"
-    assert record["reasons"] == ["pr_no_checks"]
-    assert record["details"] == ["Ylopo/one#1 — the PR has no CI checks to capture"]
+    assert record["decision"] == "accept"
+    assert record["requests"] == [{
+        "pr": "Ylopo/one#1",
+        "head_sha": "1" * 40,
+        "gate_fingerprint": "sha256:empty",
+    }]
+    assert record["reasons"] == []

@@ -31,14 +31,6 @@ class ReasonCode(str, Enum):
     #: GitHubReadStatus).
     GITHUB_UNAVAILABLE = "github_unavailable"
     GATE_SNAPSHOT_UNAVAILABLE = "gate_snapshot_unavailable"
-    #: GitHub answered, authoritatively, that the pull request's branch has no
-    #: checks at all, so no exact-head Gate Snapshot exists to capture. Terminal
-    #: and NOT retryable, and deliberately not GITHUB_UNAVAILABLE: GitHub
-    #: answered perfectly, and saying otherwise is the exact lie this whole
-    #: classification exists to remove. Whether a CI-less repository should be
-    #: reviewable at all is a product decision, so the request stays rejected --
-    #: see `SnapshotStatus.NO_CHECKS`.
-    PR_NO_CHECKS = "pr_no_checks"
     PR_NOT_OPEN = "pr_not_open"
     UNKNOWN_FLAG = "unknown_flag"
     DUPLICATE = "duplicate"
@@ -154,10 +146,9 @@ class GitHubReadStatus(str, Enum):
     NO_CHECKS is the one answer that is neither a payload nor a failure: GitHub
     said, authoritatively, that the branch has no checks. Only a `pr checks`
     read can produce it (`pr view` is never asked the question), and it is
-    UNAVAILABLE's opposite -- a perfectly good answer that simply is not a
-    snapshot. It is kept out of FOUND on purpose: `FOUND, value=[]` would build
-    a Gate Snapshot with zero checks, and nothing blocking plus nothing pending
-    would admit a pull request whose CI never ran.
+    UNAVAILABLE's opposite. It stays distinct from FOUND so the caller can
+    intentionally build an empty Gate Snapshot without treating arbitrary empty
+    stdout as a trustworthy check rollup.
     """
 
     FOUND = "found"
@@ -297,30 +288,16 @@ class SnapshotStatus(str, Enum):
     commonest legitimate reason a capture refuses. Reporting it as GitHub being
     unavailable would be a fresh lie pointing the opposite way, and retrying it
     would slow the loop's commonest legitimate path down for nothing.
-
-    NO_CHECKS is the second refusal that was never an outage, and it used to be
-    reported as one: `gh pr checks --json ...` answers exit 1 with empty stdout
-    and `no checks reported on the '<branch>' branch` for a pull request whose
-    repository has no CI, which fell through to `json.loads("")` and read as
-    UNAVAILABLE-retryable. That said something false about the world (GitHub
-    answered), replied on every post (GITHUB_UNAVAILABLE bypasses the reply
-    cooldown), and spent three spawns retrying a deterministic answer. It is
-    terminal, never retried, and keeps the request rejected: admitting it would
-    build a snapshot with zero checks, which nothing blocking and nothing
-    pending would publish as READY_FOR_HUMAN_REVIEW on a pull request whose CI
-    never ran. Whether a CI-less repository is reviewable is a product decision,
-    not a side effect of classifying a read.
     """
 
     CAPTURED = "captured"
     HEAD_MOVED = "head_moved"
-    NO_CHECKS = "no_checks"
     UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
 class GateSnapshotLookup:
-    """The four-state result of one exact-head Gate Snapshot capture.
+    """The three-state result of one exact-head Gate Snapshot capture.
 
     Retry-eligibility is not restated here either, for the reason `PRLookup`
     gives: `github._read_json` acts on `_Read.retryable` and nothing outside it
@@ -344,10 +321,6 @@ class GateSnapshotLookup:
     @property
     def head_moved(self) -> bool:
         return self.status is SnapshotStatus.HEAD_MOVED
-
-    @property
-    def no_checks(self) -> bool:
-        return self.status is SnapshotStatus.NO_CHECKS
 
     @property
     def unavailable(self) -> bool:

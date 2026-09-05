@@ -16,6 +16,12 @@ REPO = "/Users/ctao/.hermes/hermes-agent"
 HERMES_HOME = "/Users/ctao/.hermes"
 CREATED_BY = "boris-slack-intake"
 KANBAN_DB = "/Users/ctao/.hermes/kanban.db"
+# Dispatch priority for Boris review lanes. The kanban dispatcher orders the
+# ready queue by priority DESC, created_at ASC; everything else on the board is
+# priority 0. A Boris review is short (~5 min) and someone is waiting in Slack
+# for it, so it must not sit FIFO behind long-running engineer fix lanes when
+# in-flight slots are contended (2026-09-04: three reviews starved 70+ min).
+LANE_PRIORITY = 10
 
 #: Statuses that mean a lane is finished. Anything else counts as in flight.
 TERMINAL_STATUSES = ("done", "archived", "blocked")
@@ -70,6 +76,8 @@ def create_lane(
         "boris_on_demand",
         "--created-by",
         CREATED_BY,
+        "--priority",
+        str(LANE_PRIORITY),
         "--idempotency-key",
         idempotency_key,
         "--json",

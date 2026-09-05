@@ -351,8 +351,7 @@ def test_the_outage_reply_says_what_a_reader_can_do_about_it():
 
 def test_the_missing_pr_reply_is_unchanged():
     """`pr_not_found` still means the pull request does not exist, and its text
-    must keep saying exactly that -- the new reason is what took over the
-    "couldn't check" case."""
+    must keep saying exactly that rather than claim GitHub is unavailable."""
     calls, call = recorder()
     SlackIO(call, "t", dry_run=False).reply_rejection(
         "C1", "1.0", Rejection(ReasonCode.PR_NOT_FOUND, "Ylopo/repo#5")
@@ -361,43 +360,3 @@ def test_the_missing_pr_reply_is_unchanged():
     assert calls[0][1]["text"] == (
         "I couldn't find that PR (or I can't see it). (Ylopo/repo#5)"
     )
-
-
-def test_the_no_checks_reply_says_what_is_true_and_does_not_invite_a_retry():
-    """GitHub answered, so this reply must not blame GitHub, must not claim the
-    PR is missing, and must not tell the reader to post the link again -- nothing
-    about posting it again would change the answer."""
-    calls, call = recorder()
-
-    SlackIO(call, "t", dry_run=False).reply_rejection(
-        "C1", "1.0", Rejection(
-            ReasonCode.PR_NO_CHECKS, "Ylopo/repo#5 — the PR has no CI checks to capture"
-        )
-    )
-
-    text = calls[0][1]["text"]
-    assert "Ylopo/repo#5" in text
-    for wrong in ("couldn't find", "reach GitHub", "try again", "post the link again"):
-        assert wrong not in text, f"{wrong!r} should not be in: {text!r}"
-
-
-def test_the_no_checks_reply_says_not_reported_yet_not_that_ci_is_absent():
-    """F3: `gh pr checks` gives the identical zero-check answer whether a
-    repository genuinely runs no CI or a review was requested seconds after a
-    push and CI has not registered yet. The reply must say the narrower, always
-    true thing -- no checks reported for that commit -- not assert the wider
-    claim that could be false."""
-    calls, call = recorder()
-
-    SlackIO(call, "t", dry_run=False).reply_rejection(
-        "C1", "1.0", Rejection(
-            ReasonCode.PR_NO_CHECKS, "Ylopo/repo#5 — the PR has no CI checks to capture"
-        )
-    )
-
-    text = calls[0][1]["text"]
-    base = text.split(" (", 1)[0]
-    assert "no checks have been reported" in base.lower()
-    assert "yet" in base.lower()
-    assert "has no CI" not in base
-    assert "no CI checks" not in base
