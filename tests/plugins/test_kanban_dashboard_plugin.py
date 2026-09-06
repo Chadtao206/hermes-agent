@@ -62,40 +62,6 @@ def client(kanban_home):
     return TestClient(app)
 
 
-def _write_recovery_health(*, board: str, escalations: tuple[dict[str, object], ...]):
-    """Write a real authenticated public snapshot for dashboard boundary tests."""
-    from hermes_cli.kanban_recovery_health import (
-        BoardRecoveryHealth,
-        PublicEscalation,
-        RecoveryHealthSnapshot,
-        REQUIRED_COUNTERS,
-        write_recovery_health,
-    )
-
-    boards = {board, *(str(item["board"]) for item in escalations)}
-    snapshot = RecoveryHealthSnapshot(
-        schema_version=1,
-        revision=0,
-        recorded_at=int(time.time()),
-        boards=tuple(
-            BoardRecoveryHealth(
-                board=slug,
-                review_mode="shadow",
-                transient_mode="shadow",
-                census_healthy=True,
-                ownerless_blocked_count=0,
-                multiply_owned_blocked_count=0,
-                validated_config_digest="d" * 64,
-                counters={name: 0 for name in REQUIRED_COUNTERS},
-            )
-            for slug in sorted(boards)
-        ),
-        escalations=tuple(PublicEscalation(**item) for item in escalations),
-        checksum="",
-    )
-    write_recovery_health(snapshot)
-
-
 def _escalation(
     *,
     board: str,
@@ -257,10 +223,6 @@ async function tick() {
         env={**os.environ, "DASHBOARD_BUNDLE": str(bundle)},
     )
     return json.loads(result.stdout)
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1272,20 +1234,6 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
 # ---------------------------------------------------------------------------
 # Recovery endpoints (reclaim + reassign) and warnings field
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_reclaim_endpoint_releases_running_claim(client):
