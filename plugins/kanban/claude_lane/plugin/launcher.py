@@ -214,8 +214,12 @@ def launch_lane(task, workspace, board):
     # --strict-mcp-config: ignore all discovered MCP servers (we pass none), so an
     # unattended session never blocks on an MCP-approval prompt; also shrinks the
     # locked-down blast radius (no third-party MCP tools).
+    # --disallowedTools AskUserQuestion: an unattended pane has nobody to answer
+    # a multiple-choice dialog; four lanes sat on one for days (2026-09-04).
+    # Bypass mode does not suppress the tool, so remove it from the session.
     argv = [claude, "--model", alias, "--permission-mode", "bypassPermissions",
             "--mcp-config", mcp_cfg, "--strict-mcp-config",
+            "--disallowedTools", "AskUserQuestion",
             "--session-id", session_id, "--append-system-prompt", persona, body]
 
     _tmux_new_session(tmux_bin=cfg["tmux_bin"], socket=cfg["socket"], session=session,

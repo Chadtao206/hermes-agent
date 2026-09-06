@@ -107,3 +107,33 @@ def test_launch_lane_kills_pane_and_reraises_on_spawn_failure(monkeypatch, tmp_p
     # the just-created pane was killed (so native fallback doesn't double-run)
     assert killed.get("session") == created.get("session")
     assert created.get("session", "").startswith("hermes-kanban-default-t_1")
+
+
+def test_launch_lane_disallows_ask_user_question(monkeypatch, tmp_path):
+    # 2026-09-04: four of ten wedged lanes were parked on an AskUserQuestion
+    # dialog nobody can answer in an unattended tmux pane. Bypass mode does not
+    # suppress that tool; removing it from the session does.
+    import launcher, types
+    recorded = {}
+    t = types.SimpleNamespace(id="t_q", assignee="engineer", tenant=None, branch_name=None,
+                              current_run_id=7, claim_lock=None, max_runtime_seconds=None)
+    monkeypatch.setattr(launcher, "stable_claude_bin", lambda cfg=None: "/stable/claude.exe")
+    monkeypatch.setattr(launcher, "supervisor_contract_available", lambda: True)
+    monkeypatch.setattr(launcher, "_oauth_token", lambda p: "oat-xyz")
+    monkeypatch.setattr(launcher, "_real_home", lambda: "/Users/ctao")
+    monkeypatch.setattr(launcher, "_hermes_bin", lambda: "/usr/bin/hermes")
+    monkeypatch.setattr(launcher.brief, "compile_brief", lambda tid, hb: "BRIEF")
+    monkeypatch.setattr(launcher.brief, "persona_for", lambda p: "PERSONA")
+    monkeypatch.setattr(launcher.envbuild, "mirror_kanban_env", lambda task, ws, board: {})
+    monkeypatch.setattr(launcher.envbuild, "build_session_env", lambda **kw: {"HOME": "/Users/ctao"})
+    monkeypatch.setattr(launcher.cfgdir, "prepare_session_config_dir", lambda **kw: str(tmp_path / "cfg"))
+    monkeypatch.setattr(launcher.cfgdir, "transcript_path", lambda c, w, s: "/t.jsonl")
+    monkeypatch.setattr(launcher.router, "profile_model_provider", lambda p: ("claude-opus-4-8", "anthropic"))
+    monkeypatch.setattr(launcher, "_tmux_new_session", lambda **kw: recorded.update(kw))
+    monkeypatch.setattr(launcher, "_spawn_supervisor", lambda **kw: 4242)
+    monkeypatch.setattr(launcher.state, "session_save", lambda tid, rec: None)
+    (tmp_path / "cfg").mkdir()
+    launcher.launch_lane(t, str(tmp_path), "default")
+    argv = recorded["argv"]
+    assert "--disallowedTools" in argv
+    assert argv[argv.index("--disallowedTools") + 1] == "AskUserQuestion"
