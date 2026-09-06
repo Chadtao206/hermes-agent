@@ -348,7 +348,7 @@ def _stream_transcript(transcript, log_path, offset):
     size = os.path.getsize(transcript)
     if size <= offset:
         return offset, tail, False
-    with open(transcript, "r") as f:
+    with open(transcript, "r", encoding="utf-8") as f:
         f.seek(offset)
         chunk = f.read()
         offset = f.tell()

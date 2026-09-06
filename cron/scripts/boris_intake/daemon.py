@@ -303,10 +303,10 @@ def catch_up(cfg: Config, token: str, pipeline: Pipeline) -> None:
     for channel in cfg.channels:
         wm_file = _watermark_path(channel)
         try:
-            oldest = wm_file.read_text().strip()
+            oldest = wm_file.read_text(encoding="utf-8").strip()
         except OSError:
             wm_file.parent.mkdir(parents=True, exist_ok=True)
-            wm_file.write_text(f"{time.time():.6f}")
+            wm_file.write_text(f"{time.time():.6f}", encoding="utf-8")
             continue
         resp = slack_call(token, "conversations.history", channel=channel,
                           oldest=oldest, limit=200)
@@ -317,7 +317,7 @@ def catch_up(cfg: Config, token: str, pipeline: Pipeline) -> None:
             raw.setdefault("channel", channel)
             pipeline.handle(normalize(raw))
         if messages:
-            wm_file.write_text(max(m.get("ts", "0") for m in messages))
+            wm_file.write_text(max(m.get("ts", "0") for m in messages), encoding="utf-8")
 
 
 def build_pipeline(cfg: Config, token: str) -> Pipeline:
@@ -394,7 +394,7 @@ def main() -> int:
     async def on_request(cli: SocketModeClient, req: SocketModeRequest):
         await cli.send_socket_mode_response(
             SocketModeResponse(envelope_id=req.envelope_id))
-        HEARTBEAT.write_text(f"{time.time():.0f}")
+        HEARTBEAT.write_text(f"{time.time():.0f}", encoding="utf-8")
         if req.type != "events_api":
             return
         event = (req.payload or {}).get("event") or {}
@@ -416,11 +416,11 @@ def main() -> int:
         await client.connect()
         stop = asyncio.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+            asyncio.get_running_loop().add_signal_handler(sig, stop.set)  # windows-footgun: ok
         sys.stderr.write(f"boris_intake: connected, mode={cfg.mode}, "
                          f"channels={list(cfg.channels)}\n")
         sys.stderr.flush()
-        HEARTBEAT.write_text(f"{time.time():.0f}")
+        HEARTBEAT.write_text(f"{time.time():.0f}", encoding="utf-8")
         await stop.wait()
         await client.close()
 

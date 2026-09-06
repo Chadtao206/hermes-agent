@@ -1700,7 +1700,9 @@ def test_finalize_observation_window_accepts_successful_delivery_failure_complet
     latest_retained = next(
         job for job in retirement_fixture.read_jobs() if job["id"] == RETAIN_ID
     )
-    assert latest_retained["last_status"] == "ok"
+    # upstream (Aug 2026): agent success + delivery failure is recorded as
+    # ``delivery_failed`` (never ``ok``) and still counts as a completion.
+    assert latest_retained["last_status"] == "delivery_failed"
     assert latest_retained["last_error"] is None
     assert latest_retained["last_delivery_error"] == "fixture delivery failed"
     assert latest_retained["fire_claim"] is None

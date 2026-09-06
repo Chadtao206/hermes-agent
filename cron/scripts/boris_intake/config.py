@@ -69,7 +69,7 @@ def _tuple(raw, fallback: tuple[str, ...]) -> tuple[str, ...]:
 def load_config(path: Path | None = None) -> Config:
     path = path or DEFAULT_CONFIG
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return Config()
     block = data.get("boris_intake")

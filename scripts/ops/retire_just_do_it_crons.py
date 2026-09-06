@@ -1567,6 +1567,9 @@ def _validate_retained_record_progress(
         "last_delivery_error",
         "fire_claim",
         "run_claim",
+        # upstream (Aug 2026) keeps a per-job consecutive-failure counter that
+        # mark_job_run rewrites on every run: scheduler progress, not config.
+        "failure_streak",
     )
 
     def fail(detail: str) -> None:
@@ -1626,8 +1629,11 @@ def _validate_retained_record_progress(
         record_name: str,
     ) -> None:
         status = runtime["last_status"]
+        # upstream (Aug 2026) records a run whose agent succeeded but whose delivery
+        # failed as ``delivery_failed`` (never ``ok``); it is still a terminal completion.
         if status is not missing and status is not None and status not in (
             "ok",
+            "delivery_failed",
             "error",
         ):
             fail(f"{record_name} last_status has an invalid runtime value")
@@ -1653,9 +1659,9 @@ def _validate_retained_record_progress(
                 fail(
                     f"{record_name} repeat.completed is not coupled to a completion"
                 )
-        elif status not in ("ok", "error"):
+        elif status not in ("ok", "delivery_failed", "error"):
             fail(f"{record_name} completed run requires a terminal status")
-        if status == "ok" and runtime["last_error"] not in (missing, None):
+        if status in ("ok", "delivery_failed") and runtime["last_error"] not in (missing, None):
             fail(f"{record_name} successful run cannot retain last_error")
 
     def scheduled_next(base: datetime, detail: str) -> datetime:

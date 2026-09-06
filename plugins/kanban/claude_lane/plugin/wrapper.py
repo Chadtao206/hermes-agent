@@ -104,7 +104,7 @@ def _list_sessions(cfg):
 
 def _pid_alive(pid):
     try:
-        os.kill(int(pid), 0)
+        os.kill(int(pid), 0)  # windows-footgun: ok
         return True
     except Exception:
         return False
@@ -144,7 +144,7 @@ def _maybe_gc():
         if now - last < _GC_THROTTLE_SECONDS:
             return
         stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(str(now))  # touch BEFORE gc so a slow/failing gc doesn't re-trigger every spawn
+        stamp.write_text(str(now), encoding="utf-8")  # touch BEFORE gc so a slow/failing gc doesn't re-trigger every spawn
     except Exception:
         return
     _gc_now(config.lane_config())

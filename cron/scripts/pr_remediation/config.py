@@ -34,7 +34,7 @@ def load_config(path: Path | None = None) -> RemediationConfig:
     # YAML — do not add parsing for them here.
     path = path or DEFAULT_CONFIG
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return RemediationConfig()
     if not isinstance(data, dict):

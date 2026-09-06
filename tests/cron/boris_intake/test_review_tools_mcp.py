@@ -110,9 +110,9 @@ def test_submission_tool_exposes_the_complete_judgment_contract():
     from boris_intake import review_tools_mcp
 
     tools = asyncio.run(review_tools_mcp.server.list_tools())
-    schema = next(
-        tool for tool in tools if tool.name == "submit_review_result"
-    ).inputSchema
+    tool = next(tool for tool in tools if tool.name == "submit_review_result")
+    # mcp 2.0 renamed Tool.inputSchema -> input_schema; accept both.
+    schema = getattr(tool, "input_schema", None) or tool.inputSchema
     payload = schema["properties"]["payload"]
 
     assert payload["additionalProperties"] is False

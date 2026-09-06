@@ -10,7 +10,10 @@ from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp >= 2.0 renamed FastMCP -> MCPServer and removed mcp.server.fastmcp
+    from mcp.server import MCPServer as FastMCP
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP
 from pydantic import WithJsonSchema
 
 from boris_intake.models import LifecycleRequest

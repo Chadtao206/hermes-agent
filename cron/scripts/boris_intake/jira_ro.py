@@ -31,20 +31,39 @@ async def _fetch(key: str) -> dict | None:
     sys.path.insert(0, f"{HERMES_HOME}/hermes-agent")
     os.environ.setdefault("HERMES_HOME", HERMES_HOME)
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
     from tools.mcp_oauth_manager import get_manager
 
+    try:  # mcp >= 2.0: streams API renamed; auth rides on a caller-owned httpx2 client
+        from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+        mcp2 = True
+    except ImportError:  # mcp 1.x
+        from mcp.client.streamable_http import streamablehttp_client
+        mcp2 = False
+
+    async def _call(session) -> dict | None:
+        await session.initialize()
+        result = await session.call_tool(
+            "getJiraIssue",
+            {"cloudId": CLOUD_ID, "issueIdOrKey": key},
+        )
+        # mcp 2.0 renamed CallToolResult.isError -> is_error; accept both.
+        is_error = getattr(result, "is_error", None)
+        if is_error is None:
+            is_error = getattr(result, "isError", False)
+        if is_error or not result.content:
+            return None
+        return json.loads(result.content[0].text)
+
     auth = get_manager().get_or_build_provider(SERVER, MCP_URL, None)
+    if mcp2:
+        # The SDK skips cleanup when http_client is provided, so own its lifetime here.
+        async with create_mcp_http_client(auth=auth) as http_client:
+            async with streamable_http_client(MCP_URL, http_client=http_client) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    return await _call(session)
     async with streamablehttp_client(MCP_URL, auth=auth) as (read, write, _):
         async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(
-                "getJiraIssue",
-                {"cloudId": CLOUD_ID, "issueIdOrKey": key},
-            )
-            if getattr(result, "isError", False) or not result.content:
-                return None
-            return json.loads(result.content[0].text)
+            return await _call(session)
 
 
 def _evidence(key: str, issue: dict) -> dict | None:

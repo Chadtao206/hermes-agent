@@ -206,7 +206,7 @@ def test_coldstart_requeue_exit_code_requeues_not_blocks():
 def test_cleanup_cfgdir_removes_dir(tmp_path):
     d = tmp_path / "cfg"
     d.mkdir()
-    (d / "settings.json").write_text("{}")
+    (d / "settings.json").write_text("{}", encoding="utf-8")
     cks._cleanup_cfgdir(str(d))
     assert not d.exists()
     cks._cleanup_cfgdir("")  # empty/no-op must not raise

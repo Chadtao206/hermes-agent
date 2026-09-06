@@ -366,7 +366,7 @@ BENIGN_EMPTY_SCALARS = {"", "-", "--", "n/a", "na", "null", "nil", "none", "no",
 
 
 def run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    return subprocess.run(cmd, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -379,7 +379,7 @@ def load_json(path: Path, default: Any) -> Any:
 def save_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -2215,7 +2215,7 @@ def main(argv: list[str] | None = None) -> int:
         now = int(time.time())
         raw_text = None
         try:
-            raw_text = STATE_PATH.read_text()
+            raw_text = STATE_PATH.read_text(encoding="utf-8")
         except OSError:
             raw_text = None
         raw = load_json(STATE_PATH, None)
@@ -2248,7 +2248,7 @@ def main(argv: list[str] | None = None) -> int:
             backup = STATE_PATH.with_name(STATE_PATH.name + STATE_BACKUP_SUFFIX)
             if not backup.exists():
                 try:
-                    backup.write_text(raw_text)
+                    backup.write_text(raw_text, encoding="utf-8")
                 except OSError as exc:  # pragma: no cover - disk failure only
                     notes.append(f"state backup failed: {exc}")
         if not args.dry_run and persist_state:

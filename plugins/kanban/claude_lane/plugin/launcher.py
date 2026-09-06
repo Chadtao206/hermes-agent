@@ -81,12 +81,12 @@ def stable_claude_bin(cfg=None):
 
 
 def _oauth_token(token_path):
-    with open(os.path.expanduser(token_path)) as f:
+    with open(os.path.expanduser(token_path), encoding="utf-8") as f:
         return f.read().strip()
 
 
 def _real_home():
-    return pwd.getpwuid(os.getuid()).pw_dir
+    return pwd.getpwuid(os.getuid()).pw_dir  # windows-footgun: ok
 
 
 def _hermes_bin():
@@ -198,7 +198,7 @@ def launch_lane(task, workspace, board):
     # found by walking up from a workspace under ~/.hermes) and blocks on its approval
     # prompt. --strict-mcp-config alone is a no-op without a --mcp-config argument.
     mcp_cfg = os.path.join(cdir, "empty-mcp.json")
-    with open(mcp_cfg, "w") as f:
+    with open(mcp_cfg, "w", encoding="utf-8") as f:
         f.write('{"mcpServers": {}}')
 
     kanban_env = envbuild.mirror_kanban_env(task, workspace, board)

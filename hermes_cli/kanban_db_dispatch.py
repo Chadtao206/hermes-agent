@@ -376,25 +376,6 @@ def _defer_reclaim_for_live_worker(
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
-def heartbeat_worker(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    note: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
-    ttl_seconds: Optional[int] = None,
-    worker_pid: Optional[int] = None,
-) -> bool:
-    """Record a ``heartbeat`` event, touch ``last_heartbeat_at`` and renew the
-    claim TTL in one run-fenced transaction; ``worker_pid`` adopts ownership.
-    Fork behaviour — see :func:`hermes_cli.kanban_db_guards.heartbeat_worker`.
-    Returns False if the task is not running or its run was superseded.
-    """
-    return _kbg.heartbeat_worker(
-        conn, task_id, note=note, expected_run_id=expected_run_id,
-        ttl_seconds=ttl_seconds, worker_pid=worker_pid,
-    )
-
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -1101,15 +1082,6 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
             (task_id,),
         )
 
-
-def check_respawn_guard(
-    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
-) -> Optional[str]:
-    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None
-    (``rate_limit_cooldown`` / ``blocker_auth`` / ``recent_success`` / ``active_pr``).
-    Fork semantics — see :func:`hermes_cli.kanban_db_guards.check_respawn_guard`.
-    """
-    return _kbg.check_respawn_guard(conn, task_id, lane=lane)
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
@@ -2247,3 +2219,10 @@ from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
 from hermes_cli import kanban_db_guards as _kbg  # noqa: E402
+
+# Fork: ``heartbeat_worker`` / ``check_respawn_guard`` are implemented in
+# kanban_db_guards.  Bind the *same* objects here (not wrappers) so the
+# ``kanban_db`` compat pointer (-> kanban_db_dispatch) resolves to the sibling's
+# object, as tests/test_compat_manifest_targets.py requires.
+heartbeat_worker = _kbg.heartbeat_worker
+check_respawn_guard = _kbg.check_respawn_guard
