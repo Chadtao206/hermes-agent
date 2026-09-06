@@ -385,6 +385,42 @@ def test_identical_retry_completes_the_task_after_a_completion_failure(tmp_path,
     assert len(attempts) == 2
 
 
+def test_completion_calls_the_real_kanban_complete_task(tmp_path, monkeypatch):
+    """Regression: upstream v0.21.0 dropped the fork-only ``operation_id`` kwarg
+    from ``kanban_db.complete_task``. The MCP tool kept passing it, the call raised
+    TypeError inside ``_complete_bound_task``, the judgment was accepted but the
+    lane never completed, and the dispatcher re-ran every review three more times
+    as a protocol violation (2026-09-06). Exercise the real kanban_db, not a stub."""
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    module, _store, request = bind_request(tmp_path, monkeypatch)
+    db_path = kanban_db_connect.init_db(tmp_path / "kanban.db")
+    with kanban_db_connect.connect_closing(db_path) as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Read-only Boris review: Ylopo/example#42 @ aaaaaaa",
+            assignee="boris_on_demand",
+        )
+        assert kanban_db.claim_task(conn, task_id, claimer="test-dispatcher:1") is not None
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+    assert run_id is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    assert module._complete_bound_task(task_id, request.request_id, "sha256:judgment") is True
+
+    with kanban_db_connect.connect_closing(db_path) as conn:
+        status, current = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        outcome = conn.execute(
+            "SELECT outcome FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()[0]
+    assert (status, current, outcome) == ("done", None, "completed")
+
+
 def diff_for(*files):
     parts = []
     for name, lines in files:

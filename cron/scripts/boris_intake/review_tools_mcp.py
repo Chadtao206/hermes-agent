@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -621,14 +622,20 @@ def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> b
     from hermes_cli import kanban_db
 
     from hermes_cli import kanban_db_connect as kbc
-    operation_id = f"boris-review-submit:{request_id}:{judgment_hash}"
+    # Upstream v0.21.0 (cut over 2026-09-06) dropped the fork-only ``operation_id``
+    # idempotency kwarg from complete_task. Passing it raised TypeError inside the
+    # MCP tool, the judgment was accepted but the lane never completed, and the
+    # dispatcher re-ran every review 3 more times as a protocol violation.
+    completion_kwargs: dict = {}
+    if "operation_id" in inspect.signature(kanban_db.complete_task).parameters:
+        completion_kwargs["operation_id"] = f"boris-review-submit:{request_id}:{judgment_hash}"
     with kbc.connect_closing(db_path) as connection:
         return kanban_db.complete_task(
             connection,
             task_id,
             summary="Structured Boris review judgment accepted.",
             expected_run_id=run_id,
-            operation_id=operation_id,
+            **completion_kwargs,
         )
 
 
