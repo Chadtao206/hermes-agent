@@ -397,3 +397,55 @@ def test_shared_reaction_is_reconciled_in_an_owned_channel():
 
     removed = {kw["name"] for method, kw in calls[1:] if method == "reactions.remove"}
     assert removed == {"warning", "rubbing", "doge_notes", "blinkapproved"}
+
+
+def test_clean_verdict_in_an_unowned_channel_uses_the_boris_only_reaction():
+    """In just-do-it `blinkapproved` means "the auto-approve stamp was applied". A
+    Boris READY_CLEAN there must not add it (the poller skips self-authored PRs on
+    purpose), so the clean verdict is shown with Boris-only vocabulary instead."""
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append((method, kw))
+        return {"ok": True}
+
+    SlackIO(call, "t", dry_run=False, owned_channels=frozenset({"C9"})).reconcile_source_reaction(
+        lifecycle_request(), "blinkapproved"
+    )
+
+    assert calls[0][0] == "reactions.add" and calls[0][1]["name"] == "doge_notes"
+    removed = {kw["name"] for method, kw in calls[1:] if method == "reactions.remove"}
+    assert removed == {"face_vomiting", "warning", "rubbing"}
+    assert "blinkapproved" not in removed
+
+
+def test_clean_verdict_in_an_owned_channel_keeps_blinkapproved():
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append((method, kw))
+        return {"ok": True}
+
+    request = lifecycle_request()
+    SlackIO(call, "t", dry_run=False, owned_channels=frozenset({request.channel_id})).reconcile_source_reaction(
+        request, "blinkapproved"
+    )
+
+    assert calls[0][0] == "reactions.add" and calls[0][1]["name"] == "blinkapproved"
+    removed = {kw["name"] for method, kw in calls[1:] if method == "reactions.remove"}
+    assert removed == {"face_vomiting", "warning", "rubbing", "doge_notes"}
+
+
+def test_unowned_substitutes_are_boris_only_lifecycle_reactions():
+    """A substitute outside the lifecycle vocabulary would never be cleared by the
+    stale loop; a shared one would never be added in an unowned channel."""
+    from boris_intake.slack_io import (
+        _LIFECYCLE_REACTIONS,
+        _SHARED_REACTIONS,
+        _UNOWNED_SUBSTITUTE,
+    )
+
+    assert set(_UNOWNED_SUBSTITUTE) <= _SHARED_REACTIONS
+    for substitute in _UNOWNED_SUBSTITUTE.values():
+        assert substitute in _LIFECYCLE_REACTIONS
+        assert substitute not in _SHARED_REACTIONS

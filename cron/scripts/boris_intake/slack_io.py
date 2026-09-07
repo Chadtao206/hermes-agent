@@ -21,8 +21,11 @@ _LIFECYCLE_REACTIONS = (
 # Reactions another automation also uses on the same messages. In just-do-it the
 # jdi_autoapprove poller adds `blinkapproved` as its stamp acknowledgement, so in a
 # channel Boris does not own (not a passive channel) removing it would read as
-# withdrawing the auto-approval.
+# withdrawing the auto-approval, and adding it would read as a stamp Boris never
+# gave (the poller skips self-authored PRs on purpose). There a clean verdict is
+# shown with Boris-only vocabulary; the thread status still says READY_CLEAN.
 _SHARED_REACTIONS = frozenset({"blinkapproved"})
+_UNOWNED_SUBSTITUTE = {"blinkapproved": "doge_notes"}
 
 
 class SlackLifecycleError(RuntimeError):
@@ -214,6 +217,9 @@ class SlackIO:
     ) -> None:
         if reaction not in _LIFECYCLE_REACTIONS:
             raise ValueError(f"unsupported lifecycle reaction: {reaction}")
+        owned = self._owned_channels is None or request.channel_id in self._owned_channels
+        if not owned:
+            reaction = _UNOWNED_SUBSTITUTE.get(reaction, reaction)
         target = {"channel": request.channel_id, "timestamp": request.message_ts}
         self._lifecycle_call(
             "reactions.add",
@@ -221,7 +227,6 @@ class SlackIO:
             **target,
             name=reaction,
         )
-        owned = self._owned_channels is None or request.channel_id in self._owned_channels
         for stale in _LIFECYCLE_REACTIONS:
             if stale == reaction:
                 continue

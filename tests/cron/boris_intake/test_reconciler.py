@@ -2180,3 +2180,53 @@ def test_real_dependency_builder_owns_reactions_only_in_passive_channels(tmp_pat
     )
 
     assert deps.slack._owned_channels == frozenset({"C_OWNED"})
+
+
+def test_store_memo_keeps_the_aggregate_when_slack_shows_the_substitute(tmp_path):
+    """In an unowned channel SlackIO shows `doge_notes` for a clean verdict, but the
+    store memo keeps the aggregate `blinkapproved` so an unchanged aggregate is
+    still recognised on the next tick instead of re-issuing the Slack calls."""
+    from boris_intake.reconciler import ReconcilerDeps, _reconcile_source_reaction, tick
+    from boris_intake.slack_io import SlackIO
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    fake = SlackFake()
+    deps = ReconcilerDeps(
+        slack=fake,
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+    while store.get_request(admitted.request_id).workflow_state is not WorkflowState.REVIEWING:
+        tick(store, deps)
+        clock.advance()
+    store.submit_judgment(
+        admitted.request_id, canonicalize_judgment(validate_judgment(valid_payload())), clock()
+    )
+    while store.get_request(admitted.request_id).workflow_state is not WorkflowState.COMPLETE:
+        tick(store, deps)
+        clock.advance()
+    assert fake.source_reactions[-1] == "blinkapproved"
+    request = store.get_request(admitted.request_id)
+    # Rewind the memo to the pre-terminal state so the terminal reconcile runs again,
+    # this time through a real SlackIO that does not own the channel.
+    store.record_source_reaction(request.request_id, "rubbing", clock())
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append((method, kw))
+        return {"ok": True}
+
+    deps = ReconcilerDeps(
+        slack=SlackIO(call, "t", dry_run=False, owned_channels=frozenset()),
+        github=GitHubFake(admitted.gate_snapshot),
+        kanban=KanbanFake(),
+        now=clock,
+    )
+    _reconcile_source_reaction(store, request, deps, delivered_request_id=request.request_id)
+    _reconcile_source_reaction(store, request, deps, delivered_request_id=request.request_id)
+
+    added = [kw["name"] for method, kw in calls if method == "reactions.add"]
+    assert added == ["doge_notes"]
+    assert store.source_reaction(request.channel_id, request.message_ts) == "blinkapproved"

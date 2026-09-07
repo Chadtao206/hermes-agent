@@ -330,6 +330,9 @@ def _reconcile_source_reaction(
             request,
             reaction,
         )
+        # The memo keys on the aggregate, not on what Slack shows: in a channel
+        # Boris does not own SlackIO may substitute a Boris-only emoji for a
+        # shared one, and the memo must still match the next tick's aggregate.
         store.record_source_reaction(request.request_id, reaction, deps.now())
     finally:
         store.release_source_reaction_lease(request.channel_id, request.message_ts)
