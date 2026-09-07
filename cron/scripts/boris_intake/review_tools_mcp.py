@@ -1,29 +1,35 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import subprocess
 import time
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote
 
 try:  # mcp >= 2.0 renamed FastMCP -> MCPServer and removed mcp.server.fastmcp
     from mcp.server import MCPServer as FastMCP
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP
-from pydantic import WithJsonSchema
+from pydantic import Field, WithJsonSchema
 
-from boris_intake.models import LifecycleRequest
+from boris_intake.models import LifecycleRequest, PriorReview
 from boris_intake.result import (
     ValidationError,
     canonicalize_judgment,
     validate_judgment,
 )
 from boris_intake.store import Store
+
+
+logger = logging.getLogger("boris_intake.review_tools_mcp")
 
 
 class ToolError(RuntimeError):
@@ -50,7 +56,24 @@ _OPERATIONS = frozenset({
     "pr_comments",
     "file_at_head",
 })
-_DIFF_PAGE_BUDGET = 60_000
+# Hermes persists any mcp_ tool result whose rendered handler output exceeds
+# tools.budget_config.DEFAULT_MCP_RESULT_SIZE_CHARS (50k), and this lane has no
+# file tool to read a persisted result back, so a spilled page is lost to the
+# review. "Rendered" is what Hermes measures: the MCP server's indent=2 JSON of the
+# return value, JSON-encoded once more by Hermes, so quotes, backslashes and control
+# characters in code cost up to four chars each. Every page is budgeted in rendered
+# chars against this figure, envelope included, with headroom under the threshold.
+_RESULT_BUDGET = 44_000
+# Bounded lists that ride on every page or listing; the totals are always reported.
+# Counts cap the work, rendered size caps what reaches the model: deep monorepo
+# paths made a 300-entry all_files list alone outgrow the result budget.
+_ALL_FILES_LISTED = 300
+_DIR_ENTRIES_LISTED = 200
+_LIST_BUDGET = 12_000
+# GitHub's contents API withholds `content` above 1 MiB (encoding "none").
+_CONTENTS_LIMIT = 1_048_576
+_NOT_FOUND = re.compile(r"HTTP 404|Not Found")
+_METADATA_FIELDS = "headRefOid,title,body,author,state,baseRefName,headRefName"
 _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 # GitHub refuses to render a pull request diff once it grows past roughly 20k
 # changed lines. The changed-file inventory still answers, so it is the only
@@ -195,6 +218,11 @@ _NIT_SCHEMA = {
 }
 _JUDGMENT_PAYLOAD_SCHEMA = {
     "type": "object",
+    "description": (
+        "The Boris-owned judgment: exactly these nine fields. Request identity, "
+        "policy, gate, outcome, and destination are owned by workflow code and "
+        "are rejected here."
+    ),
     "additionalProperties": False,
     "properties": {
         "summary": {"type": "string", "minLength": 1, "maxLength": 4_000},
@@ -324,6 +352,9 @@ def _github(
 
 
 def _metadata(request: LifecycleRequest) -> dict:
+    """Identity and description of the bound pull request. Comments and reviews are
+    unbounded and belong to pr_comments; carrying them here made the first call of
+    every lane spill on busy pull requests and took review_context down with it."""
     data = _github(
         request,
         [
@@ -333,7 +364,7 @@ def _metadata(request: LifecycleRequest) -> dict:
             "-R",
             f"{request.owner}/{request.repo}",
             "--json",
-            "headRefOid,title,body,author,state,baseRefName,headRefName,comments,reviews",
+            _METADATA_FIELDS,
         ],
         expect_json=True,
     )
@@ -368,6 +399,63 @@ def _diff_sections(diff: str) -> list[tuple[str, str]]:
     return sections
 
 
+def _rendered_len(text: str) -> int:
+    """Chars *text* occupies in the model-facing result: the MCP server JSON-encodes
+    the return value and Hermes JSON-encodes that string once more. Measured by
+    double-encoding, minus the two pairs of quotes."""
+    return len(json.dumps(json.dumps(text, ensure_ascii=False), ensure_ascii=False)) - 6
+
+
+def _fit(text: str, budget: int) -> str:
+    """Longest prefix of *text* whose rendered length fits *budget*."""
+    if budget <= 0:
+        return ""
+    if _rendered_len(text) <= budget:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _rendered_len(text[:mid]) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low]
+
+
+def _rendered_items_len(items: list, depth: int = 2) -> int:
+    """Rendered size of a JSON list as the model receives it (indent=2, encoded twice)
+    when the list sits *depth* levels deep in the result: every line inside it carries
+    2*depth more indentation than a top-level render. Lists under `data` are at 2;
+    with real gh comment shapes (a dozen lines each) the difference is what tipped a
+    600-comment thread over the threshold."""
+    inner = json.dumps(items, indent=2, ensure_ascii=False)
+    return len(json.dumps(inner, ensure_ascii=False)) + 2 * depth * inner.count("\n")
+
+
+def _fit_items(items: list, budget: int, depth: int = 2) -> list:
+    """Longest prefix of *items* whose rendered JSON fits *budget* at *depth*."""
+    if budget <= 0:
+        return []
+    if _rendered_items_len(items, depth) <= budget:
+        return items
+    low, high = 0, len(items)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _rendered_items_len(items[:mid], depth) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return items[:low]
+
+
+def _content_budget(envelope: dict) -> int:
+    """Rendered chars left for content once *envelope* (the result with its content
+    blank and its counters at their widest) is paid for. Every list in an envelope is
+    itself size-bounded, so the small floor only guards against a negative budget."""
+    used = len(json.dumps(json.dumps(envelope, indent=2, ensure_ascii=False), ensure_ascii=False))
+    return max(_RESULT_BUDGET - used, 2_000)
+
+
 def _split_oversized(path: str, text: str, budget: int) -> list[tuple[str, str]]:
     """Break one file's diff at hunk boundaries, marking any hunk still too large."""
     pieces: list[tuple[str, str]] = []
@@ -381,17 +469,17 @@ def _split_oversized(path: str, text: str, budget: int) -> list[tuple[str, str]]
         else:
             header.append(line)
     if not hunks:
-        return [(path, text[:budget])]
+        return [(path, _fit(text, budget))]
     prefix = "".join(header)
     for hunk in hunks:
         body = "".join(hunk)
-        room = budget - len(prefix)
-        if len(body) > room:
+        room = budget - _rendered_len(prefix)
+        if _rendered_len(body) > room:
             marker = (
-                f"[boris: {len(body)} lines of this hunk omitted — "
+                f"\n[boris: {body.count(chr(10))} lines of this hunk omitted — "
                 f"read {path} with file_at_head for full content]\n"
             )
-            kept = body[: max(room - len(marker) - 1, 0)].rsplit("\n", 1)[0]
+            kept = _fit(body, room - _rendered_len(marker)).rsplit("\n", 1)[0]
             omitted = body[len(kept) :].count("\n")
             body = (
                 f"{kept}\n[boris: {omitted} lines of this hunk omitted — "
@@ -402,24 +490,52 @@ def _split_oversized(path: str, text: str, budget: int) -> list[tuple[str, str]]
     return pieces
 
 
-def paginate_diff(diff: str, page: int, budget: int = _DIFF_PAGE_BUDGET) -> dict:
-    """Page a unified diff at file boundaries so nothing is silently truncated."""
+def paginate_diff(diff: str, page: int, budget: int | None = None) -> dict:
+    """Page a unified diff at file boundaries so nothing is silently truncated.
+    *budget* is rendered chars for the diff text plus the per-page file list; by
+    default it is what remains of _RESULT_BUDGET after the envelope."""
+    sections = _diff_sections(diff)
+    all_files = sorted({path for path, _ in sections if path})
+    listed = _fit_items(all_files[:_ALL_FILES_LISTED], _LIST_BUDGET)
+    if budget is None:
+        envelope = {
+            "operation": "pr_diff",
+            "head_sha": "0" * 40,
+            "data": {
+                "diff": "",
+                "page": 9_999,
+                "total_pages": 9_999,
+                "files_on_page": [],
+                "has_more": False,
+                "all_files": listed,
+                "total_files": len(all_files),
+                "all_files_truncated": False,
+                "source": "changed_files_api",
+            },
+        }
+        budget = _content_budget(envelope)
+
     units: list[tuple[str, str]] = []
-    for path, text in _diff_sections(diff):
-        if len(text) > budget:
+    for path, text in sections:
+        if _rendered_len(text) > budget:
             units.extend(_split_oversized(path, text, budget))
         else:
             units.append((path, text))
+
+    def cost(unit: tuple[str, str]) -> int:
+        # The diff text plus this file's entry in files_on_page (indent, quotes,
+        # comma and newline, rendered twice).
+        return _rendered_len(unit[1]) + _rendered_len(unit[0]) + 13
 
     pages: list[list[tuple[str, str]]] = []
     current: list[tuple[str, str]] = []
     size = 0
     for unit in units:
-        if current and size + len(unit[1]) > budget:
+        if current and size + cost(unit) > budget:
             pages.append(current)
             current, size = [], 0
         current.append(unit)
-        size += len(unit[1])
+        size += cost(unit)
     if current:
         pages.append(current)
     if not pages:
@@ -435,7 +551,9 @@ def paginate_diff(diff: str, page: int, budget: int = _DIFF_PAGE_BUDGET) -> dict
         "total_pages": total,
         "files_on_page": sorted({path for path, _ in selected if path}),
         "has_more": page < total,
-        "all_files": sorted({path for path, _ in units if path}),
+        "all_files": listed,
+        "total_files": len(all_files),
+        "all_files_truncated": len(listed) < len(all_files),
     }
 
 
@@ -524,20 +642,359 @@ def _pr_diff(request: LifecycleRequest) -> tuple[str, str]:
     return raw, "pr_diff"
 
 
+def _split_lines(text: str) -> list[str]:
+    """Lines by "\\n" only, newline kept. Editors, blame and diff hunks number lines
+    this way; str.splitlines would also break on form feeds and U+2028 and put the
+    reviewer's line anchors off by one."""
+    if not text:
+        return []
+    pieces = text.split("\n")
+    lines = [piece + "\n" for piece in pieces[:-1]]
+    if pieces[-1]:
+        lines.append(pieces[-1])
+    return lines
+
+
+def paginate_text(text: str, page: int, budget: int) -> dict:
+    """Page a decoded file by whole lines so a large file is read in full across
+    pages instead of being cut by the transport. *budget* is rendered chars. A single
+    line longer than a page (minified bundles, fixtures) is shortened with a marker
+    and still counts as one line, so line numbers stay true to the file."""
+    lines = _split_lines(text)
+    total_lines = len(lines)
+    pages: list[tuple[int, int, str]] = []
+    current: list[str] = []
+    first = 1
+    size = 0
+    for index, line in enumerate(lines, start=1):
+        cost = _rendered_len(line)
+        if cost > budget:
+            newline = "\n" if line.endswith("\n") else ""
+            body = line[: len(line) - len(newline)]
+            marker = f" [boris: {len(body)} chars of this line omitted]"
+            kept = _fit(body, budget - _rendered_len(marker + newline))
+            line = f"{kept} [boris: {len(body) - len(kept)} chars of this line omitted]{newline}"
+            cost = _rendered_len(line)
+        if current and size + cost > budget:
+            pages.append((first, index - 1, "".join(current)))
+            current, size, first = [], 0, index
+        current.append(line)
+        size += cost
+    if current or not pages:
+        pages.append((first if total_lines else 0, total_lines, "".join(current)))
+
+    total = len(pages)
+    if page < 1 or page > total:
+        raise ToolError(f"file page {page} is out of range (1..{total})")
+    first_line, last_line, content = pages[page - 1]
+    return {
+        "content": content,
+        "page": page,
+        "total_pages": total,
+        "has_more": page < total,
+        "line_range": [first_line, last_line],
+        "total_lines": total_lines,
+    }
+
+
+def _file_evidence(request: LifecycleRequest, file_path: str, page: int) -> dict:
+    """One repository path at the pinned head: decoded text pages for a file, a
+    bounded listing for a directory. The raw contents-API object (base64 blob,
+    API links) never reaches the model."""
+    route = (
+        f"/repos/{quote(request.owner, safe='')}/{quote(request.repo, safe='')}"
+        f"/contents/{quote(file_path, safe='/')}?ref={request.head_sha}"
+    )
+    try:
+        data = _github(request, ["api", route], expect_json=True)
+    except GitHubCommandError as error:
+        if _NOT_FOUND.search(error.stderr):
+            reason = " ".join(error.stderr.split())[:_STDERR_EXCERPT]
+            raise ToolError(
+                f"{file_path} does not exist at the pinned head; take paths from "
+                "pr_diff all_files (minus files the diff deletes) or list the "
+                f"directory with file_at_head ({reason})"
+            ) from error
+        raise
+    if isinstance(data, list):
+        if page != 1:
+            raise ToolError("a directory listing has a single page")
+        # Entry paths are the listing path plus the name; repeating them doubled the
+        # size of deep listings.
+        entries = [
+            {"name": entry.get("name"), "type": entry.get("type"), "size": entry.get("size")}
+            for entry in data[:_DIR_ENTRIES_LISTED]
+            if isinstance(entry, dict)
+        ]
+        envelope = {
+            "operation": "file_at_head",
+            "head_sha": request.head_sha,
+            "data": {
+                "path": file_path,
+                "type": "dir",
+                "entries": [],
+                "total_entries": len(data),
+                "truncated": False,
+            },
+        }
+        entries = _fit_items(entries, _content_budget(envelope))
+        return {
+            "path": file_path,
+            "type": "dir",
+            "entries": entries,
+            "total_entries": len(data),
+            "truncated": len(entries) < len(data),
+        }
+    if not isinstance(data, dict):
+        raise ToolError("GitHub contents response is not an object")
+    kind = data.get("type")
+    if kind not in (None, "file"):
+        raise ToolError(f"{file_path} is a {kind}, not a readable file")
+    size = data.get("size") if isinstance(data.get("size"), int) else 0
+    encoding = data.get("encoding")
+    raw_content = data.get("content")
+    if encoding == "none" or (not raw_content and size > _CONTENTS_LIMIT):
+        raise ToolError(
+            f"{file_path} is {size} bytes; GitHub withholds file content above "
+            "1 MiB, so it cannot be read here"
+        )
+    if encoding != "base64" or not isinstance(raw_content, str):
+        raise ToolError("GitHub contents response carries no readable content")
+    try:
+        raw = base64.b64decode(raw_content)
+    except (ValueError, binascii.Error) as error:
+        raise ToolError("GitHub contents response is not valid base64") from error
+    head = {"path": file_path, "sha": data.get("sha"), "size": size}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is None or "\x00" in text:
+        if page != 1:
+            raise ToolError("a binary file has no pages")
+        return {
+            **head,
+            "binary": True,
+            "content": None,
+            "note": "binary or non-UTF-8 content is not shown",
+        }
+    envelope = {
+        "operation": "file_at_head",
+        "head_sha": request.head_sha,
+        "data": {
+            **head,
+            "encoding": "utf-8",
+            "content": "",
+            "page": 9_999,
+            "total_pages": 9_999,
+            "has_more": False,
+            "line_range": [9_999_999, 9_999_999],
+            "total_lines": 9_999_999,
+        },
+    }
+    return {**head, "encoding": "utf-8", **paginate_text(text, page, _content_budget(envelope))}
+
+
+def _prior_review_context(prior: PriorReview | None, request: LifecycleRequest) -> dict | None:
+    if prior is None:
+        return None
+    return {
+        "head_sha": prior.head_sha,
+        "same_head": prior.head_sha == request.head_sha,
+        "outcome": prior.outcome,
+        "gate_only": prior.gate_only,
+        "assembled_at": prior.assembled_at,
+        "blocking_titles": list(prior.blocking_titles),
+        "non_blocking_titles": list(prior.non_blocking_titles),
+    }
+
+
+def _review_context(store: Store, request: LifecycleRequest) -> dict:
+    """Workflow-owned facts the lane needs and cannot get from GitHub. The kanban
+    card body never reaches the model (the worker's only user message is the bare
+    task id and the kanban toolset is off), so this rides on pr_metadata, the one
+    call every lane makes first. Only validated store fields are rendered. A store
+    hiccup here must not fail that first call: GitHub has already answered, and the
+    review can proceed without context."""
+    try:
+        return {
+            "policy": {
+                "rubric_version": request.policy.rubric_version,
+                "ignore_ci": request.policy.ignore_ci,
+            },
+            "acceptance_references": list(store.acceptance_references(request.request_id)),
+            "prior_review": _prior_review_context(store.prior_review(request), request),
+        }
+    except Exception as error:  # noqa: BLE001 - degrade, never take pr_metadata down
+        logger.warning("review context unavailable for %s: %s", request.request_id, error)
+        return {"unavailable": "review context could not be loaded"}
+
+
+def _bounded_metadata(operation: str, request: LifecycleRequest, context: dict, data: dict) -> dict:
+    """pr_metadata with the description fitted to what remains of the budget after
+    review_context. Dependabot-style bodies run to 65k chars and would spill the one
+    result every lane depends on."""
+    body = data.get("body")
+    if isinstance(body, str):
+        envelope = {
+            "operation": operation,
+            "head_sha": request.head_sha,
+            "review_context": context,
+            "data": {**data, "body": "", "body_truncated": False},
+        }
+        room = _content_budget(envelope)
+        if _rendered_len(body) > room:
+            marker = f"\n[boris: {len(body)} chars of the description omitted]"
+            kept = _fit(body, room - _rendered_len(marker))
+            data = {
+                **data,
+                "body": f"{kept}\n[boris: {len(body) - len(kept)} chars of the description omitted]",
+                "body_truncated": True,
+            }
+    return {
+        "operation": operation,
+        "head_sha": request.head_sha,
+        "review_context": context,
+        "data": data,
+    }
+
+
+def _bounded_entry(entry: object, cap: int, noun: str) -> object:
+    """One comment or review with its body fitted to *cap* rendered chars. Bot
+    comments (coverage tables, dependency changelogs) are routinely the newest and
+    tens of thousands of chars; unbounded, one of them would consume the thread's
+    whole room and the newest-first fit would keep nothing at all."""
+    if not isinstance(entry, dict):
+        return entry
+    record = cast("dict[str, Any]", entry)
+    body = record.get("body")
+    if not isinstance(body, str) or _rendered_len(body) <= cap:
+        return entry
+    marker = f"\n[boris: {len(body)} chars of this {noun} omitted]"
+    kept = _fit(body, cap - _rendered_len(marker))
+    return {
+        **record,
+        "body": f"{kept}\n[boris: {len(body) - len(kept)} chars of this {noun} omitted]",
+        "body_truncated": True,
+    }
+
+
+def _bounded_thread(request: LifecycleRequest, data: dict) -> dict:
+    """Issue comments and review summaries, newest kept when the thread outgrows the
+    budget. GitHub lists both oldest first; a re-review needs the latest exchange, and
+    the counts say what was dropped."""
+    raw_comments = data.get("comments")
+    raw_reviews = data.get("reviews")
+    comments: list = raw_comments if isinstance(raw_comments, list) else []
+    reviews: list = raw_reviews if isinstance(raw_reviews, list) else []
+    envelope = {
+        "operation": "pr_comments",
+        "head_sha": request.head_sha,
+        "data": {
+            "comments": [],
+            "reviews": [],
+            "total_comments": len(comments),
+            "total_reviews": len(reviews),
+            "comments_omitted": len(comments),
+            "reviews_omitted": len(reviews),
+            "note": "omitted entries are the oldest",
+        },
+    }
+    room = _content_budget(envelope)
+    per_entry = room // 4
+    comments = [_bounded_entry(entry, per_entry, "comment") for entry in comments]
+    reviews = [_bounded_entry(entry, per_entry, "review") for entry in reviews]
+    kept_reviews = list(reversed(_fit_items(list(reversed(reviews)), room // 3)))
+    kept_comments = list(
+        reversed(_fit_items(list(reversed(comments)), room - _rendered_items_len(kept_reviews)))
+    )
+    bounded: dict[str, object] = {
+        "comments": kept_comments,
+        "reviews": kept_reviews,
+        "total_comments": len(comments),
+        "total_reviews": len(reviews),
+        "comments_omitted": len(comments) - len(kept_comments),
+        "reviews_omitted": len(reviews) - len(kept_reviews),
+    }
+    if bounded["comments_omitted"] or bounded["reviews_omitted"]:
+        bounded["note"] = "omitted entries are the oldest"
+    return bounded
+
+
+_GITHUB_TOOL_DESCRIPTION = (
+    "Read-only evidence about the one pull request bound to this review, always at "
+    "its pinned head. Call pr_metadata first: it returns title, body, author, state "
+    "and branches, plus review_context, which is workflow-owned and carries the "
+    "review policy, the authorized acceptance references, and any prior Boris review "
+    "of this pull request. pr_diff returns the unified diff paged at file "
+    "boundaries: read every page while has_more is true, and read a hunk the diff "
+    "marks as shortened in full with file_at_head. pr_checks returns check runs "
+    "(name, state, link); the merge gate is decided by workflow code, not by the "
+    "reviewer. pr_comments returns the issue comments and review summaries. "
+    "file_at_head returns one repository file at the pinned head as decoded UTF-8 "
+    "text, paged by whole lines with line_range, or a bounded directory listing "
+    "when the path is a directory; the path must exist at head, so take it from "
+    "pr_diff all_files (minus files the diff deletes), from a directory listing, or "
+    "from an import you have read."
+)
+_ACCEPTANCE_TOOL_DESCRIPTION = (
+    "Return the pre-fetched ticket this pull request claims to implement, as "
+    "authorized for this review. The reference must be exactly one of "
+    "review_context.acceptance_references from pr_metadata, a bare Jira key such as "
+    "PLAT-123. URLs, other ticket keys, and repository document paths are never "
+    "authorized; read repository documents with file_at_head. When "
+    "acceptance_references is empty there is no acceptance evidence for this "
+    "review: record that as a verification limit and assess the changed code on "
+    "its own terms."
+)
+_SUBMIT_TOOL_DESCRIPTION = (
+    "Submit the single typed Boris judgment for this review. The payload holds "
+    "exactly the nine judgment fields defined by the schema and nothing about "
+    "request identity, policy, gate, outcome, or destination; workflow code owns "
+    "those. A validation_error result names the schema mechanic to fix: correct "
+    "only that and resubmit the same judgment. An accepted result ends the review; "
+    "do not submit again."
+)
+
 server = FastMCP("boris_review")
 
 
-@server.tool()
+@server.tool(description=_GITHUB_TOOL_DESCRIPTION)
 def read_github_evidence(
-    operation: Literal[
-        "pr_metadata",
-        "pr_diff",
-        "pr_checks",
-        "pr_comments",
-        "file_at_head",
+    operation: Annotated[
+        Literal[
+            "pr_metadata",
+            "pr_diff",
+            "pr_checks",
+            "pr_comments",
+            "file_at_head",
+        ],
+        Field(
+            description=(
+                "pr_metadata (call first; includes review_context), pr_diff (paged), "
+                "pr_checks, pr_comments (issue comments and review summaries), or "
+                "file_at_head (decoded file text or a directory listing, needs path)."
+            )
+        ),
     ],
-    path: str | None = None,
-    page: int = 1,
+    path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Repository-relative path for file_at_head: a file to read or a "
+                "directory to list. Not accepted by other operations."
+            )
+        ),
+    ] = None,
+    page: Annotated[
+        int,
+        Field(
+            description=(
+                "1-based page for pr_diff and file_at_head; keep reading while "
+                "has_more is true. Other operations have a single page."
+            )
+        ),
+    ] = 1,
 ) -> dict:
     if operation not in _OPERATIONS:
         raise ToolError("unknown GitHub evidence operation")
@@ -549,13 +1006,17 @@ def read_github_evidence(
         file_path = ""
     if not isinstance(page, int) or isinstance(page, bool) or page < 1:
         raise ToolError("page must be a positive integer")
-    if page != 1 and operation != "pr_diff":
-        raise ToolError("page is valid only for pr_diff")
+    if page != 1 and operation not in ("pr_diff", "file_at_head"):
+        raise ToolError("page is valid only for pr_diff and file_at_head")
 
     store, request, _ = _bound_request()
     try:
         if operation == "pr_metadata":
+            # review_context precedes GitHub's payload on purpose: if the result ever
+            # spills, Hermes keeps a head preview, and the workflow-owned facts must
+            # be in it.
             data = _metadata(request)
+            return _bounded_metadata(operation, request, _review_context(store, request), data)
         else:
             _ensure_current_head(request)
             repository = f"{request.owner}/{request.repo}"
@@ -579,7 +1040,7 @@ def read_github_evidence(
                     allowed_codes=(0, 1),
                 )
             elif operation == "pr_comments":
-                data = _github(
+                thread = _github(
                     request,
                     [
                         "pr",
@@ -592,26 +1053,44 @@ def read_github_evidence(
                     ],
                     expect_json=True,
                 )
+                if not isinstance(thread, dict):
+                    raise ToolError("GitHub comments response is not an object")
+                data = _bounded_thread(request, thread)
             else:
-                route = (
-                    f"/repos/{quote(request.owner, safe='')}/{quote(request.repo, safe='')}"
-                    f"/contents/{quote(file_path, safe='/')}?ref={request.head_sha}"
-                )
-                data = _github(request, ["api", route], expect_json=True)
+                data = _file_evidence(request, file_path, page)
         return {"operation": operation, "head_sha": request.head_sha, "data": data}
     finally:
         store.close()
 
 
-@server.tool()
-def read_acceptance_evidence(reference: str) -> dict:
+@server.tool(description=_ACCEPTANCE_TOOL_DESCRIPTION)
+def read_acceptance_evidence(
+    reference: Annotated[
+        str,
+        Field(
+            description=(
+                "One of review_context.acceptance_references from pr_metadata, "
+                "for example PLAT-123."
+            )
+        ),
+    ],
+) -> dict:
     if not isinstance(reference, str) or not reference or len(reference) > 512:
         raise ToolError("acceptance evidence reference is invalid")
     store, request, _ = _bound_request()
     try:
         evidence = store.acceptance_evidence(request.request_id, reference)
         if evidence is None:
-            raise ToolError("reference is not authorized for this review request")
+            authorized = store.acceptance_references(request.request_id)
+            hint = (
+                f"authorized references: {', '.join(authorized)}"
+                if authorized
+                else (
+                    "no acceptance evidence is authorized for this request; record "
+                    "the limit and assess the changed code on its own terms"
+                )
+            )
+            raise ToolError(f"reference is not authorized for this review request; {hint}")
         return evidence
     finally:
         store.close()
@@ -647,7 +1126,7 @@ def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> b
         )
 
 
-@server.tool()
+@server.tool(description=_SUBMIT_TOOL_DESCRIPTION)
 def submit_review_result(payload: JudgmentPayload) -> dict:
     try:
         judgment = validate_judgment(payload)

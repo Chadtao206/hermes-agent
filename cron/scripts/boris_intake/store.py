@@ -351,6 +351,16 @@ class Store:
         ).fetchone()
         return json.loads(row["evidence_json"]) if row else None
 
+    def acceptance_references(self, request_id: str) -> tuple[str, ...]:
+        """Every reference the lane may pass to read_acceptance_evidence, so the
+        model is told what is authorized instead of guessing keys and URLs."""
+        rows = self._db.execute(
+            "SELECT reference FROM request_acceptance_evidence "
+            "WHERE request_id=? ORDER BY reference",
+            (request_id,),
+        ).fetchall()
+        return tuple(str(row["reference"]) for row in rows)
+
     def submit_judgment(self, request_id: str, canonical_json: str, now: float) -> str:
         digest = f"sha256:{hashlib.sha256(canonical_json.encode()).hexdigest()}"
         self._db.execute("BEGIN IMMEDIATE")

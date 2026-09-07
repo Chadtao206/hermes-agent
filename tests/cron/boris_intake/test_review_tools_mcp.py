@@ -252,14 +252,22 @@ def test_file_evidence_rejects_traversal_and_non_repository_paths(tmp_path, monk
 
 def test_file_evidence_constructs_only_the_pinned_head_route(tmp_path, monkeypatch):
     module, _, _ = bind_request(tmp_path, monkeypatch)
-    runner, calls = github_runner(evidence=json.dumps({"content": "IyBkb2NzCg=="}))
+    contents = {
+        "type": "file",
+        "path": "docs/review guide.md",
+        "sha": "f" * 40,
+        "size": 7,
+        "content": "IyBkb2NzCg==\n",
+        "encoding": "base64",
+    }
+    runner, calls = github_runner(evidence=json.dumps(contents))
     monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
 
     result = module.read_github_evidence("file_at_head", "docs/review guide.md")
 
     command = calls[-1][0]
     assert "/repos/Ylopo/example/contents/docs/review%20guide.md?ref=" + "a" * 40 in command
-    assert result["data"]["content"] == "IyBkb2NzCg=="
+    assert result["data"]["content"] == "# docs\n"
 
 
 def test_check_evidence_accepts_failure_exit_with_valid_json(tmp_path, monkeypatch):
@@ -478,7 +486,7 @@ def test_pr_diff_returns_first_page_and_advertises_the_rest(tmp_path, monkeypatc
     assert result["data"]["page"] == 1
     assert result["data"]["has_more"] is True
     assert result["data"]["all_files"] == ["x.py", "y.py"]
-    assert len(result["data"]["diff"]) <= module._DIFF_PAGE_BUDGET
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
 
 
 TOO_LARGE = (
@@ -609,3 +617,819 @@ def test_pr_diff_rejects_page_on_other_operations(tmp_path, monkeypatch):
         module.read_github_evidence("pr_checks", None, 2)
     with pytest.raises(module.ToolError, match="positive integer"):
         module.read_github_evidence("pr_diff", None, 0)
+
+
+# --- Tool surface the model can actually learn from -----------------------------------
+#
+# The lane's user message is the bare "work kanban task <id>" and the kanban toolset is
+# disabled, so the card body never reaches the model. Everything it knows about these
+# tools comes from SOUL.md and the tool schema; every tool and parameter must carry a
+# description that states what the operation returns and how to call it.
+
+
+def _listed_tools(module):
+    return {tool.name: tool for tool in asyncio.run(module.server.list_tools())}
+
+
+def _input_schema(tool):
+    return getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None)
+
+
+def test_every_tool_and_parameter_carries_a_description():
+    from boris_intake import review_tools_mcp
+
+    tools = _listed_tools(review_tools_mcp)
+    assert set(tools) == {"read_github_evidence", "read_acceptance_evidence", "submit_review_result"}
+    for name, tool in tools.items():
+        assert tool.description and len(tool.description) > 80, name
+        for param, schema in _input_schema(tool)["properties"].items():
+            assert schema.get("description"), f"{name}.{param} has no description"
+
+    github = tools["read_github_evidence"].description
+    for fact in ("pr_metadata", "review_context", "has_more", "file_at_head", "pr_comments"):
+        assert fact in github
+    # pr_metadata no longer carries comments/reviews (they made the first call of every
+    # lane unbounded); the description must not call pr_comments redundant.
+    assert "already returned" not in github
+    assert "delete" in github  # all_files includes files the diff deletes
+    everything = " ".join(
+        text
+        for tool in tools.values()
+        for text in [tool.description or ""]
+        + [str(schema.get("description", "")) for schema in _input_schema(tool)["properties"].values()]
+    )
+    assert "same data as pr_metadata" not in everything
+    acceptance = tools["read_acceptance_evidence"].description
+    assert "acceptance_references" in acceptance and "pr_metadata" in acceptance
+    submit = tools["submit_review_result"].description
+    assert "validation_error" in submit and "accepted" in submit
+
+
+def _contents_runner(head="a" * 40, **contents):
+    """GitHub runner whose /contents/ route answers with a contents-API object."""
+    import base64
+
+    calls = []
+    encoded = contents.copy()
+    if "text" in encoded:
+        raw = encoded.pop("text").encode()
+        encoded.setdefault("content", base64.b64encode(raw).decode() + "\n")
+        encoded.setdefault("encoding", "base64")
+        encoded.setdefault("size", len(raw))
+    if "raw" in encoded:
+        raw = encoded.pop("raw")
+        encoded.setdefault("content", base64.b64encode(raw).decode())
+        encoded.setdefault("encoding", "base64")
+        encoded.setdefault("size", len(raw))
+    encoded.setdefault("type", "file")
+    encoded.setdefault("sha", "f" * 40)
+    encoded.setdefault("path", "src/app.py")
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": head, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(encoded), stderr="")
+
+    return run, calls
+
+
+def test_file_evidence_returns_decoded_text_not_base64(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    text = "import os\n\ndef main():\n    return os.getcwd()\n"
+    runner, _calls = _contents_runner(text=text)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("file_at_head", "src/app.py")["data"]
+
+    assert data["content"] == text
+    assert data["encoding"] == "utf-8"
+    assert data["path"] == "src/app.py"
+    assert data["size"] == len(text.encode())
+    assert data["total_lines"] == 4
+    assert (data["page"], data["total_pages"], data["has_more"]) == (1, 1, False)
+    assert data["line_range"] == [1, 4]
+    assert "IyBk" not in json.dumps(data)  # no base64 leaks through
+    for raw_field in ("git_url", "download_url", "_links", "html_url", "url"):
+        assert raw_field not in data
+
+
+def test_file_evidence_pages_a_large_file_by_whole_lines(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    lines = [f"line {i:03d} {'x' * 20}\n" for i in range(1, 241)]
+    text = "".join(lines)
+    monkeypatch.setattr(module, "_RESULT_BUDGET", 3_000)
+    runner, _calls = _contents_runner(text=text)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    first = module.read_github_evidence("file_at_head", "src/app.py", 1)["data"]
+    assert first["has_more"] is True
+    assert first["total_pages"] > 1
+    assert first["line_range"][0] == 1
+    assert _hermes_rendered_size(first) <= 3_000
+
+    seen = ""
+    last_end = 0
+    for page in range(1, first["total_pages"] + 1):
+        data = module.read_github_evidence("file_at_head", "src/app.py", page)["data"]
+        assert data["line_range"][0] == last_end + 1
+        assert data["content"].endswith("\n")
+        seen += data["content"]
+        last_end = data["line_range"][1]
+    assert seen == text
+    assert last_end == 240
+    assert data["has_more"] is False
+
+    with pytest.raises(module.ToolError, match="out of range"):
+        module.read_github_evidence("file_at_head", "src/app.py", first["total_pages"] + 1)
+
+
+def test_file_evidence_shortens_a_single_line_longer_than_a_page(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "_RESULT_BUDGET", 3_000)
+    text = "short\n" + "m" * 5_000 + "\nafter\n"
+    runner, _calls = _contents_runner(text=text)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    pages = []
+    page = 1
+    while True:
+        data = module.read_github_evidence("file_at_head", "src/app.py", page)["data"]
+        pages.append(data)
+        if not data["has_more"]:
+            break
+        page += 1
+
+    joined = "".join(p["content"] for p in pages)
+    assert joined.startswith("short\n") and joined.endswith("\nafter\n")
+    import re
+
+    marker = re.search(r" \[boris: (\d+) chars of this line omitted\]\n", joined)
+    assert marker, joined[:300]
+    kept = joined.split("\n")[1].split(" [boris:")[0]
+    assert set(kept) == {"m"}
+    assert len(kept) + int(marker.group(1)) == 5_000, "omitted count must be exact"
+    assert all(_hermes_rendered_size(p) <= 3_000 for p in pages)
+    assert pages[-1]["line_range"][1] == 3
+    assert pages[-1]["total_lines"] == 3
+
+
+def test_file_evidence_flags_binary_content_instead_of_dumping_it(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(raw=b"\x89PNG\r\n\x1a\n\x00\x00\xff\xfe", path="logo.png")
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("file_at_head", "logo.png")["data"]
+
+    assert data["binary"] is True
+    assert data["content"] is None
+    assert data["size"] == 12
+    assert "note" in data
+
+
+def test_file_evidence_lists_a_directory(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    listing = [
+        {"name": "app.py", "path": "src/app.py", "type": "file", "size": 120, "sha": "1" * 40,
+         "url": "u", "git_url": "g", "html_url": "h", "download_url": "d", "_links": {}},
+        {"name": "lib", "path": "src/lib", "type": "dir", "size": 0, "sha": "2" * 40,
+         "url": "u", "git_url": "g", "html_url": "h", "download_url": None, "_links": {}},
+    ]
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    data = module.read_github_evidence("file_at_head", "src")["data"]
+
+    assert data["type"] == "dir"
+    assert data["path"] == "src"
+    assert data["entries"] == [
+        {"name": "app.py", "type": "file", "size": 120},
+        {"name": "lib", "type": "dir", "size": 0},
+    ]
+    assert data["truncated"] is False and data["total_entries"] == 2
+    assert "git_url" not in json.dumps(data)
+
+
+def test_file_evidence_names_a_missing_path_plainly(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+
+    def run(command, **kwargs):
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)\n{\"message\":\"Not Found\"}"
+        )
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    with pytest.raises(module.ToolError, match=r"src/missing\.py.*not exist at the pinned head"):
+        module.read_github_evidence("file_at_head", "src/missing.py")
+
+
+def test_file_evidence_reports_content_github_withholds(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(content="", encoding="none", size=3_000_000, path="big.bin")
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    with pytest.raises(module.ToolError, match="1 MiB"):
+        module.read_github_evidence("file_at_head", "big.bin")
+
+
+def test_page_is_accepted_for_file_at_head_but_still_refused_elsewhere(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(text="one\n")
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    assert module.read_github_evidence("file_at_head", "src/app.py", 1)["data"]["page"] == 1
+    with pytest.raises(module.ToolError, match="page is valid only"):
+        module.read_github_evidence("pr_comments", None, 2)
+
+
+# --- Request context the card body used to carry ----------------------------------------
+
+
+def test_metadata_carries_review_context_for_a_first_review(tmp_path, monkeypatch):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+    runner, _calls = github_runner()
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_metadata")
+
+    context = result["review_context"]
+    assert context["policy"] == {"rubric_version": "2", "ignore_ci": False}
+    assert context["acceptance_references"] == []
+    assert context["prior_review"] is None
+    # GitHub's payload stays where it was; the context is workflow-owned, not evidence.
+    assert result["data"]["title"] == "Example"
+    assert "review_context" not in result["data"]
+
+    store.authorize_acceptance_evidence(request.request_id, "PLAT-123", {"content": "AC"})
+    store.authorize_acceptance_evidence(request.request_id, "LAB-7", {"content": "AC"})
+    context = module.read_github_evidence("pr_metadata")["review_context"]
+    assert context["acceptance_references"] == ["LAB-7", "PLAT-123"]
+
+
+def _finish_prior_review(store, request, *, head, outcome, blocking, non_blocking=(), at):
+    """An earlier request for the same PR that already produced a judgment."""
+    command = ReviewCommand(
+        owner=request.owner,
+        repo=request.repo,
+        pr_number=request.pr_number,
+        head_sha=head,
+        pr_author=request.pr_author,
+        requester_user_id="U1",
+        requester_email="a@ylopo.com",
+        channel_id="C1",
+        message_ts="0.5",
+        root_thread_ts="0.5",
+        permalink="https://ylopo.slack.com/archives/C1/p05",
+        policy=ReviewPolicy(ignore_ci=False, rubric_version="2"),
+    )
+    event = NormalizedEvent("C1", "channel", "U1", "0.5", None, "discarded", False, None)
+    snapshot = GateSnapshot("sha256:gate-prior", "2026-08-14T11:00:00Z", ())
+    prior = store.admit_event(event, (command,), (snapshot,), 900_000.0).admitted[0]
+    result = {
+        "derived": {"outcome": outcome, "presentation": "ISSUES"},
+        "assembled_at": at,
+        "blocking_issues": [{"title": title} for title in blocking],
+        "non_blocking_issues": [{"title": title} for title in non_blocking],
+    }
+    store._db.execute(
+        "UPDATE review_requests SET validated_result_json=?, workflow_state='complete', "
+        "completed_at=? WHERE request_id=?",
+        (json.dumps(result), 900_500.0, prior.request_id),
+    )
+    store._db.commit()
+    return prior
+
+
+def test_metadata_review_context_carries_the_prior_review_as_data(tmp_path, monkeypatch):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+    _finish_prior_review(
+        store,
+        request,
+        head="b" * 40,
+        outcome="ISSUES_FOUND",
+        blocking=("Ownership predicate removed",),
+        non_blocking=("Log line spelling",),
+        at="2026-09-05T10:00:00Z",
+    )
+    runner, _calls = github_runner()
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    prior = module.read_github_evidence("pr_metadata")["review_context"]["prior_review"]
+
+    assert prior == {
+        "head_sha": "b" * 40,
+        "same_head": False,
+        "outcome": "ISSUES_FOUND",
+        "gate_only": False,
+        "assembled_at": "2026-09-05T10:00:00Z",
+        "blocking_titles": ["Ownership predicate removed"],
+        "non_blocking_titles": ["Log line spelling"],
+    }
+
+
+def test_metadata_review_context_marks_a_prior_review_of_the_same_head(tmp_path, monkeypatch):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+    _finish_prior_review(
+        store, request, head=request.head_sha, outcome="READY_FOR_HUMAN_REVIEW", blocking=(),
+        at="2026-09-05T10:00:00Z",
+    )
+    runner, _calls = github_runner()
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    prior = module.read_github_evidence("pr_metadata")["review_context"]["prior_review"]
+
+    assert prior["same_head"] is True
+    assert prior["blocking_titles"] == []
+
+
+def test_unauthorized_acceptance_reference_names_what_is_authorized(tmp_path, monkeypatch):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+
+    with pytest.raises(module.ToolError, match="no acceptance evidence is authorized"):
+        module.read_acceptance_evidence("PLAT-999")
+
+    store.authorize_acceptance_evidence(request.request_id, "PLAT-123", {"content": "AC"})
+    with pytest.raises(module.ToolError, match=r"authorized references: PLAT-123"):
+        module.read_acceptance_evidence("https://ylopo.atlassian.net/browse/PLAT-123")
+
+
+# --- Results must fit Hermes' MCP spill threshold ------------------------------------------
+#
+# Hermes persists (or, without a file tool, truncates) any mcp_ tool result whose rendered
+# handler output exceeds tools.budget_config.DEFAULT_MCP_RESULT_SIZE_CHARS. The rendered
+# form is the MCP server's indent=2 JSON of the return value, JSON-encoded once more by
+# Hermes, so quotes, backslashes and control characters inflate. A page that spills is
+# unreadable to this lane, which has no read_file.
+
+
+def _hermes_rendered_size(payload) -> int:
+    """Size Hermes compares against the spill threshold for a tool return value."""
+    import pydantic_core
+    from mcp.types import CallToolResult, TextContent
+
+    from tools.mcp_tool_handlers import _render_call_tool_result
+
+    text = pydantic_core.to_json(payload, fallback=str, indent=2).decode()
+    result = CallToolResult(content=[TextContent(type="text", text=text)])
+    return len(_render_call_tool_result(result, "boris_review"))
+
+
+def _mcp_threshold() -> int:
+    from tools.budget_config import DEFAULT_BUDGET
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+
+    return int(DEFAULT_BUDGET.resolve_threshold(mcp_prefixed_tool_name("boris_review", "read_github_evidence")))
+
+
+def _worst_case_text(lines: int) -> str:
+    # Quote/backslash/tab-heavy lines (JSON fixtures, regexes) inflate most when double-encoded.
+    return "".join(f'{{"k{n}": "v\\"{n}\\\\", "t": "\\t\\\\path\\\\to"}}\t"end"\n' for n in range(lines))
+
+
+def test_default_budget_sits_under_the_live_mcp_threshold():
+    from boris_intake import review_tools_mcp as module
+
+    assert module._RESULT_BUDGET < _mcp_threshold()
+
+
+def test_file_pages_render_under_the_mcp_result_threshold(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    text = _worst_case_text(3_000)  # ~180k raw chars, ~2x when rendered
+    runner, _calls = _contents_runner(text=text)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    seen, page = "", 1
+    while True:
+        result = module.read_github_evidence("file_at_head", "src/app.py", page)
+        assert _hermes_rendered_size(result) <= _mcp_threshold(), f"page {page} would spill"
+        seen += result["data"]["content"]
+        if not result["data"]["has_more"]:
+            break
+        page += 1
+    assert seen == text
+    assert page > 1
+
+
+@pytest.mark.parametrize("depth", (1, 4))
+def test_diff_pages_render_under_the_mcp_result_threshold(tmp_path, monkeypatch, depth):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    # Many files (a long all_files list rides on every page) with quote-heavy patches;
+    # depth 4 gives ~150-char paths, where a count-capped all_files list alone spilled.
+    folder = "/".join(["a/very/deeply/nested/directory/segment"] * depth)
+    files = [(f"{folder}/{n:04d}_fixture.json", 30) for n in range(320)]
+    parts = []
+    for name, lines in files:
+        body = "".join(f'+{{"row": {n}, "q": "\\"x\\\\"}}\n' for n in range(lines))
+        parts.append(f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -0,0 +1,{lines} @@\n{body}")
+    diff = "".join(parts)
+    runner, _calls = github_runner(evidence=diff)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    seen_files, page = set(), 1
+    while True:
+        result = module.read_github_evidence("pr_diff", None, page)
+        assert _hermes_rendered_size(result) <= _mcp_threshold(), f"page {page} would spill"
+        data = result["data"]
+        seen_files.update(data["files_on_page"])
+        if not data["has_more"]:
+            break
+        page += 1
+    assert seen_files == {name for name, _ in files}
+    assert data["total_files"] == 320
+    assert data["all_files_truncated"] is True
+    assert 0 < len(data["all_files"]) <= module._ALL_FILES_LISTED
+    assert data["all_files"] == sorted(name for name, _ in files)[: len(data["all_files"])]
+
+
+def test_metadata_is_bounded_and_review_context_precedes_github_data(tmp_path, monkeypatch):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        payload = {"headRefOid": "a" * 40, "title": "Example", "comments": [], "reviews": []}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_metadata")
+
+    # Order is part of the contract: if the payload ever spills, Hermes keeps a head
+    # preview, and the workflow-owned context must be in it.
+    assert list(result) == ["operation", "head_sha", "review_context", "data"]
+    fields = calls[-1][0][-1]
+    assert "comments" not in fields and "reviews" not in fields
+    assert "body" in fields and "headRefOid" in fields
+
+    module.read_github_evidence("pr_comments")
+    assert "comments,reviews" in calls[-1][0][-1]
+
+
+def test_review_context_failure_does_not_break_pr_metadata(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = github_runner()
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    def boom(self, request):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(module.Store, "prior_review", boom)
+
+    result = module.read_github_evidence("pr_metadata")
+
+    assert result["data"]["title"] == "Example"
+    assert result["review_context"] == {"unavailable": "review context could not be loaded"}
+    assert "locked" not in json.dumps(result)
+
+
+def test_directory_listing_is_bounded(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    listing = [
+        {"name": f"f{n:03d}.py", "path": f"src/f{n:03d}.py", "type": "file", "size": n, "sha": "1" * 40}
+        for n in range(module._DIR_ENTRIES_LISTED + 50)
+    ]
+
+    def run(command, **kwargs):
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    data = module.read_github_evidence("file_at_head", "src")["data"]
+
+    assert len(data["entries"]) == module._DIR_ENTRIES_LISTED
+    assert data["truncated"] is True
+    assert data["total_entries"] == module._DIR_ENTRIES_LISTED + 50
+    assert _hermes_rendered_size(data) <= _mcp_threshold()
+    with pytest.raises(module.ToolError, match="single page"):
+        module.read_github_evidence("file_at_head", "src", 2)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_lines"),
+    (
+        ("a\n\x0cb\nc\n", 3),  # form feed is not a line break to editors or `git blame`
+        ("a b\nc", 2),  # no trailing newline: last line still counts
+        ("a\r\nb\r\n", 2),  # CRLF stays inside the line
+        ("", 0),
+    ),
+)
+def test_file_line_numbers_follow_newlines_only(tmp_path, monkeypatch, text, expected_lines):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(text=text)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("file_at_head", "src/app.py")["data"]
+
+    assert data["total_lines"] == expected_lines
+    assert data["content"] == text
+    assert data["line_range"] == ([1, expected_lines] if expected_lines else [0, 0])
+
+
+def test_binary_detection_covers_nul_bytes_in_valid_utf8(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(raw=b"plain text\x00with a NUL\n", path="data.bin")
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("file_at_head", "data.bin")["data"]
+
+    assert data["binary"] is True and data["content"] is None
+
+
+@pytest.mark.parametrize(
+    "contents",
+    (
+        {"content": "", "encoding": "none", "size": 3_000_000},
+        {"content": "", "encoding": "base64", "size": 1_048_577},
+    ),
+)
+def test_each_withheld_content_shape_is_reported(tmp_path, monkeypatch, contents):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(path="big.bin", **contents)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    with pytest.raises(module.ToolError, match="1 MiB"):
+        module.read_github_evidence("file_at_head", "big.bin")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    (
+        {"type": "symlink", "target": "../elsewhere", "size": 12},
+        {"type": "submodule", "submodule_git_url": "https://x", "size": 0},
+        {"content": None, "encoding": "base64", "size": 5},
+    ),
+)
+def test_unreadable_content_shapes_fail_plainly(tmp_path, monkeypatch, contents):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(path="odd", **contents)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    with pytest.raises(module.ToolError, match="readable"):
+        module.read_github_evidence("file_at_head", "odd")
+
+
+def test_non_integer_size_is_tolerated(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = _contents_runner(text="x = 1\n", size="unknown")
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("file_at_head", "src/app.py")["data"]
+
+    assert data["content"] == "x = 1\n" and data["size"] == 0
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    (
+        "gh: Forbidden (HTTP 403)\n{\"message\":\"Resource not accessible\"}",
+        "ghx_ro: REFUSED api path is outside the pinned repository head",
+    ),
+)
+def test_only_a_real_404_is_reported_as_a_missing_path(tmp_path, monkeypatch, stderr):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+
+    def run(command, **kwargs):
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    with pytest.raises(module.GitHubCommandError) as caught:
+        module.read_github_evidence("file_at_head", "src/app.py")
+    assert "does not exist" not in str(caught.value)
+
+
+def test_missing_path_message_carries_githubs_reason(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+
+    def run(command, **kwargs):
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    with pytest.raises(module.ToolError, match=r"deletes.*HTTP 404"):
+        module.read_github_evidence("file_at_head", "src/app.py")
+
+
+def test_mode_only_diff_of_many_deep_files_stays_under_threshold(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    # Tiny per-file content, so files_on_page and all_files dominate the page.
+    folder = "/".join(["service/module/package/component"] * 4)
+    names = [f"{folder}/{n:04d}.java" for n in range(2_000)]
+    diff = "".join(f"diff --git a/{n} b/{n}\nold mode 100644\nnew mode 100755\n" for n in names)
+    runner, _calls = github_runner(evidence=diff)
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    seen, page = set(), 1
+    while True:
+        result = module.read_github_evidence("pr_diff", None, page)
+        assert _hermes_rendered_size(result) <= _mcp_threshold(), f"page {page} would spill"
+        seen.update(result["data"]["files_on_page"])
+        if not result["data"]["has_more"]:
+            break
+        page += 1
+    assert seen == set(names)
+
+
+def test_deep_directory_listing_is_bounded_by_size(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    folder = "/".join(["a/very/deeply/nested/directory/segment"] * 3)
+    listing = [
+        {"name": f"{'component' * 3}_{n:03d}.tsx", "path": f"{folder}/x{n}", "type": "file", "size": n}
+        for n in range(module._DIR_ENTRIES_LISTED)
+    ]
+
+    def run(command, **kwargs):
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    result = module.read_github_evidence("file_at_head", folder)
+
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
+    data = result["data"]
+    assert data["total_entries"] == module._DIR_ENTRIES_LISTED
+    assert 0 < len(data["entries"]) <= module._DIR_ENTRIES_LISTED
+    assert all("path" not in entry for entry in data["entries"])
+    assert data["truncated"] == (len(data["entries"]) < module._DIR_ENTRIES_LISTED)
+
+
+def test_long_pull_request_body_is_fitted_not_spilled(tmp_path, monkeypatch):
+    module, store, request = bind_request(tmp_path, monkeypatch)
+    _finish_prior_review(
+        store, request, head="b" * 40, outcome="ISSUES_FOUND",
+        blocking=tuple(f"Prior blocker {n} " + "x" * 120 for n in range(8)),
+        non_blocking=tuple(f"Prior nit {n} " + "y" * 120 for n in range(8)),
+        at="2026-09-05T10:00:00Z",
+    )
+    body = "\n".join(f'## Release {n}\n- fixed "quoted" thing \\ path' for n in range(3_000))
+    assert len(body) > 60_000
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append(command)
+        payload = {"headRefOid": "a" * 40, "title": "Example", "body": body, "state": "OPEN"}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_metadata")
+
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
+    assert result["review_context"]["prior_review"]["blocking_titles"][7].startswith("Prior blocker 7")
+    data = result["data"]
+    assert data["body_truncated"] is True
+    assert body.startswith(data["body"].split("\n[boris:")[0])
+    assert "chars of the description omitted]" in data["body"]
+    assert data["title"] == "Example"
+
+
+def test_short_pull_request_body_is_passed_through(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    runner, _calls = github_runner()
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("pr_metadata")["data"]
+
+    assert "body_truncated" not in data
+
+
+def test_busy_comment_thread_keeps_the_newest_entries_under_threshold(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    comments = [{"id": n, "author": {"login": "dev"}, "body": f"comment {n} " + "z" * 800} for n in range(300)]
+    reviews = [{"id": n, "state": "COMMENTED", "body": f"review {n} " + "w" * 800} for n in range(40)]
+
+    def runner(command, **kwargs):
+        payload = {"headRefOid": "a" * 40, "title": "Example", "comments": comments, "reviews": reviews}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    result = module.read_github_evidence("pr_comments")
+
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
+    data = result["data"]
+    assert data["total_comments"] == 300 and data["total_reviews"] == 40
+    assert data["comments_omitted"] == 300 - len(data["comments"]) > 0
+    assert data["comments"][-1]["id"] == 299  # newest kept
+    assert [c["id"] for c in data["comments"]] == list(range(300 - len(data["comments"]), 300))
+    assert data["reviews"][-1]["id"] == 39
+    assert "oldest" in data["note"]
+
+
+def test_small_comment_thread_is_passed_through_whole(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+
+    def runner(command, **kwargs):
+        payload = {"headRefOid": "a" * 40, "title": "Example", "comments": [{"id": 1, "body": "hi"}], "reviews": []}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
+
+    data = module.read_github_evidence("pr_comments")["data"]
+
+    assert data["comments"] == [{"id": 1, "body": "hi"}]
+    assert data["comments_omitted"] == 0 and data["reviews_omitted"] == 0
+    assert "note" not in data
+
+
+def _gh_comment(n, body, reactions=3):
+    """A comment shaped like `gh pr view --json comments` really returns it."""
+    return {
+        "id": f"IC_kwDO{n:08d}",
+        "author": {"id": "MDQ6VXNlcjM1NTY1OTYx", "is_bot": False, "login": f"dev{n % 7}", "name": "Dev Eloper"},
+        "authorAssociation": "MEMBER",
+        "body": body,
+        "createdAt": "2026-09-06T15:20:08Z",
+        "includesCreatedEdit": False,
+        "isMinimized": False,
+        "minimizedReason": "",
+        "reactionGroups": [{"content": c, "users": {"totalCount": 1}} for c in ("THUMBS_UP", "EYES", "HEART")[:reactions]],
+        "url": f"https://github.com/Ylopo/example/pull/42#issuecomment-{5560190070 + n}",
+        "viewerDidAuthor": False,
+    }
+
+
+def _thread_runner(comments, reviews):
+    def runner(command, **kwargs):
+        payload = {"headRefOid": "a" * 40, "title": "Example", "comments": comments, "reviews": reviews}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    return runner
+
+
+def test_nested_list_size_estimate_matches_the_real_render():
+    from boris_intake import review_tools_mcp as module
+
+    items = [_gh_comment(n, "x" * n) for n in range(12)]
+    empty = {"operation": "pr_comments", "head_sha": "a" * 40, "data": {"comments": [], "reviews": []}}
+    full = {"operation": "pr_comments", "head_sha": "a" * 40, "data": {"comments": items, "reviews": []}}
+
+    true_delta = _hermes_rendered_size(full) - _hermes_rendered_size(empty)
+    estimate = module._rendered_items_len(items, 2) - module._rendered_items_len([], 2)
+
+    assert estimate == true_delta
+
+
+def test_many_short_gh_shaped_comments_stay_under_threshold(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    comments = [_gh_comment(n, "k", reactions=3) for n in range(600)]
+    reviews = [{"id": f"PRR_{n}", "author": {"login": "dev"}, "state": "COMMENTED", "body": "r" * 40,
+                "submittedAt": "2026-09-06T15:22:33Z", "commit": {"oid": "a" * 40}} for n in range(40)]
+    monkeypatch.setattr(module, "GITHUB_RUNNER", _thread_runner(comments, reviews))
+
+    result = module.read_github_evidence("pr_comments")
+
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
+    data = result["data"]
+    assert data["comments"][-1]["id"] == comments[-1]["id"]
+    assert data["total_comments"] == 600
+
+
+def test_one_giant_newest_comment_does_not_blank_the_thread(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    comments = [_gh_comment(n, f"human comment {n}") for n in range(12)]
+    comments.append(_gh_comment(12, "| file | coverage |\n" + "| a/b/c.py | 100% |\n" * 3_000))
+    reviews = [{"id": "PRR_1", "state": "APPROVED", "body": "lgtm"}, {"id": "PRR_2", "state": "COMMENTED", "body": "w" * 60_000}]
+    monkeypatch.setattr(module, "GITHUB_RUNNER", _thread_runner(comments, reviews))
+
+    result = module.read_github_evidence("pr_comments")
+
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
+    data = result["data"]
+    newest = data["comments"][-1]
+    assert newest["id"] == comments[-1]["id"]
+    assert newest["body_truncated"] is True
+    assert newest["body"].startswith("| file | coverage |\n")
+    assert "chars of this comment omitted]" in newest["body"]
+    # The short human comments fit alongside the capped bot comment (each gh-shaped
+    # comment renders to ~1.2k chars; the bot comment is capped at a quarter of the room).
+    assert [c["id"] for c in data["comments"]] == [c["id"] for c in comments]
+    assert data["comments_omitted"] == 0
+    assert data["reviews"][-1]["id"] == "PRR_2" and data["reviews"][-1]["body_truncated"] is True
+    assert data["reviews"][0]["id"] == "PRR_1" and "body_truncated" not in data["reviews"][0]
+    assert data["reviews_omitted"] == 0 and "note" not in data

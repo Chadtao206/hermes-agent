@@ -590,3 +590,17 @@ def test_prior_review_looks_past_a_long_run_of_incomplete_results(tmp_path):
 
     assert prior is not None
     assert prior.blocking_titles == ("Real blocker",)
+
+
+def test_acceptance_references_lists_authorized_references_in_order(tmp_path):
+    s = Store(tmp_path / "s.db")
+    request = _admit_for_pr(s, head="a" * 40, ts="1.0", now=1_000.0)
+    other = _admit_for_pr(s, head="b" * 40, ts="2.0", now=2_000.0)
+    assert s.acceptance_references(request.request_id) == ()
+
+    s.authorize_acceptance_evidence(request.request_id, "PLAT-20", {"content": "b"})
+    s.authorize_acceptance_evidence(request.request_id, "LAB-3", {"content": "a"})
+    s.authorize_acceptance_evidence(other.request_id, "MID-1", {"content": "c"})
+
+    assert s.acceptance_references(request.request_id) == ("LAB-3", "PLAT-20")
+    assert s.acceptance_references(other.request_id) == ("MID-1",)

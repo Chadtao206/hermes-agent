@@ -2,6 +2,12 @@
 
 Only validated scalars are interpolated. No Slack free text reaches this module,
 which is what keeps the lane body free of attacker-controlled instructions.
+
+The card body is read by operators on the board and in worker logs, not by the
+model: the worker's only user message is the bare task id and the profile has no
+kanban tools. The model receives the same facts through SOUL.md and the
+``review_context`` returned by ``read_github_evidence("pr_metadata")`` in
+review_tools_mcp.py; keep the two in step.
 """
 from __future__ import annotations
 
