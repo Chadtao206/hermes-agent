@@ -238,8 +238,13 @@ class BorisSource:
         `requester_user_id` and `pr_author` are the two identity filters:
         Chad asked for the review, and Chad wrote the pull request. The
         second is the SOUL.md third-party gate -- this loop must never push
-        commits to someone else's branch. Contrast `request_exists` below,
-        which deliberately applies neither.
+        commits to someone else's branch. `source_channel` is the third:
+        boris_intake also admits @-mentioned requests from other channels
+        (just-do-it, mention-only), but this loop can only ask for a
+        re-review in `cfg.boris_channel` under the request's own
+        `root_thread_ts`, so a verdict from anywhere else would open a round
+        whose re-review can never be requested. Contrast `request_exists`
+        below, which deliberately applies none of the three.
 
         `ORDER BY completed_at DESC LIMIT ?` is not cosmetic and not a
         safety net. Nothing marks a row consumed on this side; the loop's own
@@ -257,9 +262,10 @@ class BorisSource:
             "status_message_ts, semantic_outcome, validated_result_json "
             "FROM review_requests "
             "WHERE workflow_state='complete' AND semantic_outcome IS NOT NULL "
-            "AND requester_user_id=? AND pr_author=? "
+            "AND requester_user_id=? AND pr_author=? AND source_channel=? "
             "ORDER BY completed_at DESC LIMIT ?",
-            (self._cfg.chad_slack_id, self._cfg.chad_github_login, limit),
+            (self._cfg.chad_slack_id, self._cfg.chad_github_login,
+             self._cfg.boris_channel, limit),
         )
         return tuple(self._verdict(row) for row in cur.fetchall())
 

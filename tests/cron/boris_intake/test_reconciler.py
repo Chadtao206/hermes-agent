@@ -2156,3 +2156,27 @@ def test_these_modules_still_reach_the_deployed_slack_transport(module):
     assert seen["slack_read"].startswith("/Users/ctao/.hermes/scripts"), (
         "the appended root no longer supplies slack_read, so this module "
         "would fail to start")
+
+
+def test_real_dependency_builder_owns_reactions_only_in_passive_channels(tmp_path):
+    """Mention-only channels (just-do-it) share `blinkapproved` with the
+    jdi_autoapprove stamp; the live SlackIO must know which channels are Boris's."""
+    from boris_intake.config import Config
+    from boris_intake.reconciler import build_deps
+
+    cfg = Config(
+        mode="live",
+        github_token_path=tmp_path / "github-token",
+        channels=("C_OWNED", "C_MENTION_ONLY"),
+        passive_channels=("C_OWNED",),
+    )
+
+    deps = build_deps(
+        cfg,
+        "slack-token",
+        slack_caller=lambda *_args, **_kwargs: {"ok": True},
+        kanban_db=tmp_path / "kanban.db",
+        now=lambda: 123.0,
+    )
+
+    assert deps.slack._owned_channels == frozenset({"C_OWNED"})

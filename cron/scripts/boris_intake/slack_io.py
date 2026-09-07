@@ -18,6 +18,11 @@ _LIFECYCLE_REACTIONS = (
     "doge_notes",
     "blinkapproved",
 )
+# Reactions another automation also uses on the same messages. In just-do-it the
+# jdi_autoapprove poller adds `blinkapproved` as its stamp acknowledgement, so in a
+# channel Boris does not own (not a passive channel) removing it would read as
+# withdrawing the auto-approval.
+_SHARED_REACTIONS = frozenset({"blinkapproved"})
 
 
 class SlackLifecycleError(RuntimeError):
@@ -58,10 +63,19 @@ REASON_TEXT = {
 
 
 class SlackIO:
-    def __init__(self, slack_call: Callable, token: str, dry_run: bool = True):
+    def __init__(
+        self,
+        slack_call: Callable,
+        token: str,
+        dry_run: bool = True,
+        owned_channels: frozenset[str] | None = None,
+    ):
         self._call = slack_call
         self._token = token
         self.dry_run = dry_run
+        # Channels whose source-message reactions Boris fully owns (the passive
+        # channels). None keeps the historical behaviour: own everything.
+        self._owned_channels = owned_channels
         self.dry_run_log: list[tuple[str, dict]] = []
 
     def _post(self, method: str, **kw) -> None:
@@ -207,8 +221,11 @@ class SlackIO:
             **target,
             name=reaction,
         )
+        owned = self._owned_channels is None or request.channel_id in self._owned_channels
         for stale in _LIFECYCLE_REACTIONS:
             if stale == reaction:
+                continue
+            if not owned and stale in _SHARED_REACTIONS:
                 continue
             self._lifecycle_call(
                 "reactions.remove",

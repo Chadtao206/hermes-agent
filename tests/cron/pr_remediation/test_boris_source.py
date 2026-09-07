@@ -15,7 +15,7 @@ SCHEMA = """
 CREATE TABLE review_requests (
     request_id TEXT PRIMARY KEY, owner TEXT, repo TEXT, pr_number INTEGER,
     head_sha TEXT, pr_author TEXT, requester_user_id TEXT, root_thread_ts TEXT,
-    status_message_ts TEXT,
+    status_message_ts TEXT, source_channel TEXT,
     workflow_state TEXT, semantic_outcome TEXT, validated_result_json TEXT,
     created_at REAL, completed_at REAL
 );
@@ -36,6 +36,7 @@ def boris_db(tmp_path, **overrides):
         "head_sha": "a" * 40, "pr_author": "Chadtao206",
         "requester_user_id": "U07E3AHV686", "root_thread_ts": "1.0",
         "status_message_ts": "2.0",
+        "source_channel": RemediationConfig().boris_channel,
         "workflow_state": "complete", "semantic_outcome": "ISSUES_FOUND",
         "validated_result_json": json.dumps({
             "blocking_issues": [{"title": "Null deref in handler"}],
@@ -48,6 +49,7 @@ def boris_db(tmp_path, **overrides):
     db.execute(
         "INSERT INTO review_requests VALUES (:request_id,:owner,:repo,:pr_number,"
         ":head_sha,:pr_author,:requester_user_id,:root_thread_ts,:status_message_ts,"
+        ":source_channel,"
         ":workflow_state,:semantic_outcome,:validated_result_json,:created_at,"
         ":completed_at)", row)
     db.commit()
@@ -144,9 +146,10 @@ def _backlog(tmp_path, count):
     db = sqlite3.connect(str(path))
     for index in range(1, count):
         db.execute(
-            "INSERT INTO review_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO review_requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (f"br_{index}", "Ylopo", "example", 42 + index, "a" * 40,
-             "Chadtao206", "U07E3AHV686", "1.0", "2.0", "complete",
+             "Chadtao206", "U07E3AHV686", "1.0", "2.0",
+             RemediationConfig().boris_channel, "complete",
              "ISSUES_FOUND", json.dumps({"blocking_issues": [], "incomplete": None}),
              ADMITTED_AT, ADMITTED_AT + index),
         )
@@ -595,3 +598,19 @@ def test_review_incomplete_with_unreadable_incomplete_never_defaults_to_system(t
     verdict = BorisSource(path, RemediationConfig()).new_verdicts()[0]
     assert verdict.outcome == "REVIEW_INCOMPLETE"
     assert verdict.incomplete_origin is None
+
+
+def test_a_verdict_requested_outside_the_boris_channel_is_not_routed(tmp_path):
+    """boris_intake also admits @-mentioned requests from just-do-it (mention-only,
+    not passive). The loop's re-review repost goes to `cfg.boris_channel` under
+    the request's `root_thread_ts` and carries no mention, so a verdict from any
+    other channel would open a remediation round whose re-review can never be
+    asked for. Such verdicts are not this loop's to route."""
+    source = BorisSource(boris_db(tmp_path, source_channel="C08K8FQKX9S"), RemediationConfig())
+    assert source.new_verdicts() == ()
+
+
+def test_the_channel_filter_is_not_applied_to_request_exists(tmp_path):
+    source = BorisSource(boris_db(tmp_path, source_channel="C08K8FQKX9S"), RemediationConfig())
+    assert source.request_exists("Ylopo", "example", 42, "a" * 40,
+                                 ADMITTED_AT - 60).status is AdmissionStatus.ADMITTED

@@ -360,3 +360,40 @@ def test_the_missing_pr_reply_is_unchanged():
     assert calls[0][1]["text"] == (
         "I couldn't find that PR (or I can't see it). (Ylopo/repo#5)"
     )
+
+
+def test_shared_reaction_survives_in_a_channel_boris_does_not_own():
+    """`blinkapproved` is both Boris's READY_CLEAN reaction and the jdi_autoapprove
+    stamp acknowledgement in just-do-it. In a channel Boris does not own (not a
+    passive channel) removing it would read as withdrawing the auto-approval, so
+    only Boris-only vocabulary is reconciled there."""
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append((method, kw))
+        return {"ok": True}
+
+    SlackIO(call, "t", dry_run=False, owned_channels=frozenset({"C9"})).reconcile_source_reaction(
+        lifecycle_request(), "face_vomiting"
+    )
+
+    assert calls[0][0] == "reactions.add" and calls[0][1]["name"] == "face_vomiting"
+    removed = {kw["name"] for method, kw in calls[1:] if method == "reactions.remove"}
+    assert removed == {"warning", "rubbing", "doge_notes"}
+    assert "blinkapproved" not in removed
+
+
+def test_shared_reaction_is_reconciled_in_an_owned_channel():
+    calls = []
+
+    def call(token, method, **kw):
+        calls.append((method, kw))
+        return {"ok": True}
+
+    request = lifecycle_request()
+    SlackIO(call, "t", dry_run=False, owned_channels=frozenset({request.channel_id})).reconcile_source_reaction(
+        request, "face_vomiting"
+    )
+
+    removed = {kw["name"] for method, kw in calls[1:] if method == "reactions.remove"}
+    assert removed == {"warning", "rubbing", "doge_notes", "blinkapproved"}

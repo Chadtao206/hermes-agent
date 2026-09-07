@@ -1005,7 +1005,15 @@ def build_deps(
     now: Callable[[], float] = time.time,
 ) -> ReconcilerDeps:
     return ReconcilerDeps(
-        slack=SlackIO(slack_caller, token, dry_run=False),
+        # Boris fully owns source-message reactions only in its passive channels;
+        # elsewhere (just-do-it, mention-only) `blinkapproved` is also the
+        # auto-approve stamp and must survive reconciliation.
+        slack=SlackIO(
+            slack_caller,
+            token,
+            dry_run=False,
+            owned_channels=frozenset(cfg.passive_channels),
+        ),
         github=GitHubIO(cfg.github_token_path),
         kanban=KanbanIO(kanban_db),
         now=now,
