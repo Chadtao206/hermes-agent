@@ -39,6 +39,9 @@ class CLIChatTurnMixin:
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
+        # Settled result dict of this turn; one-shot callers (kanban workers in cli.py)
+        # read it for their exit code since chat() itself returns only the rendered text.
+        self._last_turn_result = None
 
         if not self._ensure_runtime_credentials():
             return None
@@ -84,7 +87,10 @@ class CLIChatTurnMixin:
             agent_thread.start()
             interrupt_msg = self._chat_monitor_agent_thread(turn, agent_thread)
             self._chat_settle_turn(turn)
-            return self._chat_render_turn(turn, agent_thread, interrupt_msg)
+            try:
+                return self._chat_render_turn(turn, agent_thread, interrupt_msg)
+            finally:
+                self._last_turn_result = turn.result
         except Exception as e:
             print(f"Error: {e}")
             return None

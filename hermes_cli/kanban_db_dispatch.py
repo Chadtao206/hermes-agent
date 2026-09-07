@@ -144,6 +144,58 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Popen handles of live workers, keyed by pid. A dropped handle lets
+# ``Popen.__del__`` park the running child in ``subprocess._active``; the next
+# ``Popen()`` anywhere in this process (the dispatcher runs inside the gateway)
+# then reaps it in ``subprocess._cleanup()``, the status never reaches
+# ``reap_worker_zombies``, and the worker is booked "pid N not alive" (a counted
+# crash) instead of by its real exit code. Rate-limited exits were the visible
+# casualty. Handles are released once the reaper has recorded the exit.
+_live_worker_procs: "dict[int, subprocess.Popen]" = {}
+_LIVE_WORKER_PROCS_MAX = 512
+
+
+def _retain_worker_proc(proc: "subprocess.Popen") -> None:
+    pid = getattr(proc, "pid", None)
+    if not pid or pid <= 0:
+        return
+    _live_worker_procs[int(pid)] = proc
+    if len(_live_worker_procs) > _LIVE_WORKER_PROCS_MAX:
+        _prune_worker_procs()
+
+
+def _prune_worker_procs() -> None:
+    """Overflow path only (the reaper normally releases handles): reap finished
+    children ourselves so their status is recorded, never merely discarded, and
+    forget pids that someone else already reaped."""
+    for stale_pid, stale in list(_live_worker_procs.items()):
+        if getattr(stale, "returncode", None) is not None:
+            _live_worker_procs.pop(stale_pid, None)
+            continue
+        if os.name == "nt":
+            continue
+        try:
+            reaped_pid, status = os.waitpid(stale_pid, os.WNOHANG)
+        except ChildProcessError:
+            _live_worker_procs.pop(stale_pid, None)
+            continue
+        except Exception:
+            continue
+        if reaped_pid == stale_pid:
+            _record_worker_exit(stale_pid, status)
+            _release_worker_proc(stale_pid, status)
+
+
+def _release_worker_proc(pid: int, raw_status: int) -> None:
+    """Forget a reaped worker's handle, stamping the exit so ``__del__`` never
+    re-registers the pid with ``subprocess._active``."""
+    proc = _live_worker_procs.pop(int(pid), None)
+    if proc is not None and getattr(proc, "returncode", 0) is None:
+        try:
+            proc.returncode = os.waitstatus_to_exitcode(int(raw_status))
+        except (ValueError, OSError):
+            proc.returncode = 0
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status; duplicate pids overwrite (latest wins)."""
@@ -200,6 +252,7 @@ def reap_worker_zombies() -> "list[int]":
                 if pid == 0:
                     break
                 _record_worker_exit(pid, status)
+                _release_worker_proc(pid, status)
                 reaped.append(pid)
         except Exception:
             pass
@@ -2151,6 +2204,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
+    _retain_worker_proc(proc)
     return proc.pid
 
 

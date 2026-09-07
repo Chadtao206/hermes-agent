@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from boris_intake.models import LifecycleRequest
+from boris_intake.models import LifecycleRequest, PriorReview
 from boris_intake.template import render
 
 PY = "/Users/ctao/.hermes/hermes-agent/venv/bin/python"
@@ -59,9 +59,13 @@ def active_lane_count(db_path: str = KANBAN_DB) -> int:
 
 
 def create_lane(
-    request: LifecycleRequest, runner=subprocess.run, *, retry: bool = False
+    request: LifecycleRequest,
+    runner=subprocess.run,
+    *,
+    retry: bool = False,
+    prior: PriorReview | None = None,
 ) -> str:
-    title, body = render(request)
+    title, body = render(request, prior)
     idempotency_key = lane_idempotency_key(request, retry=retry)
     argv = [
         PY,
@@ -134,8 +138,14 @@ class KanbanIO:
             raise RuntimeError("multiple Kanban lanes have the review idempotency key")
         return str(rows[0]["id"]) if rows else None
 
-    def create_lane(self, request: LifecycleRequest, *, retry: bool = False) -> str:
-        return create_lane(request, runner=self._runner, retry=retry)
+    def create_lane(
+        self,
+        request: LifecycleRequest,
+        *,
+        retry: bool = False,
+        prior: PriorReview | None = None,
+    ) -> str:
+        return create_lane(request, runner=self._runner, retry=retry, prior=prior)
 
     def lane_status(self, lane_id: str) -> str | None:
         rows = self._query(
@@ -145,3 +155,33 @@ class KanbanIO:
         if not rows:
             return None
         return str(rows[0]["status"])
+
+    def lane_quota_hold(self, lane_id: str) -> float | None:
+        """``ended_at`` of the lane's latest run the dispatcher booked ``rate_limited``
+        (the worker bounced off a provider quota wall and was requeued), else None.
+        Later runs are deliberately ignored: a lost exit status books a bounce as a
+        crash, and the reconciler bounds the hold by recency itself."""
+        rows = self._query(
+            "SELECT ended_at FROM task_runs"
+            " WHERE task_id=? AND outcome='rate_limited' AND ended_at IS NOT NULL"
+            " ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (lane_id,),
+        )
+        return float(rows[0]["ended_at"]) if rows else None
+
+    def retire_lane(self, lane_id: str) -> None:
+        """Archive a lane whose request is finished, so it neither keeps bouncing
+        off a quota wall nor lands a judgment nobody consumes."""
+        argv = [PY, "-m", "hermes_cli.main", "kanban", "archive", lane_id]
+        proc = self._runner(
+            argv,
+            cwd=REPO,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env=dict(os.environ, HERMES_HOME=HERMES_HOME, PYTHONPATH=REPO),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"kanban archive rc={proc.returncode}: {proc.stderr.strip()[:300]}"
+            )

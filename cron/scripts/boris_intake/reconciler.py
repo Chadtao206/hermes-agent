@@ -39,6 +39,7 @@ from boris_intake.models import (
     GateSnapshot,
     LifecycleRequest,
     PRInfo,
+    PriorReview,
     PublishedReview,
     SemanticOutcome,
     SlackStatus,
@@ -68,6 +69,10 @@ GATE_POLL_SECONDS = 15
 # Successful reviews have never taken longer than 32 minutes end to end, so 90
 # bounds the damage without cutting a slow-but-working reviewer short.
 REVIEW_WAIT_SECONDS = 90 * 60
+# A worker that bounces off the provider quota is requeued by the dispatcher, not
+# finished, so the 90-minute clock restarts from the latest bounce. This caps how
+# long one request can wait through a quota wall before failing honestly.
+QUOTA_HOLD_MAX_SECONDS = 24 * 60 * 60
 REVIEW_POLL_SECONDS = 15
 RETRY_BASE_SECONDS = 5
 RETRY_MAX_SECONDS = 5 * 60
@@ -104,8 +109,16 @@ class KanbanAdapter(Protocol):
     def find_lane(
         self, request: LifecycleRequest, *, retry: bool = False
     ) -> str | None: ...
-    def create_lane(self, request: LifecycleRequest, *, retry: bool = False) -> str: ...
+    def create_lane(
+        self,
+        request: LifecycleRequest,
+        *,
+        retry: bool = False,
+        prior: PriorReview | None = None,
+    ) -> str: ...
     def lane_status(self, lane_id: str) -> str | None: ...
+    def lane_quota_hold(self, lane_id: str) -> float | None: ...
+    def retire_lane(self, lane_id: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -130,6 +143,84 @@ def _active_text(request: LifecycleRequest, label: str) -> str:
     if request.policy.ignore_ci:
         lines.append("Policy: CI gate waived")
     return "\n".join(lines)
+
+
+def _quota_hold_text(request: LifecycleRequest) -> str:
+    return (
+        _active_text(request, "WAITING ON MODEL QUOTA")
+        + "\nThe reviewer's model provider is rate limited. The review resumes"
+        " automatically when quota returns; there is no need to repost."
+    )
+
+
+def _refresh_active_status(
+    request: LifecycleRequest, deps: "ReconcilerDeps", text: str
+) -> None:
+    """Best-effort edit of the live status message while a request keeps waiting."""
+    status = deps.slack.find_status(request)
+    if status is None or status.text == text:
+        return
+    try:
+        deps.slack.update_status(request, status.message_ts, text)
+    except SlackStatusMissing:
+        # The terminal update re-posts a missing status; a progress note is not
+        # worth a second message in the thread.
+        return
+
+
+def _announce_quota_hold(
+    store: Store, request: LifecycleRequest, deps: "ReconcilerDeps", held_at: float
+) -> None:
+    """Tell the thread once per request that the review is waiting on quota. The
+    status is edited before the note is recorded, so a Slack failure retries on
+    the next poll while a success never turns the 15-second poll into a
+    conversations.replies read per poll."""
+    events = store.request_events(request.request_id)
+    if any(event["kind"] == "quota_hold" for event in events):
+        return
+    try:
+        _refresh_active_status(request, deps, _quota_hold_text(request))
+    except SlackRootUnavailable:
+        # The thread is gone; delivery deals with that when the request finishes.
+        # Recording the note anyway keeps this from retrying on every poll.
+        pass
+    store.record_note(request.request_id, "quota_hold", {"held_at": held_at}, deps.now())
+
+
+def _finish_reviewing(
+    store: Store,
+    request: LifecycleRequest,
+    failure: SystemFailure,
+    deps: "ReconcilerDeps",
+    lane_status: str,
+) -> None:
+    """End a review that produced no judgment, then retire its lane: a finished
+    request must not leave a lane queued or bouncing (it would keep spending worker
+    slots and land a judgment nobody consumes). Retirement is best effort, and a
+    lane with a live worker is left to the dispatcher: archiving it would delete the
+    worker's workspace under it."""
+    _transition_system_incomplete(
+        store, request, WorkflowState.REVIEWING, request.gate_snapshot, failure, deps
+    )
+    if request.lane_id is None or lane_status in ("running", "archived"):
+        return
+    try:
+        deps.kanban.retire_lane(request.lane_id)
+    except Exception as error:  # noqa: BLE001 - never fail a finished review over board cleanup
+        store.record_note(
+            request.request_id,
+            "lane_retire_failed",
+            {"lane_id": request.lane_id, "error": str(error)[:300]},
+            deps.now(),
+        )
+
+
+def _quota_failure(detail: str) -> SystemFailure:
+    return SystemFailure(
+        "PROVIDER_QUOTA_EXHAUSTED",
+        detail,
+        "Repost the PR link after the provider quota resets.",
+    )
 
 
 def _load_result(request: LifecycleRequest) -> StructuredResult:
@@ -373,11 +464,13 @@ def _reconcile_starting(
     _authorize_acceptance(store, request, current, deps)
     lane_id = deps.kanban.find_lane(request)
     if lane_id is None:
-        lane_id = deps.kanban.create_lane(request)
+        lane_id = deps.kanban.create_lane(request, prior=store.prior_review(request))
     elif store.request_for_lane(lane_id) is not None:
         lane_id = deps.kanban.find_lane(request, retry=True)
         if lane_id is None:
-            lane_id = deps.kanban.create_lane(request, retry=True)
+            lane_id = deps.kanban.create_lane(
+                request, retry=True, prior=store.prior_review(request)
+            )
     if request.status_message_ts is None:
         raise ValueError("starting request has no Slack status identity")
     reviewing_text = _active_text(request, "REVIEWING")
@@ -426,37 +519,56 @@ def _reconcile_reviewing(
         if request.lane_id is None:
             raise ValueError("reviewing request has no Kanban lane identity")
         status = deps.kanban.lane_status(request.lane_id)
+        if status is None:
+            raise RuntimeError("reviewer lane could not be found")
+        held_at = deps.kanban.lane_quota_hold(request.lane_id)
+        recently_held = (
+            held_at is not None and deps.now() - held_at < REVIEW_WAIT_SECONDS
+        )
         if status in TERMINAL_STATUSES:
-            _transition_system_incomplete(
-                store,
-                request,
-                WorkflowState.REVIEWING,
-                request.gate_snapshot,
-                SystemFailure(
+            if recently_held:
+                # A bouncing lane can still be pushed to blocked (a lost exit status
+                # books a bounce as a crash); telling the thread to repost would only
+                # queue another bounce against the same wall.
+                failure = _quota_failure(
+                    "The reviewer lane stopped while the model provider quota was"
+                    " exhausted."
+                )
+            else:
+                failure = SystemFailure(
                     "LANE_NO_VALID_RESULT",
                     "The reviewer lane finished without a valid structured result.",
                     "Repost the PR link to start a new review attempt.",
-                ),
-                deps,
-            )
+                )
+            _finish_reviewing(store, request, failure, deps, status)
             return
-        if status is None:
-            raise RuntimeError("reviewer lane could not be found")
         deadline = request.created_at + REVIEW_WAIT_SECONDS
+        if held_at is not None:
+            # Requeued after a quota bounce: wait from the latest bounce, within the
+            # cap. Later crashes do not end the hold (see lane_quota_hold); recency
+            # bounds it instead.
+            deadline = min(
+                max(deadline, held_at + REVIEW_WAIT_SECONDS),
+                request.created_at + QUOTA_HOLD_MAX_SECONDS,
+            )
         if deps.now() >= deadline:
-            _transition_system_incomplete(
-                store,
-                request,
-                WorkflowState.REVIEWING,
-                request.gate_snapshot,
-                SystemFailure(
+            if recently_held:
+                failure = _quota_failure(
+                    "The reviewer's model provider quota stayed exhausted for the"
+                    " whole hold window."
+                )
+            else:
+                failure = SystemFailure(
                     "REVIEW_LANE_TIMEOUT",
                     "The reviewer lane did not produce a result within 90 minutes.",
                     "Repost the PR link to start a new review attempt.",
-                ),
-                deps,
-            )
+                )
+            _finish_reviewing(store, request, failure, deps, status)
             return
+        if held_at is not None:
+            # After the deadline check, so a Slack problem can never keep a request
+            # from finishing; tells the thread not to repost.
+            _announce_quota_hold(store, request, deps, held_at)
         store.checkpoint(
             request.request_id,
             WorkflowState.REVIEWING,

@@ -19,10 +19,12 @@ from boris_intake.models import (
     GateSnapshot,
     LifecycleRequest,
     NormalizedEvent,
+    PriorReview,
     ReviewCommand,
     ReviewPolicy,
     SemanticOutcome,
     WorkflowState,
+    prior_review_from_result,
 )
 
 _SCHEMA = """
@@ -274,6 +276,38 @@ class Store:
             "SELECT * FROM review_requests WHERE lane_id=?", (lane_id,)
         ).fetchone()
         return self._request_from_row(row) if row else None
+
+    def prior_review(self, request: LifecycleRequest) -> PriorReview | None:
+        """The latest finished judgment of the same pull request from an earlier
+        request, reduced for the next lane's body; None for a first review or
+        when every earlier request ended without a judgment. Results without a
+        judgment (REVIEW_INCOMPLETE) are skipped in SQL, so a long run of quota
+        bounces cannot hide the judgment before them."""
+        rows = self._db.execute(
+            "SELECT head_sha, validated_result_json FROM review_requests "
+            "WHERE owner=? AND repo=? AND pr_number=? AND request_id<>? "
+            "AND validated_result_json IS NOT NULL AND created_at<? "
+            "AND (CASE WHEN json_valid(validated_result_json)"
+            " THEN json_extract(validated_result_json, '$.derived.outcome') END)"
+            " IS NOT 'REVIEW_INCOMPLETE' "
+            "ORDER BY created_at DESC, request_id DESC LIMIT 10",
+            (
+                request.owner,
+                request.repo,
+                request.pr_number,
+                request.request_id,
+                request.created_at,
+            ),
+        ).fetchall()
+        for row in rows:
+            try:
+                result = json.loads(row["validated_result_json"])
+            except ValueError:
+                continue
+            prior = prior_review_from_result(str(row["head_sha"]), result)
+            if prior is not None:
+                return prior
+        return None
 
     def authorize_acceptance_evidence(
         self,

@@ -177,3 +177,23 @@ def test_real_user_systemd_scope_preserves_worker_context(
     assert payload["run"] == "23"
     assert ".scope" in payload["cgroup"]
     assert "hermes-gateway.service" not in payload["cgroup"]
+
+
+def test_default_spawn_retains_the_worker_handle(
+    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping the Popen lets subprocess._cleanup() reap the worker behind the
+    dispatcher's back; the handle must stay registered until reap_worker_zombies
+    records the exit (see tests/hermes_cli/test_kanban_worker_reap.py)."""
+    workspace, task = worker_setup
+
+    class FakeProc:
+        pid = 4244
+        returncode = None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: FakeProc())
+    monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
+
+    assert kbd._default_spawn(task, str(workspace)) == 4244
+    assert isinstance(kbd._live_worker_procs[4244], FakeProc)

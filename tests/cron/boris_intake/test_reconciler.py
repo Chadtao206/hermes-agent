@@ -112,10 +112,12 @@ class SlackFake:
         self.root_available = True
         self.uneditable = False
         self.source_reactions = []
+        self.finds = 0
 
     def find_status(self, request):
         from boris_intake.reconciler import SlackRootUnavailable, SlackStatus
 
+        self.finds += 1
         if not self.root_available:
             raise SlackRootUnavailable("thread_not_found")
 
@@ -206,14 +208,27 @@ class GitHubFake:
 class KanbanFake:
     def __init__(self, crashes=None):
         self.lanes = {}
+        self.retry_lanes = {}
         self.creations = 0
         self.crashes = crashes or CrashOnce()
         self.status = "done"
+        self.priors = []
+        self.retired = []
+        # ended_at of the latest run that bounced off a provider quota wall, if any.
+        self.quota_hold_at = None
 
-    def find_lane(self, request):
-        return self.lanes.get(request.review_identity)
+    def find_lane(self, request, *, retry=False):
+        table = self.retry_lanes if retry else self.lanes
+        return table.get(request.review_identity)
 
-    def create_lane(self, request):
+    def lane_quota_hold(self, lane_id):
+        return self.quota_hold_at
+
+    def retire_lane(self, lane_id):
+        self.retired.append(lane_id)
+
+    def create_lane(self, request, *, retry=False, prior=None):
+        self.priors.append(prior)
         self.creations += 1
         lane_id = f"t_review_{self.creations}"
         self.lanes[request.review_identity] = lane_id
@@ -237,12 +252,18 @@ def test_prior_bound_lane_uses_request_scoped_retry_lane(
         def find_lane(self, request, *, retry=False):
             return existing_retry_lane if retry else "t_prior"
 
-        def create_lane(self, request, *, retry=False):
+        def create_lane(self, request, *, retry=False, prior=None):
             self.retry_requested = retry
             return "t_retry"
 
         def lane_status(self, lane_id):
             return "in_progress"
+
+        def lane_quota_hold(self, lane_id):
+            return None
+
+        def retire_lane(self, lane_id):
+            pass
 
     store, original = admit_request(tmp_path)
     expected = WorkflowState.ADMITTED
@@ -1057,6 +1078,12 @@ def test_active_lane_without_submission_polls_then_terminal_lane_becomes_incompl
     assert completed.semantic_outcome.value == "REVIEW_INCOMPLETE"
     assert "LANE_NO_VALID_RESULT" in completed.validated_result_json
     assert github.publications == 0
+    # An archived lane has nothing left to retire; the others are archived so they
+    # neither re-run nor land a judgment nobody consumes.
+    expected_retired = [] if terminal_status == "archived" else list(kanban.lanes.values())
+    assert kanban.retired == expected_retired
+    kinds = [event["kind"] for event in store.request_events(admitted.request_id)]
+    assert "lane_retire_failed" not in kinds
 
 
 class AcceptanceFake:
@@ -1169,6 +1196,303 @@ def test_a_reviewer_lane_that_never_finishes_is_bounded(tmp_path):
     assert completed.semantic_outcome.value == "REVIEW_INCOMPLETE"
     assert "REVIEW_LANE_TIMEOUT" in completed.validated_result_json
     assert github.publications == 0
+    # A finished request must not leave its lane queued: it would keep re-running
+    # and land a judgment nobody consumes.
+    assert kanban.retired == list(kanban.lanes.values())
+
+
+def test_starting_review_hands_the_prior_judgment_to_the_lane(tmp_path):
+    """A re-review lane is told what the previous Boris review of the same PR
+    found, so it can report each prior blocking issue's disposition."""
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    earlier = ReviewCommand(
+        owner="Ylopo", repo="example", pr_number=42, head_sha="b" * 40,
+        pr_author="octocat", requester_user_id="U1", requester_email="a@ylopo.com",
+        channel_id="C1", message_ts="0.5", root_thread_ts="0.5",
+        permalink="https://ylopo.slack.com/archives/C1/p05",
+        policy=ReviewPolicy(ignore_ci=False, rubric_version="2"),
+    )
+    prior = store.admit_event(
+        NormalizedEvent("C1", "channel", "U1", "0.5", None, "discarded", False, None),
+        (earlier,),
+        (GateSnapshot("sha256:prior", "2026-08-13T12:00:00Z", ()),),
+        999_000.0,
+    ).admitted[0]
+    # The earlier request already finished; only its stored result matters here.
+    store._db.execute(
+        "UPDATE review_requests SET validated_result_json=?, workflow_state='complete',"
+        " completed_at=999_500.0 WHERE request_id=?",
+        (
+            json.dumps({
+                "derived": {"outcome": "ISSUES_FOUND", "presentation": "ISSUES"},
+                "assembled_at": "2026-08-13T12:30:00Z",
+                "blocking_issues": [{"title": "Ownership predicate removed"}],
+                "non_blocking_issues": [],
+            }),
+            prior.request_id,
+        ),
+    )
+    store._db.commit()
+    clock = Clock()
+    kanban = KanbanFake()
+    kanban.status = "in_progress"
+    deps = ReconcilerDeps(
+        slack=SlackFake(), github=GitHubFake(admitted.gate_snapshot), kanban=kanban, now=clock
+    )
+
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+
+    assert len(kanban.priors) == 1
+    assert kanban.priors[0].head_sha == "b" * 40
+    assert kanban.priors[0].blocking_titles == ("Ownership predicate removed",)
+
+
+def test_retry_lane_also_receives_the_prior_judgment(tmp_path):
+    """When the gate-keyed lane already belongs to an earlier request, the retry
+    lane created for this request must carry the prior judgment too."""
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    earlier = ReviewCommand(
+        owner="Ylopo", repo="example", pr_number=42, head_sha="b" * 40,
+        pr_author="octocat", requester_user_id="U1", requester_email="a@ylopo.com",
+        channel_id="C1", message_ts="0.5", root_thread_ts="0.5",
+        permalink="https://ylopo.slack.com/archives/C1/p05",
+        policy=ReviewPolicy(ignore_ci=False, rubric_version="2"),
+    )
+    prior = store.admit_event(
+        NormalizedEvent("C1", "channel", "U1", "0.5", None, "discarded", False, None),
+        (earlier,),
+        (GateSnapshot("sha256:prior", "2026-08-13T12:00:00Z", ()),),
+        999_000.0,
+    ).admitted[0]
+    store._db.execute(
+        "UPDATE review_requests SET validated_result_json=?, workflow_state='complete',"
+        " completed_at=999_500.0, lane_id='t_prior' WHERE request_id=?",
+        (
+            json.dumps({
+                "derived": {"outcome": "ISSUES_FOUND", "presentation": "ISSUES"},
+                "assembled_at": "2026-08-13T12:30:00Z",
+                "blocking_issues": [{"title": "Ownership predicate removed"}],
+                "non_blocking_issues": [],
+            }),
+            prior.request_id,
+        ),
+    )
+    store._db.commit()
+    kanban = KanbanFake()
+    kanban.status = "in_progress"
+    # The gate-keyed lookup finds the earlier request's lane, forcing a retry lane.
+    kanban.lanes[admitted.review_identity] = "t_prior"
+    clock = Clock()
+    deps = ReconcilerDeps(
+        slack=SlackFake(), github=GitHubFake(admitted.gate_snapshot), kanban=kanban, now=clock
+    )
+
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+
+    assert kanban.creations == 1
+    assert [p.head_sha for p in kanban.priors] == ["b" * 40]
+
+
+def test_a_lane_that_bounced_once_but_recovered_times_out_with_the_plain_code(tmp_path):
+    """One quota bounce early on must not relabel a later genuine 90-minute timeout
+    as a quota problem once the worker has long been running again."""
+    from boris_intake.reconciler import REVIEW_WAIT_SECONDS, tick
+
+    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+        tmp_path, lane_status="in_progress"
+    )
+    clock.advance(600)
+    kanban.quota_hold_at = clock()  # bounced at T+10 min, then recovered
+    clock.advance(REVIEW_WAIT_SECONDS + 60)
+    for _ in range(4):
+        tick(store, deps)
+        if (
+            store.get_request(admitted.request_id).workflow_state
+            is WorkflowState.COMPLETE
+        ):
+            break
+        clock.advance()
+
+    completed = store.get_request(admitted.request_id)
+    assert completed.workflow_state is WorkflowState.COMPLETE
+    assert "REVIEW_LANE_TIMEOUT" in completed.validated_result_json
+    assert "PROVIDER_QUOTA_EXHAUSTED" not in completed.validated_result_json
+
+
+def test_a_timed_out_request_leaves_a_running_worker_alone(tmp_path):
+    """Archiving a lane whose worker is still running would delete the workspace
+    under it and orphan the process; the dispatcher's own bookkeeping ends that run."""
+    from boris_intake.reconciler import REVIEW_WAIT_SECONDS, tick
+
+    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+        tmp_path, lane_status="running"
+    )
+    clock.advance(REVIEW_WAIT_SECONDS + 60)
+    for _ in range(4):
+        tick(store, deps)
+        if (
+            store.get_request(admitted.request_id).workflow_state
+            is WorkflowState.COMPLETE
+        ):
+            break
+        clock.advance()
+
+    completed = store.get_request(admitted.request_id)
+    assert "REVIEW_LANE_TIMEOUT" in completed.validated_result_json
+    assert kanban.retired == []
+
+
+def test_a_quota_walled_lane_holds_past_the_review_deadline_then_fails_honestly(tmp_path):
+    """A worker that bounces off the provider quota is requeued, not finished. The
+    request must wait through the wall (telling the thread why, and not to repost)
+    and fail with a quota-specific code only after the hold cap."""
+    from boris_intake.reconciler import (
+        QUOTA_HOLD_MAX_SECONDS,
+        REVIEW_WAIT_SECONDS,
+        ReconcilerDeps,
+        tick,
+    )
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    github = GitHubFake(admitted.gate_snapshot)
+    kanban = KanbanFake()
+    kanban.status = "ready"  # requeued by the dispatcher after the quota bounce
+    deps = ReconcilerDeps(slack=slack, github=github, kanban=kanban, now=clock)
+
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+
+    # The worker bounced off the quota a minute before the plain deadline.
+    clock.advance(REVIEW_WAIT_SECONDS - 60)
+    kanban.quota_hold_at = clock()
+    clock.advance(120)
+    tick(store, deps)
+    held = store.get_request(admitted.request_id)
+    assert held.workflow_state is WorkflowState.REVIEWING
+    status_text = slack.messages[admitted.request_id][1].lower()
+    assert "quota" in status_text
+    assert "repost" in status_text
+    reads_after_announcement = slack.finds
+
+    # Every fresh bounce slides the deadline, but only up to the hold cap, and the
+    # thread is told once: a 15-second poll must not become a Slack read per poll.
+    while clock() < admitted.created_at + QUOTA_HOLD_MAX_SECONDS:
+        kanban.quota_hold_at = clock()
+        tick(store, deps)
+        assert (
+            store.get_request(admitted.request_id).workflow_state
+            is WorkflowState.REVIEWING
+        )
+        clock.advance(REVIEW_WAIT_SECONDS / 2)
+    assert slack.finds == reads_after_announcement
+
+    kanban.quota_hold_at = clock()
+    for _ in range(4):
+        tick(store, deps)
+        if (
+            store.get_request(admitted.request_id).workflow_state
+            is WorkflowState.COMPLETE
+        ):
+            break
+        clock.advance()
+
+    completed = store.get_request(admitted.request_id)
+    assert completed.workflow_state is WorkflowState.COMPLETE
+    assert completed.semantic_outcome.value == "REVIEW_INCOMPLETE"
+    assert "PROVIDER_QUOTA_EXHAUSTED" in completed.validated_result_json
+    assert "REVIEW_LANE_TIMEOUT" not in completed.validated_result_json
+    assert github.publications == 0
+    assert kanban.retired == list(kanban.lanes.values())
+
+
+REVIEW_POLL_SECONDS_FOR_TEST = 15
+
+
+def _hold_until_reviewing(tmp_path, *, lane_status="ready"):
+    from boris_intake.reconciler import ReconcilerDeps, tick
+
+    store, admitted = admit_request(tmp_path)
+    clock = Clock()
+    slack = SlackFake()
+    github = GitHubFake(admitted.gate_snapshot)
+    kanban = KanbanFake()
+    kanban.status = lane_status
+    deps = ReconcilerDeps(slack=slack, github=github, kanban=kanban, now=clock)
+    while (
+        store.get_request(admitted.request_id).workflow_state
+        is not WorkflowState.REVIEWING
+    ):
+        tick(store, deps)
+        clock.advance()
+    return store, admitted, clock, slack, github, kanban, deps
+
+
+def test_a_lane_blocked_during_a_quota_wall_fails_with_the_quota_code(tmp_path):
+    """Lost exit statuses can push a bouncing lane to blocked mid-wall; the thread
+    must hear about the quota, not be told to repost into the same wall."""
+    from boris_intake.reconciler import tick
+
+    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+        tmp_path, lane_status="in_progress"
+    )
+    clock.advance(600)
+    kanban.quota_hold_at = clock() - 60
+    kanban.status = "blocked"
+    for _ in range(4):
+        tick(store, deps)
+        if (
+            store.get_request(admitted.request_id).workflow_state
+            is WorkflowState.COMPLETE
+        ):
+            break
+        clock.advance()
+
+    completed = store.get_request(admitted.request_id)
+    assert completed.workflow_state is WorkflowState.COMPLETE
+    assert "PROVIDER_QUOTA_EXHAUSTED" in completed.validated_result_json
+    assert "LANE_NO_VALID_RESULT" not in completed.validated_result_json
+    assert kanban.retired == list(kanban.lanes.values())
+
+
+def test_a_quota_hold_does_not_wedge_on_an_unavailable_slack_thread(tmp_path):
+    """Announcing the hold is best effort: a vanished thread must neither block the
+    hold's deadline bookkeeping nor produce an error event on every poll."""
+    from boris_intake.reconciler import REVIEW_WAIT_SECONDS, tick
+
+    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(tmp_path)
+    clock.advance(REVIEW_WAIT_SECONDS - 60)
+    kanban.quota_hold_at = clock()
+    slack.root_available = False
+    clock.advance(120)
+    for _ in range(5):
+        tick(store, deps)
+        clock.advance(REVIEW_POLL_SECONDS_FOR_TEST)
+
+    request = store.get_request(admitted.request_id)
+    assert request.workflow_state is WorkflowState.REVIEWING
+    kinds = [event["kind"] for event in store.request_events(admitted.request_id)]
+    assert kinds.count("quota_hold") == 1
+    assert "error" not in kinds
 
 
 def test_mechanically_invalid_submission_fails_closed_without_retries(tmp_path):

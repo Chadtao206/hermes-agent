@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 
 class ReasonCode(str, Enum):
@@ -487,3 +488,78 @@ class GateResult:
         do not consult this key at all (see `ALWAYS_REPLY_REASONS`).
         """
         return f"{self.origin.value}:{self.requester_user_id}"
+
+
+_PRIOR_TITLE_MAX = 160
+_PRIOR_TITLES_MAX = 8
+
+
+@dataclass(frozen=True)
+class PriorReview:
+    """The latest finished Boris judgment of the same pull request, reduced to
+    bounded scalars for the next lane's body. Titles were validated on submission
+    and are re-collapsed here; they are pointers to re-check, never findings."""
+
+    head_sha: str
+    outcome: str
+    assembled_at: str
+    blocking_titles: tuple[str, ...]
+    non_blocking_titles: tuple[str, ...]
+    # ISSUES_FOUND carried only by failing required checks, no code blockers.
+    gate_only: bool = False
+
+
+def _plain_title(raw: str) -> str:
+    """One line of printable text: control and format characters (the ESC of an
+    ANSI sequence, zero-width and bidi marks) are dropped, all whitespace runs
+    collapse."""
+    visible = "".join(
+        (" " if ch.isspace() else "") if unicodedata.category(ch) in ("Cc", "Cf") else ch
+        for ch in raw
+    )
+    return " ".join(visible.split())
+
+
+def _prior_titles(items: object) -> tuple[str, ...]:
+    titles: list[str] = []
+    for item in items if isinstance(items, list) else ():
+        if not isinstance(item, dict):
+            continue
+        raw = cast("dict[str, Any]", item).get("title")
+        if not isinstance(raw, str):
+            continue
+        title = _plain_title(raw)
+        if title:
+            titles.append(title[:_PRIOR_TITLE_MAX])
+        if len(titles) == _PRIOR_TITLES_MAX:
+            break
+    return tuple(titles)
+
+
+def prior_review_from_result(head_sha: str, result: object) -> PriorReview | None:
+    """Reduce a stored validated result to a PriorReview; None when the result
+    carries no judgment (system or model REVIEW_INCOMPLETE, or malformed)."""
+    if not isinstance(result, dict):
+        return None
+    data = cast("dict[str, Any]", result)
+    derived = data.get("derived")
+    outcome = derived.get("outcome") if isinstance(derived, dict) else None
+    judged = {o.value for o in SemanticOutcome} - {SemanticOutcome.REVIEW_INCOMPLETE.value}
+    if not isinstance(outcome, str) or outcome not in judged:
+        return None
+    blocking = data.get("blocking_issues")
+    non_blocking = data.get("non_blocking_issues")
+    if not isinstance(blocking, list) or not isinstance(non_blocking, list):
+        return None
+    assembled_at = data.get("assembled_at")
+    assembled_at = _plain_title(assembled_at)[:40] if isinstance(assembled_at, str) else ""
+    blocking_titles = _prior_titles(blocking)
+    gate_conditions = data.get("blocking_gate_conditions")
+    return PriorReview(
+        head_sha=head_sha,
+        outcome=outcome,
+        assembled_at=assembled_at,
+        blocking_titles=blocking_titles,
+        non_blocking_titles=_prior_titles(non_blocking),
+        gate_only=bool(gate_conditions) and not blocking,
+    )

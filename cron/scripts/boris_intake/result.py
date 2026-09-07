@@ -333,8 +333,14 @@ def _gap(value: object, path: str) -> VerificationGap:
     reason = raw.get("reason_code")
     if core and reason is None:
         raise ValidationError(f"{path}.reason_code is required for a core assessment gap")
-    if not core and reason is not None:
-        raise ValidationError(f"{path}.reason_code is only valid for a core assessment gap")
+    if reason is not None:
+        reason = _string(reason, f"{path}.reason_code", 128)
+    if not core:
+        # Only core gaps feed Incomplete.reason_codes, so a well-formed label on a
+        # non-core gap carries no meaning. The model routinely attaches one anyway
+        # and, when rejected, resubmits the same judgment without it; ignoring the
+        # label saves that round trip without changing the canonical judgment.
+        reason = None
     return VerificationGap(
         title=_string(raw["title"], f"{path}.title"),
         unassessed_claim=_string(raw["unassessed_claim"], f"{path}.unassessed_claim"),
@@ -342,7 +348,7 @@ def _gap(value: object, path: str) -> VerificationGap:
         missing_evidence=_string(raw["missing_evidence"], f"{path}.missing_evidence"),
         prevents_core_assessment=core,
         next_step=_string(raw["next_step"], f"{path}.next_step"),
-        reason_code=None if reason is None else _string(reason, f"{path}.reason_code", 128),
+        reason_code=reason,
     )
 
 

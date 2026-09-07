@@ -2868,6 +2868,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         self._interrupt_queue = queue.Queue()
         self._agent_running = self._should_exit = False
         self._last_turn_interrupted = False  # /goal never auto-queues on a Ctrl+C'd turn
+        self._last_turn_result = None  # settled turn dict; one-shot kanban workers read it for their exit code
         self._terminal_io_broken = False  # stdout EIO: freeze UI paints instead of spinning
         self._delete_session_on_exit = False  # /exit --delete
         # /update: relaunch() runs from run() after prompt_toolkit restored terminal modes.
@@ -4094,6 +4095,26 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+def _kanban_worker_exit_code(result) -> Optional[int]:
+    """EX_TEMPFAIL sentinel for a kanban worker whose turn failed purely on a provider
+    quota wall (``rate_limit`` / ``billing``), so the dispatcher requeues the task without
+    counting a failure. None for every other outcome and outside kanban workers; callers
+    keep their own default. Shared by the ``-q`` and ``-Q`` one-shot paths: the dispatcher
+    spawns ``chat -q``, and until both paths agreed a quota-walled worker exited 0 and was
+    booked as a protocol violation."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if not (isinstance(result, dict) and result.get("failed")):
+        return None
+    if result.get("failure_reason") not in ("rate_limit", "billing"):
+        return None
+    try:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    except Exception:
+        return None
+    return KANBAN_RATE_LIMIT_EXIT_CODE
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code."""
     try:
@@ -4131,13 +4152,7 @@ def _run_quiet_single_query(cli, effective_query):
     # the task without counting a failure (a quota window must not trip the breaker).
     _exit_code = 0
     if isinstance(result, dict) and result.get("failed"):
-        _exit_code = 1
-        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-            try:
-                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-                _exit_code = _RL_CODE
-            except Exception:
-                _exit_code = 1
+        _exit_code = _kanban_worker_exit_code(result) or 1
     sys.exit(_exit_code)
 
 
@@ -4456,6 +4471,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        # Same quota-wall sentinel as the -Q path; any other outcome keeps the clean exit.
+        _exit_code = _kanban_worker_exit_code(getattr(cli, "_last_turn_result", None))
+        if _exit_code is not None:
+            sys.exit(_exit_code)
     finally:
         _finalize_single_query(cli)
 

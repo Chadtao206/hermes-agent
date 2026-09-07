@@ -213,13 +213,41 @@ def test_core_verification_gap_requires_a_reason_code():
         module.validate_judgment(valid_payload(verification_gaps=[observation]))
 
 
-def test_non_core_gap_cannot_claim_an_incomplete_reason_code():
+def test_non_core_gap_reason_code_is_ignored_instead_of_rejected():
     module = result_module()
     observation = gap(core=False)
-    observation["reason_code"] = "NOT_CORE"
+    observation["reason_code"] = "ACCEPTANCE_REFERENCE_UNAUTHORIZED"
+
+    judgment = module.validate_judgment(valid_payload(verification_gaps=[observation]))
+
+    (parsed,) = judgment.verification_gaps
+    assert parsed.prevents_core_assessment is False
+    assert parsed.reason_code is None
+
+
+@pytest.mark.parametrize("label", [123, "", "x" * 129, {}, True])
+def test_non_core_gap_reason_code_must_still_be_a_string_when_present(label):
+    module = result_module()
+    observation = gap(core=False)
+    observation["reason_code"] = label
 
     with pytest.raises(module.ValidationError, match="reason_code"):
         module.validate_judgment(valid_payload(verification_gaps=[observation]))
+
+
+def test_ignored_non_core_reason_code_does_not_change_the_canonical_judgment():
+    module = result_module()
+    labelled = gap(core=False)
+    labelled["reason_code"] = "ACCEPTANCE_REFERENCE_UNAUTHORIZED"
+
+    with_label = module.canonicalize_judgment(
+        module.validate_judgment(valid_payload(verification_gaps=[labelled]))
+    )
+    without_label = module.canonicalize_judgment(
+        module.validate_judgment(valid_payload(verification_gaps=[gap(core=False)]))
+    )
+
+    assert with_label == without_label
 
 
 def test_validator_enforces_renderer_safe_payload_bounds():

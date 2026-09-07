@@ -137,7 +137,15 @@ _GAP_SCHEMA = {
         "missing_evidence": _STRING_SCHEMA,
         "prevents_core_assessment": {"type": "boolean"},
         "next_step": _STRING_SCHEMA,
-        "reason_code": {"type": "string", "minLength": 1, "maxLength": 128},
+        "reason_code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": (
+                "Stable code for why core assessment was prevented. Meaningful only "
+                "when prevents_core_assessment is true; ignored otherwise."
+            ),
+        },
     },
     "required": [
         "title",

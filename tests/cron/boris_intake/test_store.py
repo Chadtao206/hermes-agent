@@ -492,3 +492,101 @@ def test_store_migrates_existing_lifecycle_rows_for_leasing(tmp_path):
         "lease_expires_at",
     }
     assert store._db.execute("PRAGMA user_version").fetchone()[0] == 5
+
+
+def _admit_for_pr(store, *, head, ts, now):
+    from boris_intake.models import GateSnapshot
+
+    command = ReviewCommand(
+        owner="Ylopo", repo="repo", pr_number=5, head_sha=head, pr_author="octocat",
+        requester_user_id="U1", requester_email="a@ylopo.com", channel_id="C1",
+        message_ts=ts, root_thread_ts=ts, permalink=f"https://ylopo.slack.com/archives/C1/p{ts}",
+        policy=ReviewPolicy(ignore_ci=False, rubric_version="2"),
+    )
+    event = NormalizedEvent("C1", "channel", "U1", ts, None, "discarded", False, None)
+    gate = GateSnapshot(f"sha256:{ts}", "2026-08-14T12:00:00Z", ())
+    return store.admit_event(event, (command,), (gate,), now).admitted[0]
+
+
+def _finish(store, request_id, outcome, blocking=(), *, at):
+    import json
+
+    result = {
+        "derived": {"outcome": outcome, "presentation": "ISSUES"},
+        "assembled_at": at,
+        "blocking_issues": [{"title": title} for title in blocking],
+        "non_blocking_issues": [],
+    }
+    store._db.execute(
+        "UPDATE review_requests SET validated_result_json=? WHERE request_id=?",
+        (json.dumps(result), request_id),
+    )
+    store._db.commit()
+
+
+def test_prior_review_returns_the_latest_judged_prior_for_the_same_pr(tmp_path):
+    s = Store(tmp_path / "s.db")
+    oldest = _admit_for_pr(s, head="a" * 40, ts="1.0", now=1_000.0)
+    _finish(s, oldest.request_id, "ISSUES_FOUND", ("Ownership predicate removed",), at="2026-09-01T10:00:00Z")
+    incomplete = _admit_for_pr(s, head="b" * 40, ts="2.0", now=2_000.0)
+    _finish(s, incomplete.request_id, "REVIEW_INCOMPLETE", at="2026-09-01T11:00:00Z")
+    current = _admit_for_pr(s, head="c" * 40, ts="3.0", now=3_000.0)
+
+    prior = s.prior_review(current)
+
+    assert prior is not None
+    assert prior.head_sha == "a" * 40
+    assert prior.outcome == "ISSUES_FOUND"
+    assert prior.blocking_titles == ("Ownership predicate removed",)
+
+
+def test_prior_review_is_none_for_a_first_review_or_an_unfinished_prior(tmp_path):
+    s = Store(tmp_path / "s.db")
+    first = _admit_for_pr(s, head="a" * 40, ts="1.0", now=1_000.0)
+    assert s.prior_review(first) is None
+
+    # An older request that never produced a result is not a prior review.
+    second = _admit_for_pr(s, head="b" * 40, ts="2.0", now=2_000.0)
+    assert s.prior_review(second) is None
+
+    # A request never sees itself as its own prior, even once it has a result.
+    _finish(s, second.request_id, "ISSUES_FOUND", ("x",), at="2026-09-01T10:00:00Z")
+    assert s.prior_review(second) is None
+
+
+def test_prior_review_prefers_the_newest_judged_prior(tmp_path):
+    s = Store(tmp_path / "s.db")
+    older = _admit_for_pr(s, head="a" * 40, ts="1.0", now=1_000.0)
+    _finish(s, older.request_id, "ISSUES_FOUND", ("Old blocker",), at="2026-09-01T10:00:00Z")
+    newer = _admit_for_pr(s, head="b" * 40, ts="2.0", now=2_000.0)
+    _finish(s, newer.request_id, "READY_FOR_HUMAN_REVIEW", at="2026-09-01T11:00:00Z")
+    current = _admit_for_pr(s, head="c" * 40, ts="3.0", now=3_000.0)
+
+    prior = s.prior_review(current)
+
+    assert prior.head_sha == "b" * 40
+    assert prior.outcome == "READY_FOR_HUMAN_REVIEW"
+
+
+def test_prior_review_ignores_requests_admitted_after_this_one(tmp_path):
+    s = Store(tmp_path / "s.db")
+    current = _admit_for_pr(s, head="a" * 40, ts="1.0", now=1_000.0)
+    later = _admit_for_pr(s, head="b" * 40, ts="2.0", now=2_000.0)
+    _finish(s, later.request_id, "ISSUES_FOUND", ("Future blocker",), at="2026-09-01T10:00:00Z")
+
+    assert s.prior_review(current) is None
+
+
+def test_prior_review_looks_past_a_long_run_of_incomplete_results(tmp_path):
+    s = Store(tmp_path / "s.db")
+    judged = _admit_for_pr(s, head="a" * 40, ts="1.0", now=1_000.0)
+    _finish(s, judged.request_id, "ISSUES_FOUND", ("Real blocker",), at="2026-09-01T10:00:00Z")
+    for n in range(12):
+        bounced = _admit_for_pr(s, head=f"{n:02d}" * 20, ts=f"{n + 2}.0", now=2_000.0 + n)
+        _finish(s, bounced.request_id, "REVIEW_INCOMPLETE", at="2026-09-01T11:00:00Z")
+    current = _admit_for_pr(s, head="c" * 40, ts="99.0", now=9_000.0)
+
+    prior = s.prior_review(current)
+
+    assert prior is not None
+    assert prior.blocking_titles == ("Real blocker",)
