@@ -221,6 +221,9 @@ class KanbanFake:
         table = self.retry_lanes if retry else self.lanes
         return table.get(request.review_identity)
 
+    def lane_authentication_failed(self, lane_id):
+        return getattr(self, "auth_failed", False)
+
     def lane_quota_hold(self, lane_id):
         return self.quota_hold_at
 
@@ -258,6 +261,9 @@ def test_prior_bound_lane_uses_request_scoped_retry_lane(
 
         def lane_status(self, lane_id):
             return "in_progress"
+
+        def lane_authentication_failed(self, lane_id):
+            return False
 
         def lane_quota_hold(self, lane_id):
             return None
@@ -2230,3 +2236,25 @@ def test_store_memo_keeps_the_aggregate_when_slack_shows_the_substitute(tmp_path
     added = [kw["name"] for method, kw in calls if method == "reactions.add"]
     assert added == ["doge_notes"]
     assert store.source_reaction(request.channel_id, request.message_ts) == "blinkapproved"
+
+
+def test_authentication_failure_is_actionable_even_after_a_quota_hold(tmp_path):
+    from boris_intake.reconciler import tick
+
+    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+        tmp_path, lane_status="in_progress"
+    )
+    kanban.status = "blocked"
+    kanban.auth_failed = True
+    kanban.quota_hold_at = clock()
+    for _ in range(5):
+        tick(store, deps)
+        clock.advance()
+    completed = store.get_request(admitted.request_id)
+    assert completed.workflow_state is WorkflowState.COMPLETE
+    result = json.loads(completed.validated_result_json)
+    assert result["incomplete"]["reason_codes"] == ["PROVIDER_AUTHENTICATION_REQUIRED"]
+    assert "hermes" in result["incomplete"]["retry_guidance"]
+    assert "boris_on_demand" in result["incomplete"]["retry_guidance"]
+    assert github.publications == 0
+    assert kanban.retired == list(kanban.lanes.values())

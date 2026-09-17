@@ -36,6 +36,10 @@ class ToolError(RuntimeError):
     pass
 
 
+class GitHubResponseTooLarge(ToolError):
+    pass
+
+
 class GitHubCommandError(ToolError):
     """A refused `gh` invocation, carrying GitHub's own reason for refusing."""
 
@@ -78,8 +82,8 @@ _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 # GitHub refuses to render a pull request diff once it grows past roughly 20k
 # changed lines. The changed-file inventory still answers, so it is the only
 # changed-code evidence available on the largest pull requests. Ask for 50 files
-# a page rather than the 100 maximum: it keeps each response inside the 2 MiB
-# ceiling above, and GitHub withholds fewer patches on the smaller page (on a
+# a page rather than the 100 maximum; oversized batches shrink further.
+# GitHub withholds fewer patches on the smaller page (on a
 # 112-file pull request, 1 patch withheld at 50 against 3 at 100).
 _DIFF_REFUSED = re.compile(r"HTTP 406|exceeded the maximum number of lines|too_large")
 _FILES_PER_PAGE = 50
@@ -342,7 +346,7 @@ def _github(
         )
     output = proc.stdout or ""
     if len(output.encode()) > 2 * 1024 * 1024:
-        raise ToolError("GitHub evidence response exceeds 2 MiB")
+        raise GitHubResponseTooLarge("GitHub evidence response exceeds 2 MiB")
     if not expect_json:
         return output
     try:
@@ -574,12 +578,12 @@ def _changed_file_section(entry: object) -> str:
     if status == "removed":
         # Deleted files are gone at head, so file_at_head cannot recover them.
         note = (
-            f"[boris: GitHub withheld the patch for this deleted file "
+            f"[boris: Patch unavailable from GitHub or the evidence size limit for this deleted file "
             f"({changes} lines removed); it is not readable at head]\n"
         )
     else:
         note = (
-            f"[boris: GitHub withheld the patch for this file (status {status}, "
+            f"[boris: Patch unavailable from GitHub or the evidence size limit for this file (status {status}, "
             f"{changes} changed lines) — read {filename} with file_at_head "
             f"for full content]\n"
         )
@@ -592,27 +596,38 @@ def _changed_files_diff(request: LifecycleRequest) -> str:
     repo = quote(request.repo, safe="")
     sections: list[str] = []
     exhausted = True
-    for page in range(1, _MAX_FILE_PAGES + 1):
-        batch = _github(
-            request,
-            [
-                "api",
-                f"/repos/{owner}/{repo}/pulls/{request.pr_number}"
-                f"/files?per_page={_FILES_PER_PAGE}&page={page}",
-            ],
-            expect_json=True,
-        )
+    per_page = _FILES_PER_PAGE
+    page = 1
+    limit = _MAX_FILE_PAGES * _FILES_PER_PAGE
+    while (page - 1) * per_page < limit:
+        args = [
+            "api",
+            f"/repos/{owner}/{repo}/pulls/{request.pr_number}"
+            f"/files?per_page={per_page}&page={page}",
+        ]
+        try:
+            batch = _github(request, args, expect_json=True)
+        except GitHubResponseTooLarge:
+            if per_page > 1:
+                # Restart because changing per_page changes every page boundary.
+                per_page = max(1, per_page // 2)
+                page = 1
+                sections.clear()
+                continue
+            batch = _github(
+                request, [*args, "--jq", "map(del(.patch))"], expect_json=True
+            )
         if not isinstance(batch, list):
             raise ToolError("GitHub changed-file response is not a list")
         sections.extend(_changed_file_section(entry) for entry in batch)
-        if len(batch) < _FILES_PER_PAGE:
+        if len(batch) < per_page:
             exhausted = False
             break
+        page += 1
     if not sections:
         raise ToolError("GitHub reported no changed files for this pull request")
     if exhausted:
         # Never let a bounded walk read as complete coverage.
-        limit = _MAX_FILE_PAGES * _FILES_PER_PAGE
         sections.append(
             f"diff --git a/x b/[boris]-changed-file-inventory-truncated\n"
             f"[boris: the changed-file inventory stopped at {limit} files; "
@@ -635,6 +650,8 @@ def _pr_diff(request: LifecycleRequest) -> tuple[str, str]:
             ],
             expect_json=False,
         )
+    except GitHubResponseTooLarge:
+        return _changed_files_diff(request), "changed_files_api"
     except GitHubCommandError as error:
         if not _DIFF_REFUSED.search(error.stderr):
             raise

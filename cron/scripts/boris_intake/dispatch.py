@@ -156,6 +156,16 @@ class KanbanIO:
             return None
         return str(rows[0]["status"])
 
+    def lane_authentication_failed(self, lane_id: str) -> bool:
+        rows = self._query(
+            "SELECT outcome, summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (lane_id,),
+        )
+        return bool(
+            rows and rows[0]["outcome"] == "blocked"
+            and (rows[0]["summary"] or "").startswith("PROVIDER_AUTHENTICATION_REQUIRED:")
+        )
+
     def lane_quota_hold(self, lane_id: str) -> float | None:
         """``ended_at`` of the lane's latest run the dispatcher booked ``rate_limited``
         (the worker bounced off a provider quota wall and was requeued), else None.

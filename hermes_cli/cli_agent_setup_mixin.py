@@ -192,6 +192,19 @@ class CLIAgentSetupMixin:
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
             ChatConsole().print(f"[bold red]{message}[/]")
+            from hermes_cli.auth import AuthError
+            import os
+            task_id = os.environ.get("HERMES_KANBAN_TASK")
+            run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+            if (task_id and run_id and isinstance(_primary_exc, AuthError)
+                    and _primary_exc.relogin_required):
+                from hermes_cli import kanban_db, kanban_db_connect
+                with kanban_db_connect.connect_closing() as connection:
+                    kanban_db.block_task(
+                        connection, task_id, kind="needs_input", expected_run_id=int(run_id),
+                        reason="PROVIDER_AUTHENTICATION_REQUIRED: Provider credentials are missing "
+                        "or expired. Reauthenticate this worker profile with hermes model before retrying.",
+                    )
             return False
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")

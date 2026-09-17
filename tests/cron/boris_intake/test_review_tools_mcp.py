@@ -1433,3 +1433,41 @@ def test_one_giant_newest_comment_does_not_blank_the_thread(tmp_path, monkeypatc
     assert data["reviews"][-1]["id"] == "PRR_2" and data["reviews"][-1]["body_truncated"] is True
     assert data["reviews"][0]["id"] == "PRR_1" and "body_truncated" not in data["reviews"][0]
     assert data["reviews_omitted"] == 0 and "note" not in data
+
+
+@pytest.mark.parametrize("oversized_single_file", [False, True])
+def test_oversized_diff_and_file_batches_preserve_complete_inventory(
+    tmp_path, monkeypatch, oversized_single_file
+):
+    from urllib.parse import parse_qs, urlsplit
+
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    entries = [
+        {"filename": f"src/f{i}.py", "status": "modified", "changes": 2,
+         "patch": "@@ -1 +1 @@\n-old\n+" + "x" * (2200000 if oversized_single_file and i == 0 else 60000)}
+        for i in range(53)
+    ]
+
+    def run(command, **kwargs):
+        if "view" in command:
+            output = json.dumps({"headRefOid": "a" * 40})
+        elif "diff" in command:
+            output = "x" * 2200000
+        else:
+            route = command[2]
+            query = parse_qs(urlsplit(route).query)
+            count, page = int(query["per_page"][0]), int(query["page"][0])
+            batch = entries[(page - 1) * count:page * count]
+            if "--jq" in command:
+                batch = [{k: v for k, v in entry.items() if k != "patch"} for entry in batch]
+            output = json.dumps(batch)
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+    result = module.read_github_evidence("pr_diff")
+    assert result["data"]["all_files"] == sorted(entry["filename"] for entry in entries)
+    assert result["data"]["source"] == "changed_files_api"
+    assert _hermes_rendered_size(result) <= _mcp_threshold()
+    if oversized_single_file:
+        assert "Patch unavailable" in result["data"]["diff"]
+        assert "file_at_head" in result["data"]["diff"]

@@ -118,6 +118,7 @@ class KanbanAdapter(Protocol):
     ) -> str: ...
     def lane_status(self, lane_id: str) -> str | None: ...
     def lane_quota_hold(self, lane_id: str) -> float | None: ...
+    def lane_authentication_failed(self, lane_id: str) -> bool: ...
     def retire_lane(self, lane_id: str) -> None: ...
 
 
@@ -524,6 +525,18 @@ def _reconcile_reviewing(
         status = deps.kanban.lane_status(request.lane_id)
         if status is None:
             raise RuntimeError("reviewer lane could not be found")
+        if deps.kanban.lane_authentication_failed(request.lane_id):
+            _finish_reviewing(
+                store, request,
+                SystemFailure(
+                    "PROVIDER_AUTHENTICATION_REQUIRED",
+                    "The reviewer could not authenticate with its model provider.",
+                    "Reauthenticate with `hermes --profile boris_on_demand model`, "
+                    "then repost the PR link.",
+                ),
+                deps, status,
+            )
+            return
         held_at = deps.kanban.lane_quota_hold(request.lane_id)
         recently_held = (
             held_at is not None and deps.now() - held_at < REVIEW_WAIT_SECONDS
