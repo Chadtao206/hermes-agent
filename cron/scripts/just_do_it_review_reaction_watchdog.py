@@ -238,6 +238,9 @@ BLOCKING_MARKERS = (
     "BLOCKED",
     "FAILED-REVIEW",
 )
+# A verdict the reviewer itself labels non-blocking is a comment review, whatever
+# blocking marker precedes the label ("NEEDS_FIX_NON_BLOCKING_COMMENT" -> notes).
+NONBLOCKING_MARKERS = ("NON-BLOCKING", "COMMENT-ONLY")
 COMMENT_MARKERS = (
     "COMMENTED",
     "COMMENT",
@@ -890,6 +893,8 @@ def run_indicates_block(run_row: dict[str, Any]) -> tuple[bool, str]:
     if md is None:
         return False, "no metadata dict"
     for key, text in _verdict_texts(md):
+        if _marker_hit(text, NONBLOCKING_MARKERS):
+            continue
         marker = _marker_hit(text, BLOCKING_MARKERS)
         if marker:
             return True, f"{key}~{marker}"
@@ -917,6 +922,8 @@ def run_indicates_comments(run_row: dict[str, Any]) -> tuple[bool, str]:
         return False, "no metadata dict"
     for key, text in _verdict_texts(md):
         marker = _marker_hit(text, COMMENT_MARKERS)
+        if not marker and _marker_hit(text, NONBLOCKING_MARKERS) and _marker_hit(text, BLOCKING_MARKERS):
+            marker = "NON-BLOCKING"
         if marker:
             return True, f"{key}~{marker}"
     for container in _containers(md):
@@ -1064,6 +1071,20 @@ def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
             )
         return emoji, f"run={run_row.get('id')} {why}"
     return None, "no classifiable reviewer run metadata"
+
+
+def _jev_shadow(task_id: str, show: dict[str, Any], lane_state: str | None, why: str) -> None:
+    """Shadow-log a Jev judgment of the newest reviewer run; JEV_SHADOW=1 only, never decides."""
+    if os.environ.get("JEV_SHADOW") != "1":
+        return
+    try:
+        import jev_judge
+
+        runs = [r for r in (show.get("runs") or []) if isinstance(r, dict)
+                and r.get("profile") in (None, "reviewer")]
+        jev_judge.shadow(task_id, max(runs, key=_run_epoch, default=None), lane_state, why)
+    except Exception:  # noqa: BLE001 - shadow must never break the tick
+        pass
 
 
 def lane_status_kind(status: Any) -> str:
@@ -1887,6 +1908,7 @@ def process_tick(
         attempts.pop(task_id, None)
         seen[task_id] = row_epoch(row)
         lane_state, why = classify_task(show)
+        _jev_shadow(task_id, show, lane_state, why)
         # Metadata/comment provenance also counts for lanes we already fetched
         # (legacy reach), unioned with the body links that queued the lane.
         show_links = links + [

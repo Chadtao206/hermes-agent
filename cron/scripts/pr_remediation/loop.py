@@ -252,6 +252,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pr_remediation import jev_gate
 from pr_remediation.boris_source import Verdict
 from pr_remediation.config import RemediationConfig
 from pr_remediation.lanes import TERMINAL_LANE_STATUSES
@@ -2449,6 +2450,7 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     if route.action == ROUTE_DROP_ORPHAN:
         return _drop_orphan(deps, loop, route.detail)
     if route.action == ROUTE_OPEN_LANE:
+        jev_gate.shadow(deps, loop, verdict)
         return _open_lane(deps, loop, verdict, int(route.detail["round"]))
     # ROUTE_DEFER: the in-flight lane drives the loop, not this verdict, and
     # the note above is the whole of what we owe it.
