@@ -1040,6 +1040,9 @@ def test_diff_pages_render_under_the_mcp_result_threshold(tmp_path, monkeypatch,
 
     seen_files, page = set(), 1
     while True:
+        # Walking a diff past what one context can hold is a paginator property, not a review, so
+        # the per-review evidence tally is cleared rather than ending the walk partway.
+        module._evidence_served.clear()
         result = module.read_github_evidence("pr_diff", None, page)
         assert _hermes_rendered_size(result) <= _mcp_threshold(), f"page {page} would spill"
         data = result["data"]
@@ -1243,6 +1246,9 @@ def test_mode_only_diff_of_many_deep_files_stays_under_threshold(tmp_path, monke
 
     seen, page = set(), 1
     while True:
+        # Walking a diff past what one context can hold is a paginator property, not a review, so
+        # the per-review evidence tally is cleared rather than ending the walk partway.
+        module._evidence_served.clear()
         result = module.read_github_evidence("pr_diff", None, page)
         assert _hermes_rendered_size(result) <= _mcp_threshold(), f"page {page} would spill"
         seen.update(result["data"]["files_on_page"])
@@ -1471,3 +1477,76 @@ def test_oversized_diff_and_file_batches_preserve_complete_inventory(
     if oversized_single_file:
         assert "Patch unavailable" in result["data"]["diff"]
         assert "file_at_head" in result["data"]["diff"]
+
+def test_gitattributes_generated_files_keep_their_place_but_not_their_patch(tmp_path, monkeypatch):
+    """A repo declaring a path machine-written gets its patch withheld, not the file hidden.
+
+    forge-content-service and million-stars both mark their emitted OpenAPI spec and generated
+    client this way and pin them with a CI drift guard, but the pulls/files API returns the patch
+    regardless, so a one-line route change buries the reviewable code under tens of thousands of
+    emitted lines.
+    """
+    import base64
+
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    attrs = base64.b64encode(
+        b"# emitted, pinned by the drift guard\n"
+        b"openapi.json -diff linguist-generated=true\n"
+        b"src/contract/forge-api.ts -diff linguist-generated=true\n"
+        b"README.md text\n"
+    ).decode()
+    listing = [
+        {"filename": "openapi.json", "status": "modified", "changes": 50318,
+         "patch": "@@ -1 +1 @@\n-emitted\n+emitted harder\n"},
+        {"filename": "src/services/normalized-save.ts", "status": "modified", "changes": 12,
+         "patch": "@@ -1 +1 @@\n-real\n+really real\n"},
+    ]
+
+    def run(command, **kwargs):
+        tail = " ".join(command)
+        if "view" in command and "headRefOid" in tail:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"headRefOid": "a" * 40, "title": "Example", "comments": []}),
+                stderr="")
+        if ".gitattributes" in tail:
+            return SimpleNamespace(returncode=0, stdout=attrs, stderr="")
+        if "/files?" in tail:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="")
+        # Force the changed-files route, which is the one a diff this size takes.
+        return SimpleNamespace(returncode=1, stdout="", stderr="HTTP 406")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+    data = module.read_github_evidence("pr_diff", None, 1)["data"]
+    diff = data["diff"]
+
+    assert "emitted harder" not in diff, "declared-generated patch text reached the reviewer"
+    assert "declared machine-written in .gitattributes" in diff
+    assert "50318 changed lines" in diff
+    assert "really real" in diff, "an undeclared file must still be reviewable"
+    assert "openapi.json" in data["files_on_page"], "suppression must not hide the file"
+    assert "openapi.json" in data["all_files"]
+
+
+def test_gitattributes_absent_leaves_every_patch_intact(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    listing = [{"filename": "openapi.json", "status": "modified", "changes": 9,
+                "patch": "@@ -1 +1 @@\n-a\n+b\n"}]
+
+    def run(command, **kwargs):
+        tail = " ".join(command)
+        if "view" in command and "headRefOid" in tail:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"headRefOid": "a" * 40, "title": "Example", "comments": []}),
+                stderr="")
+        if ".gitattributes" in tail:
+            return SimpleNamespace(returncode=1, stdout="", stderr="Not Found")
+        if "/files?" in tail:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="HTTP 406")
+
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+    diff = module.read_github_evidence("pr_diff", None, 1)["data"]["diff"]
+    assert "+b" in diff
+    assert "declared machine-written" not in diff

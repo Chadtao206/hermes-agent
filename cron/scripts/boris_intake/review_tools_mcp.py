@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fnmatch
 import hashlib
 import inspect
 import json
@@ -68,6 +69,25 @@ _OPERATIONS = frozenset({
 # characters in code cost up to four chars each. Every page is budgeted in rendered
 # chars against this figure, envelope included, with headroom under the threshold.
 _RESULT_BUDGET = 44_000
+# Keeping every page under the spill threshold means no page ever spills, so evidence accumulates
+# in context instead. A PR needing many pages therefore grows the context ~44k at a time until
+# pre-API compression fires, and compression discards the evidence -- the reviewer restarts at page
+# one and thrashes until the turn budget dies, ending the lane with no verdict at all. Measured
+# across 957 lane sessions: every review that produced a verdict read under 472k chars of
+# unspilled evidence, every review that died read over 1.43M, and that ceiling is not a
+# coincidence: measured against the context trajectory, ~400k chars of evidence costs ~94k tokens,
+# so evidence crosses the compression threshold at roughly 470k -- exactly where the surviving
+# reviews stop. Past it a review cannot hold its own evidence, whatever the turn budget says. The
+# paginator itself goes further (its tests walk a 2,000-file diff to 1.22M) because paging is a
+# separate concern from what one context can carry. Cutting off here reports a gap instead of a
+# verdict, which is what an exhausted turn budget already produces -- the same outcome, named,
+# after ~12 pages instead of 60.
+_EVIDENCE_BUDGET = 500_000
+# Keyed by request id because a server may bind more than one review over its life. Cleared
+# wholesale when it grows past the cap: a dropped counter only restarts the tally for a review
+# already in flight, which is cheaper than tracking liveness for a number this cheap to rebuild.
+_EVIDENCE_TRACKED = 64
+_evidence_served: dict[str, int] = {}
 # Bounded lists that ride on every page or listing; the totals are always reported.
 # Counts cap the work, rendered size caps what reaches the model: deep monorepo
 # paths made a 300-entry all_files list alone outgrow the result budget.
@@ -561,7 +581,66 @@ def paginate_diff(diff: str, page: int, budget: int | None = None) -> dict:
     }
 
 
-def _changed_file_section(entry: object) -> str:
+# A repo that marks a path `-diff` or `linguist-generated=true` in .gitattributes is stating that
+# the file is machine-written and its line diff is not the reviewable record -- forge-content-service
+# and million-stars both say so of their emitted OpenAPI spec and generated client, and pin them with
+# a CI drift guard instead. GitHub honours that in its own UI but the pulls/files API returns the
+# patch regardless, so without this the reviewer reads tens of thousands of generated lines to reach
+# a few hundred hand-written ones, and on a large PR never reaches them at all. The file stays in the
+# inventory and stays readable with file_at_head; only its patch is withheld.
+_GENERATED_ATTRS = ("-diff", "linguist-generated=true", "linguist-generated")
+
+
+def _generated_globs(request: LifecycleRequest) -> tuple[str, ...]:
+    """Paths the repo itself declares machine-written, read from .gitattributes at the head."""
+    owner = quote(request.owner, safe="")
+    repo = quote(request.repo, safe="")
+    try:
+        raw = _github(
+            request,
+            ["api", f"/repos/{owner}/{repo}/contents/.gitattributes"
+                    f"?ref={quote(request.head_sha, safe='')}", "--jq", ".content // empty"],
+            expect_json=False,
+            allowed_codes=(0, 1),
+        )
+    except ToolError:
+        return ()
+    if not isinstance(raw, str) or not raw.strip():
+        return ()
+    try:
+        text = base64.b64decode(raw.strip(), validate=False).decode("utf-8", "replace")
+    except (binascii.Error, ValueError):
+        return ()
+    globs: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        if any(attr in fields[1:] for attr in _GENERATED_ATTRS):
+            globs.append(fields[0])
+    return tuple(globs)
+
+
+def _is_generated(filename: str, globs: tuple[str, ...]) -> bool:
+    """gitattributes matching, narrowed to what these patterns use: a pattern with no slash
+    matches the basename at any depth, one with a slash matches the whole path."""
+    if not globs:
+        return False
+    for raw in globs:
+        pattern = raw.lstrip("/")
+        if fnmatch.fnmatch(filename, pattern):
+            return True
+        if "/" not in pattern and fnmatch.fnmatch(PurePosixPath(filename).name, pattern):
+            return True
+        if pattern.endswith("/**") and filename.startswith(pattern[:-3] + "/"):
+            return True
+    return False
+
+
+def _changed_file_section(entry: object, generated: tuple[str, ...] = ()) -> str:
     """Rebuild one file's diff section from its changed-file inventory entry."""
     if not isinstance(entry, dict):
         raise ToolError("GitHub changed-file entry is not an object")
@@ -571,6 +650,13 @@ def _changed_file_section(entry: object) -> str:
     previous = entry.get("previous_filename")
     header = f"diff --git a/{previous or filename} b/{filename}\n"
     patch = entry.get("patch")
+    if _is_generated(filename, generated):
+        changes = entry.get("changes", 0)
+        return header + (
+            f"[boris: {filename} is declared machine-written in .gitattributes ({changes} changed "
+            f"lines); its patch is not shown because the generator's inputs, not this file, are the "
+            f"reviewable record. Read it with file_at_head if a specific emitted value matters]\n"
+        )
     if isinstance(patch, str) and patch:
         return header + (patch if patch.endswith("\n") else patch + "\n")
     status = str(entry.get("status") or "modified")
@@ -594,6 +680,7 @@ def _changed_files_diff(request: LifecycleRequest) -> str:
     """A unified diff rebuilt from the changed-file inventory."""
     owner = quote(request.owner, safe="")
     repo = quote(request.repo, safe="")
+    generated = _generated_globs(request)
     sections: list[str] = []
     exhausted = True
     per_page = _FILES_PER_PAGE
@@ -619,7 +706,7 @@ def _changed_files_diff(request: LifecycleRequest) -> str:
             )
         if not isinstance(batch, list):
             raise ToolError("GitHub changed-file response is not a list")
-        sections.extend(_changed_file_section(entry) for entry in batch)
+        sections.extend(_changed_file_section(entry, generated) for entry in batch)
         if len(batch) < per_page:
             exhausted = False
             break
@@ -976,6 +1063,13 @@ _SUBMIT_TOOL_DESCRIPTION = (
 server = FastMCP("boris_review")
 
 
+def _record_evidence(request_id: str, result: dict) -> None:
+    if len(_evidence_served) >= _EVIDENCE_TRACKED and request_id not in _evidence_served:
+        _evidence_served.clear()
+    _evidence_served[request_id] = _evidence_served.get(request_id, 0) + len(
+        json.dumps(result, ensure_ascii=False))
+
+
 @server.tool(description=_GITHUB_TOOL_DESCRIPTION)
 def read_github_evidence(
     operation: Annotated[
@@ -1028,12 +1122,25 @@ def read_github_evidence(
 
     store, request, _ = _bound_request()
     try:
+        served = _evidence_served.get(request.request_id, 0)
+        if served >= _EVIDENCE_BUDGET:
+            # Refused before the fetch, so a reviewer that retries pays nothing and cannot thrash.
+            raise ToolError(
+                f"Evidence budget exhausted: {served:,} chars already read for this review, past "
+                f"the {_EVIDENCE_BUDGET:,} that fit in one context. Further pages would push the "
+                "context into compression and discard the evidence already gathered, so this PR "
+                "cannot be assessed by reading more. Submit the judgment now with a verification "
+                "gap whose prevents_core_assessment is true and whose reason_code is "
+                "DIFF_EVIDENCE_RESPONSE_TOO_LARGE, citing the evidence actually inspected."
+            )
         if operation == "pr_metadata":
             # review_context precedes GitHub's payload on purpose: if the result ever
             # spills, Hermes keeps a head preview, and the workflow-owned facts must
             # be in it.
             data = _metadata(request)
-            return _bounded_metadata(operation, request, _review_context(store, request), data)
+            result = _bounded_metadata(operation, request, _review_context(store, request), data)
+            _record_evidence(request.request_id, result)
+            return result
         else:
             _ensure_current_head(request)
             repository = f"{request.owner}/{request.repo}"
@@ -1075,7 +1182,9 @@ def read_github_evidence(
                 data = _bounded_thread(request, thread)
             else:
                 data = _file_evidence(request, file_path, page)
-        return {"operation": operation, "head_sha": request.head_sha, "data": data}
+        result = {"operation": operation, "head_sha": request.head_sha, "data": data}
+        _record_evidence(request.request_id, result)
+        return result
     finally:
         store.close()
 
