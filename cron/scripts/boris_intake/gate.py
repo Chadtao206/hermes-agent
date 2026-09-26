@@ -135,6 +135,7 @@ def evaluate(
 
     # 1: real human message, or the remediation loop's own marked re-review,
     #    or the discovery cron's own marked top-level request
+    #    or a trusted teammate bot, attributed to its owner
     loop_repost = _is_loop_repost(event, cfg)
     discovery = _is_discovery_post(event, cfg)
 
@@ -148,9 +149,13 @@ def evaluate(
         else RequestOrigin.DISCOVERY if discovery
         else RequestOrigin.HUMAN
     )
+    bot_owner = (
+        cfg.trusted_bots.get(event.user_id or "", "")
+        if event.is_bot and not event.subtype else ""
+    )
     requester_user_id = (
         cfg.loop_attributed_user_id if (loop_repost or discovery)
-        else (event.user_id or "")
+        else bot_owner or (event.user_id or "")
     )
 
     def reject(reason: ReasonCode, detail: str = "") -> GateResult:
@@ -160,7 +165,8 @@ def evaluate(
             origin=origin,
         )
 
-    if not (loop_repost or discovery) and (event.is_bot or not event.user_id or event.subtype):
+    if not (loop_repost or discovery or bot_owner) and (
+            event.is_bot or not event.user_id or event.subtype):
         return reject(ReasonCode.NOT_HUMAN, event.subtype or "no user id")
 
     # 2: channel allowlist (also excludes DMs — no im channel is ever listed)

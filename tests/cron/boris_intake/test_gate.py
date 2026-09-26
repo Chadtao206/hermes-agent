@@ -90,6 +90,29 @@ def test_bot_message_rejected():
     assert ReasonCode.NOT_HUMAN in reasons(r)
 
 
+def test_trusted_teammate_bot_is_admitted_as_its_owner():
+    cfg = replace(CFG, trusted_bots={"U_AARON_BOT": "U_AARON"})
+    looked_up = []
+    d = replace(deps(), identity=lambda uid: looked_up.append(uid) or GOOD)
+    r = evaluate(ev(user_id="U_AARON_BOT", is_bot=True), cfg, d)
+    assert r.accepted
+    assert looked_up == ["U_AARON"]
+    assert r.commands[0].requester_user_id == "U_AARON"
+
+
+def test_untrusted_bot_is_still_rejected_when_another_bot_is_trusted():
+    cfg = replace(CFG, trusted_bots={"U_AARON_BOT": "U_AARON"})
+    r = evaluate(ev(user_id="U_OTHER_BOT", is_bot=True), cfg, deps())
+    assert ReasonCode.NOT_HUMAN in reasons(r)
+
+
+def test_trusted_bot_subtype_message_is_rejected():
+    cfg = replace(CFG, trusted_bots={"U_AARON_BOT": "U_AARON"})
+    r = evaluate(ev(user_id="U_AARON_BOT", is_bot=True, subtype="message_changed"),
+                 cfg, deps())
+    assert ReasonCode.NOT_HUMAN in reasons(r)
+
+
 def test_workflow_builder_post_rejected():
     r = evaluate(ev(user_id=None, subtype="bot_message"), CFG, deps())
     assert ReasonCode.NOT_HUMAN in reasons(r)

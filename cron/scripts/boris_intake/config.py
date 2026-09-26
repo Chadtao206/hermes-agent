@@ -56,6 +56,10 @@ class Config:
     # discovery cron posts as the same bot user as Boris itself).
     discovery_marker: str = ""
     discovery_bot_user_id: str = ""
+    # A teammate's bot -> the human who owns it. That bot's links are reviewed
+    # as if the owner had posted them, so identity, quota and audit all resolve
+    # to a real person.
+    trusted_bots: dict[str, str] = field(default_factory=dict)
     limits: Limits = field(default_factory=Limits)
 
 
@@ -97,6 +101,10 @@ def load_config(path: Path | None = None) -> Config:
     loop_attributed_user_id = str(block.get("loop_attributed_user_id", "") or "").strip()
     discovery_marker = str(block.get("discovery_marker", "") or "").strip()
     discovery_bot_user_id = str(block.get("discovery_bot_user_id", "") or "").strip()
+    raw_bots = block.get("trusted_bots") if isinstance(block.get("trusted_bots"), dict) else {}
+    trusted_bots = {str(bot).strip(): str(owner).strip()
+                    for bot, owner in raw_bots.items()
+                    if str(bot).strip() and str(owner or "").strip()}
     return Config(
         mode=mode,
         team_id=str(block.get("team_id", "T02PND103")),
@@ -113,5 +121,6 @@ def load_config(path: Path | None = None) -> Config:
         loop_attributed_user_id=loop_attributed_user_id,
         discovery_marker=discovery_marker,
         discovery_bot_user_id=discovery_bot_user_id,
+        trusted_bots=trusted_bots,
         limits=limits,
     )

@@ -104,6 +104,18 @@ def test_discovery_fields_round_trip_and_do_not_alias_the_loop_fields(tmp_path):
     assert cfg.discovery_bot_user_id != cfg.bot_user_id
 
 
+def test_trusted_bots_load_and_drop_entries_without_an_owner(tmp_path):
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "boris_intake:\n"
+        "  mode: live\n"
+        "  trusted_bots:\n"
+        "    U0BCS6LUWT1: U032RQY7XA9\n"
+        "    U_ORPHAN_BOT: ''\n"
+    )
+    assert load_config(cfg_file).trusted_bots == {"U0BCS6LUWT1": "U032RQY7XA9"}
+
+
 def test_review_policy_has_stable_canonical_identity():
     normal = models.ReviewPolicy(ignore_ci=False, rubric_version="2")
     waived = models.ReviewPolicy(ignore_ci=True, rubric_version="2")
