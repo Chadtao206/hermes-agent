@@ -2781,7 +2781,9 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         error="Interrupted by gateway shutdown before terminal completion.")
 
 
-def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
+def _finish_completed_run(
+    d: _RunDelivery, fire_owner: Optional[str], execution_id: str, purpose_output: str = "",
+) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     mark_kwargs = {"delivery_error": d.delivery_error}
@@ -2808,7 +2810,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome,
+        purpose_output=purpose_output)
     return True
 
 
@@ -2890,6 +2893,10 @@ def _run_one_job_body(
         if not external_owner and mark_execution_running(execution_id) is None:
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
             return True
+
+        from cron.executions import capture_purpose_contract
+
+        capture_purpose_contract(execution_id, job)
 
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
         # resolve credentials, so the scope must span delivery too (reset in the outer finally).
@@ -2979,7 +2986,7 @@ def _run_one_job_body(
             _finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
-        return _finish_completed_run(d, fire_owner, execution_id)
+        return _finish_completed_run(d, fire_owner, execution_id, final_response)
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.

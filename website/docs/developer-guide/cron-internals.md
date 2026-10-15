@@ -240,6 +240,40 @@ This timeout bounds the **pre-run script only**, not the agent. Skill-based / LL
 
 This mirrors the gateway's behavior — without it, cron agents would fail on rate limits without attempting recovery.
 
+## Shadow purpose outcomes
+
+Execution completion and purpose success are separate ledger fields. Each owned
+run snapshots its optional `purpose_contract` after entering `running`, before
+executing the script or agent. The snapshot cannot be replaced by later job edits
+or a different process. Terminal completion atomically records `purpose_outcome`
+and `purpose_reason`; interrupted and historical attempts remain unknown.
+
+Operators can set the contract through `cron.jobs.update_job`:
+
+```python
+update_job(job_id, {"purpose_contract": {
+    "version": 1,
+    "required_task": False,
+    "validator": "json_status",
+    "status_outcomes": {"observed": "succeeded", "window_ended": "no_work"},
+}})
+```
+
+`json_status` only trusts a configured `no_agent` script's JSON response. Its
+`status` must match an explicit mapping to `succeeded`, `no_work`, `blocked`, or
+`failed`. This contract is appropriate only when the maintained script verifies
+the intended result before reporting that status. Agent self-reports, `[SILENT]`,
+empty output, unknown statuses, malformed JSON, and unsupported validators do not
+establish success. A nonzero execution always records purpose failure. Set
+`required_task: true` with `task_id` for task-bound jobs; a missing identity is
+recorded as purpose failure even if execution completes.
+
+This is shadow recording: missing-task findings do not yet prevent execution,
+change delivery, or create new alerts. Run the planned seven-day observation
+before enabling enforcement on selected jobs. Existing delivery deduplication,
+claim ownership, and terminal immutability remain authoritative. Removing the
+job contract disables future positive purpose evidence without rewriting history.
+
 ## Delivery Model
 
 Cron job results can be delivered to any supported platform.

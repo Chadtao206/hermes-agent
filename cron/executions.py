@@ -107,6 +107,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    for name, definition in (
+        ("purpose_contract", "purpose_contract TEXT"),
+        ("purpose_outcome", "purpose_outcome TEXT NOT NULL DEFAULT 'unknown'"),
+        ("purpose_reason", "purpose_reason TEXT NOT NULL DEFAULT 'missing_terminal_evidence'"),
+    ):
+        add_column_if_missing(conn, "executions", name, definition)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -253,22 +259,42 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     return record
 
 
+def capture_purpose_contract(execution_id: str, job: dict) -> bool:
+    from cron.purpose import snapshot_contract
+
+    contract = snapshot_contract(job)
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET purpose_contract=?
+               WHERE id=? AND job_id=? AND status='running'
+                 AND process_id=? AND pid=? AND purpose_contract IS NULL""",
+            (contract, execution_id, job["id"], _PROCESS_ID, os.getpid()),
+        )
+        return cur.rowcount == 1
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
-    delivery_outcome: Optional[str] = None,
+    delivery_outcome: Optional[str] = None, purpose_output: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+    from cron.purpose import classify_purpose
+
     with _transaction() as conn:
+        existing = _fetch(conn, execution_id)
+        if existing is None:
+            return None
+        outcome, reason = classify_purpose(existing["purpose_contract"], success, purpose_output)
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, purpose_outcome=?, purpose_reason=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, outcome, reason, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
