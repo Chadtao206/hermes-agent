@@ -2120,9 +2120,9 @@ def test_finalize_compensation_preserves_latest_retained_scheduler_progress(
     registry_writes: list[list[dict]] = []
     interleaved_retained: dict = {}
 
-    def observe_save(jobs):
+    def observe_save(jobs, **kwargs):
         registry_writes.append(copy.deepcopy(jobs))
-        return real_save(jobs)
+        return real_save(jobs, **kwargs)
 
     def fail_second_removal(job_id):
         if job_id == "ff865c33c5ea":
@@ -2186,7 +2186,7 @@ def test_finalize_compensation_restores_verified_sources_before_retired_records(
     real_save = cron_jobs.save_jobs
     source_state_at_registry_restore: list[bool] = []
 
-    def observe_save(jobs):
+    def observe_save(jobs, **kwargs):
         if RETIRE_IDS <= {job.get("id") for job in jobs}:
             source_state_at_registry_restore.append(
                 all(
@@ -2195,7 +2195,7 @@ def test_finalize_compensation_restores_verified_sources_before_retired_records(
                     for fingerprint in entrypoints
                 )
             )
-        return real_save(jobs)
+        return real_save(jobs, **kwargs)
 
     def fail_second_removal(job_id):
         if job_id == "ff865c33c5ea":
@@ -2240,11 +2240,11 @@ def test_finalize_compensation_source_verification_failure_gates_registry_restor
             raise RetirementError("injected source compensation verification failure")
         return real_require(fingerprint, path)
 
-    def observe_save(jobs):
+    def observe_save(jobs, **kwargs):
         nonlocal registry_restores
         if RETIRE_IDS <= {job.get("id") for job in jobs}:
             registry_restores += 1
-        return real_save(jobs)
+        return real_save(jobs, **kwargs)
 
     monkeypatch.setattr(cron_jobs, "remove_job", fail_second_removal)
     monkeypatch.setattr(
@@ -2335,11 +2335,11 @@ def test_finalize_compensation_active_archive_collision_gates_registry_restore(
             return False
         return real_remove(job_id)
 
-    def observe_save(jobs):
+    def observe_save(jobs, **kwargs):
         nonlocal registry_restores
         if RETIRE_IDS <= {job.get("id") for job in jobs}:
             registry_restores += 1
-        return real_save(jobs)
+        return real_save(jobs, **kwargs)
 
     monkeypatch.setattr(cron_jobs, "remove_job", fail_second_removal)
     monkeypatch.setattr(cron_jobs, "save_jobs", observe_save)
@@ -2611,7 +2611,7 @@ def test_finalize_compensation_never_writes_enabled_retired_records(
     real_save = cron_jobs.save_jobs
     enabled_writes: list[set[str]] = []
 
-    def observe_save(jobs):
+    def observe_save(jobs, **kwargs):
         enabled_writes.append(
             {
                 job["id"]
@@ -2619,7 +2619,7 @@ def test_finalize_compensation_never_writes_enabled_retired_records(
                 if job.get("id") in RETIRE_IDS and job.get("enabled") is True
             }
         )
-        return real_save(jobs)
+        return real_save(jobs, **kwargs)
 
     def fail_second(job_id):
         if job_id == "ff865c33c5ea":
