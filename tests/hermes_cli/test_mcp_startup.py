@@ -366,6 +366,15 @@ def test_discover_mcp_tools_spawns_only_allowed_servers(monkeypatch):
     _mcp_discovery.discover_mcp_tools(allowed_mcp_names=["mcp-code-mcp"])
     assert set(seen) == {"code-mcp"}
 
+    # Canonical toolsets win over colliding raw aliases, as in get_toolset().
+    servers["mcp-code-mcp"] = {"command": "true"}
+    seen.clear()
+    _mcp_discovery.discover_mcp_tools(allowed_mcp_names=["mcp-code-mcp"])
+    assert set(seen) == {"code-mcp"}
+    seen.clear()
+    _mcp_discovery.discover_mcp_tools(allowed_mcp_names=["mcp-mcp-code-mcp"])
+    assert set(seen) == {"mcp-code-mcp"}
+
     # `-t terminal` — no MCP server in the filter: skip the whole MCP load,
     # including the ~260ms `mcp` SDK import.
     seen.clear()
