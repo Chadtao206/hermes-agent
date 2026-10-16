@@ -1242,14 +1242,28 @@ def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> b
     completion_kwargs: dict = {}
     if "operation_id" in inspect.signature(kanban_db.complete_task).parameters:
         completion_kwargs["operation_id"] = f"boris-review-submit:{request_id}:{judgment_hash}"
+    completion = {"request_id": request_id, "judgment_hash": judgment_hash}
     with kbc.connect_closing(db_path) as connection:
-        return kanban_db.complete_task(
+        if kanban_db.complete_task(
             connection,
             task_id,
             summary="Structured Boris review judgment accepted.",
+            metadata={"boris_review_completion": completion},
             expected_run_id=run_id,
             **completion_kwargs,
-        )
+        ):
+            return True
+        with kbc.write_txn(connection):
+            task = kanban_db.get_task(connection, task_id)
+            latest = kanban_db.latest_run(connection, task_id)
+            return bool(
+                run_id is not None and task is not None and task.status == "done"
+                and task.current_run_id is None and latest is not None
+                and latest.id == run_id and latest.outcome == "completed"
+                and latest.status == "done" and latest.ended_at is not None
+                and isinstance(latest.metadata, dict)
+                and latest.metadata.get("boris_review_completion") == completion
+            )
 
 
 @server.tool(description=_SUBMIT_TOOL_DESCRIPTION)

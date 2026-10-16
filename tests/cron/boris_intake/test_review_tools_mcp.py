@@ -1579,3 +1579,82 @@ def test_gitattributes_absent_leaves_every_patch_intact(tmp_path, monkeypatch):
     diff = module.read_github_evidence("pr_diff", None, 1)["data"]["diff"]
     assert "+b" in diff
     assert "declared machine-written" not in diff
+
+
+@pytest.mark.parametrize("tamper", [None, "run", "request", "digest", "missing_marker", "reopened", "concurrent_reopen"])
+def test_retry_recovers_after_kanban_commit_before_judgment_completion_marker(tmp_path, monkeypatch, tamper):
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    db_path = kanban_db_connect.init_db(tmp_path / 'kanban.db')
+    with kanban_db_connect.connect_closing(db_path) as conn:
+        task_id = kanban_db.create_task(conn, title='Boris crash recovery', assignee='boris_on_demand')
+        assert kanban_db.claim_task(conn, task_id, claimer='test-dispatcher:1') is not None
+        run_id = conn.execute('SELECT current_run_id FROM tasks WHERE id = ?', (task_id,)).fetchone()[0]
+    module, store, request = bind_request(tmp_path, monkeypatch, task_id=task_id)
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(db_path))
+    monkeypatch.setenv('BORIS_KANBAN_RUN_ID', str(run_id))
+    mark_completed = Store.mark_judgment_task_completed
+    crashed = False
+
+    def crash_before_marker(self, *args, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError('injected crash after Kanban commit')
+        return mark_completed(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, 'mark_judgment_task_completed', crash_before_marker)
+    with pytest.raises(RuntimeError, match='injected crash'):
+        module.submit_review_result(valid_payload())
+    stored = store.judgment_for_request(request.request_id)
+    assert stored is not None
+    assert not store.judgment_task_completed(request.request_id)
+    with kanban_db_connect.connect_closing(db_path) as conn:
+        assert conn.execute('SELECT status FROM tasks WHERE id = ?', (task_id,)).fetchone()[0] == 'done'
+    reopen_blocked = []
+    if tamper == 'concurrent_reopen':
+        import sqlite3
+        get_task = kanban_db.get_task
+
+        def competing_reopen(conn, bound_task):
+            observed = get_task(conn, bound_task)
+            with sqlite3.connect(db_path, timeout=0) as competing:
+                try:
+                    competing.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+                    competing.commit()
+                except sqlite3.OperationalError as error:
+                    assert 'locked' in str(error)
+                    reopen_blocked.append(True)
+                else:
+                    reopen_blocked.append(False)
+            return observed
+
+        monkeypatch.setattr(kanban_db, 'get_task', competing_reopen)
+    if tamper not in (None, 'concurrent_reopen'):
+        if tamper == 'run':
+            monkeypatch.setenv('BORIS_KANBAN_RUN_ID', str(run_id + 1))
+        else:
+            with kanban_db_connect.connect_closing(db_path) as conn:
+                if tamper == 'reopened':
+                    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+                else:
+                    metadata = json.loads(conn.execute('SELECT metadata FROM task_runs WHERE id = ?', (run_id,)).fetchone()[0])
+                    if tamper == 'missing_marker':
+                        metadata.pop('boris_review_completion')
+                    else:
+                        field = 'request_id' if tamper == 'request' else 'judgment_hash'
+                        metadata['boris_review_completion'][field] = 'different'
+                    conn.execute('UPDATE task_runs SET metadata = ? WHERE id = ?', (json.dumps(metadata), run_id))
+                conn.commit()
+        with pytest.raises(module.ToolError, match='task completion failed'):
+            module.submit_review_result(valid_payload())
+        assert not store.judgment_task_completed(request.request_id)
+        assert store.judgment_for_request(request.request_id) == stored
+        return
+    assert module.submit_review_result(valid_payload()) == {'status': 'idempotent', 'task_completed': True}
+    assert store.judgment_for_request(request.request_id) == stored
+    assert store.judgment_task_completed(request.request_id)
+    if tamper == 'concurrent_reopen':
+        assert reopen_blocked == [True]
+    with kanban_db_connect.connect_closing(db_path) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id = ?', (task_id,)).fetchone()[0] == 1
