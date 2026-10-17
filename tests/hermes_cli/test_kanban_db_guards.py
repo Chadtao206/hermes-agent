@@ -10,6 +10,7 @@ import time
 import types
 from pathlib import Path
 import shutil
+from dataclasses import replace
 import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_workspace as kbw
@@ -410,6 +411,136 @@ def test_low_disk_watermark_blocks_new_scratch_but_allows_existing(
         existing_task = kb.get_task(conn, existing_id)
         assert existing_task is not None
         assert kbw.resolve_workspace(existing_task) == existing_path
+
+
+@pytest.mark.parametrize("failure", ["disk", "workspace", "spawn"])
+def test_dispatch_waits_for_disk_but_counts_real_failures(
+    kanban_home, all_assignees_spawnable, monkeypatch, failure,
+):
+    gib = 1024 ** 3
+    capacity = {"free": (10 if failure == "disk" else 30) * gib}
+    monkeypatch.setattr(kbg, "_configured_min_free_disk_gb", lambda: 20.0)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+    def disk_usage(_path):
+        if failure == "workspace":
+            raise PermissionError("filesystem unavailable")
+        return types.SimpleNamespace(
+            total=100 * gib, used=100 * gib - capacity["free"], free=capacity["free"],
+        )
+
+    monkeypatch.setattr(shutil, "disk_usage", disk_usage)
+    spawned = []
+
+    def spawn(task, workspace):
+        if failure == "spawn":
+            raise RuntimeError("worker launch failed")
+        spawned.append(task.id)
+        return None
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="disk admission wait", assignee="alice")
+        if failure != "disk":
+            for count in (1, 2):
+                result = kbd.dispatch_once(conn, spawn_fn=spawn, failure_limit=2)
+                task = kb.get_task(conn, task_id)
+                assert task.consecutive_failures == count
+                assert task.current_run_id is None
+                assert task.claim_lock is None
+            assert task.status == "blocked"
+            assert result.auto_blocked == [task_id]
+            assert not spawned
+            return
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'alice', 'crashed', 'crashed', ?, ?, ?)",
+            (task_id, int(time.time()) - 120, int(time.time()) - 60, '{"protocol_violation": true}'),
+        )
+        conn.commit()
+        for _ in range(3):
+            result = kbd.dispatch_once(conn, spawn_fn=spawn, failure_limit=2)
+            task = kb.get_task(conn, task_id)
+            assert task.status == "ready"
+            assert task.consecutive_failures == 0
+            assert task.current_run_id is None
+            assert task.claim_lock is None
+            assert not result.auto_blocked
+            assert not spawned
+            assert not (kb.workspaces_root() / task_id).exists()
+        assert conn.execute(
+            "SELECT count(*) FROM task_runs WHERE task_id=?", (task_id,),
+        ).fetchone()[0] == 2
+        assert kbd._protocol_violation_streak(conn, task_id) == 1
+        assert conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+        capacity["free"] = 30 * gib
+        kbd.dispatch_once(conn, spawn_fn=spawn, failure_limit=2)
+        assert spawned == [task_id]
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+@pytest.mark.parametrize("phase", ["ready", "review"])
+@pytest.mark.parametrize("ownership", ["owned", "stale_claim", "stale_run", "worker_started"])
+def test_disk_wait_only_releases_owned_unstarted_run(kanban_home, phase, ownership):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="owned disk wait", assignee="alice")
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (phase, task_id))
+        conn.commit()
+        claim = kb.claim_review_task if phase == "review" else kb.claim_task
+        task = claim(conn, task_id)
+        assert task is not None
+        if ownership == "stale_claim":
+            task = replace(task, claim_lock="former-owner")
+        elif ownership == "stale_run":
+            task = replace(task, current_run_id=task.current_run_id + 1)
+        elif ownership == "worker_started":
+            conn.execute("UPDATE tasks SET worker_pid=42 WHERE id=?", (task_id,))
+            conn.commit()
+        before = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+        error = kbg.WorkspaceDiskSpaceError("capacity low", path=kb.workspaces_root() / task_id)
+        changed = kbg.defer_workspace_capacity(conn, task, error)
+        current = kb.get_task(conn, task_id)
+        if ownership == "owned":
+            assert changed
+            assert current.status == phase
+            assert current.current_run_id is None
+            assert current.claim_lock is None
+            assert current.consecutive_failures == 0
+        else:
+            assert not changed
+            assert tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()) == before
+            assert conn.execute(
+                "SELECT ended_at FROM task_runs WHERE task_id=?", (task_id,),
+            ).fetchone()[0] is None
+
+
+def test_disk_wait_follows_changed_board_workspace(kanban_home, tmp_path, monkeypatch, all_assignees_spawnable):
+    full_repo, healthy_repo = tmp_path / "full", tmp_path / "healthy"
+    _init_git_repo(full_repo)
+    _init_git_repo(healthy_repo)
+    gib = 1024 ** 3
+    monkeypatch.setattr(kbg, "_configured_min_free_disk_gb", lambda: 20.0)
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+
+    def disk_usage(path):
+        free = (10 if Path(path).is_relative_to(full_repo) else 30) * gib
+        return types.SimpleNamespace(total=100 * gib, used=100 * gib - free, free=free)
+
+    monkeypatch.setattr(shutil, "disk_usage", disk_usage)
+    spawns = []
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="move board volume", assignee="alice", workspace_kind="worktree")
+        kb.write_board_metadata(kb.get_current_board(), default_workdir=str(full_repo))
+        kbd.dispatch_once(conn, spawn_fn=lambda task, path: spawns.append(path))
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert not spawns
+        kb.write_board_metadata(kb.get_current_board(), default_workdir=str(healthy_repo))
+        kbd.dispatch_once(conn, spawn_fn=lambda task, path: spawns.append(path))
+        assert spawns == [str(healthy_repo / ".worktrees" / task_id)]
+        assert kb.get_task(conn, task_id).consecutive_failures == 0
+        assert not (full_repo / ".worktrees" / task_id).exists()
 
 
 def test_low_disk_watermark_blocks_new_git_worktree(

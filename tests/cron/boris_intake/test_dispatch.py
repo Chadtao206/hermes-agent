@@ -330,6 +330,30 @@ def test_kanban_lifecycle_lookup_uses_gate_aware_idempotency_and_reads_status(tm
     assert adapter.lane_status("t_missing") is None
 
 
+def test_resource_wait_window_is_bound_to_lane_and_first_resumed_attempt(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "kanban.db"
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, outcome TEXT, "
+            "started_at INTEGER, ended_at INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO task_runs (task_id,outcome,started_at,ended_at) VALUES (?,?,?,?)",
+            [("waiting", "resource_wait", 100, 101), ("other", "resource_wait", 200, 201)],
+        )
+    adapter = dispatch.KanbanIO(db)
+    assert adapter.lane_resource_window("waiting") == (101, None)
+    assert adapter.lane_resource_window("missing") is None
+    with sqlite3.connect(db) as connection:
+        connection.executemany(
+            "INSERT INTO task_runs (task_id,outcome,started_at,ended_at) VALUES (?,?,?,?)",
+            [("waiting", "crashed", 300, 301), ("waiting", None, 400, None)],
+        )
+    assert adapter.lane_resource_window("waiting") == (101, 300)
+
+
 def test_kanban_lane_quota_hold_reports_the_latest_rate_limited_bounce_even_after_a_lost_status(tmp_path):
     """The dispatcher sometimes misses a worker's exit status and books the bounce
     as a crash instead; the hold must key on the latest rate_limited run itself,

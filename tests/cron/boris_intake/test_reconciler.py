@@ -227,6 +227,9 @@ class KanbanFake:
     def lane_quota_hold(self, lane_id):
         return self.quota_hold_at
 
+    def lane_resource_window(self, lane_id):
+        return None
+
     def retire_lane(self, lane_id):
         self.retired.append(lane_id)
 
@@ -266,6 +269,9 @@ def test_prior_bound_lane_uses_request_scoped_retry_lane(
             return False
 
         def lane_quota_hold(self, lane_id):
+            return None
+
+        def lane_resource_window(self, lane_id):
             return None
 
         def retire_lane(self, lane_id):
@@ -1451,6 +1457,41 @@ def _hold_until_reviewing(tmp_path, *, lane_status="ready"):
         tick(store, deps)
         clock.advance()
     return store, admitted, clock, slack, github, kanban, deps
+
+
+@pytest.mark.parametrize("resumes", [False, True])
+def test_disk_admission_wait_does_not_expire_as_reviewer_execution(tmp_path, resumes):
+    from boris_intake.reconciler import QUOTA_HOLD_MAX_SECONDS, REVIEW_WAIT_SECONDS, tick
+
+    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(tmp_path)
+    waiting_since = clock()
+    kanban.lane_resource_window = lambda lane_id: (waiting_since, None)
+    clock.advance(REVIEW_WAIT_SECONDS + 60)
+    tick(store, deps)
+    assert store.get_request(admitted.request_id).workflow_state is WorkflowState.REVIEWING
+    assert not kanban.retired
+    assert github.publications == 0
+    if resumes:
+        resumed_at = clock()
+        kanban.lane_resource_window = lambda lane_id: (waiting_since, resumed_at)
+        kanban.status = "running"
+        clock.advance(REVIEW_WAIT_SECONDS - 60)
+        tick(store, deps)
+        assert store.get_request(admitted.request_id).workflow_state is WorkflowState.REVIEWING
+        clock.advance(120)
+    else:
+        clock.advance(admitted.created_at + QUOTA_HOLD_MAX_SECONDS - clock() + 1)
+    tick(store, deps)
+    result = store.get_request(admitted.request_id)
+    assert result.workflow_state is WorkflowState.DELIVERY_PENDING
+    assert result.semantic_outcome.value == "REVIEW_INCOMPLETE"
+    if resumes:
+        assert "REVIEW_LANE_TIMEOUT" in result.validated_result_json
+        assert not kanban.retired
+    else:
+        assert "LOCAL_RESOURCE_WAIT_EXPIRED" in result.validated_result_json
+        assert kanban.retired == list(kanban.lanes.values())
+    assert github.publications == 0
 
 
 def test_a_lane_blocked_during_a_quota_wall_fails_with_the_quota_code(tmp_path):

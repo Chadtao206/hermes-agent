@@ -118,6 +118,7 @@ class KanbanAdapter(Protocol):
     ) -> str: ...
     def lane_status(self, lane_id: str) -> str | None: ...
     def lane_quota_hold(self, lane_id: str) -> float | None: ...
+    def lane_resource_window(self, lane_id: str) -> tuple[float, float | None] | None: ...
     def lane_authentication_failed(self, lane_id: str) -> bool: ...
     def retire_lane(self, lane_id: str) -> None: ...
 
@@ -567,8 +568,22 @@ def _reconcile_reviewing(
                 max(deadline, held_at + REVIEW_WAIT_SECONDS),
                 request.created_at + QUOTA_HOLD_MAX_SECONDS,
             )
+        resource_window = deps.kanban.lane_resource_window(request.lane_id)
+        resource_waiting = resource_window is not None and resource_window[1] is None
+        if resource_window is not None:
+            resumed_at = resource_window[1]
+            deadline = min(
+                max(deadline, (deps.now() if resumed_at is None else resumed_at) + REVIEW_WAIT_SECONDS),
+                request.created_at + QUOTA_HOLD_MAX_SECONDS,
+            )
         if deps.now() >= deadline:
-            if recently_held:
+            if resource_waiting:
+                failure = SystemFailure(
+                    "LOCAL_RESOURCE_WAIT_EXPIRED",
+                    "The reviewer could not start within the 24-hour local capacity wait limit.",
+                    "Restore local disk capacity, then repost the PR link.",
+                )
+            elif recently_held:
                 failure = _quota_failure(
                     "The reviewer's model provider quota stayed exhausted for the"
                     " whole hold window."

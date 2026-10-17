@@ -448,7 +448,11 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        try:
+            return _anchored_worktree(repo_root, task.id, branch_name)
+        except _kbg.WorkspaceDiskSpaceError as error:
+            error.board_workspace = (board_slug, board_default)
+            raise
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():

@@ -50,6 +50,35 @@ DEFAULT_MIN_FREE_DISK_GB = 5.0
 class WorkspaceDiskSpaceError(RuntimeError):
     """Raised before materializing a workspace below the free-disk floor."""
 
+    def __init__(self, message: str, *, path: Path | None = None):
+        super().__init__(message)
+        self.path = path
+        self.board_workspace: tuple[str, str] | None = None
+
+
+def defer_workspace_capacity(conn: sqlite3.Connection, task, error: WorkspaceDiskSpaceError) -> bool:
+    with _kb.write_txn(conn):
+        retry_status = _kb._retry_status_for_run(conn, task.id, task.current_run_id)
+        changed = conn.execute(
+            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND status='running' AND current_run_id=? AND claim_lock IS ? "
+            "AND worker_pid IS NULL",
+            (retry_status, task.id, task.current_run_id, task.claim_lock),
+        )
+        if changed.rowcount != 1:
+            return False
+        payload = {
+            "reason": "workspace_disk_capacity", "retry_status": retry_status,
+            "capacity_path": str(error.path) if error.path is not None else None,
+            "workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path,
+            "board_workspace": error.board_workspace,
+        }
+        run_id = _kb._end_run(
+            conn, task.id, outcome="resource_wait", error=str(error)[:500], metadata=payload,
+        )
+        _kb._append_event(conn, task.id, "resource_wait", payload, run_id=run_id)
+    return True
+
 
 def _configured_min_free_disk_gb() -> float:
     """Return the configured workspace creation floor in GiB."""
@@ -88,7 +117,8 @@ def _ensure_workspace_capacity(path: Path) -> None:
     raise WorkspaceDiskSpaceError(
         f"refusing to create workspace {path}: {free_gb:.1f} GiB free; "
         f"kanban.min_free_disk_gb requires at least {minimum_gb:g} GiB. "
-        "Run `hermes kanban gc`, remove unneeded data, or lower the configured watermark."
+        "Run `hermes kanban gc`, remove unneeded data, or lower the configured watermark.",
+        path=path,
     )
 
 
@@ -228,7 +258,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
       permanent for 24 hours and an explicitly requeued card was refused on
       every tick (live incident ``t_b14df276``).
     """
-    row = conn.execute("SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT last_failure_error, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
     if row is None:
         return None
 
@@ -238,10 +271,31 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
     #    the requeue stamps a quota-flavored last_failure_error).
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "SELECT outcome, ended_at, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
+    if latest_run is not None and latest_run["outcome"] == "resource_wait":
+        wait = _kb._json_dict(latest_run["metadata"])
+        path = wait.get("capacity_path")
+        board_workspace = wait.get("board_workspace")
+        board_unchanged = board_workspace is None or (
+            isinstance(board_workspace, list) and len(board_workspace) == 2
+            and (_kb.read_board_metadata(board_workspace[0]).get("default_workdir") or "").strip()
+            == board_workspace[1]
+        )
+        if (
+            isinstance(path, str) and path
+            and board_unchanged
+            and wait.get("workspace_kind") == row["workspace_kind"]
+            and wait.get("workspace_path") == row["workspace_path"]
+        ):
+            try:
+                _ensure_workspace_capacity(Path(path))
+            except WorkspaceDiskSpaceError:
+                return "workspace_disk_capacity"
+            except OSError:
+                return "workspace_capacity_unavailable"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             return None

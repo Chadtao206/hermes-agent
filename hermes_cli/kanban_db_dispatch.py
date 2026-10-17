@@ -705,8 +705,8 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
+    just closed). ``rate_limited`` and ``resource_wait`` runs are neutral and
+    skipped; any other closed run breaks the streak, so
     the budget counts ONLY protocol violations. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
@@ -720,7 +720,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in {"rate_limited", "resource_wait"}:
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -1485,6 +1485,10 @@ def _dispatch_lane_task(
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
+    except _kbg.WorkspaceDiskSpaceError as exc:
+        if _kbg.defer_workspace_capacity(conn, claimed, exc):
+            result.respawn_guarded.append((task_id, "workspace_disk_capacity"))
+        return False
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",

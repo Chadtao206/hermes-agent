@@ -166,6 +166,23 @@ class KanbanIO:
             and (rows[0]["summary"] or "").startswith("PROVIDER_AUTHENTICATION_REQUIRED:")
         )
 
+    def lane_resource_window(self, lane_id: str) -> tuple[float, float | None] | None:
+        rows = self._query(
+            "SELECT waiting.ended_at, "
+            "(SELECT MIN(resumed.started_at) FROM task_runs resumed "
+            " WHERE resumed.task_id=waiting.task_id AND resumed.id>waiting.id) AS resumed_at "
+            "FROM task_runs waiting WHERE waiting.task_id=? "
+            "AND waiting.outcome='resource_wait' AND waiting.ended_at IS NOT NULL "
+            "ORDER BY waiting.id DESC LIMIT 1",
+            (lane_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return float(row["ended_at"]), (
+            float(row["resumed_at"]) if row["resumed_at"] is not None else None
+        )
+
     def lane_quota_hold(self, lane_id: str) -> float | None:
         """``ended_at`` of the lane's latest run the dispatcher booked ``rate_limited``
         (the worker bounced off a provider quota wall and was requeued), else None.
