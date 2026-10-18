@@ -316,6 +316,7 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *, job_id: Optional[str] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -350,6 +351,11 @@ def _run_job_script(
                 "errors": "replace"}
         env = build_subprocess_env()
         env.update(env_overlay)
+        env.pop('_HERMES_CRON_JOB_ID', None)
+        env.pop('_HERMES_CRON_EXECUTION_ID', None)
+        if all(isinstance(value, str) and value.strip() for value in (job_id, execution_id)):
+            env['_HERMES_CRON_JOB_ID'] = job_id
+            env['_HERMES_CRON_EXECUTION_ID'] = execution_id
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -432,7 +438,8 @@ def _run_job_script_with_claim_heartbeat(
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               job_id=job.get("id"), execution_id=job.get("execution_id"))
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -450,10 +457,12 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               job_id=job.get("id"), execution_id=job.get("execution_id"))
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+                               job_id=job.get("id"), execution_id=job.get("execution_id"))
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
