@@ -16,7 +16,7 @@ TIMEOUT_SECONDS = 15.0
 MAX_ISSUES = 20
 # The daemon runs under launchd with a fixed environment, so knobs come from the deployed
 # .env, last match wins (the same rule selftest._autofix_open applies to PR_REVIEW_AUTOFIX).
-ENV_PATH = Path("/Users/ctao/.hermes/.env")
+ENV_PATH = Path(os.environ.get("HERMES_HOME") or "/Users/ctao/.hermes") / ".env"
 
 
 def _env(name: str) -> str | None:

@@ -243,6 +243,7 @@ def test_allows_the_three_reads_discovery_makes(args):
     assert result.stdout.startswith("ghx_discovery: would run gh ")
 
 
+@pytest.mark.allow_real_home_io
 @pytest.mark.skipif(not DEPLOYED.exists(),
                     reason="wrapper is not deployed on this machine")
 def test_the_deployed_wrapper_matches_the_copy_under_test():

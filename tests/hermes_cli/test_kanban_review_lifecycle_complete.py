@@ -431,6 +431,9 @@ def test_respawn_guards_compare_mixed_int_and_iso_times_by_value(conn) -> None:
     def card(title):
         task_id = kb.create_task(conn, title=title, assignee="dev")
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        # active_pr arms only once a profile has run the card (fork rule).
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+                     "VALUES (?, 'dev', 'done', 'blocked', ?, ?)", (task_id, now - 100 * 86400, now - 100 * 86400))
         return task_id
 
     def comment(task_id, at):

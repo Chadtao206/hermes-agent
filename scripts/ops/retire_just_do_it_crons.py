@@ -1567,9 +1567,10 @@ def _validate_retained_record_progress(
         "last_delivery_error",
         "fire_claim",
         "run_claim",
-        # upstream (Aug 2026) keeps a per-job consecutive-failure counter that
-        # mark_job_run rewrites on every run: scheduler progress, not config.
+        # upstream keeps per-job failure bookkeeping that mark_job_run rewrites
+        # on every run: scheduler progress, not config.
         "failure_streak",
+        "last_failure",
     )
 
     def fail(detail: str) -> None:

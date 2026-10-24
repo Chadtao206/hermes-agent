@@ -492,6 +492,18 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def _ran_as(conn, tid, profile):
+    """The fork arms ``active_pr`` only for a card ``profile`` has already run,
+    and counts PR comments only from profiles that ran it."""
+    now = int(__import__("time").time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, 'done', 'blocked', ?, ?)",
+            (tid, profile, now - 7200, now - 3600),
+        )
+
+
 def _backdate_comments(conn, tid, seconds=60):
     """Second-granularity timestamps: make the PR comment older than the
     handoff that follows it in the same test."""
@@ -524,8 +536,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
 
     with kbc.connect() as conn:
         dev_id = kb.create_task(conn, title="dev own pr", assignee="dev")
+        _ran_as(conn, dev_id, "dev")
         kb.add_comment(conn, dev_id, author="dev", body=pr_comment)
         closer_id = kb.create_task(conn, title="closer recovery", assignee="dev")
+        _ran_as(conn, closer_id, "dev")
         kb.add_comment(conn, closer_id, author="dev", body=pr_comment)
         _backdate_comments(conn, closer_id)
         assert kb.assign_task(conn, closer_id, "closer") is True
@@ -537,6 +551,7 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
         assert closer_id in [s[0] for s in res.spawned]
         assert dict(res.respawn_guarded).get(dev_id) == "active_pr"
 
+        _ran_as(conn, closer_id, "closer")
         kb.add_comment(
             conn, closer_id, author="closer",
             body="Pushed to https://github.com/example/repo/pull/44",
@@ -562,6 +577,7 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
     pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="same assign", assignee="dev")
+        _ran_as(conn, tid, "dev")
         kb.add_comment(conn, tid, author="dev", body=pr_comment)
         _backdate_comments(conn, tid)
         assert kb.assign_task(conn, tid, "dev") is True

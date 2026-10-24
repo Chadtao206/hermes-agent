@@ -353,6 +353,7 @@ def test_versioned_launcher_and_wrapper_pass_their_own_ownership_suite(tmp_path)
 # Drift between the versioned copies and whatever this host has installed
 # ---------------------------------------------------------------------------
 
+@pytest.mark.allow_real_home_io
 def test_installed_host_artifacts_match_the_versioned_copies(installer):
     """Drift check, gated on the install actually being expected.
 

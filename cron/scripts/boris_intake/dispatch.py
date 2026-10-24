@@ -163,13 +163,27 @@ class KanbanIO:
         )
         if not rows:
             return False
-        summary = rows[0]["summary"] or ""
-        # Fork workers used to block the card themselves with this prefix; upstream workers
-        # now exit KANBAN_TERMINAL_PROVIDER_EXIT_CODE and the dispatcher trips the breaker
-        # on the crashed run with the text below.
-        if rows[0]["outcome"] == "blocked" and summary.startswith("PROVIDER_AUTHENTICATION_REQUIRED:"):
+        # Legacy workers blocked the card themselves with this prefix.
+        if rows[0]["outcome"] == "blocked" and (rows[0]["summary"] or "").startswith(
+            "PROVIDER_AUTHENTICATION_REQUIRED:"
+        ):
             return True
-        return rows[0]["outcome"] in ("crashed", "gave_up") and "terminal provider error" in summary
+        # Current workers exit KANBAN_TERMINAL_PROVIDER_EXIT_CODE and the dispatcher trips the
+        # breaker with a ``gave_up`` event flagged ``terminal_provider``; anything that resumes
+        # the card afterwards supersedes it (same reading as kanban_diagnostics).
+        events = self._query(
+            "SELECT kind, payload FROM task_events WHERE task_id=? "
+            "AND kind IN ('gave_up', 'unblocked', 'promoted', 'completed', 'claimed') "
+            "ORDER BY id DESC LIMIT 1",
+            (lane_id,),
+        )
+        if not events or events[0]["kind"] != "gave_up":
+            return False
+        try:
+            payload = json.loads(events[0]["payload"] or "{}")
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and bool(payload.get("terminal_provider"))
 
     def lane_resource_window(self, lane_id: str) -> tuple[float, float | None] | None:
         rows = self._query(

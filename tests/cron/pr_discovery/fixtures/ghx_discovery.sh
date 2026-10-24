@@ -40,7 +40,7 @@ refuse() { echo "ghx_discovery: REFUSED $*" >&2; exit 3; }
 # retargets an identically-named org on another GitHub host.
 for a in "$@"; do
   case "$a" in
-    --approve|--request-changes|--admin|--merge|--squash|--rebase|--delete-branch|--hostname)
+    --approve|--request-changes|--admin|--merge|--squash|--rebase|--delete-branch|--hostname|--hostname=*)
       refuse "flag $a" ;;
     -X*|--method=*|-f|--field|--field=*|-F|--raw-field|--raw-field=*|--input|--input=*)
       refuse "request-writing flag $a" ;;
@@ -73,13 +73,16 @@ require_org_owner() {
 # A URL argument is refused outright because `gh pr view <url>` overrides -R
 # entirely -- an in-scope -R next to an out-of-scope URL reads the URL.
 require_org_repo() {
-  local _seen="" _prev="" _repo="" _rowner _rname a
+  local _seen="" _prev="" _repo="" _provided="" _rowner _rname a
   for a in "$@"; do
-    _repo=""
+    _repo=""; _provided=""
     case "$a" in *://*) refuse "URL argument '$a' would override -R" ;; esac
-    case "$_prev" in -R|--repo) _repo="$a" ;; esac
-    case "$a" in --repo=*) _repo="${a#--repo=}" ;; esac
-    if [ -n "$_repo" ]; then
+    case "$_prev" in -R|--repo) _repo="$a"; _provided=1 ;; esac
+    case "$a" in
+      --repo=*) _repo="${a#--repo=}"; _provided=1 ;;
+      -R?*) _repo="${a#-R}"; _provided=1 ;;
+    esac
+    if [ -n "$_provided" ]; then
       _rowner="${_repo%%/*}"
       _rname="${_repo#*/}"
       { [ "$_rowner" = "$_scope" ] && [ -n "$_rname" ] && [ "$_rname" != "$_repo" ]; } ||

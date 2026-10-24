@@ -78,14 +78,18 @@ class SourceFake:
         return AdmissionLookup(AdmissionStatus.NOT_ADMITTED)
 
 
+_READABLE_EMPTY = object()
+
+
 class GitHubFake:
-    """claim/release return bool, as GitHubIO now does."""
+    """claim/release return bool, as GitHubIO now does. ``bot_threads=None`` is
+    an unreadable GitHub; the default is a readable PR with no bot threads."""
 
     def __init__(self, head="a" * 40, author="Chadtao206", hold=False,
                  claim_ok=True, release_ok=True, hold_raises=(),
-                 pr_state="OPEN", bot_threads=None,
+                 pr_state="OPEN", bot_threads=_READABLE_EMPTY,
                  base_branch="main", head_branch="chad/example-branch"):
-        if bot_threads is None:
+        if bot_threads is _READABLE_EMPTY:
             bot_threads = []
         self.head, self.author_login, self.hold = head, author, hold
         self.claim_ok, self.release_ok = claim_ok, release_ok

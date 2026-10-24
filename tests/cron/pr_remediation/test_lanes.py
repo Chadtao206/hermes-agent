@@ -484,7 +484,7 @@ def test_our_brief_cap_does_not_exceed_the_kanban_body_cap_that_actually_binds()
     a copy of a contract can only ever confirm the copy. This must fail if
     EITHER side moves.
     """
-    from hermes_cli.kanban_db import _CTX_MAX_BODY_BYTES
+    from hermes_cli.kanban_db_context import _CTX_MAX_BODY_BYTES
 
     assert MAX_BRIEF_CHARS <= _CTX_MAX_BODY_BYTES, (
         f"MAX_BRIEF_CHARS={MAX_BRIEF_CHARS} exceeds kanban's "

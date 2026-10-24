@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import contextlib
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -432,7 +432,7 @@ def test_self_removed_job_still_delivers_after_post_removal_heartbeat(tmp_path, 
     delivered.assert_called_once()
     finished.assert_called_once_with(
         "self-removal-heartbeat-execution",
-        success=True, error=None, delivery_outcome="delivered")
+        purpose_output=ANY, success=True, error=None, delivery_outcome="delivered")
     with jobs.use_cron_store(tmp_path):
         assert jobs.load_jobs() == []
 

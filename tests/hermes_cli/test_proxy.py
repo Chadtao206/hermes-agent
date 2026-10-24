@@ -362,9 +362,9 @@ def test_codex_adapter_sets_required_cloudflare_headers(tmp_path, monkeypatch):
 
     # Official chatgpt.com endpoint -> Hermes identity (upstream policy since
     # agent.codex_headers); custom endpoints keep the codex_cli_rs identity.
-    from hermes_cli import __version__
+    from hermes_cli.version_info import get_version_info
     assert headers == {
-        "User-Agent": f"HermesAgent/{__version__}",
+        "User-Agent": f"HermesAgent/{get_version_info().base_version}",
         "originator": "hermes-agent",
         "ChatGPT-Account-ID": "acct_123",
     }

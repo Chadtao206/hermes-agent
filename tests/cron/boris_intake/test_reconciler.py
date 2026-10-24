@@ -1988,6 +1988,7 @@ def test_service_loop_stops_after_signal_event(tmp_path):
     assert store.get_request(admitted.request_id).workflow_state is WorkflowState.ADMITTED
 
 
+@pytest.mark.allow_real_home_io
 def test_real_dependency_builder_uses_live_lifecycle_adapters(tmp_path):
     from boris_intake.config import Config
     from boris_intake.dispatch import KanbanIO
@@ -2205,6 +2206,7 @@ def test_these_modules_still_reach_the_deployed_slack_transport(module):
         "would fail to start")
 
 
+@pytest.mark.allow_real_home_io
 def test_real_dependency_builder_owns_reactions_only_in_passive_channels(tmp_path):
     """Mention-only channels (just-do-it) share `blinkapproved` with the
     jdi_autoapprove stamp; the live SlackIO must know which channels are Boris's."""

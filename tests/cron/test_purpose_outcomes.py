@@ -31,7 +31,7 @@ def test_contract_snapshot_survives_edits_and_rejects_foreign_owners(tmp_path, m
     (False, {'version': 1, 'validator': 'json_status', 'status_outcomes': {'observed': 'succeeded'}}, '{"status":"observed"}', True, 'unknown'),
     (True, {'version': 1, 'required_task': True}, '[SILENT]', True, 'failed'),
     (True, None, '[SILENT]', True, 'unknown'),
-    pytest.param(True, {'version': 1, 'validator': 'json_status', 'status_outcomes': {'ok': 'succeeded'}}, '{"status":"ok","extra":' + '[' * 1100 + '0' + ']' * 1100 + '\n}', True, 'unknown', id='deep-json-stays-unknown'),
+    pytest.param(True, {'version': 1, 'validator': 'json_status', 'status_outcomes': {'ok': 'succeeded'}}, '{"status":"ok","extra":' + '[' * 49_000 + '0' + ']' * 49_000 + '\n}', True, 'unknown', id='deep-json-stays-unknown'),
     (True, {'version': 1, 'validator': 'json_status', 'status_outcomes': {'observed': 'succeeded'}}, '{"status":"observed"}', False, 'failed'),
     (True, {'version': 1, 'validator': 'json_status', 'status_outcomes': {'observed': 'succeeded'}}, '{"status":[]}', True, 'unknown'),
 ])
@@ -44,10 +44,12 @@ def test_real_script_run_records_shadow_purpose_without_repeating_side_effects(
     scripts = home / 'scripts'
     scripts.mkdir(parents=True)
     marker = home / 'ran'
+    evidence = home / 'evidence.txt'
+    evidence.write_text(output)
     (scripts / 'probe.py').write_text(
         'from pathlib import Path\n'
         f'with Path({str(marker)!r}).open("a") as stream: stream.write("once\\n")\n'
-        f'print({output!r})\n'
+        f'print(Path({str(evidence)!r}).read_text())\n'
         f'raise SystemExit({0 if success else 1})\n'
     )
     monkeypatch.setenv('HERMES_HOME', str(home))

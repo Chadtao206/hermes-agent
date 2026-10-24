@@ -312,7 +312,7 @@ class TestFailureAttribution:
         # These tests define the complete pool under test.  Keep a developer's
         # Claude Code file or macOS Keychain entry from adding another row.
         monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials",
+            "agent.anthropic_credentials.read_claude_code_credentials",
             lambda: None,
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

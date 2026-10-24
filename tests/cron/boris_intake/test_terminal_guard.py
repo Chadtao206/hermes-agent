@@ -2,9 +2,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from boris_intake import terminal_guard as tg
+
+pytestmark = pytest.mark.allow_real_home_io
 
 WS = "/tmp/prrun"
 GHX = "/Users/ctao/.hermes/scripts/pr/ghx_ro.sh"

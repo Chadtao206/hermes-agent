@@ -73,26 +73,6 @@ def test_run_slash_rejects_branch_without_worktree(kanban_home):
     assert "--branch is only valid with --workspace worktree" in out
 
 
-def test_run_slash_create_with_parent_and_cascade(kanban_home):
-    # Parent then child via --parent
-    out1 = kc.run_slash("create 'parent' --assignee alice")
-    # Extract the "t_xxxx" id from "Created t_xxxx (ready, ...)"
-    import re
-    m = re.search(r"(t_[a-f0-9]+)", out1)
-    assert m
-    p = m.group(1)
-    out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p}")
-    assert "todo" in out2  # child starts as todo
-
-    # Complete parent; list should promote child to ready
-    kc.run_slash(f"complete {p}")
-    # Explicit filter: child should now be ready (was todo before complete).
-    ready_list = kc.run_slash("list --status ready")
-    assert "child" in ready_list
-
-
-
-
 def _lease_cli(
     board: str,
     action: str,

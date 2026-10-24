@@ -344,15 +344,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
 
     # 3. Completed run within the guard window, unless deliberately re-queued after it.
     cutoff = now - _kbd._RESPAWN_GUARD_SUCCESS_WINDOW
-    recent_completed = conn.execute(
-        "SELECT ended_at FROM task_runs WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
-        "ORDER BY ended_at DESC LIMIT 1",
-        (task_id, cutoff),
-    ).fetchone()
-    if recent_completed:
-        completed_at = _kb._to_epoch(recent_completed["ended_at"]) or 0
-        if not _deliberate_rerun_since(conn, task_id, completed_at):
-            return "recent_success"
+    # SQLite sorts TEXT above every INTEGER, so the range also returns ISO stamps written
+    # outside the mutators; each row is decided on its parsed epoch (unreadable → ignored).
+    completed_at = max(
+        (t for t in (_kb._to_epoch(r["ended_at"]) for r in conn.execute(
+            "SELECT ended_at FROM task_runs WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+            (task_id, cutoff),
+        )) if t is not None and t >= cutoff),
+        default=None,
+    )
+    if completed_at is not None and not _deliberate_rerun_since(conn, task_id, completed_at):
+        return "recent_success"
 
     # 4. GitHub PR URL in a recent comment by a profile that ran the task.
     prior_run = conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone()
@@ -364,17 +366,21 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? "
-        "AND author IN (SELECT DISTINCT profile FROM task_runs WHERE task_id = ? AND profile IS NOT NULL) "
-        "ORDER BY created_at DESC, id DESC",
+        "AND author IN (SELECT DISTINCT profile FROM task_runs WHERE task_id = ? AND profile IS NOT NULL)",
         (task_id, pr_cutoff, task_id),
     ).fetchall():
         body = _kb._lossy_text(c["body"]) or ""
         urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(body)
-        if urls:
-            # Duplicate-PR risk: an unreadable stamp fails closed as "just now".
-            newest_pr_comment_at = _kb._to_epoch(c["created_at"]) or now
+        if not urls:
+            continue
+        # Duplicate-PR risk: an unreadable stamp fails closed as "just now".
+        at = _kb._to_epoch(c["created_at"])
+        at = now if at is None else at
+        if at < pr_cutoff:
+            continue
+        if newest_pr_comment_at is None or at > newest_pr_comment_at:
+            newest_pr_comment_at = at
             newest_pr_urls = tuple(u.lower() for u in urls)
-            break
     if newest_pr_comment_at is not None and not _deliberate_rerun_since(
         conn, task_id, newest_pr_comment_at, strict=True, ack_pr_urls=newest_pr_urls,
         include_handoffs=True,
