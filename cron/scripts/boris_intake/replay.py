@@ -11,7 +11,7 @@ import argparse
 import collections
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 # APPENDED, never prepended -- `slack_read` lives only under this directory
@@ -23,18 +23,18 @@ from pathlib import Path
 # exact mistake was made and fixed.
 sys.path.append("/Users/ctao/.hermes/scripts")
 
-from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
+from slack_read import ENV_PATH, parse_env, slack_call
 
-from boris_intake import audit  # noqa: E402
-from boris_intake.config import load_config  # noqa: E402
-from boris_intake.daemon import normalize  # noqa: E402
-from boris_intake.gate import GateDeps, evaluate  # noqa: E402
-from boris_intake.github import (  # noqa: E402
+from boris_intake import audit
+from boris_intake.config import load_config
+from boris_intake.daemon import normalize
+from boris_intake.gate import GateDeps, evaluate
+from boris_intake.github import (
     GitHubRetryBudget,
     fetch_gate_snapshot,
     fetch_pr,
 )
-from boris_intake.identity import IdentityResolver  # noqa: E402
+from boris_intake.identity import IdentityResolver
 
 
 def main() -> int:
@@ -95,7 +95,7 @@ def main() -> int:
                 snapshot_rejections = []
                 if result.accepted:
                     captured_at = datetime.fromtimestamp(
-                        deps.now(), timezone.utc
+                        deps.now(), UTC
                     ).isoformat().replace("+00:00", "Z")
                     for c in result.commands:
                         capture = fetch_gate_snapshot(

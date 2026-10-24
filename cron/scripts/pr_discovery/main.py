@@ -59,15 +59,20 @@ _PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PACKAGE_ROOT not in sys.path:
     sys.path.append(_PACKAGE_ROOT)
 
-import yaml  # noqa: E402
+try:
+    import yaml
+    from yaml import YAMLError
+except ModuleNotFoundError:  # PyYAML left upstream's dependency set; hermes_yaml wraps ruamel
+    import hermes_yaml as yaml
+    from ruamel.yaml.error import YAMLError
 
-from pr_discovery.discover import (  # noqa: E402
+from pr_discovery.discover import (
     DEFAULT_TOKEN_PATH, DiscoveryResult, GhClient, IntakeSource, candidates,
 )
-from pr_discovery.post import (  # noqa: E402
+from pr_discovery.post import (
     DISCOVERY_MARKER, INTAKE_CHANNEL, Poster, slug,
 )
-from pr_discovery.state import Ledger  # noqa: E402
+from pr_discovery.state import Ledger
 
 DEFAULT_CONFIG = Path("/Users/ctao/.hermes/config.yaml")
 DEFAULT_LEDGER_DB = Path("/Users/ctao/.hermes/state/pr_discovery.db")
@@ -398,7 +403,7 @@ def _declared_constant_failures(config_path: Path) -> list[str]:
     """
     try:
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError, UnicodeDecodeError):
+    except (OSError, YAMLError, UnicodeDecodeError):
         # A config we cannot read is `load_config`'s problem (it fails safe to
         # shadow); there is nothing to compare here.
         return []
@@ -431,7 +436,7 @@ def _gate_failures(intake_config_path: Path) -> list[str]:
     """
     try:
         from boris_intake.config import load_config as load_intake_config
-    except Exception as error:  # noqa: BLE001 - unverifiable is a failure here
+    except Exception as error:
         return [f"boris_intake is not importable ({error}), so the gate's "
                 "discovery door cannot be verified"]
     cfg = load_intake_config(intake_config_path)
@@ -528,7 +533,7 @@ def load_config(path: Path | None = None) -> DiscoveryConfig:
     path = Path(path) if path is not None else DEFAULT_CONFIG
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError, UnicodeDecodeError):
+    except (OSError, YAMLError, UnicodeDecodeError):
         return DiscoveryConfig()
     if not isinstance(data, dict):
         return DiscoveryConfig()
@@ -608,7 +613,7 @@ def main(argv=None) -> int:
     cfg = load_config()
     try:
         failures = run_selftest(mode=cfg.mode)
-    except Exception as error:  # noqa: BLE001 - a crashed check still fails closed
+    except Exception as error:
         # A precondition check that itself explodes (boris_intake missing from
         # the deployed tree, an exotic config error the checked loaders do not
         # catch) must be reported the same way any other precondition failure

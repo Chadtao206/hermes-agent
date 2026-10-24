@@ -169,20 +169,20 @@ def test_the_synthetic_old_core_is_hermetic_against_this_host(tmp_path):
     stub = _stub_core(tmp_path / "hermetic", attrs=None)
     probe = (
         "import hermes_cli\n"
-        "assert hermes_cli.__file__.startswith(%r), hermes_cli.__file__\n"
+        f"assert hermes_cli.__file__.startswith({str(stub)!r}), hermes_cli.__file__\n"
         "import hermes_cli.kanban_db as kb\n"
-        "assert kb.__file__.startswith(%r), kb.__file__\n"
+        f"assert kb.__file__.startswith({str(stub)!r}), kb.__file__\n"
         "try:\n"
         "    import hermes_cli.kanban_supervisor as leaked\n"
         "except ModuleNotFoundError:\n"
         "    print('HERMETIC')\n"
         "else:\n"
         "    print('LEAKED ' + (leaked.__file__ or '?'))\n"
-    ) % (str(stub), str(stub))
+    )
     env = dict(os.environ)
     env["PYTHONPATH"] = str(stub)
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
-                         text=True, cwd=str(stub), env=env, timeout=120)
+                         text=True, cwd=str(stub), env=env, timeout=120, check=False)
     assert out.returncode == 0, out.stdout + out.stderr
     assert out.stdout.strip() == "HERMETIC", out.stdout + out.stderr
 
@@ -234,7 +234,7 @@ def _run_supervisor_without_contract(tmp_path, argv):
     env["PYTHONPATH"] = str(stub)
     return subprocess.run(
         [sys.executable, str(LANE_SUPERVISOR), *argv],
-        capture_output=True, text=True, cwd=str(stub), env=env, timeout=120,
+        capture_output=True, text=True, cwd=str(stub), env=env, timeout=120, check=False,
     )
 
 
@@ -340,7 +340,7 @@ def test_versioned_launcher_and_wrapper_pass_their_own_ownership_suite(tmp_path)
     out = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          str(plugin / "tests" / "test_supervisor_ownership.py")],
-        capture_output=True, text=True, cwd=str(plugin), env=env, timeout=600,
+        capture_output=True, text=True, cwd=str(plugin), env=env, timeout=600, check=False,
     )
     assert out.returncode == 0, out.stdout + out.stderr
     # rc 0 with nothing collected would be a silent pass; pytest exits 5 for

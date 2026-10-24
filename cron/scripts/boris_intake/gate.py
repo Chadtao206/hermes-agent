@@ -30,7 +30,7 @@ class GateDeps:
     #: Takes the message's shared retry budget as its last argument, so all of
     #: one message's PR reads spend one window between them. See
     #: `github.GitHubRetryBudget`.
-    pr_info: Callable[[str, str, int, "GitHubRetryBudget"], PRLookup]
+    pr_info: Callable[[str, str, int, GitHubRetryBudget], PRLookup]
     rate_verdict: Callable[[str], str]
     now: Callable[[], float]
 
@@ -121,7 +121,7 @@ def evaluate(
     event: NormalizedEvent,
     cfg: Config,
     deps: GateDeps,
-    budget: "GitHubRetryBudget | None" = None,
+    budget: GitHubRetryBudget | None = None,
 ) -> GateResult:
     """Decide one message. `budget` is the retry window its PR reads share.
 

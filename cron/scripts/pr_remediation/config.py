@@ -4,7 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+    from yaml import YAMLError
+except ModuleNotFoundError:  # PyYAML left upstream's dependency set; hermes_yaml wraps ruamel
+    import hermes_yaml as yaml
+    from ruamel.yaml.error import YAMLError
 
 DEFAULT_CONFIG = Path("/Users/ctao/.hermes/config.yaml")
 VALID_MODES = ("shadow", "live", "off")
@@ -35,7 +40,7 @@ def load_config(path: Path | None = None) -> RemediationConfig:
     path = path or DEFAULT_CONFIG
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return RemediationConfig()
     if not isinstance(data, dict):
         return RemediationConfig()

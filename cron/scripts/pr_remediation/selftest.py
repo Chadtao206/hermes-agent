@@ -137,7 +137,7 @@ def _channel_membership(caller: Callable[..., Any], token: str,
     """
     try:
         response = caller(token, _MEMBERSHIP_METHOD, channel=channel)
-    except Exception as error:  # noqa: BLE001 - inconclusive, not a failure
+    except Exception as error:
         _LOG.info("pr_remediation selftest: reachability check for %s "
                   "raised %r; treating as inconclusive", channel, error)
         return None

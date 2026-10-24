@@ -478,7 +478,7 @@ def test_paginate_diff_rejects_a_page_beyond_the_end(tmp_path, monkeypatch):
 def test_pr_diff_returns_first_page_and_advertises_the_rest(tmp_path, monkeypatch):
     module, _, _ = bind_request(tmp_path, monkeypatch)
     big = diff_for(("x.py", 4000), ("y.py", 4000))
-    runner, calls = github_runner(evidence=big)
+    runner, _calls = github_runner(evidence=big)
     monkeypatch.setattr(module, "GITHUB_RUNNER", runner)
 
     result = module.read_github_evidence("pr_diff")
@@ -1058,7 +1058,7 @@ def test_diff_pages_render_under_the_mcp_result_threshold(tmp_path, monkeypatch,
 
 
 def test_metadata_is_bounded_and_review_context_precedes_github_data(tmp_path, monkeypatch):
-    module, store, request = bind_request(tmp_path, monkeypatch)
+    module, _store, _request = bind_request(tmp_path, monkeypatch)
     calls = []
 
     def runner(command, **kwargs):

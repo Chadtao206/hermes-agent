@@ -319,7 +319,7 @@ def _import_in(*roots: str, script: str | None = None) -> dict:
         "}))\n"
     )
     proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
-                          text=True, timeout=60)
+                          text=True, timeout=60, check=False)
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
 

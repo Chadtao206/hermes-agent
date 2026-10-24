@@ -59,7 +59,7 @@ def test_ready_notification_goes_to_pr_curator():
     call, calls = caller_for()
     SlackIO(RemediationConfig(), TOK, TOK, call).notify_ready(
         VERDICT, rounds=2, unresolved_threads=[])
-    token, method, params = calls[0]
+    _token, _method, params = calls[0]
     assert params["channel"] == "C0BANB70BHR"
     assert "ready for human review" in params["text"].lower()
     assert "https://github.com/Ylopo/example/pull/42" in params["text"]

@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Callable
 
@@ -26,19 +26,19 @@ from typing import Callable
 # exact mistake was made and fixed.
 sys.path.append("/Users/ctao/.hermes/scripts")
 
-from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
+from slack_read import ENV_PATH, parse_env, slack_call
 
-from boris_intake import audit  # noqa: E402
-from boris_intake.config import Config, load_config  # noqa: E402
-from boris_intake.dispatch import active_lane_count  # noqa: E402
-from boris_intake.gate import GateDeps, evaluate  # noqa: E402
-from boris_intake.github import (  # noqa: E402
+from boris_intake import audit
+from boris_intake.config import Config, load_config
+from boris_intake.dispatch import active_lane_count
+from boris_intake.gate import GateDeps, evaluate
+from boris_intake.github import (
     GitHubRetryBudget,
     fetch_gate_snapshot,
     fetch_pr,
 )
-from boris_intake.identity import IdentityResolver  # noqa: E402
-from boris_intake.models import (  # noqa: E402
+from boris_intake.identity import IdentityResolver
+from boris_intake.models import (
     ALWAYS_REPLY_REASONS,
     GateResult,
     GateSnapshot,
@@ -48,9 +48,9 @@ from boris_intake.models import (  # noqa: E402
     Rejection,
     ReviewCommand,
 )
-from boris_intake.selftest import run_selftest  # noqa: E402
-from boris_intake.slack_io import SlackIO  # noqa: E402
-from boris_intake.store import Store  # noqa: E402
+from boris_intake.selftest import run_selftest
+from boris_intake.slack_io import SlackIO
+from boris_intake.store import Store
 
 STATE_DIR = Path("/Users/ctao/.hermes/state")
 DB_PATH = STATE_DIR / "boris_intake.db"
@@ -60,7 +60,7 @@ WATERMARK_PREFIX = "boris_intake_watermark_"
 
 
 def _timestamp(value: float) -> str:
-    return datetime.fromtimestamp(value, timezone.utc).isoformat().replace(
+    return datetime.fromtimestamp(value, UTC).isoformat().replace(
         "+00:00", "Z"
     )
 

@@ -83,8 +83,10 @@ class GitHubFake:
 
     def __init__(self, head="a" * 40, author="Chadtao206", hold=False,
                  claim_ok=True, release_ok=True, hold_raises=(),
-                 pr_state="OPEN", bot_threads=[],
+                 pr_state="OPEN", bot_threads=None,
                  base_branch="main", head_branch="chad/example-branch"):
+        if bot_threads is None:
+            bot_threads = []
         self.head, self.author_login, self.hold = head, author, hold
         self.claim_ok, self.release_ok = claim_ok, release_ok
         self.hold_raises = set(hold_raises)
@@ -3250,8 +3252,8 @@ def test_a_stale_close_is_recorded_as_stale_not_as_an_escalation(tmp_path):
     deps = build(tmp_path, SourceFake([verdict()]), store=store,
                  github=GitHubFake(pr_state="MERGED"))
     tick(deps)
-    loop_id = [e for e in store._db.execute("SELECT loop_id, state, "
-                                            "escalation_reason FROM loops")][0]
+    loop_id = next(iter(store._db.execute("SELECT loop_id, state, "
+                                            "escalation_reason FROM loops")))
     assert loop_id[1] == LoopState.STALE.value
     assert loop_id[2] == PR_NOT_OPEN
     assert PR_NOT_OPEN in kinds(deps, loop_id[0])

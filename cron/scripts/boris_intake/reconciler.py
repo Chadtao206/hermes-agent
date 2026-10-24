@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -29,7 +29,7 @@ from typing import Callable, Protocol
 # test runner has pointed somewhere else.
 sys.path.append("/Users/ctao/.hermes/scripts")
 
-from slack_read import ENV_PATH, parse_env, slack_call  # noqa: E402
+from slack_read import ENV_PATH, parse_env, slack_call
 
 from boris_intake.acceptance import JiraAcceptanceAdapter, helper_is_installed
 from boris_intake.config import Config, load_config
@@ -136,7 +136,7 @@ class ReconcilerDeps:
 
 def _timestamp(now: float) -> str:
     return (
-        datetime.fromtimestamp(now, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        datetime.fromtimestamp(now, tz=UTC).isoformat().replace("+00:00", "Z")
     )
 
 
@@ -156,7 +156,7 @@ def _quota_hold_text(request: LifecycleRequest) -> str:
 
 
 def _refresh_active_status(
-    request: LifecycleRequest, deps: "ReconcilerDeps", text: str
+    request: LifecycleRequest, deps: ReconcilerDeps, text: str
 ) -> None:
     """Best-effort edit of the live status message while a request keeps waiting."""
     status = deps.slack.find_status(request)
@@ -171,7 +171,7 @@ def _refresh_active_status(
 
 
 def _announce_quota_hold(
-    store: Store, request: LifecycleRequest, deps: "ReconcilerDeps", held_at: float
+    store: Store, request: LifecycleRequest, deps: ReconcilerDeps, held_at: float
 ) -> None:
     """Tell the thread once per request that the review is waiting on quota. The
     status is edited before the note is recorded, so a Slack failure retries on
@@ -193,7 +193,7 @@ def _finish_reviewing(
     store: Store,
     request: LifecycleRequest,
     failure: SystemFailure,
-    deps: "ReconcilerDeps",
+    deps: ReconcilerDeps,
     lane_status: str,
 ) -> None:
     """End a review that produced no judgment, then retire its lane: a finished
@@ -208,7 +208,7 @@ def _finish_reviewing(
         return
     try:
         deps.kanban.retire_lane(request.lane_id)
-    except Exception as error:  # noqa: BLE001 - never fail a finished review over board cleanup
+    except Exception as error:
         store.record_note(
             request.request_id,
             "lane_retire_failed",
@@ -441,7 +441,7 @@ def _authorize_acceptance(
             store.authorize_acceptance_evidence(
                 request.request_id, reference, evidence
             )
-    except Exception as error:  # noqa: BLE001 - never fail a review over this
+    except Exception as error:
         store.record_note(
             request.request_id,
             "acceptance_evidence_unavailable",

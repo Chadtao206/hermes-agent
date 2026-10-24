@@ -16,7 +16,7 @@ def run(args, scope="Ylopo/repo#1", head="a" * 40):
         env["BORIS_PR_HEAD_SHA"] = head
     return subprocess.run(
         [str(GHX_RO), *args], capture_output=True, text=True,
-        env=env,
+        env=env, check=False,
     )
 
 

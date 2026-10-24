@@ -32,7 +32,7 @@ def supervisor_contract_available():
     native worker.
     """
     try:
-        import hermes_cli.kanban_supervisor  # noqa: F401
+        import hermes_cli.kanban_supervisor
     except Exception as exc:
         logger.warning(
             "claude-kanban-lane: core ownership contract unavailable (%s: %s); "
@@ -120,7 +120,7 @@ def _tmux_new_session(*, tmux_bin, socket, session, workspace, env, argv):
 def _tmux_kill(*, tmux_bin, socket, session):
     """Best-effort kill of a just-created tmux session (no raise)."""
     subprocess.run([tmux_bin, "-L", socket, "kill-session", "-t", session],
-                   capture_output=True, stdin=subprocess.DEVNULL)
+                   capture_output=True, stdin=subprocess.DEVNULL, check=False)
 
 
 def _spawn_supervisor(*, task, board, session, transcript, cfgdir, cfg,

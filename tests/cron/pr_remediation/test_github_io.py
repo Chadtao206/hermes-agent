@@ -530,7 +530,7 @@ def test_the_page_bound_being_hit_returns_none_not_a_clean_or_partial_answer(
     those would repeat the exact false all-clear this whole change exists to
     remove. A low bound is monkeypatched in so this test doesn't need
     dozens of fake pages to prove the point."""
-    import pr_remediation.github_io as github_io
+    from pr_remediation import github_io
     monkeypatch.setattr(github_io, "_MAX_THREAD_PAGES", 3)
 
     pages = [

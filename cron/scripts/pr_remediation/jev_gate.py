@@ -106,9 +106,9 @@ def shadow(deps: Any, loop: Any, verdict: Verdict) -> None:
     try:
         answers = judge_issues(verdict.blocking_issues)
         detail = {"would_open": any(lane_worthy(a) for a in answers), "issues": answers}
-    except Exception as exc:  # noqa: BLE001 - shadow must never block a lane
+    except Exception as exc:
         detail = {"would_open": None, "error": repr(exc)[:300]}
     try:
         deps.store.record_note(loop.loop_id, "jev_gate_shadow", detail, deps.now())
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass

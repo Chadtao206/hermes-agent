@@ -71,7 +71,6 @@ class _FailingGh:
 
     def open_prs(self, org, author):
         self.calls.append((org, author))
-        return None
 
 
 class _FakeReviewed:
@@ -910,7 +909,7 @@ def test_the_credential_travels_to_the_wrapper_as_a_path(tmp_path):
     runner = _ScriptedRunner(search=_Proc(0, "[]"))
     path = _token_file(tmp_path, "ghp_secret_value")
     GhClient(runner=runner, token_path=path).open_prs("Ylopo", "Chadtao206")
-    argv, env = _search_call(runner)
+    _argv, env = _search_call(runner)
     assert env.get("DISCOVERY_GH_TOKEN_PATH") == str(path)
     assert "ghp_secret_value" not in str(env)
 

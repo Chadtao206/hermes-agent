@@ -127,6 +127,9 @@ def _ensure_workspace_capacity(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 _RESPAWN_REQUEUE_EVENT_KINDS = ("status", "promoted", "promoted_manual", "unblocked", "reclaimed")
+# A handoff after the newest PR comment names the profile that must now work on THAT PR
+# (upstream #111910): it lifts ``active_pr`` only, never ``recent_success``.
+_RESPAWN_HANDOFF_EVENT_KINDS = ("assigned", "changes_requested", "review_reopened")
 
 # ``status`` payload reasons written by an automatic cascade rather than by an
 # operator/API transition. Anything else on a ``status`` event came from somebody
@@ -166,7 +169,15 @@ def _is_deliberate_requeue(kind: str, payload_raw: Optional[str]) -> bool:
         return False
     if kind == "status":
         return payload.get("reason") not in _AUTOMATIC_STATUS_REASONS
-    return True  # promoted_manual, unblocked: operator-only paths
+    if kind == "assigned":
+        # Only a move to a DIFFERENT profile is a handoff; a no-op re-assign, an unassign
+        # or the dispatcher's own default-assignee write would lift the guard for the
+        # very implementer that opened the PR. No ``from`` recorded → fail closed.
+        if payload.get("source") == "kanban.default_assignee":
+            return False
+        to = payload.get("assignee")
+        return bool(to) and "from" in payload and payload["from"] != to
+    return True  # promoted_manual, unblocked, changes_requested, review_reopened: operator paths
 
 
 def _payload_acknowledges_pr(payload_raw: Optional[str], pr_urls: tuple[str, ...]) -> bool:
@@ -186,6 +197,7 @@ def _deliberate_rerun_since(
     *,
     strict: bool = False,
     ack_pr_urls: tuple[str, ...] = (),
+    include_handoffs: bool = False,
 ) -> bool:
     """True when a *deliberate* re-queue event landed after ``since``.
 
@@ -196,17 +208,23 @@ def _deliberate_rerun_since(
     (``ack_pr_urls``). ``recent_success`` keeps the inclusive reading because
     its boundary is the task's own run ending, not a competing external write.
     """
+    kinds = _RESPAWN_REQUEUE_EVENT_KINDS + (_RESPAWN_HANDOFF_EVENT_KINDS if include_handoffs else ())
+    # SQLite sorts TEXT above every INTEGER, so the range also returns text stamps written
+    # outside the mutators; each row is decided on its parsed epoch (unreadable → ignored).
     rows = conn.execute(
         "SELECT kind, payload, created_at FROM task_events "
         "WHERE task_id = ? AND created_at >= ? "
-        f"AND kind IN ({', '.join('?' * len(_RESPAWN_REQUEUE_EVENT_KINDS))}) "
+        f"AND kind IN ({', '.join('?' * len(kinds))}) "
         "ORDER BY created_at, id",
-        (task_id, int(since), *_RESPAWN_REQUEUE_EVENT_KINDS),
+        (task_id, int(since), *kinds),
     ).fetchall()
     for row in rows:
         if not _is_deliberate_requeue(row["kind"], row["payload"]):
             continue
-        if not strict or int(row["created_at"] or 0) > int(since):
+        created_at = _kb._to_epoch(row["created_at"])
+        if created_at is None or created_at < int(since):
+            continue
+        if not strict or created_at > int(since):
             return True
         if _payload_acknowledges_pr(row["payload"], ack_pr_urls):
             return True
@@ -236,7 +254,8 @@ def _should_log_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: st
         prev_reason = None
     if prev_reason != reason:
         return True
-    return (now - int(row["created_at"] or 0)) >= _RESPAWN_GUARD_EVENT_REPEAT_SECONDS
+    created_at = _kb._to_epoch(row["created_at"])
+    return created_at is None or (now - created_at) >= _RESPAWN_GUARD_EVENT_REPEAT_SECONDS
 
 
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "ready") -> Optional[str]:
@@ -296,17 +315,28 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
                 return "workspace_disk_capacity"
             except OSError:
                 return "workspace_capacity_unavailable"
+    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
+        # An infrastructure spawn refusal (upstream #114720) shares the cooldown: the host
+        # condition is not the card's, so it retries forever, spaced, and never reaches the breaker.
+        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+            ended_at = _kb._to_epoch(latest_run["ended_at"])
+            if ended_at is not None and (now - ended_at) < rl_cooldown:
+                return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             return None
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        ended_at = _kb._to_epoch(latest_run["ended_at"])
+        if ended_at is not None and (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
-    if err and _kbd._RESPAWN_BLOCKER_RE.search(err):
+    # A plain crash is different: its persisted error includes the worker's last captured
+    # output, which is context rather than a diagnosis and may contain benign commands such
+    # as ``claude auth status`` (upstream #117097).
+    err = _kb._lossy_text(row["last_failure_error"])
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if err and latest_outcome != "crashed" and _kbd._RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     if lane == "review":
@@ -320,7 +350,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
         (task_id, cutoff),
     ).fetchone()
     if recent_completed:
-        completed_at = int(recent_completed["ended_at"] or 0)
+        completed_at = _kb._to_epoch(recent_completed["ended_at"]) or 0
         if not _deliberate_rerun_since(conn, task_id, completed_at):
             return "recent_success"
 
@@ -338,13 +368,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str, *, lane: str = "
         "ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff, task_id),
     ).fetchall():
-        urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(c["body"]) if c["body"] else []
+        body = _kb._lossy_text(c["body"]) or ""
+        urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(body)
         if urls:
-            newest_pr_comment_at = int(c["created_at"] or 0)
+            # Duplicate-PR risk: an unreadable stamp fails closed as "just now".
+            newest_pr_comment_at = _kb._to_epoch(c["created_at"]) or now
             newest_pr_urls = tuple(u.lower() for u in urls)
             break
     if newest_pr_comment_at is not None and not _deliberate_rerun_since(
         conn, task_id, newest_pr_comment_at, strict=True, ack_pr_urls=newest_pr_urls,
+        include_handoffs=True,
     ):
         return "active_pr"
 
@@ -433,12 +466,13 @@ class StaleClaimHold:
 
 
 def heartbeat_age_seconds(row: sqlite3.Row, now: int) -> Optional[int]:
-    hb = row["last_heartbeat_at"]
-    return None if hb is None else now - int(hb)
+    hb = _kb._to_epoch(row["last_heartbeat_at"])
+    return None if hb is None else now - hb
 
 
 def stale_claim_hold(
     row: sqlite3.Row, now: int, *, claim_ttl: int, host_local: bool, heartbeat_stale: bool,
+    pid_alive: Optional[bool] = None,
 ) -> Optional[StaleClaimHold]:
     """Decide whether ``release_stale_claims`` should hold an expired claim.
 
@@ -455,7 +489,8 @@ def stale_claim_hold(
     if not host_local or heartbeat_stale:
         return None
     hb_age = heartbeat_age_seconds(row, now)
-    pid_alive = bool(row["worker_pid"]) and _kbd._pid_alive(row["worker_pid"])
+    if pid_alive is None:
+        pid_alive = bool(row["worker_pid"]) and _kbd._pid_alive(row["worker_pid"])
     heartbeat_fresh = hb_age is not None and hb_age < claim_ttl
     if pid_alive:
         return StaleClaimHold(now + claim_ttl, "pid_alive", hb_age)
@@ -520,16 +555,21 @@ def _cas_worker_pid_locked(
         return (_OWNERSHIP_ALREADY_OURS, current)
     if current is not None and not (allow_dead_takeover and not _kbd._pid_alive(current)):
         return (_OWNERSHIP_CONFLICT, current)
+    # Upstream's restart-stable fingerprint rides along with the pid so ``_worker_alive`` can tell
+    # this worker from a process that recycled the number after a reboot.
+    started_at = _kbd._process_fingerprint(pid_i) or _kbd.UNVERIFIED_WORKER_FINGERPRINT
     # ``IS`` rather than ``=`` so the NULL case (no prior owner) uses the same predicate.
-    sql = "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running' AND worker_pid IS ?"
-    params: list[Any] = [pid_i, task_id, current]
+    sql = ("UPDATE tasks SET worker_pid = ?, worker_started_at = ? "
+           "WHERE id = ? AND status = 'running' AND worker_pid IS ?")
+    params: list[Any] = [pid_i, started_at, task_id, current]
     if expected_run_id is not None:
         sql += " AND current_run_id = ?"
         params.append(int(expected_run_id))
     if conn.execute(sql, params).rowcount != 1:
         return (_OWNERSHIP_CONFLICT, current)
     if run_id is not None:
-        conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (pid_i, run_id))
+        conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                     (pid_i, started_at, run_id))
     return (_OWNERSHIP_REPLACED_DEAD if current is not None else _OWNERSHIP_RECORDED, current)
 
 
@@ -684,7 +724,7 @@ def _record_spawn_ownership(
 
 # Late-bound sibling namespaces (see module docstring); imported LAST so this
 # module is fully populated before the siblings import from it.
-from hermes_cli import kanban_db as _kb  # noqa: E402
-from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
-from hermes_cli import kanban_db_dispatch as _kbd  # noqa: E402
-from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_db as _kb
+from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli import kanban_db_dispatch as _kbd
+from hermes_cli import kanban_db_workspace as _kbw

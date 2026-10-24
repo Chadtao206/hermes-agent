@@ -157,7 +157,7 @@ class Poster:
         try:
             response = self._call(self._token, "chat.postMessage",
                                   channel=self._channel, text=text)
-        except Exception:  # noqa: BLE001 - an unattended tick must not raise
+        except Exception:
             return None
         if not isinstance(response, dict) or not response.get("ok"):
             return None

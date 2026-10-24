@@ -219,7 +219,7 @@ def is_coldstart_flake(*, made_progress, elapsed, coldstart_grace):
 # -- side-effecting helpers ---------------------------------------------------
 def _tmux_kill(tmux_bin, socket, session):
     subprocess.run([tmux_bin, "-L", socket, "kill-session", "-t", session],
-                   capture_output=True)
+                   capture_output=True, check=False)
 
 
 def _tmux_capture(tmux_bin, socket, session, lines=120):
@@ -233,7 +233,7 @@ def _tmux_capture(tmux_bin, socket, session, lines=120):
     try:
         p = subprocess.run([tmux_bin, "-L", socket, "capture-pane", "-p",
                             "-t", session, "-S", f"-{lines}"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, check=False)
         return p.stdout if p.returncode == 0 else ""
     except Exception:
         return ""
@@ -251,7 +251,7 @@ def _append_worker_log(log_path, text):
 
 def _tmux_alive(tmux_bin, socket, session):
     return subprocess.run([tmux_bin, "-L", socket, "has-session", "-t", session],
-                          capture_output=True).returncode == 0
+                          capture_output=True, check=False).returncode == 0
 
 
 def _cleanup_cfgdir(cfgdir):
@@ -305,7 +305,7 @@ def _hermes_task_shim(task, board, *args, run_id, claim_lock=None):
         os.environ, task_id=task, board=board,
         run_id=run_id, claim_lock=claim_lock,
     )
-    subprocess.run([shim, *args], capture_output=True, env=env)
+    subprocess.run([shim, *args], capture_output=True, env=env, check=False)
 
 
 # Last exception swallowed by _read_card (text), or None after a good read. The
@@ -484,7 +484,7 @@ def main(argv):
 
     # import state lazily (lives in the plugin dir; supervisor finds it via the path we add)
     sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/claude-kanban-lane"))
-    import state  # noqa: E402
+    import state
 
     while True:
         now = time.time()

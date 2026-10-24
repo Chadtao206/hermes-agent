@@ -91,7 +91,7 @@ def _list_sessions(cfg):
     """
     try:
         out = subprocess.run([cfg["tmux_bin"], "-L", cfg["socket"], "list-sessions", "-F", "#{session_name}"],
-                             capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                             capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False)
     except Exception:
         return (False, [])
     if out.returncode == 0:
@@ -254,7 +254,7 @@ def readopt():
             # run-N-adopts-run-N+1 bug — it would fight the successor's own
             # supervisor over the card. Reap the orphan pane instead.
             subprocess.run([cfg["tmux_bin"], "-L", cfg["socket"], "kill-session", "-t", name],
-                           capture_output=True, stdin=subprocess.DEVNULL)
+                           capture_output=True, stdin=subprocess.DEVNULL, check=False)
             state.session_delete(task_id)
             active.discard(task_id)
             logger.warning(
@@ -300,7 +300,7 @@ def readopt():
             logger.info("claude-kanban-lane: readopt relaunched supervisor for %s (pid %s)", name, new_pid)
         elif card is None or status in _TERMINAL_STATUSES:
             subprocess.run([cfg["tmux_bin"], "-L", cfg["socket"], "kill-session", "-t", name],
-                           capture_output=True, stdin=subprocess.DEVNULL)
+                           capture_output=True, stdin=subprocess.DEVNULL, check=False)
             state.session_delete(task_id)
             logger.info("claude-kanban-lane: readopt reaped orphan session %s", name)
 

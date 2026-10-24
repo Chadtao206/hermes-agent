@@ -6,7 +6,12 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+    from yaml import YAMLError
+except ModuleNotFoundError:  # PyYAML left upstream's dependency set; hermes_yaml wraps ruamel
+    import hermes_yaml as yaml
+    from ruamel.yaml.error import YAMLError
 
 from boris_intake.config import Config
 from boris_intake.result import load_gate_registry
@@ -44,7 +49,7 @@ _EXPECTED_TOOLS = {
 def _check_profile() -> list[str]:
     try:
         profile = yaml.safe_load(PROFILE_CONFIG.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as error:
+    except (OSError, YAMLError) as error:
         return [f"boris profile unavailable: {error}"]
     if profile.get("toolsets") != ["mcp-boris_review"]:
         return ["boris profile does not select only mcp-boris_review"]
@@ -129,7 +134,7 @@ def run_selftest(cfg: Config) -> list[str]:
                 capture_output=True,
                 text=True,
                 timeout=15,
-                env=env,
+                env=env, check=False,
             )
         except Exception as error:
             failures.append(f"ghx_ro read probe {argv} errored: {error}")
@@ -144,7 +149,7 @@ def run_selftest(cfg: Config) -> list[str]:
                 capture_output=True,
                 text=True,
                 timeout=15,
-                env=env,
+                env=env, check=False,
             )
         except Exception as error:
             failures.append(f"ghx_ro refusal probe {argv} errored: {error}")

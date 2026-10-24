@@ -161,10 +161,15 @@ class KanbanIO:
             "SELECT outcome, summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
             (lane_id,),
         )
-        return bool(
-            rows and rows[0]["outcome"] == "blocked"
-            and (rows[0]["summary"] or "").startswith("PROVIDER_AUTHENTICATION_REQUIRED:")
-        )
+        if not rows:
+            return False
+        summary = rows[0]["summary"] or ""
+        # Fork workers used to block the card themselves with this prefix; upstream workers
+        # now exit KANBAN_TERMINAL_PROVIDER_EXIT_CODE and the dispatcher trips the breaker
+        # on the crashed run with the text below.
+        if rows[0]["outcome"] == "blocked" and summary.startswith("PROVIDER_AUTHENTICATION_REQUIRED:"):
+            return True
+        return rows[0]["outcome"] in ("crashed", "gave_up") and "terminal provider error" in summary
 
     def lane_resource_window(self, lane_id: str) -> tuple[float, float | None] | None:
         rows = self._query(

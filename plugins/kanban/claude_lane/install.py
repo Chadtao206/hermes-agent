@@ -257,7 +257,7 @@ def runtime_contract_status(python: str | None = None) -> tuple[bool, str]:
             stdin=subprocess.DEVNULL,
             cwd=tempfile.gettempdir(),
             env=env,
-            timeout=120,
+            timeout=120, check=False,
         )
     except Exception as exc:  # pragma: no cover - unusable interpreter
         return (False, f"{exe}: probe failed ({exc.__class__.__name__}: {exc})")

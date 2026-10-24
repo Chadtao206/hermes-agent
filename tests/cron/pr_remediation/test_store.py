@@ -181,8 +181,8 @@ class _RacingConnection:
     def execute(self, sql, params=()):
         if self._armed and sql.startswith("INSERT INTO loops"):
             self._armed = False
-            (_loop_id, owner, repo, pr_number, generation, head_sha,
-             boris_request_id, root_thread_ts, status_message_ts, state,
+            (_loop_id, owner, repo, pr_number, generation, _head_sha,
+             _boris_request_id, _root_thread_ts, status_message_ts, state,
              created_at, updated_at) = params
             self._real.execute(
                 sql,
@@ -622,7 +622,7 @@ def test_concurrent_ticks_yield_exactly_one_winner_and_no_errors(tmp_path):
                     store.release(loop_id)
             finally:
                 store.close()
-        except BaseException as exc:  # noqa: BLE001 - recorded, then asserted on
+        except BaseException as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=tick) for _ in range(workers)]

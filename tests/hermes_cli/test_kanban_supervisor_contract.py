@@ -737,7 +737,7 @@ def test_local_shim_forwards_worker_pid(kanban_home, monkeypatch, tmp_path):
     shim = _load_script(SC_SHIM, "sc_shim_worker_pid")
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text('#!/bin/sh\necho "$@" >> %s\n' % calls)
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
     fake.chmod(0o755)
 
     monkeypatch.setenv("HERMES_BIN", str(fake))
@@ -756,7 +756,7 @@ def test_local_shim_refuses_a_foreign_task_id(kanban_home, monkeypatch, tmp_path
     shim = _load_script(SC_SHIM, "sc_shim_foreign")
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text('#!/bin/sh\necho "$@" >> %s\n' % calls)
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
     fake.chmod(0o755)
 
     monkeypatch.setenv("HERMES_BIN", str(fake))

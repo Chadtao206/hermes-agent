@@ -14,9 +14,9 @@ from dataclasses import replace
 import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_workspace as kbw
-from hermes_cli import kanban_db_connect as kbc  # noqa: F401
-from hermes_cli import kanban_db_dispatch as kbd  # noqa: F401
-from hermes_cli import kanban_db_guards as kbg  # noqa: F401
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_guards as kbg
 
 
 @pytest.fixture
@@ -420,7 +420,7 @@ def test_dispatch_waits_for_disk_but_counts_real_failures(
     gib = 1024 ** 3
     capacity = {"free": (10 if failure == "disk" else 30) * gib}
     monkeypatch.setattr(kbg, "_configured_min_free_disk_gb", lambda: 20.0)
-    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
     def disk_usage(_path):
         if failure == "workspace":
             raise PermissionError("filesystem unavailable")
@@ -435,7 +435,6 @@ def test_dispatch_waits_for_disk_but_counts_real_failures(
         if failure == "spawn":
             raise RuntimeError("worker launch failed")
         spawned.append(task.id)
-        return None
 
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="disk admission wait", assignee="alice")
@@ -522,7 +521,7 @@ def test_disk_wait_follows_changed_board_workspace(kanban_home, tmp_path, monkey
     _init_git_repo(healthy_repo)
     gib = 1024 ** 3
     monkeypatch.setattr(kbg, "_configured_min_free_disk_gb", lambda: 20.0)
-    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {})
+    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
 
     def disk_usage(path):
         free = (10 if Path(path).is_relative_to(full_repo) else 30) * gib

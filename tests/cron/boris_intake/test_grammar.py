@@ -60,7 +60,7 @@ def test_instructions_around_a_valid_pr_are_discarded():
 
 
 def test_zero_width_characters_do_not_forge_a_host():
-    assert extract_pr_refs("https://github​.com/Ylopo/x/pull/1") == []
+    assert extract_pr_refs("https://github\u200b.com/Ylopo/x/pull/1") == []
 
 
 def test_trailing_at_suffix_does_not_change_the_ref():

@@ -57,21 +57,21 @@ from hermes_cli import kanban_db_guards as kbg
 
 from hermes_cli import kanban_db_connect as kbc
 __all__ = [
-    "SUPERVISOR_CONTRACT_ENV_KEYS",
-    "OWNERSHIP_HELD_OUTCOMES",
-    "OWNERSHIP_HELD",
-    "OWNERSHIP_REFUSED",
-    "OWNERSHIP_UNVERIFIED",
     "ADOPTION_ATTEMPTS",
     "ADOPTION_RETRY_SECONDS",
+    "OWNERSHIP_HELD",
+    "OWNERSHIP_HELD_OUTCOMES",
+    "OWNERSHIP_REFUSED",
+    "OWNERSHIP_UNVERIFIED",
+    "SUPERVISOR_CONTRACT_ENV_KEYS",
     "SupervisorRunUnresolved",
-    "require_run_id",
-    "supervisor_shim_env",
-    "supervisor_heartbeat_argv",
-    "resolve_supervised_run",
-    "pin_supervised_run",
-    "adopt_session_ownership",
     "acquire_session_ownership",
+    "adopt_session_ownership",
+    "pin_supervised_run",
+    "require_run_id",
+    "resolve_supervised_run",
+    "supervisor_heartbeat_argv",
+    "supervisor_shim_env",
 ]
 
 

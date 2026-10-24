@@ -27,7 +27,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -229,7 +229,7 @@ class Paths:
         }
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "Paths":
+    def from_dict(cls, raw: Mapping[str, Any]) -> Paths:
         return cls(**{key: Path(value) if value is not None else None for key, value in raw.items()})
 
 
@@ -253,7 +253,7 @@ class FileFingerprint:
         }
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any]) -> "FileFingerprint":
+    def from_dict(cls, raw: Mapping[str, Any]) -> FileFingerprint:
         return cls(
             sha256=str(raw["sha256"]),
             mode=int(raw["mode"]),
@@ -348,7 +348,7 @@ class Manifest:
             raise
 
     @classmethod
-    def load(cls, path: Path | str) -> "Manifest":
+    def load(cls, path: Path | str) -> Manifest:
         manifest_path = _resolved(path)
         if not manifest_path.is_absolute():  # defensive; _resolved is absolute
             raise RetirementError("manifest path must be absolute")
@@ -399,20 +399,20 @@ class Manifest:
 
 def _epoch(value: Any) -> int:
     if isinstance(value, datetime):
-        current = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        current = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
         return int(current.timestamp())
     return int(value)
 
 
 def _utc_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
-        current = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return current.astimezone(timezone.utc)
-    return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        current = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return current.astimezone(UTC)
+    return datetime.fromtimestamp(int(value), tz=UTC)
 
 
 def _iso(epoch: int) -> str:
-    return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(int(epoch), tz=UTC).isoformat()
 
 
 def _file_hash(path: Path) -> str:
@@ -897,7 +897,7 @@ def _repository_identity(
 
 
 def _unique_archive_dir(paths: Paths, epoch: int) -> Path:
-    stamp = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     base = paths.archive_root / f"just-do-it-retirement-{stamp}"
     candidate = base
     suffix = 0
@@ -1259,7 +1259,7 @@ def verify_quiescent(
         claimed_epoch = None
         try:
             claimed_epoch = int(
-                datetime.fromisoformat(str(item["claimed_at"]).replace("Z", "+00:00")).timestamp()
+                datetime.fromisoformat(str(item["claimed_at"])).timestamp()
             )
         except (TypeError, ValueError):
             errors.append(
@@ -1594,7 +1594,7 @@ def _validate_retained_record_progress(
             fail(f"{record_name} {field_name} has an invalid runtime shape")
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             fail(f"{record_name} {field_name} must be timezone-aware")
-        return parsed.astimezone(timezone.utc)
+        return parsed.astimezone(UTC)
 
     def claim(
         value: Any, field_name: str, record_name: str

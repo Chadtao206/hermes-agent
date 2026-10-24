@@ -1324,7 +1324,7 @@ def test_a_lane_that_bounced_once_but_recovered_times_out_with_the_plain_code(tm
     as a quota problem once the worker has long been running again."""
     from boris_intake.reconciler import REVIEW_WAIT_SECONDS, tick
 
-    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+    store, admitted, clock, _slack, _github, kanban, deps = _hold_until_reviewing(
         tmp_path, lane_status="in_progress"
     )
     clock.advance(600)
@@ -1350,7 +1350,7 @@ def test_a_timed_out_request_leaves_a_running_worker_alone(tmp_path):
     under it and orphan the process; the dispatcher's own bookkeeping ends that run."""
     from boris_intake.reconciler import REVIEW_WAIT_SECONDS, tick
 
-    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+    store, admitted, clock, _slack, _github, kanban, deps = _hold_until_reviewing(
         tmp_path, lane_status="running"
     )
     clock.advance(REVIEW_WAIT_SECONDS + 60)
@@ -1463,7 +1463,7 @@ def _hold_until_reviewing(tmp_path, *, lane_status="ready"):
 def test_disk_admission_wait_does_not_expire_as_reviewer_execution(tmp_path, resumes):
     from boris_intake.reconciler import QUOTA_HOLD_MAX_SECONDS, REVIEW_WAIT_SECONDS, tick
 
-    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(tmp_path)
+    store, admitted, clock, _slack, github, kanban, deps = _hold_until_reviewing(tmp_path)
     waiting_since = clock()
     kanban.lane_resource_window = lambda lane_id: (waiting_since, None)
     clock.advance(REVIEW_WAIT_SECONDS + 60)
@@ -1499,7 +1499,7 @@ def test_a_lane_blocked_during_a_quota_wall_fails_with_the_quota_code(tmp_path):
     must hear about the quota, not be told to repost into the same wall."""
     from boris_intake.reconciler import tick
 
-    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+    store, admitted, clock, _slack, _github, kanban, deps = _hold_until_reviewing(
         tmp_path, lane_status="in_progress"
     )
     clock.advance(600)
@@ -1526,7 +1526,7 @@ def test_a_quota_hold_does_not_wedge_on_an_unavailable_slack_thread(tmp_path):
     hold's deadline bookkeeping nor produce an error event on every poll."""
     from boris_intake.reconciler import REVIEW_WAIT_SECONDS, tick
 
-    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(tmp_path)
+    store, admitted, clock, slack, _github, kanban, deps = _hold_until_reviewing(tmp_path)
     clock.advance(REVIEW_WAIT_SECONDS - 60)
     kanban.quota_hold_at = clock()
     slack.root_available = False
@@ -2031,7 +2031,7 @@ def test_slack_only_routing_sends_findings_to_github_and_bare_incompletes_to_sla
     from boris_intake.reconciler import _slack_only
     from boris_intake import result as result_module
 
-    store, admitted = admit_request(tmp_path)
+    _store, admitted = admit_request(tmp_path)
 
     def assemble(**payload_changes):
         judgment = validate_judgment(valid_payload(**payload_changes))
@@ -2163,7 +2163,7 @@ def test_importing_these_modules_does_not_rebind_sibling_packages(module):
         "print(pr_discovery.main.__file__)\n"
     )
     done = subprocess.run([_sys.executable, "-B", "-c", code],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, check=False)
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip().startswith(str(repo_scripts)), (
@@ -2194,7 +2194,7 @@ def test_these_modules_still_reach_the_deployed_slack_transport(module):
         "                  'slack_read': slack_read.__file__}))\n"
     )
     done = subprocess.run([_sys.executable, "-B", "-c", code],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60, check=False)
 
     assert done.returncode == 0, done.stderr
     seen = json.loads(done.stdout)
@@ -2282,7 +2282,7 @@ def test_store_memo_keeps_the_aggregate_when_slack_shows_the_substitute(tmp_path
 def test_authentication_failure_is_actionable_even_after_a_quota_hold(tmp_path):
     from boris_intake.reconciler import tick
 
-    store, admitted, clock, slack, github, kanban, deps = _hold_until_reviewing(
+    store, admitted, clock, _slack, github, kanban, deps = _hold_until_reviewing(
         tmp_path, lane_status="in_progress"
     )
     kanban.status = "blocked"

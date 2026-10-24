@@ -123,7 +123,7 @@ HOLD_REASON_BY_KIND = {
 PERMALINK_RE = re.compile(
     r"https://ylopo\.slack\.com/archives/(?P<channel>[A-Z0-9]+)/p(?P<ts>\d{16})(?!\d)"
     r"(?:\?[^\s)>'\"]*)?",
-    re.I,
+    re.IGNORECASE,
 )
 # Source channels whose posts this watchdog may react to. #meeting-room and
 # other chatter channels must never be reacted to.
@@ -369,7 +369,7 @@ BENIGN_EMPTY_SCALARS = {"", "-", "--", "n/a", "na", "null", "nil", "none", "no",
 
 
 def run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    return subprocess.run(cmd, text=True, encoding="utf-8", capture_output=True, timeout=timeout, check=False)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -1002,7 +1002,7 @@ def _epoch(value: Any) -> int:
         try:
             from datetime import datetime
 
-            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+            return int(datetime.fromisoformat(raw).timestamp())
         except ValueError:
             return 0
     return 0
@@ -1083,7 +1083,7 @@ def _jev_shadow(task_id: str, show: dict[str, Any], lane_state: str | None, why:
         runs = [r for r in (show.get("runs") or []) if isinstance(r, dict)
                 and r.get("profile") in (None, "reviewer")]
         jev_judge.shadow(task_id, max(runs, key=_run_epoch, default=None), lane_state, why)
-    except Exception:  # noqa: BLE001 - shadow must never break the tick
+    except Exception:
         pass
 
 
@@ -1802,7 +1802,7 @@ def process_tick(
     try:
         rows = lister()
         metrics["lane_list_calls"] += 1
-    except Exception as exc:  # noqa: BLE001 - cron surface: report, do not raise
+    except Exception as exc:
         outputs.append(f"JUST_DO_IT_REVIEW_REACTIONS kanban_list_failed: {str(exc)[-500:]}")
         return 1, outputs, metrics
     fresh: dict[str, dict[str, dict[str, str]]] = {}
@@ -1898,7 +1898,7 @@ def process_tick(
         metrics["task_show_calls"] += 1
         try:
             show = shower(task_id)
-        except Exception as exc:  # noqa: BLE001 - one bad lane must not kill the tick
+        except Exception as exc:
             _note_attempt(attempts, task_id, now)
             _hold_links(unshowable, links, task_id,
                         HOLD_KIND_UNSHOWABLE, f"show failed: {str(exc)[-160:]}")

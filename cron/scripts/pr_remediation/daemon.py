@@ -40,14 +40,14 @@ _PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PACKAGE_ROOT not in sys.path:
     sys.path.append(_PACKAGE_ROOT)
 
-from pr_remediation.boris_source import BorisSource  # noqa: E402
-from pr_remediation.config import RemediationConfig, load_config  # noqa: E402
-from pr_remediation.github_io import GitHubIO  # noqa: E402
-from pr_remediation.lanes import LaneIO  # noqa: E402
-from pr_remediation.loop import LoopDeps, tick  # noqa: E402
-from pr_remediation.selftest import DEFAULT_BORIS_DB, DEFAULT_TOKEN, run_selftest  # noqa: E402
-from pr_remediation.slack_io import SlackIO  # noqa: E402
-from pr_remediation.store import Store  # noqa: E402
+from pr_remediation.boris_source import BorisSource
+from pr_remediation.config import RemediationConfig, load_config
+from pr_remediation.github_io import GitHubIO
+from pr_remediation.lanes import LaneIO
+from pr_remediation.loop import LoopDeps, tick
+from pr_remediation.selftest import DEFAULT_BORIS_DB, DEFAULT_TOKEN, run_selftest
+from pr_remediation.slack_io import SlackIO
+from pr_remediation.store import Store
 
 STATE_DB = Path("/Users/ctao/.hermes/state/pr_remediation.db")
 HEARTBEAT = Path("/Users/ctao/.hermes/state/pr_remediation_heartbeat")
@@ -96,7 +96,7 @@ def parse_env(path: Path | None = None) -> dict[str, str]:
     sys.path mutation this module no longer takes at import time. Keeping the
     name at module scope keeps the seam the daemon tests already patch.
     """
-    from slack_read import ENV_PATH as SLACK_READ_ENV_PATH  # noqa: N811
+    from slack_read import ENV_PATH as SLACK_READ_ENV_PATH
     from slack_read import parse_env as _parse_env
 
     return _parse_env(SLACK_READ_ENV_PATH if path is None else path)
@@ -148,7 +148,7 @@ def _run(deps: LoopDeps, *, should_stop: Callable[[], bool],
     while not should_stop():
         try:
             tick(deps)
-        except Exception as error:  # noqa: BLE001 - a bad tick must not kill the loop
+        except Exception as error:
             sys.stderr.write(f"pr_remediation: tick error: {error}\n")
             sys.stderr.flush()
         heartbeat.write_text(f"{time.time():.0f}", encoding="utf-8")
@@ -174,7 +174,7 @@ def main() -> int:
         failures = run_selftest(cfg, review_token=review_token,
                                 notify_token=notify_token,
                                 slack_caller=slack_caller)
-    except Exception as error:  # noqa: BLE001 - a selftest crash must still fail closed
+    except Exception as error:
         # load_boris_intake_config only catches OSError/yaml.YAMLError; something
         # like a UnicodeDecodeError from a non-UTF-8 config file would otherwise
         # propagate straight out of main() as a raw traceback. Under a KeepAlive

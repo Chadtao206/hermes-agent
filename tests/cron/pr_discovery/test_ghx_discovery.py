@@ -42,7 +42,7 @@ def run(args, *, scope="Ylopo", token=str(TOKEN_FIXTURE), dry_run=True):
     if dry_run:
         env["GHX_DISCOVERY_DRY_RUN"] = "1"
     return subprocess.run([str(FIXTURE), *args], capture_output=True,
-                          text=True, env=env)
+                          text=True, env=env, check=False)
 
 
 # ---------------------------------------------------------------------------

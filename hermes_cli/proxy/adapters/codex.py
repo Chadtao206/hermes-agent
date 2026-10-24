@@ -18,7 +18,7 @@ from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 logger = logging.getLogger(__name__)
 
 _POOL_PROVIDER = "openai-codex"
-_ALLOWED_PATHS: FrozenSet[str] = frozenset({"/responses", "/models"})
+_ALLOWED_PATHS: frozenset[str] = frozenset({"/responses", "/models"})
 
 
 class CodexAdapter(UpstreamAdapter):
@@ -39,7 +39,7 @@ class CodexAdapter(UpstreamAdapter):
         return "OpenAI Codex (ChatGPT)"
 
     @property
-    def allowed_paths(self) -> FrozenSet[str]:
+    def allowed_paths(self) -> frozenset[str]:
         return _ALLOWED_PATHS
 
     def is_authenticated(self) -> bool:

@@ -929,7 +929,7 @@ def _review_context(store: Store, request: LifecycleRequest) -> dict:
             "acceptance_references": list(store.acceptance_references(request.request_id)),
             "prior_review": _prior_review_context(store.prior_review(request), request),
         }
-    except Exception as error:  # noqa: BLE001 - degrade, never take pr_metadata down
+    except Exception as error:
         logger.warning("review context unavailable for %s: %s", request.request_id, error)
         return {"unavailable": "review context could not be loaded"}
 

@@ -155,7 +155,7 @@ def test_redelivery_recovers_an_audit_crash_after_atomic_admission(
 
 
 def test_every_decision_is_audited(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, _store, _calls, _captures = _pipeline(tmp_path)
     p.handle(normalize(msg(channel="C_OTHER")))
     rec = records(tmp_path)[0]
     assert rec["decision"] == "reject"
@@ -163,7 +163,7 @@ def test_every_decision_is_audited(tmp_path):
 
 
 def test_unknown_flag_rejects_before_snapshot_or_admission(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, store, _calls, captures = _pipeline(tmp_path)
 
     p.handle(normalize(msg(text=msg()["text"] + " --ignore-cii")))
 
@@ -173,7 +173,7 @@ def test_unknown_flag_rejects_before_snapshot_or_admission(tmp_path):
 
 
 def test_rejection_reply_failure_is_audited(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, store, calls, _captures = _pipeline(tmp_path)
 
     def fail_slack(token, method, **kwargs):
         calls.append((method, kwargs))
@@ -191,7 +191,7 @@ def test_rejection_reply_failure_is_audited(tmp_path):
 
 
 def test_snapshot_failure_rejects_only_that_pr_and_admits_the_rest(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, store, _calls, _captures = _pipeline(tmp_path)
     original_capture = p.capture_gate_snapshot
 
     def capture(command, captured_at, budget):
@@ -252,7 +252,7 @@ def test_one_budget_is_shared_by_the_gate_and_the_snapshot_capture(tmp_path):
     a single synchronous handler call. See `github.RETRY_DEADLINE`."""
     from dataclasses import replace as replace_field
 
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, _store, _calls, _captures = _pipeline(tmp_path)
     seen = []
     p.deps = replace_field(
         p.deps,
@@ -276,7 +276,7 @@ def test_one_budget_is_shared_by_the_gate_and_the_snapshot_capture(tmp_path):
 def test_each_message_opens_its_own_window(tmp_path):
     from dataclasses import replace as replace_field
 
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, _store, _calls, _captures = _pipeline(tmp_path)
     seen = []
     p.deps = replace_field(
         p.deps,
@@ -337,7 +337,7 @@ def test_the_live_wiring_forwards_the_message_budget_to_the_real_reads(
 
 
 def test_an_unreadable_snapshot_is_reported_as_github_unavailable(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, store, _calls, _captures = _pipeline(tmp_path)
     p.capture_gate_snapshot = lambda command, at, budget: GateSnapshotLookup(
         SnapshotStatus.UNAVAILABLE,
         detail="the PR checks could not be read: GitHub answered with an error",
@@ -352,7 +352,7 @@ def test_an_unreadable_snapshot_is_reported_as_github_unavailable(tmp_path):
 
 
 def test_a_moved_head_keeps_its_own_terminal_reason(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, _store, _calls, _captures = _pipeline(tmp_path)
     p.capture_gate_snapshot = lambda command, at, budget: GateSnapshotLookup(
         SnapshotStatus.HEAD_MOVED, detail="the head moved to abc1234 after the request"
     )
@@ -393,7 +393,7 @@ def _doors(tmp_path, lookup=ABSENT_PR):
     `lookup`."""
     from dataclasses import replace as replace_field
 
-    p, store, calls, captures = _pipeline(tmp_path, cfg=DOOR_LIVE)
+    p, store, calls, _captures = _pipeline(tmp_path, cfg=DOOR_LIVE)
     p.deps = replace_field(p.deps, pr_info=lambda o, r, n, budget: lookup)
     return p, store, calls
 
@@ -421,7 +421,7 @@ def replies(calls):
 def test_a_loop_rejection_is_not_silenced_by_another_bot_doors_rejection(tmp_path):
     """P1, in the exact shape the incident had: both doors post as the same bot
     user, so keying on `event.user_id` put them in one row."""
-    p, store, calls = _doors(tmp_path)
+    p, _store, calls = _doors(tmp_path)
 
     p.handle(discovery_post("1.0"))
     p.handle(loop_repost("2.0"))
@@ -432,7 +432,7 @@ def test_a_loop_rejection_is_not_silenced_by_another_bot_doors_rejection(tmp_pat
 def test_a_loop_rejection_is_not_silenced_by_chads_own_rejection(tmp_path):
     """P1 again, and why the attributed requester alone is not the key: the loop
     resolves AS Chad, so a bad link Chad pastes must not silence it."""
-    p, store, calls = _doors(tmp_path)
+    p, _store, calls = _doors(tmp_path)
     chad_typo = normalize({
         "channel": "C1", "channel_type": "channel", "user": CHAD, "ts": "1.0",
         "text": "https://github.com/Ylopo/repo/pull/9",
@@ -446,7 +446,7 @@ def test_a_loop_rejection_is_not_silenced_by_chads_own_rejection(tmp_path):
 
 def test_a_human_pasting_bad_links_still_gets_one_reply_per_window(tmp_path):
     """P3: the anti-noise property this cooldown exists for, unchanged."""
-    p, store, calls = _doors(tmp_path)
+    p, _store, calls = _doors(tmp_path)
     first = normalize({
         "channel": "C1", "channel_type": "channel", "user": "U1", "ts": "1.0",
         "text": "https://github.com/Ylopo/repo/pull/9",
@@ -466,7 +466,7 @@ def test_an_infrastructure_rejection_is_always_delivered(tmp_path):
     """P2: nobody can act on "GitHub could not be read" unless they see it, and
     it cannot become noise -- it only happens while GitHub is failing, and the
     loop's own re-post budget is 12 attempts 10 minutes apart."""
-    p, store, calls = _doors(tmp_path, lookup=UNREADABLE_PR)
+    p, _store, calls = _doors(tmp_path, lookup=UNREADABLE_PR)
 
     p.handle(loop_repost("1.0"))
     p.handle(loop_repost("2.0"))
@@ -479,7 +479,7 @@ def test_an_infrastructure_rejection_is_always_delivered(tmp_path):
 def test_an_infrastructure_reply_does_not_consume_the_ordinary_cooldown(tmp_path):
     """The bypass must not stamp the row, or an outage reply would silence the
     next genuine bad-link reply for an hour -- trading the bug for a new one."""
-    p, store, calls = _doors(tmp_path, lookup=UNREADABLE_PR)
+    p, _store, calls = _doors(tmp_path, lookup=UNREADABLE_PR)
     p.handle(loop_repost("1.0"))
 
     from dataclasses import replace as replace_field
@@ -494,7 +494,7 @@ def test_the_infrastructure_rejection_is_the_one_reported(tmp_path):
     reader has to see -- and it is what justified skipping the throttle."""
     from dataclasses import replace as replace_field
 
-    p, store, calls = _doors(tmp_path)
+    p, _store, calls = _doors(tmp_path)
     p.deps = replace_field(
         p.deps,
         pr_info=lambda o, r, n, budget: UNREADABLE_PR if n == 5 else ABSENT_PR,
@@ -517,7 +517,7 @@ def test_the_infrastructure_rejection_is_the_one_reported(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_a_pull_request_with_no_checks_is_admitted_with_ci_waived(tmp_path):
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, store, calls, _captures = _pipeline(tmp_path)
     p.capture_gate_snapshot = lambda command, at, budget: CAPTURED
 
     p.handle(normalize(msg()))
@@ -535,7 +535,7 @@ def test_a_moved_head_reply_is_throttled_not_guaranteed(tmp_path):
     refusal, and a moved head is "your request was wrong": the requester pushed
     while requesting. Bypassing the cooldown for that would hand anyone racing a
     push against their own link an un-throttled reply on every post."""
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, _store, calls, _captures = _pipeline(tmp_path)
     p.capture_gate_snapshot = lambda command, at, budget: GateSnapshotLookup(
         SnapshotStatus.HEAD_MOVED, detail="the head moved to abc1234 after the request"
     )
@@ -554,7 +554,7 @@ def test_the_gate_rejection_audit_row_carries_its_details(tmp_path):
     next incident is read from -- and `"details": []` survived."""
     from dataclasses import replace as replace_field
 
-    p, store, calls, captures = _pipeline(tmp_path)
+    p, _store, _calls, _captures = _pipeline(tmp_path)
     p.deps = replace_field(p.deps, pr_info=lambda o, r, n, budget: UNREADABLE_PR)
 
     p.handle(normalize(msg()))

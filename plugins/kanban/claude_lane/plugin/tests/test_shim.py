@@ -22,7 +22,7 @@ def _run(args, env_extra, fake_hermes_out):
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env,
+        env=env, check=False,
     )
 
 
@@ -39,7 +39,7 @@ def test_rejects_foreign_task_id(tmp_path):
 def test_forces_id_and_redacts(tmp_path):
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text("#!/bin/sh\necho \"$@\" >> %s\n" % calls, encoding="utf-8")
+    fake.write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n", encoding="utf-8")
     fake.chmod(0o755)
     r = _run(["complete", "--summary", "token sk-ant-oat01-SECRETSECRETSECRET done"],
              {"HERMES_KANBAN_TASK": "t_MINE"}, str(fake))
@@ -53,7 +53,7 @@ def test_metadata_is_redacted(tmp_path):
     # MAJOR 5: --metadata must be redacted too (was passed verbatim before).
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text("#!/bin/sh\necho \"$@\" >> %s\n" % calls, encoding="utf-8")
+    fake.write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n", encoding="utf-8")
     fake.chmod(0o755)
     r = _run(["complete", "--metadata", '{"k":"sk-ant-oat01-SECRETSECRETSECRET"}'],
              {"HERMES_KANBAN_TASK": "t_MINE"}, str(fake))
@@ -71,7 +71,7 @@ def test_heartbeat_forwards_worker_pid(tmp_path):
     supervisor-lane runs on the live board had no owner recorded."""
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text("#!/bin/sh\necho \"$@\" >> %s\n" % calls, encoding="utf-8")
+    fake.write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n", encoding="utf-8")
     fake.chmod(0o755)
     r = _run(["heartbeat", "--note", "supervisor alive", "--worker-pid", "4242"],
              {"HERMES_KANBAN_TASK": "t_MINE"}, str(fake))
@@ -86,7 +86,7 @@ def test_heartbeat_refuses_a_non_integer_worker_pid(tmp_path):
     rather than silently heartbeat with no ownership."""
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text("#!/bin/sh\necho \"$@\" >> %s\n" % calls, encoding="utf-8")
+    fake.write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n", encoding="utf-8")
     fake.chmod(0o755)
     r = _run(["heartbeat", "--worker-pid", "not-a-pid; rm -rf /"],
              {"HERMES_KANBAN_TASK": "t_MINE"}, str(fake))
@@ -100,7 +100,7 @@ def test_heartbeat_drops_a_non_positive_worker_pid(tmp_path):
     bogus ownership record."""
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "fake-hermes"
-    fake.write_text("#!/bin/sh\necho \"$@\" >> %s\n" % calls, encoding="utf-8")
+    fake.write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n", encoding="utf-8")
     fake.chmod(0o755)
     r = _run(["heartbeat", "--worker-pid", "0"], {"HERMES_KANBAN_TASK": "t_MINE"}, str(fake))
     assert r.returncode == 0

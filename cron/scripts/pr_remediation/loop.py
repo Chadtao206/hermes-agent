@@ -1577,9 +1577,7 @@ def _orphaned_lane(deps: LoopDeps, loop: LoopRequest) -> dict | None:
         kind, detail = event["kind"], event["detail"]
         if kind == EVENT_ORPHANED_LANE and detail.get("lane_id"):
             orphan = detail
-        elif kind == EVENT_TRANSITION and detail.get("lane_id"):
-            orphan = None
-        elif kind == EVENT_ORPHAN_SUPERSEDED:
+        elif kind == EVENT_TRANSITION and detail.get("lane_id") or kind == EVENT_ORPHAN_SUPERSEDED:
             orphan = None
     return orphan
 

@@ -9,7 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -251,7 +251,7 @@ def _run_retained_job_three_times(
     with cron_jobs.use_cron_store(fixture.paths.hermes_home):
         for index in range(1, 4):
             run_time = datetime.fromtimestamp(
-                fixture.now + (index * 60), tz=timezone.utc
+                fixture.now + (index * 60), tz=UTC
             )
             monkeypatch.setattr(
                 cron_jobs, "_hermes_now", lambda current=run_time: current
@@ -286,7 +286,7 @@ class RetirementFixture:
     head_commit: str = ""
 
     def utc_iso(self, epoch: int) -> str:
-        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(epoch, tz=UTC).isoformat()
 
     def write_jobs(self) -> None:
         self.paths.jobs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1430,7 +1430,7 @@ def test_finalize_dry_run_accepts_an_exact_external_fire_claim_transition(
     _configure_retained_progress_job(retirement_fixture)
     manifest = retirement_fixture.preflight_and_pause()
     claim_time = datetime.fromtimestamp(
-        manifest.cutoff_epoch + 120, tz=timezone.utc
+        manifest.cutoff_epoch + 120, tz=UTC
     )
     monkeypatch.setattr(cron_jobs, "_hermes_now", lambda: claim_time)
     monkeypatch.setenv("HERMES_MACHINE_ID", "fixture-scheduler:123")
@@ -1660,7 +1660,7 @@ def test_finalize_observation_window_accepts_inclusive_scheduler_boundaries(
     manifest = retirement_fixture.preflight_and_pause()
     finalize_epoch = manifest.created_epoch + 182
     transition_time = datetime.fromtimestamp(
-        manifest.created_epoch + offset, tz=timezone.utc
+        manifest.created_epoch + offset, tz=UTC
     )
     monkeypatch.setattr(cron_jobs, "_hermes_now", lambda: transition_time)
     monkeypatch.setenv("HERMES_MACHINE_ID", "fixture-scheduler:123")
@@ -1686,7 +1686,7 @@ def test_finalize_observation_window_accepts_successful_delivery_failure_complet
     _configure_retained_progress_job(retirement_fixture)
     manifest = retirement_fixture.preflight_and_pause()
     run_time = datetime.fromtimestamp(
-        manifest.created_epoch + 60, tz=timezone.utc
+        manifest.created_epoch + 60, tz=UTC
     )
     monkeypatch.setattr(cron_jobs, "_hermes_now", lambda: run_time)
     monkeypatch.setenv("HERMES_MACHINE_ID", "fixture-scheduler:123")
@@ -2127,7 +2127,7 @@ def test_finalize_compensation_preserves_latest_retained_scheduler_progress(
     def fail_second_removal(job_id):
         if job_id == "ff865c33c5ea":
             run_time = datetime.fromtimestamp(
-                retirement_fixture.now + 240, tz=timezone.utc
+                retirement_fixture.now + 240, tz=UTC
             )
             monkeypatch.setattr(
                 cron_jobs, "_hermes_now", lambda: run_time
