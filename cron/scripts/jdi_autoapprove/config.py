@@ -14,7 +14,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+    from yaml import YAMLError
+except ModuleNotFoundError:  # PyYAML left upstream's dependency set; hermes_yaml wraps ruamel
+    import hermes_yaml as yaml
+    from ruamel.yaml.error import YAMLError
 
 HERMES_HOME = Path("/Users/ctao/.hermes")
 DEFAULT_CONFIG = HERMES_HOME / "config.yaml"
@@ -67,7 +72,7 @@ def load_config(path: Path | None = None) -> Config:
     path = path or DEFAULT_CONFIG
     try:
         data = yaml.safe_load(path.read_text()) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, YAMLError):
         return Config()
     block = data.get("jdi_autoapprove")
     if not isinstance(block, dict):

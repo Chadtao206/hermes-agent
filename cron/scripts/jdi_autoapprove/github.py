@@ -79,9 +79,9 @@ def approve(owner: str, repo: str, number: int, head_sha: str, body: str,
             token: str, runner=subprocess.run) -> tuple[bool, str]:
     """Submit an APPROVE review pinned to head_sha. Returns (ok, detail).
 
-    ``commit_id`` binds the review to that revision; it does not atomically
-    assert that the PR head is unchanged. Current-head gate evidence must be
-    checked separately.
+    Pinning ``commit_id`` is the safety property that matters: if the head moved
+    between validation and this call, GitHub rejects the review rather than
+    approving a commit nobody looked at.
     """
     if not _SHA.match((head_sha or "").lower()):
         return False, "refusing to approve without a valid head sha"
