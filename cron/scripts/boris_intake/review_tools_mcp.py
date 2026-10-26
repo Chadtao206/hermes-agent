@@ -290,7 +290,7 @@ JudgmentPayload = Annotated[
 
 
 def _bound_request() -> tuple[Store, LifecycleRequest, str]:
-    task_id = os.environ.get("HERMES_KANBAN_TASK", "")
+    task_id = os.environ.get("BORIS_KANBAN_TASK", "")
     if not _TASK_ID.fullmatch(task_id):
         raise ToolError("missing or malformed task binding")
     if os.environ.get("HERMES_PROFILE") != _PROFILE:
@@ -1227,7 +1227,7 @@ def _complete_bound_task(task_id: str, request_id: str, judgment_hash: str) -> b
     db_path = Path(raw_db) if raw_db else None
     if db_path is None or not db_path.is_absolute() or not db_path.is_file():
         raise ToolError("Kanban database configuration is missing or invalid")
-    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    run_id_raw = os.environ.get("BORIS_KANBAN_RUN_ID")
     try:
         run_id = int(run_id_raw) if run_id_raw else None
     except ValueError as error:
@@ -1290,7 +1290,15 @@ def submit_review_result(payload: JudgmentPayload) -> dict:
         store.close()
 
 
+
+
+def _unfence_kanban() -> None:
+    """Kanban workers hand every child process Hermes' delegate fence, which opens the board
+    read-only. This server's only board write is completing the lane it is bound to."""
+    os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+
 def main() -> None:
+    _unfence_kanban()
     server.run(transport="stdio")
 
 

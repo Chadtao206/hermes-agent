@@ -70,8 +70,8 @@ def _check_profile() -> list[str]:
     env = server.get("env")
     required_binding = {
         "HERMES_PROFILE": "boris_on_demand",
-        "HERMES_KANBAN_TASK": "${HERMES_KANBAN_TASK}",
-        "HERMES_KANBAN_RUN_ID": "${HERMES_KANBAN_RUN_ID}",
+        "BORIS_KANBAN_TASK": "${HERMES_KANBAN_TASK}",
+        "BORIS_KANBAN_RUN_ID": "${HERMES_KANBAN_RUN_ID}",
     }
     if not isinstance(env, dict) or any(
         env.get(name) != value for name, value in required_binding.items()

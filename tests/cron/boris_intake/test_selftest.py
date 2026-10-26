@@ -74,7 +74,7 @@ def test_selftest_fails_closed_without_worker_task_binding(hermetic_selftest):
     profile = hermetic_selftest.profile_path.read_text()
     hermetic_selftest.profile_path.write_text(
         profile.replace(
-            "      HERMES_KANBAN_TASK: ${HERMES_KANBAN_TASK}\n", ""
+            "      BORIS_KANBAN_TASK: ${HERMES_KANBAN_TASK}\n", ""
         )
     )
 

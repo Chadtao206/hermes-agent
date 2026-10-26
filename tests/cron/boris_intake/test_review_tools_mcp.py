@@ -71,7 +71,7 @@ def bind_request(tmp_path, monkeypatch, task_id="t_boris_lane"):
     )
     token_path = tmp_path / "github-token"
     token_path.write_text("secret", encoding="utf-8")
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("BORIS_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_PROFILE", "boris_on_demand")
     monkeypatch.setenv("BORIS_REVIEW_DB", str(db_path))
     monkeypatch.setenv("BORIS_GH_TOKEN_PATH", str(token_path))
@@ -194,12 +194,12 @@ def test_submission_tool_exposes_the_complete_judgment_contract():
 def test_missing_or_unbound_task_context_fails_closed(tmp_path, monkeypatch):
     from boris_intake import review_tools_mcp
 
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("BORIS_KANBAN_TASK", raising=False)
     monkeypatch.setenv("BORIS_REVIEW_DB", str(tmp_path / "missing.db"))
     with pytest.raises(review_tools_mcp.ToolError, match="task binding"):
         review_tools_mcp.read_github_evidence("pr_metadata")
 
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_not_bound")
+    monkeypatch.setenv("BORIS_KANBAN_TASK", "t_not_bound")
     monkeypatch.setenv("HERMES_PROFILE", "boris_on_demand")
     with pytest.raises(review_tools_mcp.ToolError, match="database"):
         review_tools_mcp.read_github_evidence("pr_metadata")
@@ -413,9 +413,9 @@ def test_completion_calls_the_real_kanban_complete_task(tmp_path, monkeypatch):
             "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()[0]
     assert run_id is not None
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("BORIS_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("BORIS_KANBAN_RUN_ID", str(run_id))
 
     assert module._complete_bound_task(task_id, request.request_id, "sha256:judgment") is True
 
@@ -427,6 +427,35 @@ def test_completion_calls_the_real_kanban_complete_task(tmp_path, monkeypatch):
             "SELECT outcome FROM task_runs WHERE id = ?", (run_id,)
         ).fetchone()[0]
     assert (status, current, outcome) == ("done", None, "completed")
+
+
+def test_completion_survives_the_delegate_fence_a_kanban_worker_hands_its_children(tmp_path, monkeypatch):
+    """Since the 2026-10-24 upstream merge every child a kanban worker spawns, the MCP server
+    included, inherits HERMES_DELEGATED_CHILD_CONTEXT, which opens the board read-only."""
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    module, _store, request = bind_request(tmp_path, monkeypatch)
+    db_path = kanban_db_connect.init_db(tmp_path / "kanban.db")
+    with kanban_db_connect.connect_closing(db_path) as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Read-only Boris review: Ylopo/example#42 @ aaaaaaa",
+            assignee="boris_on_demand",
+        )
+        assert kanban_db.claim_task(conn, task_id, claimer="test-dispatcher:1") is not None
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+    monkeypatch.setenv("BORIS_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("BORIS_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(tmp_path))
+
+    with pytest.raises(PermissionError):
+        module._complete_bound_task(task_id, request.request_id, "sha256:judgment")
+
+    module._unfence_kanban()
+
+    assert module._complete_bound_task(task_id, request.request_id, "sha256:judgment") is True
 
 
 def diff_for(*files):
