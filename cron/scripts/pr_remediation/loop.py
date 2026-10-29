@@ -2448,8 +2448,9 @@ def _perform(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     if route.action == ROUTE_DROP_ORPHAN:
         return _drop_orphan(deps, loop, route.detail)
     if route.action == ROUTE_OPEN_LANE:
+        opened = _open_lane(deps, loop, verdict, int(route.detail["round"]))
         jev_gate.shadow(deps, loop, verdict)
-        return _open_lane(deps, loop, verdict, int(route.detail["round"]))
+        return opened
     # ROUTE_DEFER: the in-flight lane drives the loop, not this verdict, and
     # the note above is the whole of what we owe it.
     return False
@@ -2468,6 +2469,8 @@ def _rehearse(deps: LoopDeps, loop: LoopRequest, verdict: Verdict,
     trail, and the live tick that finds the claim still there will drop it.
     """
     _shadow(deps, loop, route)
+    if route.action == ROUTE_OPEN_LANE:
+        jev_gate.shadow(deps, loop, verdict)
     if route.defer is not None:
         _defer_verdict(deps, loop, verdict, route.defer)
     if route.action == ROUTE_ADOPT_LANE:

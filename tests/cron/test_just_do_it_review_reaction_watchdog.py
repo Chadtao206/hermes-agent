@@ -1053,7 +1053,7 @@ class BorisMigrationTest(unittest.TestCase):
             completed.stdout = json.dumps({"id": "lane-1"})
             m.kanban_show("lane-1")
         verbs = [call.args[0][2] for call in run.call_args_list]
-        self.assertEqual(verbs, ["list", "show"])
+        self.assertEqual(verbs, ["list"] * len(m.REVIEWER_IDENTITIES) + ["show"])
 
     def mixed_channel_state(self):
         state = m.migrate_state(None, NOW)[0]

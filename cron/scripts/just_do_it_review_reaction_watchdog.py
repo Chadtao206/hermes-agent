@@ -73,6 +73,7 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -402,6 +403,14 @@ def exclusive_run_lock(path: Path | None = None):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+# The reviewer identity was renamed from `reviewer` to `boris_on_demand` on 2026-09-06. Four
+# filters still named only the old one, so from that day this watchdog listed nothing, classified
+# nothing and reacted to nothing. Both names are accepted: the old one still owns 1,468 historical
+# lanes, and dropping it would re-blind the watchdog to everything before the rename.
+REVIEWER_IDENTITIES = ("reviewer", "boris_on_demand")
+REVIEWER_PROFILES = (None, *REVIEWER_IDENTITIES)
+
+
 def kanban_json(args: list[str], *, timeout: int = 90) -> Any:
     proc = run(["hermes", "kanban", *args], timeout=timeout)
     if proc.returncode != 0:
@@ -410,9 +419,26 @@ def kanban_json(args: list[str], *, timeout: int = 90) -> Any:
 
 
 def kanban_reviewer_lanes() -> list[dict[str, Any]]:
-    """One bounded list call per tick: every non-archived reviewer lane."""
-    rows = kanban_json(["list", "--assignee", "reviewer", "--json"])
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    """One bounded list call per reviewer identity per tick: every non-archived reviewer lane.
+
+    `--assignee` takes a single value and the last one wins, so the identities cannot be folded
+    into one call. Lanes are de-duplicated by id because a task could in principle be listed twice.
+    """
+    seen_ids: set[str] = set()
+    lanes: list[dict[str, Any]] = []
+    for identity in REVIEWER_IDENTITIES:
+        rows = kanban_json(["list", "--assignee", identity, "--json"])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            task_id = str(row.get("id") or row.get("task_id") or "")
+            if task_id and task_id in seen_ids:
+                continue
+            seen_ids.add(task_id)
+            lanes.append(row)
+    return lanes
 
 
 def kanban_show(task_id: str) -> dict[str, Any]:
@@ -1034,6 +1060,116 @@ def task_approval(show: dict[str, Any]) -> tuple[bool, str]:
     return emoji == STATE_APPROVED, why
 
 
+INTAKE_DB = HOME / "state" / "boris_intake.db"
+# On 2026-09-06 boris reviews moved to the intake service and stopped writing a verdict onto the
+# kanban run, so `classify_run_status` sees `metadata=None` and every current lane reads as "no
+# signal". The verdict lives in boris_intake instead, keyed by `lane_id`, which IS the kanban task
+# id. The two eras do not overlap -- reviewer-profile lanes have no intake row, boris_on_demand
+# lanes have one for all 914 -- so this is consulted only after the run loop finds nothing, and can
+# turn "no signal" into a verdict but never overturn one a run already stated.
+INTAKE_BLOCKED = {"ISSUES", "GATE_BLOCKED"}       # a defect, or a merge gate that is still red
+INTAKE_HELD = {"INCOMPLETE", "INCOMPLETE_WITH_FINDINGS"}  # the review stopped early: may hide a block
+# READY_WITH_COMMENTS is not an approval: all 278 such reviews carry verification_limits and
+# evidence_reviewed, most carry verification_gaps, and some carry release_conditions -- substance a
+# human is meant to read -- while READY_CLEAN carries none of it. So the checkmark is reserved for
+# READY_CLEAN and everything else ready gets the comment mark.
+INTAKE_APPROVED = {"READY_CLEAN"}
+INTAKE_NOTES = {"READY_WITH_COMMENTS"}
+INTAKE_COMMENTARY = ("non_blocking_issues", "nits", "verification_gaps", "release_conditions",
+                     "risk_hypotheses")
+# A review stopped for one of these was reviewing a head nobody will merge, so there is no verdict
+# still coming for it. Holding it is permanent, and the hold outlives the successor review at the
+# current head -- so the verdict that does describe the PR could never reach Slack. Every other
+# incomplete reason concerns the head still under review and keeps quarantining.
+INTAKE_MOOT_REASONS = {"HEAD_SUPERSEDED", "PR_NOT_OPEN"}
+
+
+def incomplete_is_moot(payload: dict[str, Any]) -> bool:
+    """True when every reason the review stopped is one that a new head makes irrelevant."""
+    incomplete = payload.get("incomplete")
+    codes = incomplete.get("reason_codes") if isinstance(incomplete, dict) else None
+    if not isinstance(codes, list) or not codes:
+        return False
+    return all(str(code) in INTAKE_MOOT_REASONS for code in codes)
+
+
+def show_task_id(show: dict[str, Any]) -> str:
+    """`kanban show` nests the task under `task`; older payloads put the id at the top level."""
+    if not isinstance(show, dict):
+        return ""
+    task = show.get("task")
+    if isinstance(task, dict) and task.get("id"):
+        return str(task["id"])
+    return str(show.get("id") or show.get("task_id") or "")
+
+
+def intake_verdict(task_id: str) -> tuple[str | None, str] | None:
+    """(state, why) for a lane whose verdict lives in boris_intake, else None to fall back.
+
+    `presentation` owns the fail-closed axis; the payload's own finding lists separate comments
+    from approval, exactly as the run-metadata classifier did. An unrecognised non-empty presentation
+    quarantines rather than passing: a vocabulary that grows is how this watchdog went blind the
+    first time, and a lane held is recoverable where a lane waved through is not.
+    """
+    if not task_id or not INTAKE_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{INTAKE_DB}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "select validated_result_json from review_requests where lane_id=? "
+                "order by created_at desc limit 1", (task_id,)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return QUARANTINE, f"intake unreadable: {str(exc)[:80]}"
+    if row is None:
+        return None
+    if not (row[0] or "").strip():
+        # The request exists but its result is not assembled yet. That is "no verdict yet", not an
+        # ambiguity: quarantining it would hold and alert on every review still in flight, and the
+        # hold would outlive the payload arriving because holds do not release on their own.
+        return None
+    try:
+        payload = json.loads(row[0])
+    except ValueError:
+        return QUARANTINE, "intake result is not JSON"
+    if not isinstance(payload, dict):
+        return QUARANTINE, f"intake result is {type(payload).__name__}, not an object"
+    derived = payload.get("derived")
+    presentation = derived.get("presentation") if isinstance(derived, dict) else None
+    if not presentation:
+        # `derived` is filled in a later step than the row itself, so a payload that is present
+        # but carries no presentation is still mid-assembly -- the same "no verdict yet" as an
+        # empty payload, one step further in. Only a non-empty value the vocabulary does not know
+        # is an ambiguity worth holding for; holding this one would freeze a review that is about
+        # to state a perfectly ordinary verdict, and the hold outlives its arrival.
+        return None
+
+    def _count(key: str) -> int:
+        value = payload.get(key)
+        return len(value) if isinstance(value, list) else 0
+
+    # Only plain INCOMPLETE with nothing to report: INCOMPLETE_WITH_FINDINGS reached findings worth
+    # a human's eyes, and a review that recorded a blocker or a red gate before it was cut short
+    # still holds -- a superseded head is not evidence that the blocker was fixed, and dropping it
+    # is the one direction this watchdog never moves.
+    if (presentation == "INCOMPLETE" and incomplete_is_moot(payload)
+            and not _count("blocking_issues") and not _count("blocking_gate_conditions")):
+        return None
+    if presentation in INTAKE_HELD:
+        return QUARANTINE, f"intake {presentation}"
+    if presentation in INTAKE_BLOCKED or _count("blocking_issues"):
+        return STATE_BLOCKED, f"intake {presentation}"
+    if presentation in INTAKE_NOTES:
+        return STATE_NOTES, f"intake {presentation}"
+    if presentation not in INTAKE_APPROVED:
+        return QUARANTINE, f"intake presentation {presentation!r} not recognised"
+    if any(_count(key) for key in INTAKE_COMMENTARY):
+        return STATE_NOTES, f"intake {presentation} with commentary"
+    return STATE_APPROVED, f"intake {presentation}"
+
+
 def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
     """The newest reviewer run decides the lane, and only it may say ✅.
 
@@ -1056,7 +1192,7 @@ def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
     )
     unclassified: list[str] = []
     for run_row in ordered:
-        if "profile" in run_row and run_row.get("profile") not in (None, "reviewer"):
+        if "profile" in run_row and run_row.get("profile") not in REVIEWER_PROFILES:
             continue
         status, emoji, why = classify_run_status(run_row)
         if status == "quarantine":
@@ -1070,21 +1206,7 @@ def classify_task(show: dict[str, Any]) -> tuple[str | None, str]:
                 f"run(s) {','.join(unclassified[:3])}"
             )
         return emoji, f"run={run_row.get('id')} {why}"
-    return None, "no classifiable reviewer run metadata"
-
-
-def _jev_shadow(task_id: str, show: dict[str, Any], lane_state: str | None, why: str) -> None:
-    """Shadow-log a Jev judgment of the newest reviewer run; JEV_SHADOW=1 only, never decides."""
-    if os.environ.get("JEV_SHADOW") != "1":
-        return
-    try:
-        import jev_judge
-
-        runs = [r for r in (show.get("runs") or []) if isinstance(r, dict)
-                and r.get("profile") in (None, "reviewer")]
-        jev_judge.shadow(task_id, max(runs, key=_run_epoch, default=None), lane_state, why)
-    except Exception:
-        pass
+    return intake_verdict(show_task_id(show)) or (None, "no classifiable reviewer run metadata")
 
 
 def lane_status_kind(status: Any) -> str:
@@ -1351,6 +1473,11 @@ def _reconcile_converged(
 
 
 # --- state ---------------------------------------------------------------
+
+
+def source_gone(record: object) -> bool:
+    """True once the Slack message behind a post is known deleted; the post is then inert."""
+    return isinstance(record, dict) and bool(record.get("gone_at"))
 
 
 def record_state(record: object) -> str | None:
@@ -1822,7 +1949,7 @@ def process_tick(
             and _epoch(row.get("created_at")) >= lifecycle_watermark
         ):
             continue
-        if row.get("assignee") != "reviewer":
+        if row.get("assignee") not in REVIEWER_IDENTITIES:
             continue
         kind = lane_status_kind(row.get("status"))
         if kind == "inert":
@@ -1908,7 +2035,6 @@ def process_tick(
         attempts.pop(task_id, None)
         seen[task_id] = row_epoch(row)
         lane_state, why = classify_task(show)
-        _jev_shadow(task_id, show, lane_state, why)
         # Metadata/comment provenance also counts for lanes we already fetched
         # (legacy reach), unioned with the body links that queued the lane.
         show_links = links + [
@@ -1955,10 +2081,14 @@ def process_tick(
             | set(resolved.get(permalink) or ())
         )
 
+    # A gone post is dropped here rather than where posts are re-added, because `candidates`
+    # is also seeded from this tick's fresh lanes: the lane that cites a deleted message keeps
+    # producing signal, and filtering only the re-add path lets it back in every tick.
     selected_candidates = {
         permalink
         for permalink in candidates
-        if is_selected_permalink(
+        if not source_gone(posts.get(permalink))
+        and is_selected_permalink(
             permalink, extra_task_ids=discovered_task_ids(permalink)
         )
     }
@@ -2127,6 +2257,20 @@ def process_tick(
             owned_reactions(permalink),
         )
         metrics["reaction_calls"] += int(result.get("calls") or 0)
+        if not result.get("ok") and "message_not_found" in str(result.get("error")):
+            # A deleted message can never be reacted to, but `last_error` alone keeps the post a
+            # candidate, so it retries at the backoff ceiling for ever and pins the error count
+            # above zero -- which is where a real failure would otherwise have been visible.
+            state["failures"].pop(failure_key, None)
+            posts[permalink] = {**(record or {}), "gone_at": now,
+                                "lanes": persisted_lanes, "pending_removals": []}
+            posts[permalink].pop("last_error", None)
+            posts[permalink].pop("want", None)
+            outputs.append(
+                f"JUST_DO_IT_REVIEW_REACTIONS source_gone source={permalink} "
+                f"(message deleted; no longer retried)")
+            continue
+
         if not result.get("ok"):
             _note_attempt(state["failures"], failure_key, now)
             # Persist the retained state plus the unmet intent, so the post stays a
