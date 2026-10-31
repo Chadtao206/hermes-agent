@@ -5,7 +5,7 @@ GHX_RO = Path(__file__).with_name("fixtures") / "ghx_ro.sh"
 TOKEN_FIXTURE = GHX_RO.with_name("gh_token")
 
 
-def run(args, scope="Ylopo/repo#1", head="a" * 40):
+def run(args, scope="Ylopo/repo#1", head="a" * 40, submodule=None):
     env = {
         "PATH": "/usr/bin:/bin",
         "BORIS_PR_SCOPE": scope,
@@ -14,6 +14,8 @@ def run(args, scope="Ylopo/repo#1", head="a" * 40):
     }
     if head is not None:
         env["BORIS_PR_HEAD_SHA"] = head
+    if submodule is not None:
+        env["BORIS_PR_SUBMODULE"] = submodule
     return subprocess.run(
         [str(GHX_RO), *args], capture_output=True, text=True,
         env=env, check=False,
@@ -137,3 +139,23 @@ def test_changed_file_inventory_accepts_only_pagination_query_parameters():
     for query in ("ref=deadbeef", "per_page=50&evil=1", "page=1;rm", "per_page=abc", ""):
         result = run(["api", f"/repos/Ylopo/repo/pulls/1/files?{query}"])
         assert result.returncode == 3, query
+
+
+def test_submodule_contents_are_readable_only_at_the_pinned_revision():
+    pin = "Ylopo/core@" + "c" * 40
+    good = "/repos/Ylopo/core/contents/src/plugin.py?ref=" + "c" * 40
+    root = "/repos/Ylopo/core/contents/?ref=" + "c" * 40
+    assert run(["api", good], submodule=pin).returncode == 0
+    assert run(["api", root], submodule=pin).returncode == 0
+    assert run(["api", good]).returncode == 3
+    assert run(["api", good], submodule="Ylopo/core@" + "d" * 40).returncode == 3
+    assert run(["api", good], submodule="Ylopo/core@main").returncode == 3
+
+
+def test_submodule_pin_never_widens_scope_beyond_contents_or_the_owner():
+    pin = "Ylopo/core@" + "c" * 40
+    assert run(["api", "/repos/Ylopo/core/pulls/1/files"], submodule=pin).returncode == 3
+    assert run(["api", "/repos/Ylopo/core/issues/1"], submodule=pin).returncode == 3
+    foreign = "Other/core@" + "c" * 40
+    assert run(["api", "/repos/Other/core/contents/a.py?ref=" + "c" * 40], submodule=foreign).returncode == 3
+    assert run(["api", "/repos/Ylopo/repo/contents/a.py?ref=" + "c" * 40], submodule=pin).returncode == 3

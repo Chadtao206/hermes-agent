@@ -78,7 +78,11 @@ files directly before claiming the diff was unavailable. Unavailable acceptance
 evidence never qualifies either: an unauthorized `read_acceptance_evidence`
 reference limits contract-conformance judgment, not assessment of the changed
 behavior. Record the gap, state the limit, and assess the changed code on its
-own terms.
+own terms. A submodule pin is reviewable: `file_at_head` follows the gitlink
+into the pinned revision, so read the pinned source before claiming it was
+unavailable. A pin `file_at_head` refuses (outside the organization) is a
+`verification_limits` entry for the pinned code; it prevents core assessment
+only when the parent's own changes cannot be assessed without it.
 Do not add a duplicate verification finding when a concrete defect is already
 substantiated.
 

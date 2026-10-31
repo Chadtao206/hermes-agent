@@ -97,6 +97,10 @@ _LIST_BUDGET = 12_000
 # GitHub's contents API withholds `content` above 1 MiB (encoding "none").
 _CONTENTS_LIMIT = 1_048_576
 _NOT_FOUND = re.compile(r"HTTP 404|Not Found")
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SUBMODULE_URL = re.compile(
+    r"^(?:git@github\.com:|https://github\.com/)([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
 _METADATA_FIELDS = "headRefOid,title,body,author,state,baseRefName,headRefName"
 _PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 # GitHub refuses to render a pull request diff once it grows past roughly 20k
@@ -335,22 +339,26 @@ def _github(
     *,
     expect_json: bool,
     allowed_codes: tuple[int, ...] = (0,),
+    submodule: tuple[str, str] | None = None,
 ):
     runner = GITHUB_RUNNER
     if runner is None:
         raise ToolError("GitHub adapter is not configured")
+    env = {
+        "PATH": _PATH,
+        "BORIS_PR_SCOPE": request.slug,
+        "BORIS_PR_HEAD_SHA": request.head_sha,
+        "BORIS_GH_TOKEN_PATH": _token_path(),
+    }
+    if submodule is not None:
+        env["BORIS_PR_SUBMODULE"] = f"{submodule[0]}@{submodule[1]}"
     try:
         proc = runner(
             [GHX_RO, *args],
             capture_output=True,
             text=True,
             timeout=30,
-            env={
-                "PATH": _PATH,
-                "BORIS_PR_SCOPE": request.slug,
-                "BORIS_PR_HEAD_SHA": request.head_sha,
-                "BORIS_GH_TOKEN_PATH": _token_path(),
-            },
+            env=env,
         )
     except ToolError:
         raise
@@ -801,25 +809,88 @@ def paginate_text(text: str, page: int, budget: int) -> dict:
     }
 
 
+def _contents(request: LifecycleRequest, path: str, pin: tuple[str, str] | None = None):
+    """Contents-API object for one path: at the pinned head of the bound repository,
+    or at the pinned revision of a submodule the head carries."""
+    repository, ref = pin if pin is not None else (f"{request.owner}/{request.repo}", request.head_sha)
+    owner, repo = repository.split("/", 1)
+    route = (
+        f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        f"/contents/{quote(path, safe='/')}?ref={ref}"
+    )
+    return _github(request, ["api", route], expect_json=True, submodule=pin)
+
+
+def _submodule_pin(request: LifecycleRequest, gitlink: str, data: dict) -> tuple[str, str]:
+    """Repository and revision a gitlink pins. The wrapper only admits the pull
+    request owner's repositories, so a foreign pin is refused here with a reason the
+    reviewer can record."""
+    match = _SUBMODULE_URL.match(str(data.get("submodule_git_url") or ""))
+    sha = str(data.get("sha") or "")
+    if match is None or not _FULL_SHA.fullmatch(sha):
+        raise ToolError(
+            f"{gitlink} is a submodule whose pinned repository cannot be resolved, "
+            "so it is not readable here"
+        )
+    owner, repo = match.groups()
+    if owner.lower() != request.owner.lower():
+        raise ToolError(
+            f"{gitlink} is a submodule of {owner}/{repo}, outside the {request.owner} "
+            "organization; its pinned source cannot be read here"
+        )
+    return f"{owner}/{repo}", sha
+
+
+def _enclosing_submodule(request: LifecycleRequest, file_path: str) -> tuple[tuple[str, str] | None, str]:
+    """Nearest existing ancestor of a missing path: a gitlink yields its pin and the
+    path below it, any other ancestor means the path is simply absent."""
+    parts = PurePosixPath(file_path).parts
+    for depth in range(len(parts) - 1, 0, -1):
+        gitlink = "/".join(parts[:depth])
+        try:
+            data = _contents(request, gitlink)
+        except GitHubCommandError as error:
+            if _NOT_FOUND.search(error.stderr):
+                continue
+            raise
+        if isinstance(data, dict) and data.get("type") == "submodule":
+            return _submodule_pin(request, gitlink, data), "/".join(parts[depth:])
+        break
+    return None, ""
+
+
 def _file_evidence(request: LifecycleRequest, file_path: str, page: int) -> dict:
     """One repository path at the pinned head: decoded text pages for a file, a
-    bounded listing for a directory. The raw contents-API object (base64 blob,
-    API links) never reaches the model."""
-    route = (
-        f"/repos/{quote(request.owner, safe='')}/{quote(request.repo, safe='')}"
-        f"/contents/{quote(file_path, safe='/')}?ref={request.head_sha}"
-    )
+    bounded listing for a directory. A gitlink, or a path below one, is served from
+    the submodule at the revision the head pins. The raw contents-API object
+    (base64 blob, API links) never reaches the model."""
+    pin = None
     try:
-        data = _github(request, ["api", route], expect_json=True)
+        data = _contents(request, file_path)
     except GitHubCommandError as error:
-        if _NOT_FOUND.search(error.stderr):
+        if not _NOT_FOUND.search(error.stderr):
+            raise
+        pin, below = _enclosing_submodule(request, file_path)
+        if pin is None:
             reason = " ".join(error.stderr.split())[:_STDERR_EXCERPT]
             raise ToolError(
                 f"{file_path} does not exist at the pinned head; take paths from "
                 "pr_diff all_files (minus files the diff deletes) or list the "
                 f"directory with file_at_head ({reason})"
             ) from error
-        raise
+        try:
+            data = _contents(request, below, pin)
+        except GitHubCommandError as inner:
+            if _NOT_FOUND.search(inner.stderr):
+                raise ToolError(
+                    f"{file_path} does not exist in submodule {pin[0]} at its pinned "
+                    f"revision {pin[1][:7]}; list the gitlink path with file_at_head"
+                ) from inner
+            raise
+    if isinstance(data, dict) and data.get("type") == "submodule":
+        pin = _submodule_pin(request, file_path, data)
+        data = _contents(request, "", pin)
+    pinned = {"submodule": {"repository": pin[0], "pinned_sha": pin[1]}} if pin else {}
     if isinstance(data, list):
         if page != 1:
             raise ToolError("a directory listing has a single page")
@@ -845,6 +916,7 @@ def _file_evidence(request: LifecycleRequest, file_path: str, page: int) -> dict
         return {
             "path": file_path,
             "type": "dir",
+            **pinned,
             "entries": entries,
             "total_entries": len(data),
             "truncated": len(entries) < len(data),
@@ -868,7 +940,7 @@ def _file_evidence(request: LifecycleRequest, file_path: str, page: int) -> dict
         raw = base64.b64decode(raw_content)
     except (ValueError, binascii.Error) as error:
         raise ToolError("GitHub contents response is not valid base64") from error
-    head = {"path": file_path, "sha": data.get("sha"), "size": size}
+    head = {"path": file_path, "sha": data.get("sha"), "size": size, **pinned}
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -1039,7 +1111,9 @@ _GITHUB_TOOL_DESCRIPTION = (
     "text, paged by whole lines with line_range, or a bounded directory listing "
     "when the path is a directory; the path must exist at head, so take it from "
     "pr_diff all_files (minus files the diff deletes), from a directory listing, or "
-    "from an import you have read."
+    "from an import you have read. A submodule gitlink, or any path below it, is "
+    "served from that submodule at the revision the head pins (same organization "
+    "only); the result names the submodule repository and pinned_sha."
 )
 _ACCEPTANCE_TOOL_DESCRIPTION = (
     "Return the pre-fetched ticket this pull request claims to implement, as "

@@ -23,7 +23,7 @@ _scope_num="${_scope##*#}"
 # Reject write/blocking flags wherever they appear in argv.
 for a in "$@"; do
   case "$a" in
-    --approve|--request-changes|--admin|--merge|--squash|--rebase|--delete-branch|--hostname)
+    --approve|--request-changes|--admin|--merge|--squash|--rebase|--delete-branch|--hostname|--hostname=*)
       refuse "flag $a" ;;
     -X*|--method=*|-f|--field|--field=*|-F|--raw-field|--raw-field=*|--input|--input=*)
       refuse "request-writing flag $a" ;;
@@ -33,9 +33,18 @@ done
 verb="${1:-}"; sub="${2:-}"
 
 require_pr_scope() {
-  local _r="" _n="" _prev="" a
+  local _r="" _n="" _prev="" _candidate="" _provided="" a
   for a in "$@"; do
-    case "$_prev" in -R|--repo) _r="$a" ;; esac
+    _candidate=""; _provided=""
+    case "$_prev" in -R|--repo) _candidate="$a"; _provided=1 ;; esac
+    case "$a" in
+      --repo=*) _candidate="${a#--repo=}"; _provided=1 ;;
+      -R?*) _candidate="${a#-R}"; _provided=1 ;;
+    esac
+    if [ -n "$_provided" ]; then
+      [ "$_candidate" = "$_scope_repo" ] || refuse "out of scope repo '$_candidate' (scope $_scope)"
+      _r="$_candidate"
+    fi
     case "$a" in [0-9]*) [ -z "$_n" ] && _n="$a" ;; esac
     _prev="$a"
   done
@@ -71,13 +80,34 @@ case "$verb" in
     _files_route="/repos/${_scope_repo}/pulls/${_scope_num}/files"
     _pagination='^(per_page=[0-9]{1,3}|page=[0-9]{1,4})(&(per_page=[0-9]{1,3}|page=[0-9]{1,4}))*$'
     case "$_api_path" in
-      "/repos/${_scope_repo}/contents/"*"?ref=${_head}") ;;
+      "/repos/${_scope_repo}/contents/"*\?*)
+        _query="${_api_path#*\?}"
+        [ "$_query" = "ref=${_head}" ] || refuse "contents query must contain only the pinned ref" ;;
       "$_files_route") ;;
       "$_files_route"\?*)
         _query="${_api_path#*\?}"
         [[ "$_query" =~ $_pagination ]] ||
           refuse "api query is not an allowed pagination parameter" ;;
-      *) refuse "api path is outside the pinned repository head" ;;
+      *)
+        # A gitlink the pinned head carries is readable at exactly the revision it
+        # pins, within the same owner. review_tools_mcp sets BORIS_PR_SUBMODULE from
+        # the gitlink object it read at head; the model never supplies it.
+        _sub="${BORIS_PR_SUBMODULE:-}"
+        [ -n "$_sub" ] || refuse "api path is outside the pinned repository head"
+        _sub_repo="${_sub%%@*}"; _sub_sha="${_sub##*@}"
+        [[ "$_sub_sha" =~ ^[0-9a-f]{40}$ ]] || refuse "BORIS_PR_SUBMODULE revision is invalid"
+        case "$_sub_repo" in
+          */*/*|*/|/*|"") refuse "BORIS_PR_SUBMODULE repository is invalid" ;;
+        esac
+        [ "${_sub_repo%%/*}" = "${_scope_repo%%/*}" ] ||
+          refuse "submodule '$_sub_repo' is outside the owner of scope $_scope"
+        case "$_api_path" in
+          "/repos/${_sub_repo}/contents/"*\?*)
+            _query="${_api_path#*\?}"
+            [ "$_query" = "ref=${_sub_sha}" ] ||
+              refuse "submodule contents query must contain only the pinned revision" ;;
+          *) refuse "api path is outside the pinned repository head and its submodule" ;;
+        esac ;;
     esac ;;
   *) refuse "verb '$verb'" ;;
 esac

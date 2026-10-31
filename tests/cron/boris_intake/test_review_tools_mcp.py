@@ -865,6 +865,113 @@ def test_file_evidence_names_a_missing_path_plainly(tmp_path, monkeypatch):
         module.read_github_evidence("file_at_head", "src/missing.py")
 
 
+_PIN = "c" * 40
+_GITLINK = {
+    "type": "submodule",
+    "path": "vendor/core",
+    "sha": _PIN,
+    "size": 0,
+    "submodule_git_url": "git@github.com:Ylopo/core.git",
+}
+_NOT_FOUND_PROC = SimpleNamespace(
+    returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)\n{\"message\":\"Not Found\"}"
+)
+
+
+def _submodule_runner(routes):
+    """Answer the contents API from a route→payload table; anything else is 404."""
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if "view" in command and "headRefOid" in command[-1]:
+            payload = {"headRefOid": "a" * 40, "title": "Example", "comments": []}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        payload = routes.get(command[-1])
+        if payload is None:
+            return _NOT_FOUND_PROC
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    return run, calls
+
+
+def test_file_evidence_lists_a_gitlink_from_the_submodule_at_its_pinned_revision(
+    tmp_path, monkeypatch
+):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    listing = [{"name": "plugin.py", "type": "file", "size": 12, "sha": "1" * 40}]
+    run, calls = _submodule_runner({
+        "/repos/Ylopo/example/contents/vendor/core?ref=" + "a" * 40: _GITLINK,
+        "/repos/Ylopo/core/contents/?ref=" + _PIN: listing,
+    })
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    data = module.read_github_evidence("file_at_head", "vendor/core")["data"]
+
+    assert data["type"] == "dir"
+    assert data["submodule"] == {"repository": "Ylopo/core", "pinned_sha": _PIN}
+    assert data["entries"] == [{"name": "plugin.py", "type": "file", "size": 12}]
+    submodule_call = calls[-1]
+    assert submodule_call[0][-1] == "/repos/Ylopo/core/contents/?ref=" + _PIN
+    assert submodule_call[1]["env"]["BORIS_PR_SUBMODULE"] == "Ylopo/core@" + _PIN
+    assert submodule_call[1]["env"]["BORIS_PR_SCOPE"] == "Ylopo/example#42"
+
+
+def test_file_evidence_reads_a_path_below_a_gitlink_from_the_submodule(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    source = {
+        "type": "file",
+        "path": "src/plugin.py",
+        "sha": "2" * 40,
+        "size": 12,
+        "content": "cHJpbnQoImhpIikK\n",
+        "encoding": "base64",
+    }
+    run, calls = _submodule_runner({
+        "/repos/Ylopo/example/contents/vendor/core?ref=" + "a" * 40: _GITLINK,
+        "/repos/Ylopo/core/contents/src/plugin.py?ref=" + _PIN: source,
+    })
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    data = module.read_github_evidence("file_at_head", "vendor/core/src/plugin.py")["data"]
+
+    assert data["content"] == 'print("hi")\n'
+    assert data["submodule"] == {"repository": "Ylopo/core", "pinned_sha": _PIN}
+    routes = [call[0][-1] for call in calls if call[0][1] == "api"]
+    assert routes == [
+        "/repos/Ylopo/example/contents/vendor/core/src/plugin.py?ref=" + "a" * 40,
+        "/repos/Ylopo/example/contents/vendor/core/src?ref=" + "a" * 40,
+        "/repos/Ylopo/example/contents/vendor/core?ref=" + "a" * 40,
+        "/repos/Ylopo/core/contents/src/plugin.py?ref=" + _PIN,
+    ]
+    pinned_calls = [call for call in calls if "BORIS_PR_SUBMODULE" in call[1].get("env", {})]
+    assert [call[0][-1] for call in pinned_calls] == routes[-1:]
+
+
+def test_file_evidence_names_a_path_missing_inside_the_submodule(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    run, _ = _submodule_runner({
+        "/repos/Ylopo/example/contents/vendor/core?ref=" + "a" * 40: _GITLINK,
+    })
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    with pytest.raises(module.ToolError, match=r"not exist in submodule Ylopo/core at its pinned"):
+        module.read_github_evidence("file_at_head", "vendor/core/src/gone.py")
+
+
+def test_file_evidence_refuses_a_gitlink_outside_the_pull_request_owner(tmp_path, monkeypatch):
+    module, _, _ = bind_request(tmp_path, monkeypatch)
+    foreign = {**_GITLINK, "submodule_git_url": "https://github.com/Other/core"}
+    run, calls = _submodule_runner({
+        "/repos/Ylopo/example/contents/vendor/core?ref=" + "a" * 40: foreign,
+    })
+    monkeypatch.setattr(module, "GITHUB_RUNNER", run)
+
+    with pytest.raises(module.ToolError, match=r"outside the Ylopo organization"):
+        module.read_github_evidence("file_at_head", "vendor/core/src/plugin.py")
+    assert not any("BORIS_PR_SUBMODULE" in call[1].get("env", {}) for call in calls)
+
+
 def test_file_evidence_reports_content_github_withholds(tmp_path, monkeypatch):
     module, _, _ = bind_request(tmp_path, monkeypatch)
     runner, _calls = _contents_runner(content="", encoding="none", size=3_000_000, path="big.bin")
