@@ -604,3 +604,38 @@ def test_acceptance_references_lists_authorized_references_in_order(tmp_path):
 
     assert s.acceptance_references(request.request_id) == ("LAB-3", "PLAT-20")
     assert s.acceptance_references(other.request_id) == ("MID-1",)
+
+
+@pytest.mark.parametrize("advance", ("checkpoint", "transition"))
+def test_a_request_can_reach_the_gate_state_another_request_for_its_head_holds(
+    tmp_path, advance
+):
+    s = Store(tmp_path / "s.db")
+    s.admit_event(event("1.0"), (command(ts="1.0"),), (snapshot(),), 1_000_000.0)
+    second = s.admit_event(
+        event("2.0"),
+        (command(ts="2.0"),),
+        (snapshot("sha256:gate-b"),),
+        1_000_001.0,
+    ).admitted[0]
+
+    state = models.WorkflowState.ADMITTED
+    if advance == "checkpoint":
+        moved = s.checkpoint(second.request_id, state, gate_snapshot_json=snapshot())
+    else:
+        moved = s.transition(
+            second.request_id,
+            state,
+            models.WorkflowState.STATUS_MESSAGE_PENDING,
+            gate_snapshot_json=snapshot(),
+        )
+
+    assert moved is True
+    settled = s.get_request(second.request_id)
+    assert settled.gate_snapshot.fingerprint == "sha256:gate-a"
+    # The head is still known at both gate states, so neither repost starts a review.
+    for ts, gate in (("3.0", "sha256:gate-a"), ("4.0", "sha256:gate-b")):
+        repost = s.admit_event(
+            event(ts), (command(ts=ts),), (snapshot(gate),), 1_000_002.0
+        )
+        assert repost.admitted == ()

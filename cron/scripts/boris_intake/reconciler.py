@@ -7,7 +7,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Callable, Protocol
@@ -74,6 +74,9 @@ REVIEW_WAIT_SECONDS = 90 * 60
 # long one request can wait through a quota wall before failing honestly.
 QUOTA_HOLD_MAX_SECONDS = 24 * 60 * 60
 REVIEW_POLL_SECONDS = 15
+# Each restart is a full reviewer run, so an author who keeps pushing gets a
+# bounded number of them before the thread is asked to repost.
+MAX_HEAD_RESTARTS = 3
 RETRY_BASE_SECONDS = 5
 RETRY_MAX_SECONDS = 5 * 60
 LOOP_SECONDS = 5
@@ -362,15 +365,51 @@ def _transition_system_incomplete(
     )
 
 
-def _head_failure(request: LifecycleRequest, current: PRInfo | None) -> SystemFailure:
+def _follow_head(
+    store: Store, request: LifecycleRequest, current: PRInfo, deps: ReconcilerDeps
+) -> bool:
+    snapshot = deps.github.capture_gate_snapshot(
+        replace(request, head_sha=current.head_sha), _timestamp(deps.now())
+    )
+    if snapshot is None:
+        raise RuntimeError("could not capture the Gate Snapshot of the superseding head")
+    # Intake waives CI for a head that has no checks at all; only a waiver the
+    # requester asked for (one given while checks existed) carries to a new head.
+    requested_waiver = request.policy.ignore_ci and bool(request.gate_snapshot.checks)
+    policy = replace(
+        request.policy, ignore_ci=requested_waiver or not snapshot.checks
+    )
+    successor = store.follow_head(
+        request, current.head_sha, policy, snapshot, deps.now(), MAX_HEAD_RESTARTS
+    )
+    return successor is not None
+
+
+def _head_failure(
+    store: Store,
+    request: LifecycleRequest,
+    current: PRInfo | None,
+    deps: ReconcilerDeps,
+) -> SystemFailure:
+    """Why a request can no longer finish at its head. A head that merely moved
+    on an open pull request is followed first, so the failure can say whether a
+    repost is still needed."""
     if current is not None and current.head_sha != request.head_sha:
+        followed = current.state == "OPEN" and _follow_head(
+            store, request, current, deps
+        )
         return SystemFailure(
             "HEAD_SUPERSEDED",
             (
                 f"The requested head {request.head_sha} was superseded by "
                 f"{current.head_sha} before this review could finish."
             ),
-            "Repost the PR link to review the current head.",
+            (
+                "Already under way: the review restarted automatically on "
+                f"{current.head_sha[:7]}, no repost needed."
+                if followed
+                else "Repost the PR link to review the current head."
+            ),
         )
     if current is not None and current.state != "OPEN":
         return SystemFailure(
@@ -462,7 +501,7 @@ def _reconcile_starting(
             request,
             WorkflowState.STARTING_REVIEW,
             request.gate_snapshot,
-            _head_failure(request, current),
+            _head_failure(store, request, current, deps),
             deps,
         )
         return
@@ -596,6 +635,21 @@ def _reconcile_reviewing(
                 )
             _finish_reviewing(store, request, failure, deps, status)
             return
+        # The evidence tools refuse a moved head, so the lane cannot finish this
+        # review; waiting for it to say so only delays the restart. After the
+        # deadline check, so a GitHub problem can never keep a request from
+        # finishing.
+        current = deps.github.current_pr(request)
+        if (
+            current is not None
+            and current.state == "OPEN"
+            and current.head_sha != request.head_sha
+        ):
+            _finish_reviewing(
+                store, request, _head_failure(store, request, current, deps),
+                deps, status,
+            )
+            return
         if held_at is not None:
             # After the deadline check, so a Slack problem can never keep a request
             # from finishing; tells the thread not to repost.
@@ -633,7 +687,7 @@ def _reconcile_reviewing(
             request,
             WorkflowState.REVIEWING,
             request.gate_snapshot,
-            _head_failure(request, current),
+            _head_failure(store, request, current, deps),
             deps,
         )
         return
@@ -686,7 +740,7 @@ def _reconcile_gate_wait(
             request,
             WorkflowState.GATE_WAIT_PENDING,
             request.gate_snapshot,
-            _head_failure(request, current),
+            _head_failure(store, request, current, deps),
             deps,
         )
         return
@@ -757,7 +811,7 @@ def _reconcile_publication(
                 request,
                 WorkflowState.PUBLICATION_PENDING,
                 request.gate_snapshot,
-                _head_failure(request, current),
+                _head_failure(store, request, current, deps),
                 deps,
             )
             return

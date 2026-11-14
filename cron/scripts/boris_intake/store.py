@@ -462,6 +462,108 @@ class Store:
     def requests_for_event(self, channel: str, ts: str) -> tuple[LifecycleRequest, ...]:
         return self._requests_for_link(channel, ts, "admitted")
 
+    def _admit_command(
+        self,
+        command: ReviewCommand,
+        snapshot: GateSnapshot,
+        now: float,
+        unlocked_by: dict[str, str],
+    ) -> tuple[LifecycleRequest, str]:
+        """Insert one request inside the caller's transaction, or return the
+        live request that already holds its identity as a duplicate."""
+        existing = self._db.execute(
+            "SELECT * FROM review_requests "
+            "WHERE review_identity=? AND gate_fingerprint=?",
+            (command.idempotency_key, snapshot.fingerprint),
+        ).fetchone()
+        if (
+            existing
+            and existing["workflow_state"]
+            in (
+                WorkflowState.COMPLETE.value,
+                WorkflowState.SLACK_UNAVAILABLE.value,
+            )
+            and existing["semantic_outcome"]
+            == SemanticOutcome.REVIEW_INCOMPLETE.value
+            and existing["github_review_id"] is None
+            and existing["github_review_url"] is None
+        ):
+            self._db.execute(
+                "UPDATE review_requests SET review_identity=? "
+                "WHERE request_id=?",
+                (
+                    f'{existing["review_identity"]}:retired='
+                    f'{existing["request_id"]}',
+                    existing["request_id"],
+                ),
+            )
+            self._db.execute(
+                "INSERT INTO request_events "
+                "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                (
+                    existing["request_id"],
+                    "retry_unlocked",
+                    json.dumps(unlocked_by, separators=(",", ":"), sort_keys=True),
+                    now,
+                ),
+            )
+            existing = None
+        if existing:
+            return self._request_from_row(existing), "duplicate"
+        else:
+            request_id = f"br_{uuid.uuid4().hex}"
+            values = {
+                "request_id": request_id,
+                "review_identity": command.idempotency_key,
+                "gate_fingerprint": snapshot.fingerprint,
+                "owner": command.owner,
+                "repo": command.repo,
+                "pr_number": command.pr_number,
+                "head_sha": command.head_sha,
+                "pr_author": command.pr_author,
+                "policy_json": command.policy.canonical_json(),
+                "policy_fingerprint": command.policy.fingerprint(),
+                "gate_snapshot_json": snapshot.canonical_json(),
+                "requester_user_id": command.requester_user_id,
+                "requester_email": command.requester_email,
+                "source_channel": command.channel_id,
+                "source_message_ts": command.message_ts,
+                "root_thread_ts": command.root_thread_ts,
+                "permalink": command.permalink,
+                "workflow_state": WorkflowState.ADMITTED.value,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._db.execute(
+                """
+                INSERT INTO review_requests (
+                    request_id, review_identity, gate_fingerprint,
+                    owner, repo, pr_number, head_sha, pr_author,
+                    policy_json, policy_fingerprint, gate_snapshot_json,
+                    requester_user_id, requester_email, source_channel,
+                    source_message_ts, root_thread_ts, permalink,
+                    workflow_state, created_at, updated_at
+                ) VALUES (
+                    :request_id, :review_identity, :gate_fingerprint,
+                    :owner, :repo, :pr_number, :head_sha, :pr_author,
+                    :policy_json, :policy_fingerprint, :gate_snapshot_json,
+                    :requester_user_id, :requester_email, :source_channel,
+                    :source_message_ts, :root_thread_ts, :permalink,
+                    :workflow_state, :created_at, :updated_at
+                )
+                """,
+                values,
+            )
+            self._db.execute(
+                "INSERT INTO request_events "
+                "(request_id, kind, to_state, at) VALUES (?,?,?,?)",
+                (request_id, "admitted", WorkflowState.ADMITTED.value, now),
+            )
+            request = self.get_request(request_id)
+            if request is None:
+                raise RuntimeError("admitted request could not be reloaded")
+            return request, "admitted"
+
     def admit_event(
         self,
         event: NormalizedEvent,
@@ -495,105 +597,11 @@ class Store:
             admitted: list[LifecycleRequest] = []
             duplicates: list[LifecycleRequest] = []
             for ordinal, (command, snapshot) in enumerate(zip(commands, gate_snapshots)):
-                existing = self._db.execute(
-                    "SELECT * FROM review_requests "
-                    "WHERE review_identity=? AND gate_fingerprint=?",
-                    (command.idempotency_key, snapshot.fingerprint),
-                ).fetchone()
-                if (
-                    existing
-                    and existing["workflow_state"]
-                    in (
-                        WorkflowState.COMPLETE.value,
-                        WorkflowState.SLACK_UNAVAILABLE.value,
-                    )
-                    and existing["semantic_outcome"]
-                    == SemanticOutcome.REVIEW_INCOMPLETE.value
-                    and existing["github_review_id"] is None
-                    and existing["github_review_url"] is None
-                ):
-                    self._db.execute(
-                        "UPDATE review_requests SET review_identity=? "
-                        "WHERE request_id=?",
-                        (
-                            f'{existing["review_identity"]}:retired='
-                            f'{existing["request_id"]}',
-                            existing["request_id"],
-                        ),
-                    )
-                    self._db.execute(
-                        "INSERT INTO request_events "
-                        "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
-                        (
-                            existing["request_id"],
-                            "retry_unlocked",
-                            json.dumps(
-                                {"channel": event.channel_id, "ts": event.ts},
-                                separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                            now,
-                        ),
-                    )
-                    existing = None
-                if existing:
-                    request = self._request_from_row(existing)
-                    duplicates.append(request)
-                    disposition = "duplicate"
-                else:
-                    request_id = f"br_{uuid.uuid4().hex}"
-                    values = {
-                        "request_id": request_id,
-                        "review_identity": command.idempotency_key,
-                        "gate_fingerprint": snapshot.fingerprint,
-                        "owner": command.owner,
-                        "repo": command.repo,
-                        "pr_number": command.pr_number,
-                        "head_sha": command.head_sha,
-                        "pr_author": command.pr_author,
-                        "policy_json": command.policy.canonical_json(),
-                        "policy_fingerprint": command.policy.fingerprint(),
-                        "gate_snapshot_json": snapshot.canonical_json(),
-                        "requester_user_id": command.requester_user_id,
-                        "requester_email": command.requester_email,
-                        "source_channel": command.channel_id,
-                        "source_message_ts": command.message_ts,
-                        "root_thread_ts": command.root_thread_ts,
-                        "permalink": command.permalink,
-                        "workflow_state": WorkflowState.ADMITTED.value,
-                        "created_at": now,
-                        "updated_at": now,
-                    }
-                    self._db.execute(
-                        """
-                        INSERT INTO review_requests (
-                            request_id, review_identity, gate_fingerprint,
-                            owner, repo, pr_number, head_sha, pr_author,
-                            policy_json, policy_fingerprint, gate_snapshot_json,
-                            requester_user_id, requester_email, source_channel,
-                            source_message_ts, root_thread_ts, permalink,
-                            workflow_state, created_at, updated_at
-                        ) VALUES (
-                            :request_id, :review_identity, :gate_fingerprint,
-                            :owner, :repo, :pr_number, :head_sha, :pr_author,
-                            :policy_json, :policy_fingerprint, :gate_snapshot_json,
-                            :requester_user_id, :requester_email, :source_channel,
-                            :source_message_ts, :root_thread_ts, :permalink,
-                            :workflow_state, :created_at, :updated_at
-                        )
-                        """,
-                        values,
-                    )
-                    self._db.execute(
-                        "INSERT INTO request_events "
-                        "(request_id, kind, to_state, at) VALUES (?,?,?,?)",
-                        (request_id, "admitted", WorkflowState.ADMITTED.value, now),
-                    )
-                    request = self.get_request(request_id)
-                    if request is None:
-                        raise RuntimeError("admitted request could not be reloaded")
-                    admitted.append(request)
-                    disposition = "admitted"
+                request, disposition = self._admit_command(
+                    command, snapshot, now,
+                    {"channel": event.channel_id, "ts": event.ts},
+                )
+                (admitted if disposition == "admitted" else duplicates).append(request)
                 self._db.execute(
                     "INSERT INTO event_requests "
                     "(channel, ts, ordinal, request_id, disposition) VALUES (?,?,?,?,?)",
@@ -608,6 +616,96 @@ class Store:
                 self._db.execute("DELETE FROM requests WHERE at < ?", (now - 172800,))
             self._db.commit()
             return AdmissionResult(tuple(admitted), tuple(duplicates), False)
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def follow_head(
+        self,
+        request: LifecycleRequest,
+        head_sha: str,
+        policy: ReviewPolicy,
+        snapshot: GateSnapshot,
+        now: float,
+        max_restarts: int,
+    ) -> LifecycleRequest | None:
+        """Admit a successor on the head that superseded `request`, taking its
+        place on the source message. None once that message has spent its
+        restarts or another live request already holds the new head."""
+        command = ReviewCommand(
+            owner=request.owner,
+            repo=request.repo,
+            pr_number=request.pr_number,
+            head_sha=head_sha,
+            pr_author=request.pr_author,
+            requester_user_id=request.requester_user_id,
+            requester_email=request.requester_email,
+            channel_id=request.channel_id,
+            message_ts=request.message_ts,
+            root_thread_ts=request.root_thread_ts,
+            permalink=request.permalink,
+            policy=policy,
+        )
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            attempts = self._db.execute(
+                "SELECT request_id, head_sha, created_at FROM review_requests "
+                "WHERE source_channel=? AND source_message_ts=? "
+                "AND owner=? AND repo=? AND pr_number=? ORDER BY rowid",
+                (request.channel_id, request.message_ts,
+                 request.owner, request.repo, request.pr_number),
+            ).fetchall()
+            newest = attempts[-1]["request_id"]
+            successor = None
+            # A retry after a crash between this commit and the caller's own
+            # transition must find the successor it already admitted.
+            already = next(
+                (row for row in attempts
+                 if row["head_sha"] == head_sha
+                 and row["created_at"] > request.created_at),
+                None,
+            )
+            if already is not None:
+                successor = self.get_request(already["request_id"])
+            # The admission key includes the gate fingerprint, which drifts as
+            # checks progress, so a repost of the same head seconds earlier would
+            # not read as a duplicate there. Two live reviews of one head collide
+            # on that key once their snapshots converge.
+            elif len(attempts) <= max_restarts and not self._db.execute(
+                "SELECT 1 FROM review_requests "
+                "WHERE review_identity=? AND workflow_state NOT IN (?,?)",
+                (command.idempotency_key,
+                 *(state.value for state in _TERMINAL_STATES)),
+            ).fetchone():
+                candidate, disposition = self._admit_command(
+                    command, snapshot, now, {"superseded": request.request_id}
+                )
+                if disposition == "admitted":
+                    successor = candidate
+                    newest = successor.request_id
+                    self._db.execute(
+                        "INSERT INTO request_events "
+                        "(request_id, kind, detail_json, at) VALUES (?,?,?,?)",
+                        (
+                            request.request_id,
+                            "head_followed",
+                            json.dumps(
+                                {"successor": successor.request_id, "head_sha": head_sha},
+                                separators=(",", ":"),
+                            ),
+                            now,
+                        ),
+                    )
+            # Keyed on the whole chain, not on `request`: a predecessor whose own
+            # transition failed can follow a later push after the link has moved.
+            marks = ",".join("?" for _ in attempts)
+            self._db.execute(
+                f"UPDATE event_requests SET request_id=? "
+                f"WHERE disposition='admitted' AND request_id IN ({marks})",
+                (newest, *(row["request_id"] for row in attempts)),
+            )
+            self._db.commit()
+            return successor
         except Exception:
             self._db.rollback()
             raise
@@ -762,6 +860,19 @@ class Store:
         self._db.commit()
         return cur.rowcount == 1
 
+    def _gate_fingerprint_taken(self, request_id: str, fingerprint: str) -> bool:
+        """Whether another request for the same review already holds this gate
+        state. The fingerprint column is only the admission dedup key, and two
+        requests for one head converge on the same checks; the later one keeps
+        the key it was admitted under instead of colliding on the unique index."""
+        return self._db.execute(
+            "SELECT 1 FROM review_requests mine JOIN review_requests other "
+            "ON other.review_identity=mine.review_identity "
+            "AND other.request_id<>mine.request_id "
+            "WHERE mine.request_id=? AND other.gate_fingerprint=?",
+            (request_id, fingerprint),
+        ).fetchone() is not None
+
     def transition(
         self,
         request_id: str,
@@ -800,7 +911,8 @@ class Store:
             if isinstance(converted.get("gate_snapshot_json"), GateSnapshot):
                 snapshot = converted["gate_snapshot_json"]
                 converted["gate_snapshot_json"] = snapshot.canonical_json()
-                converted.setdefault("gate_fingerprint", snapshot.fingerprint)
+                if not self._gate_fingerprint_taken(request_id, snapshot.fingerprint):
+                    converted.setdefault("gate_fingerprint", snapshot.fingerprint)
             converted["workflow_state"] = target.value
             converted["updated_at"] = changed_at
             if target in _TERMINAL_STATES:
@@ -853,7 +965,8 @@ class Store:
         if isinstance(converted.get("gate_snapshot_json"), GateSnapshot):
             snapshot = converted["gate_snapshot_json"]
             converted["gate_snapshot_json"] = snapshot.canonical_json()
-            converted.setdefault("gate_fingerprint", snapshot.fingerprint)
+            if not self._gate_fingerprint_taken(request_id, snapshot.fingerprint):
+                converted.setdefault("gate_fingerprint", snapshot.fingerprint)
         changed_at = time.time() if now is None else float(now)
         converted["updated_at"] = changed_at
         assignments = ", ".join(f"{name}=?" for name in converted)
