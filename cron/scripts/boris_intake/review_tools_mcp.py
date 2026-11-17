@@ -88,7 +88,7 @@ _EVIDENCE_BUDGET = 500_000
 # already in flight, which is cheaper than tracking liveness for a number this cheap to rebuild.
 _EVIDENCE_TRACKED = 64
 _evidence_served: dict[str, int] = {}
-# Bounded lists that ride on every page or listing; the totals are always reported.
+# Bounded lists that ride on a page or listing; the totals are always reported.
 # Counts cap the work, rendered size caps what reaches the model: deep monorepo
 # paths made a 300-entry all_files list alone outgrow the result budget.
 _ALL_FILES_LISTED = 300
@@ -577,16 +577,19 @@ def paginate_diff(diff: str, page: int, budget: int | None = None) -> dict:
     if page < 1 or page > total:
         raise ToolError(f"diff page {page} is out of range (1..{total})")
     selected = pages[page - 1]
-    return {
+    result = {
         "diff": "".join(text for _, text in selected),
         "page": page,
         "total_pages": total,
         "files_on_page": sorted({path for path, _ in selected if path}),
         "has_more": page < total,
-        "all_files": listed,
         "total_files": len(all_files),
         "all_files_truncated": len(listed) < len(all_files),
     }
+    # Every page counts against the review's evidence budget, so the list rides once.
+    if page == 1:
+        result["all_files"] = listed
+    return result
 
 
 # A repo that marks a path `-diff` or `linguist-generated=true` in .gitattributes is stating that
@@ -1103,7 +1106,8 @@ _GITHUB_TOOL_DESCRIPTION = (
     "and branches, plus review_context, which is workflow-owned and carries the "
     "review policy, the authorized acceptance references, and any prior Boris review "
     "of this pull request. pr_diff returns the unified diff paged at file "
-    "boundaries: read every page while has_more is true, and read a hunk the diff "
+    "boundaries, with all_files (every changed path) on page 1 only: read every "
+    "page while has_more is true, and read a hunk the diff "
     "marks as shortened in full with file_at_head. pr_checks returns check runs "
     "(name, state, link); the merge gate is decided by workflow code, not by the "
     "reviewer. pr_comments returns the issue comments and review summaries. "

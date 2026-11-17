@@ -475,7 +475,13 @@ def test_paginate_diff_keeps_every_file_across_pages_without_silent_loss(tmp_pat
         guard += 1
         result = module.paginate_diff(diff, page, budget=900)
         seen.append(result["diff"])
-        assert result["all_files"] == ["a.py", "b.py", "c.py"]
+        # The full list is evidence the reviewer already holds after page 1; repeating it
+        # on every page spent a tenth of a large review's evidence budget.
+        if page == 1:
+            assert result["all_files"] == ["a.py", "b.py", "c.py"]
+        else:
+            assert "all_files" not in result
+        assert result["total_files"] == 3
         if not result["has_more"]:
             assert result["page"] == result["total_pages"]
             break
@@ -1182,6 +1188,8 @@ def test_diff_pages_render_under_the_mcp_result_threshold(tmp_path, monkeypatch,
         result = module.read_github_evidence("pr_diff", None, page)
         assert _hermes_rendered_size(result) <= _mcp_threshold(), f"page {page} would spill"
         data = result["data"]
+        if page == 1:
+            listed = data["all_files"]
         seen_files.update(data["files_on_page"])
         if not data["has_more"]:
             break
@@ -1189,8 +1197,8 @@ def test_diff_pages_render_under_the_mcp_result_threshold(tmp_path, monkeypatch,
     assert seen_files == {name for name, _ in files}
     assert data["total_files"] == 320
     assert data["all_files_truncated"] is True
-    assert 0 < len(data["all_files"]) <= module._ALL_FILES_LISTED
-    assert data["all_files"] == sorted(name for name, _ in files)[: len(data["all_files"])]
+    assert 0 < len(listed) <= module._ALL_FILES_LISTED
+    assert listed == sorted(name for name, _ in files)[: len(listed)]
 
 
 def test_metadata_is_bounded_and_review_context_precedes_github_data(tmp_path, monkeypatch):
