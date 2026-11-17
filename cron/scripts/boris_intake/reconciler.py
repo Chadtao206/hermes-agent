@@ -31,6 +31,7 @@ sys.path.append("/Users/ctao/.hermes/scripts")
 
 from slack_read import ENV_PATH, parse_env, slack_call
 
+from boris_intake import approval
 from boris_intake.acceptance import JiraAcceptanceAdapter, helper_is_installed
 from boris_intake.config import Config, load_config
 from boris_intake.dispatch import KANBAN_DB, TERMINAL_STATUSES, KanbanIO
@@ -104,7 +105,7 @@ class GitHubLifecycleAdapter(Protocol):
     ) -> GateSnapshot | None: ...
     def find_review(self, request: LifecycleRequest) -> PublishedReview | None: ...
     def publish_review(
-        self, request: LifecycleRequest, body: str
+        self, request: LifecycleRequest, body: str, *, approve: bool = False
     ) -> PublishedReview: ...
 
 
@@ -884,7 +885,11 @@ def _reconcile_publication(
             request = store.get_request(request.request_id)
             if request is None:
                 return
-        published = deps.github.publish_review(request, render_github(result))
+        published = deps.github.publish_review(
+            request,
+            render_github(result),
+            approve=approval.verdict_block(result) is None,
+        )
     marker = (
         f"<!-- boris-review request_id={request.request_id} "
         f"result_hash={result.result_hash} -->"

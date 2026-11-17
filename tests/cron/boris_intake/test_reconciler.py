@@ -176,6 +176,7 @@ class GitHubFake:
         self.publications = 0
         self.crashes = crashes or CrashOnce()
         self.fail_publish = 0
+        self.approvals = []
 
     def current_pr(self, request):
         return PRInfo(self.head_sha, request.pr_author, "OPEN")
@@ -188,8 +189,10 @@ class GitHubFake:
     def find_review(self, request):
         return self.reviews.get(request.request_id)
 
-    def publish_review(self, request, body):
+    def publish_review(self, request, body, *, approve=False):
         from boris_intake.reconciler import PublishedReview
+
+        self.approvals.append(approve)
 
         if self.fail_publish:
             self.fail_publish -= 1

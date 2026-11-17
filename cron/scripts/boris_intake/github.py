@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from boris_intake import approval
 from boris_intake.models import (
     GateSnapshot,
     GateSnapshotLookup,
@@ -600,6 +602,7 @@ class GitHubIO:
     def __init__(self, token_path: Path, runner=subprocess.run):
         self._token_path = Path(token_path)
         self._runner = runner
+        self._viewer: str | None = None
 
     def _token(self) -> str:
         try:
@@ -632,6 +635,33 @@ class GitHubIO:
             raise RuntimeError(
                 "GitHub lifecycle call returned malformed JSON"
             ) from error
+
+    def _login(self) -> str:
+        if self._viewer is None:
+            raw = self._api(["user"])
+            login = raw.get("login") if isinstance(raw, dict) else None
+            if not login:
+                raise RuntimeError("GitHub did not name the reviewing account")
+            self._viewer = str(login)
+        return self._viewer
+
+    def _approval_block(self, request: LifecycleRequest) -> str | None:
+        pull_path = f"repos/{request.owner}/{request.repo}/pulls/{request.pr_number}"
+        try:
+            pull = self._api([pull_path])
+            pages = self._api(["--paginate", "--slurp", f"{pull_path}/files?per_page=100"])
+            viewer = self._login()
+        except RuntimeError as error:
+            return f"pull request facts are unreadable ({error})"
+        if not isinstance(pull, dict) or not isinstance(pages, list):
+            return "pull request facts are malformed"
+        files = [
+            str(item.get("filename") or "")
+            for page in pages
+            for item in (page if isinstance(page, list) else [page])
+            if isinstance(item, dict)
+        ]
+        return approval.pull_request_block(pull, files, viewer)
 
     def current_pr(self, request: LifecycleRequest) -> PRInfo | None:
         """Deliberately still two-state, and deliberately not retried here.
@@ -707,7 +737,17 @@ class GitHubIO:
             raise RuntimeError("marker-matched GitHub review is missing identity")
         return PublishedReview(review_id, url, str(match.get("body") or ""))
 
-    def publish_review(self, request: LifecycleRequest, body: str) -> PublishedReview:
+    def publish_review(
+        self, request: LifecycleRequest, body: str, *, approve: bool = False
+    ) -> PublishedReview:
+        payload = {"event": "COMMENT", "body": body}
+        if approve:
+            withheld = self._approval_block(request)
+            if withheld is None:
+                payload = {"event": "APPROVE", "body": body, "commit_id": request.head_sha}
+            else:
+                sys.stderr.write(f"boris approval withheld for {request.slug}: {withheld}\n")
+                sys.stderr.flush()
         raw = self._api(
             [
                 "--method",
@@ -716,7 +756,7 @@ class GitHubIO:
                 "--input",
                 "-",
             ],
-            payload={"event": "COMMENT", "body": body},
+            payload=payload,
         )
         if not isinstance(raw, dict):
             raise RuntimeError("GitHub review publication returned a non-object")
